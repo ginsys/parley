@@ -22,6 +22,14 @@ import (
 // retries automatically (design plan §3).
 var ErrQueueAmbiguous = errors.New("codex queue outcome ambiguous")
 
+// ErrRecipientMismatch marks an envelope addressed to a peer other than the
+// one this Transport is bound to. Nothing upstream of Deliver (Bridge.Send,
+// IngestTurn, Bridge.Dispatch) filters envelopes by ToPeer before calling a
+// Transport, so a single Codex Transport wired into a Bridge alongside other
+// peers' envelopes must reject a misdirected one itself, not queue it into
+// its own thread under its own fromLabel.
+var ErrRecipientMismatch = errors.New("envelope addressed to a different peer than this transport is bound to")
+
 // QueueSender is the one host operation this adapter needs: hand text to a
 // specific thread's queue. ExecSender is the real implementation; tests use
 // a fake.
@@ -57,20 +65,25 @@ func runAndClassify(ctx context.Context, cmd *exec.Cmd) error {
 	return fmt.Errorf("codex queue: %w", err)
 }
 
-// Transport implements dispatch.Transport for one Codex thread. fromLabel is
+// Transport implements dispatch.Transport for one Codex thread, bound to
+// exactly the one peer identity (toPeer) that thread represents. fromLabel is
 // the bridge-assigned sender name stamped on every wrapped message (§2), not
 // a free-text field the message content can override.
 type Transport struct {
 	sender    QueueSender
 	threadID  string
 	fromLabel string
+	toPeer    string
 }
 
-func NewTransport(sender QueueSender, threadID, fromLabel string) *Transport {
-	return &Transport{sender: sender, threadID: threadID, fromLabel: fromLabel}
+func NewTransport(sender QueueSender, threadID, fromLabel, toPeer string) *Transport {
+	return &Transport{sender: sender, threadID: threadID, fromLabel: fromLabel, toPeer: toPeer}
 }
 
 func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
+	if e.ToPeer != t.toPeer {
+		return fmt.Errorf("%w: envelope to %q, transport bound to %q", ErrRecipientMismatch, e.ToPeer, t.toPeer)
+	}
 	wrapped, err := bridgetext.Wrap(t.fromLabel, e.Text)
 	if err != nil {
 		return err
