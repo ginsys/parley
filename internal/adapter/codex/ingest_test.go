@@ -159,3 +159,72 @@ func TestIngestTurnStaleReplyStopsDelivery(t *testing.T) {
 		t.Fatalf("want ErrStaleReply, got %v", err)
 	}
 }
+
+// Regression for a finding on PR #4: IngestTurn fetched the current grant
+// only to copy its GrantVersion, never checking that the grant's Direction
+// actually permits fromPeer -> marker.To. A reply must be rejected under a
+// one-directional grant that doesn't cover that direction, not queued
+// silently in the reverse direction from what was granted.
+func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	ctrl := controller.New(db)
+	conversation := "conv-direction"
+
+	// b_to_a only: claude-session-a -> codex-thread-b is permitted, but a
+	// reply going codex-thread-b -> claude-session-a (a_to_b) is not.
+	if _, err := ctrl.Grant(ctx, controller.GrantParams{
+		Conversation: conversation,
+		PeerAID:      "codex-thread-b",
+		PeerBID:      "claude-session-a",
+		Direction:    store.BToA,
+		MaxExchanges: 10,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, conversation)
+	if err != nil {
+		t.Fatalf("current grant: %v", err)
+	}
+	e := store.Envelope{
+		ID:           "env-direction",
+		Conversation: conversation,
+		FromPeer:     "claude-session-a",
+		ToPeer:       "codex-thread-b",
+		Text:         "please respond",
+		GrantVersion: g.GrantVersion,
+		State:        store.Queued,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+		UpdatedAt:    "2026-01-01T00:00:00Z",
+	}
+	if err := store.InsertQueued(ctx, tx, e); err != nil {
+		t.Fatalf("insert queued: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"" + e.ID + "\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	_, err = codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
+	if !errors.Is(err, codex.ErrDirectionNotPermitted) {
+		t.Fatalf("want ErrDirectionNotPermitted, got %v", err)
+	}
+
+	tx2, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx2.Rollback(ctx)
+	original, err := store.GetByID(ctx, tx2, e.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if original.State != store.Queued {
+		t.Fatalf("rejected direction must not touch the original envelope's state, got %s", original.State)
+	}
+}
