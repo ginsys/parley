@@ -160,6 +160,42 @@ func TestExtractRejectsTruncatedSecondOpener(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3: quoting the marker's exact syntax
+// inside an outer four-backtick (or tilde) fence — e.g. documentation
+// showing the protocol by example — must not be extracted as a live marker.
+// Markdown fences don't nest, so a shorter same-character fence inside a
+// still-open outer one is never itself a real fence boundary; it must be
+// treated the same as any other quoted text.
+func TestExtractIgnoresMarkerNestedInsideOuterFence(t *testing.T) {
+	turn := "discussing the protocol:\n````\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n````"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker nested inside an outer fence, got %v", err)
+	}
+}
+
+func TestExtractIgnoresMarkerNestedInsideOuterTildeFence(t *testing.T) {
+	turn := "discussing the protocol:\n~~~\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n~~~"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker nested inside an outer tilde fence, got %v", err)
+	}
+}
+
+// Regression for a finding on PR #3: a marker sent with Windows-style CRLF
+// line endings must still be recognized — the fence patterns anchor to line
+// boundaries, and an un-normalized "\r" before each "$" broke that anchor.
+func TestExtractAcceptsCRLFLineEndings(t *testing.T) {
+	turn := "some prose\r\n```BRIDGE-REPLY\r\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"here you go\"}\r\n```\r\nmore prose"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if m.InReplyTo != "env-1" || m.To != "claude-session-a" || m.Text != "here you go" {
+		t.Fatalf("unexpected marker: %+v", m)
+	}
+}
+
 // Fixture 8: duplicate reply markers — two well-formed markers in one turn
 // must stop delivery, not pick one arbitrarily.
 func TestExtractDuplicateMarkers(t *testing.T) {

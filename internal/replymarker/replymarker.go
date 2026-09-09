@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 
 	"github.com/ginsys/parley/internal/store"
 )
@@ -52,35 +53,101 @@ type Marker struct {
 	Text      string `json:"text"`
 }
 
-// Both patterns anchor the opening and closing fences to their own line
-// (^...$ under multiline mode). A prior version matched the closing fence
-// as a bare "\n```" substring, so two adjacent markers like
-// "```BRIDGE-REPLY\n{a}\n```BRIDGE-REPLY\n{b}\n```" had the second block's
-// opener consumed as the first block's closer, yielding one match instead
-// of a rejected duplicate. Counting openers independently of the
-// fence-extraction regex catches that case even if the extraction regex
-// itself were ever loosened again.
+// bridgeReplyOpener matches our own marker's exact opening fence line,
+// anchored to its own line (^...$ under multiline mode) so a longer backtick
+// run (e.g. "````BRIDGE-REPLY") never satisfies it.
+//
+// genericFenceLine matches any Markdown code-fence delimiter line: up to
+// three leading spaces, a run of three or more backticks or tildes, then the
+// rest of the line (an info string, for an opening line).
 var (
-	openerPattern = regexp.MustCompile("(?m)^```BRIDGE-REPLY[ \\t]*$")
-	fencePattern  = regexp.MustCompile("(?sm)^```BRIDGE-REPLY[ \\t]*\\n(.*?)\\n^```[ \\t]*$")
+	bridgeReplyOpener = regexp.MustCompile(`(?m)^` + "```" + `BRIDGE-REPLY[ \t]*$`)
+	genericFenceLine  = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
 )
+
+// closesFence reports whether line closes a fence opened with run: the same
+// character, at least as long, and — per Markdown's own closing-fence rule —
+// no trailing info string.
+func closesFence(line, run string) bool {
+	m := genericFenceLine.FindStringSubmatch(line)
+	if m == nil {
+		return false
+	}
+	return m[1][0] == run[0] && len(m[1]) >= len(run) && strings.TrimSpace(m[2]) == ""
+}
+
+// markerScan is the result of scanning a turn's text for BRIDGE-REPLY
+// fences.
+type markerScan struct {
+	openerCount int
+	content     string
+	closed      bool
+}
+
+// scanForMarker walks text line by line tracking at most one open fence at a
+// time — Markdown fences don't nest, so a line that looks like our opener
+// while a *different*, unrelated fence (a longer backtick run, a tilde
+// fence, or a same-length fence with another info string) is still open is
+// just quoted example text, never a live marker. A second BRIDGE-REPLY-
+// looking line nested inside our *own* still-open block is a different,
+// already-seen case (adjacent markers where the second opener would
+// otherwise be consumed as the first block's closer): that still counts
+// toward openerCount, so it's rejected as ambiguous rather than silently
+// merged into the first block's content.
+func scanForMarker(text string) markerScan {
+	lines := strings.Split(text, "\n")
+	var result markerScan
+	var openRun string
+	var isOurs bool
+	var contentStart int
+	for i, line := range lines {
+		trimmed := strings.TrimRight(line, " \t")
+		if openRun == "" {
+			if bridgeReplyOpener.MatchString(trimmed) {
+				result.openerCount++
+				openRun = "```"
+				isOurs = true
+				contentStart = i + 1
+			} else if m := genericFenceLine.FindStringSubmatch(trimmed); m != nil {
+				openRun = m[1]
+				isOurs = false
+			}
+			continue
+		}
+		if isOurs && bridgeReplyOpener.MatchString(trimmed) {
+			result.openerCount++
+			continue
+		}
+		if closesFence(trimmed, openRun) {
+			if isOurs {
+				result.content = strings.Join(lines[contentStart:i], "\n")
+				result.closed = true
+			}
+			openRun = ""
+			isOurs = false
+		}
+	}
+	return result
+}
 
 // Extract finds the single BRIDGE-REPLY marker in a turn's text and parses
 // it. It never guesses: zero, more than one, or an unparseable/incomplete
-// block are all distinct errors, none of which yield a usable Marker.
+// block are all distinct errors, none of which yield a usable Marker. Line
+// endings are normalized first so a marker sent with Windows-style CRLF
+// isn't missed by the line-anchored fence patterns.
 func Extract(turnText string) (*Marker, error) {
-	if openers := openerPattern.FindAllString(turnText, -1); len(openers) == 0 {
+	text := strings.ReplaceAll(turnText, "\r\n", "\n")
+	scan := scanForMarker(text)
+	switch {
+	case scan.openerCount == 0:
 		return nil, ErrNoMarker
-	} else if len(openers) > 1 {
+	case scan.openerCount > 1:
 		return nil, ErrMultipleMarkers
-	}
-
-	matches := fencePattern.FindAllStringSubmatch(turnText, -1)
-	if len(matches) != 1 {
+	case !scan.closed:
 		return nil, fmt.Errorf("%w: fenced block not properly closed", ErrMalformedMarker)
 	}
 
-	m, err := decodeMarker([]byte(matches[0][1]))
+	m, err := decodeMarker([]byte(scan.content))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformedMarker, err)
 	}
