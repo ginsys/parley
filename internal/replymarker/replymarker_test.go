@@ -344,6 +344,67 @@ func TestExtractIgnoresCommentOpenerInsideCodeSpan(t *testing.T) {
 	}
 }
 
+// Regression for a finding on review 5160464724's second follow-up: a type-7
+// raw HTML tag whose quoted attribute value itself contains '>' (e.g.
+// `<custom title="a > b">`) must still be recognized as opening the block —
+// the prior `[^<>]*` restriction rejected the opener entirely, letting the
+// following marker through as a live top-level one even though CommonMark
+// keeps it hidden until a blank line.
+func TestExtractIgnoresMarkerInsideCustomTagWithQuotedAngleBracket(t *testing.T) {
+	turn := "<custom title=\"a > b\">\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker inside a type-7 block opened by a quoted-'>' attribute tag, got %v", err)
+	}
+}
+
+// The same type-7 block still ends at the next blank line, same as before.
+func TestExtractFindsMarkerAfterBlankLineEndsCustomTagBlock(t *testing.T) {
+	turn := "<custom title=\"a > b\">\nhidden\n\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after the blank line closing the custom-tag block, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
+// Regression for a finding on review 5160464724's second follow-up: once an
+// HTML comment is already open, a closing "-->" surrounded by backticks
+// still closes it — inside raw HTML, backticks carry no Markdown code-span
+// meaning. Stripping code spans there (the prior implementation) left
+// inComment stuck true and swallowed a later, genuinely top-level marker.
+func TestExtractFindsMarkerAfterBacktickWrappedCommentCloser(t *testing.T) {
+	turn := "<!--\nhidden\n`-->`\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after a backtick-wrapped HTML comment closer, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
+// Regression for a finding on review 5160464724's second follow-up:
+// CommonMark forbids a backtick in a backtick-fence's info string, so a line
+// like "``` `weird` info" never opens a fence at all. The prior unrestricted
+// "(.*)" info-string pattern accepted it, hiding a later, genuinely
+// top-level marker as if it were nested inside that bogus fence.
+func TestExtractFindsMarkerAfterBacktickFenceWithBacktickInInfoString(t *testing.T) {
+	turn := "``` `weird` info\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after a backtick-fence-lookalike line with a backtick in its info string, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
 func TestExtractDuplicateMarkers(t *testing.T) {
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"first\"}\n```\n" +
 		"and also\n```BRIDGE-REPLY\n{\"in_reply_to\": \"env-2\", \"to\": \"claude-session-a\", \"text\": \"second\"}\n```"
