@@ -55,6 +55,16 @@ const maxMessageBytes = 96 * 1024
 // Linux's per-argument exec limit if handed to `codex queue --message`.
 var ErrMessageTooLarge = errors.New("message exceeds codex queue's argv size limit")
 
+// ErrQueuePermanentlyRejected marks a QueueMessage outcome that is rejected
+// before exec is ever called, for a reason the message's own content
+// guarantees will still hold on every future retry (currently: size).
+// Transport.Deliver reports this as dispatch.ErrPermanentlyRejected, which
+// Dispatch refunds but never requeues — unlike ErrQueueNotAttempted's
+// transient causes (a canceled context), retrying an oversized message can
+// only ever reproduce the identical rejection, so refund-and-requeue would
+// loop forever instead of resolving.
+var ErrQueuePermanentlyRejected = errors.New("codex queue permanently rejected the message")
+
 // QueueSender is the one host operation this adapter needs: hand text to a
 // specific thread's queue. ExecSender is the real implementation; tests use
 // a fake.
@@ -69,7 +79,7 @@ type ExecSender struct{}
 
 func (ExecSender) QueueMessage(ctx context.Context, threadID, text string) error {
 	if len(text) > maxMessageBytes {
-		return fmt.Errorf("%w: %d bytes > %d: %w", ErrMessageTooLarge, len(text), maxMessageBytes, ErrQueueNotAttempted)
+		return fmt.Errorf("%w: %d bytes > %d: %w", ErrMessageTooLarge, len(text), maxMessageBytes, ErrQueuePermanentlyRejected)
 	}
 	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", threadID, "--message", text)
 	return runAndClassify(ctx, cmd)
@@ -128,6 +138,9 @@ func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
 	if err := t.sender.QueueMessage(ctx, t.threadID, wrapped); err != nil {
 		if errors.Is(err, ErrQueueAmbiguous) {
 			return fmt.Errorf("%w: %v", dispatch.ErrAmbiguous, err)
+		}
+		if errors.Is(err, ErrQueuePermanentlyRejected) {
+			return fmt.Errorf("%w: %v", dispatch.ErrPermanentlyRejected, err)
 		}
 		if errors.Is(err, ErrQueueNotAttempted) {
 			return fmt.Errorf("%w: %v", dispatch.ErrNoAttempt, err)

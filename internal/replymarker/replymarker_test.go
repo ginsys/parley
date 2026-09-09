@@ -371,6 +371,20 @@ func TestExtractFindsMarkerAfterBlankLineEndsCustomTagBlock(t *testing.T) {
 	}
 }
 
+// Regression for finding 3973918524 on PR #3: CommonMark defines a blank
+// line as containing only ASCII space/tab, not general Unicode whitespace.
+// A line holding only U+00A0 (NBSP) must not end a blank-line-terminated
+// raw HTML block (types 6/7) — the marker must stay hidden inside the still-
+// open <div>, not be exposed as if the block had already ended.
+func TestExtractIgnoresMarkerAfterNonASCIIWhitespaceOnlyLineInDivBlock(t *testing.T) {
+	turn := "<div>\nhidden\n \n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	_, err := replymarker.Extract(turn)
+	if !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker (marker still hidden inside the <div> block), got %v", err)
+	}
+}
+
 // Regression for a finding on review 5160464724's second follow-up: once an
 // HTML comment is already open, a closing "-->" surrounded by backticks
 // still closes it — inside raw HTML, backticks carry no Markdown code-span

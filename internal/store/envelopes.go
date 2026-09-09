@@ -55,22 +55,34 @@ func CancelQueuedUnderVersion(ctx context.Context, tx *Tx, conversation string, 
 		`conversation = ? AND grant_version = ? AND state = 'queued'`, updatedAt, conversation, version)
 }
 
-// CarryForwardQueuedReplies re-stamps queued reply rows (in_reply_to set)
-// from oldVersion to newVersion instead of letting CancelQueuedUnderVersion
-// cancel them. A reply's own originating envelope was already
-// unconditionally marked 'acked' by IngestTurn before the reply was queued,
-// so unlike a fresh Send, there is no live sender left to notice the
-// cancellation and resubmit — cancelling a reply here would strand its
-// content with no path back to delivery, even though the whole point of a
-// renewal is to let an already-in-progress exchange continue. Must run
-// after the new grant_version row exists (InsertGrant), since
+// CarryForwardQueuedReplies re-stamps queued reply rows from oldVersion to
+// newVersion instead of letting CancelQueuedUnderVersion cancel them. A
+// reply's own originating envelope was already unconditionally marked
+// 'acked' by IngestTurn before the reply was queued, so unlike a fresh Send,
+// there is no live sender left to notice the cancellation and resubmit —
+// cancelling a reply here would strand its content with no path back to
+// delivery, even though the whole point of a renewal is to let an
+// already-in-progress exchange continue. Must run after the new
+// grant_version row exists (InsertGrant), since
 // envelopes(conversation, grant_version) has an immediate foreign key
 // against grants.
+//
+// A row only qualifies if in_reply_to names an envelope that this same
+// conversation has actually acked — the exact state IngestTurn puts the
+// original in, atomically, before inserting the reply
+// (replymarker.Validate requires it to have been 'handed_off' first). Bare
+// "in_reply_to IS NOT NULL" is not provenance: dispatch.Bridge.Send takes an
+// arbitrary caller-supplied inReplyTo with no validation at all, so any
+// ordinary send could otherwise claim reply status and get silently carried
+// across a renewal instead of cancelled like every other old-grant message.
 func CarryForwardQueuedReplies(ctx context.Context, tx *Tx, conversation string, oldVersion, newVersion int64, updatedAt string) (int64, error) {
 	res, err := tx.Exec(ctx, `
 		UPDATE envelopes SET grant_version = ?, updated_at = ?
-		WHERE conversation = ? AND grant_version = ? AND state = 'queued' AND in_reply_to IS NOT NULL`,
-		newVersion, updatedAt, conversation, oldVersion)
+		WHERE conversation = ? AND grant_version = ? AND state = 'queued'
+		  AND in_reply_to IN (
+		      SELECT id FROM envelopes WHERE conversation = ? AND state = 'acked'
+		  )`,
+		newVersion, updatedAt, conversation, oldVersion, conversation)
 	if err != nil {
 		return 0, fmt.Errorf("carry forward queued replies: %w", err)
 	}
@@ -104,19 +116,29 @@ func TransitionToDispatching(ctx context.Context, tx *Tx, id, updatedAt string) 
 	return n == 1, nil
 }
 
-// RequeueUnattempted reverts one 'dispatching' envelope back to 'queued'.
-// Used when a Transport reports it never actually attempted delivery (the
-// host process didn't start, or the transport rejected the message before
-// ever calling the host) — the claimed budget slot must be refunded by the
-// caller in the same transaction (store.RefundExchange) so an unattempted
-// message doesn't count against max_exchanges. Guarded to only affect a row
-// still 'dispatching': a concurrent state change (there shouldn't be one,
-// since nothing else touches a 'dispatching' row) is surfaced as false
-// rather than silently overwriting whatever it became.
-func RequeueUnattempted(ctx context.Context, tx *Tx, id, updatedAt string) (bool, error) {
+// RequeueUnattempted reverts one 'dispatching' envelope back to 'queued'
+// under grantVersion. Used when a Transport reports it never actually
+// attempted delivery (the host process didn't start, or the transport
+// rejected the message before ever calling the host) — the claimed budget
+// slot must be refunded by the caller in the same transaction
+// (store.RefundExchange) so an unattempted message doesn't count against
+// max_exchanges. grantVersion lets the caller re-stamp the row onto whatever
+// grant is current now, rather than blindly restoring the version it was
+// claimed under: a revoke or renewal that committed while delivery was in
+// flight can make that original version no longer active, and a row left
+// 'queued' under a dead version can never be claimed again (ClaimExchange
+// requires status = 'active') or picked up by a later renewal's
+// CarryForwardQueuedReplies (which only ever matches the version it is
+// itself superseding) — it would be silently stranded forever. Callers that
+// confirm the version is still current simply pass it back unchanged.
+// Guarded to only affect a row still 'dispatching': a concurrent state
+// change (there shouldn't be one, since nothing else touches a 'dispatching'
+// row) is surfaced as false rather than silently overwriting whatever it
+// became.
+func RequeueUnattempted(ctx context.Context, tx *Tx, id string, grantVersion int64, updatedAt string) (bool, error) {
 	res, err := tx.Exec(ctx, `
-		UPDATE envelopes SET state = 'queued', updated_at = ?
-		WHERE id = ? AND state = 'dispatching'`, updatedAt, id)
+		UPDATE envelopes SET state = 'queued', grant_version = ?, updated_at = ?
+		WHERE id = ? AND state = 'dispatching'`, grantVersion, updatedAt, id)
 	if err != nil {
 		return false, fmt.Errorf("requeue unattempted: %w", err)
 	}

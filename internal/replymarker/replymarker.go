@@ -301,7 +301,14 @@ func scanForMarker(text string) markerScan {
 					inRawHTMLBlock = false
 					openRawHTMLClose = nil
 				}
-			} else if strings.TrimSpace(trimmed) == "" {
+			} else if strings.Trim(trimmed, " \t") == "" {
+				// ASCII space/tab only, matching closesFence's own rule above:
+				// CommonMark defines a blank line as containing nothing but
+				// spaces/tabs, not general Unicode whitespace. strings.TrimSpace
+				// would also strip e.g. U+00A0 NBSP, wrongly treating a
+				// visually-blank-looking line as ending a blank-line-terminated
+				// raw HTML block (types 6/7) one line early, exposing a marker
+				// on the next line that should still be hidden inside it.
 				inRawHTMLBlock = false
 			}
 			continue

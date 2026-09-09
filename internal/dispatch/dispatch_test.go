@@ -330,6 +330,38 @@ func TestStaleGrantVersionCancelledByRenewal(t *testing.T) {
 	}
 }
 
+// ackEnvelope inserts and immediately acks an envelope directly, standing in
+// for the original message a genuine BRIDGE-REPLY responds to — IngestTurn
+// always acks the original atomically before queuing its reply, and
+// CarryForwardQueuedReplies now requires that provenance (see the finding
+// 3973918530 regression test below), so any test exercising a reply's
+// carry-forward/rescue path needs a real acked row behind it, not a bare
+// InReplyTo string.
+func ackEnvelope(t *testing.T, db *store.DB, conversation, id string, grantVersion int64) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	e := store.Envelope{
+		ID: id, Conversation: conversation, FromPeer: "claude-session-a", ToPeer: "codex-thread-b",
+		Text: "original", GrantVersion: grantVersion, State: store.Queued,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.InsertQueued(ctx, tx, e); err != nil {
+		t.Fatalf("insert original: %v", err)
+	}
+	if err := store.SetState(ctx, tx, id, store.Acked, now); err != nil {
+		t.Fatalf("ack original: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
 // Regression for a finding on the merge-triggered review: a reply queued
 // under a grant version that gets renewed before it's dispatched must be
 // carried forward to the new version, not cancelled — the reply's own
@@ -340,6 +372,7 @@ func TestRenewCarriesForwardQueuedReplyInsteadOfCancelling(t *testing.T) {
 	db := openTestDB(t)
 	ctrl := controller.New(db)
 	grantOne(t, ctrl, "conv-reply-renew", 10)
+	ackEnvelope(t, db, "conv-reply-renew", "original-envelope-id", 1)
 
 	transport := newFakeTransport()
 	bridge := dispatch.New(db, transport)
@@ -451,5 +484,302 @@ func TestDispatchRequeuesAndRefundsNeverAttemptedDelivery(t *testing.T) {
 	}
 	if len(transport.delivered) != 1 || transport.delivered[0] != e.ID {
 		t.Fatalf("want exactly one real delivery after the refund, got %v", transport.delivered)
+	}
+}
+
+// Regression for finding 3973918513 on PR #3: the ErrNoAttempt refund/requeue
+// fix above didn't check whether the grant version an envelope was claimed
+// under was still the conversation's active one before resurrecting it as
+// 'queued'. A renewal that commits while Deliver is in flight tears down
+// that old version — resurrecting an ordinary send under it would strand the
+// row forever (ClaimExchange never matches a superseded version again, and
+// a later renewal's CarryForwardQueuedReplies only ever matches the version
+// it is itself superseding, never this stale one). An ordinary send has no
+// path back once its grant version is gone — same rule Renew already
+// applies to any other row still queued under an old version — so it must
+// be cancelled, not resurrected.
+func TestDispatchCancelsUnattemptedOrdinarySendWhenGrantRenewedMidFlight(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-no-attempt-renewed", 5)
+	ctx := context.Background()
+
+	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
+		if _, err := ctrl.Renew(context.Background(), controller.RenewParams{Conversation: "conv-no-attempt-renewed", MaxExchanges: 5}); err != nil {
+			t.Fatalf("renew during deliver: %v", err)
+		}
+		return dispatch.ErrNoAttempt
+	})
+	bridge := dispatch.New(db, transport)
+
+	e, err := bridge.Send(ctx, "conv-no-attempt-renewed", "a", "b", "ordinary send", nil)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Cancelled {
+		t.Fatalf("want cancelled once its grant version is torn down mid-flight, got %s", state)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	var used int64
+	if err := tx.QueryRow(ctx,
+		`SELECT exchanges_used FROM grants WHERE conversation = ? AND grant_version = ?`,
+		"conv-no-attempt-renewed", int64(1)).Scan(&used); err != nil {
+		t.Fatalf("query old grant: %v", err)
+	}
+	if used != 0 {
+		t.Fatalf("want the claimed slot refunded on the superseded grant version, got exchanges_used=%d", used)
+	}
+}
+
+// Regression for finding 3973918513 on PR #3, reply side: unlike an ordinary
+// send, a reply has no live sender left to resubmit it if cancelled (its
+// source turn is already permanently 'acked'), so when the grant version it
+// was claimed under gets superseded mid-flight, it must be rescued onto
+// whatever grant is current now — the same rescue a renewal's own
+// CarryForwardQueuedReplies performs for a still-queued reply — rather than
+// stranded under the dead version or cancelled outright.
+func TestDispatchRescuesUnattemptedReplyOntoRenewedGrantVersion(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-reply-rescue", 5)
+	ackEnvelope(t, db, "conv-reply-rescue", "original-envelope-id", 1)
+	ctx := context.Background()
+
+	renewed := false
+	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
+		if !renewed {
+			renewed = true
+			if _, err := ctrl.Renew(context.Background(), controller.RenewParams{Conversation: "conv-reply-rescue", MaxExchanges: 5}); err != nil {
+				t.Fatalf("renew during deliver: %v", err)
+			}
+			return dispatch.ErrNoAttempt
+		}
+		return nil
+	})
+	bridge := dispatch.New(db, transport)
+
+	original := "original-envelope-id"
+	reply, err := bridge.Send(ctx, "conv-reply-rescue", "codex-thread-b", "claude-session-a", "reply text", &original)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, reply.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Queued {
+		t.Fatalf("want the reply rescued back to queued under the renewed grant, got %s", state)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	got, err := store.GetByID(ctx, tx, reply.ID)
+	tx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.GrantVersion != 2 {
+		t.Fatalf("want the reply re-stamped onto the renewed grant version 2, got %d", got.GrantVersion)
+	}
+
+	state2, err := bridge.Dispatch(ctx, reply.ID)
+	if err != nil {
+		t.Fatalf("redispatch: %v", err)
+	}
+	if state2 != store.HandedOff {
+		t.Fatalf("want the rescued reply to dispatch successfully under the new grant, got %s", state2)
+	}
+}
+
+// Companion to the rescue test above: when the grant is torn down mid-flight
+// by a revoke rather than a renewal, there is no successor grant to rescue
+// the reply onto — it must be cancelled, the same terminal outcome a
+// revoke gives every other undelivered row for that conversation.
+func TestDispatchCancelsUnattemptedReplyWhenNoActiveGrantSurvives(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-reply-revoked", 5)
+	ackEnvelope(t, db, "conv-reply-revoked", "original-envelope-id", 1)
+	ctx := context.Background()
+
+	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
+		if _, err := ctrl.Revoke(context.Background(), "conv-reply-revoked"); err != nil {
+			t.Fatalf("revoke during deliver: %v", err)
+		}
+		return dispatch.ErrNoAttempt
+	})
+	bridge := dispatch.New(db, transport)
+
+	original := "original-envelope-id"
+	reply, err := bridge.Send(ctx, "conv-reply-revoked", "codex-thread-b", "claude-session-a", "reply text", &original)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, reply.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Cancelled {
+		t.Fatalf("want cancelled once there is no active grant left to rescue it onto, got %s", state)
+	}
+}
+
+// Regression for finding 3973918534 on PR #3: cancelling any queued
+// envelope outright when its grant expires at claim time is correct for an
+// ordinary send (TestGrantExpiryRecheckedAtDispatch above), but a reply has
+// no live sender left to resubmit it if cancelled — its source turn is
+// already permanently 'acked'. It must instead be left 'queued' under the
+// expired-but-not-yet-superseded grant version so a future renewal's
+// CarryForwardQueuedReplies (keyed on exactly that version, since expiry
+// alone never changes the grant row's status) can still rescue it.
+func TestGrantExpiryPreservesQueuedReplyForRenewal(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	ctx := context.Background()
+
+	past := time.Now().UTC().Add(-time.Hour)
+	if _, err := ctrl.Grant(ctx, controller.GrantParams{
+		Conversation: "conv-expiry-reply",
+		PeerAID:      "claude-session-a",
+		PeerBID:      "codex-thread-b",
+		Direction:    store.Bidirectional,
+		MaxExchanges: 10,
+		ExpiresAt:    &past,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	ackEnvelope(t, db, "conv-expiry-reply", "original-envelope-id", 1)
+
+	transport := newFakeTransport()
+	bridge := dispatch.New(db, transport)
+
+	original := "original-envelope-id"
+	reply, err := bridge.Send(ctx, "conv-expiry-reply", "codex-thread-b", "claude-session-a", "reply after expiry", &original)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, reply.ID)
+	if !errors.Is(err, dispatch.ErrGrantExpired) {
+		t.Fatalf("want ErrGrantExpired, got %v", err)
+	}
+	if state != store.Queued {
+		t.Fatalf("want the reply left queued (rescuable by a future renewal), got %s", state)
+	}
+	if len(transport.delivered) != 0 {
+		t.Fatalf("transport must not have been called for an expired-grant envelope")
+	}
+
+	future := time.Now().UTC().Add(time.Hour)
+	if _, err := ctrl.Renew(ctx, controller.RenewParams{Conversation: "conv-expiry-reply", MaxExchanges: 10, ExpiresAt: &future}); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+
+	state2, err := bridge.Dispatch(ctx, reply.ID)
+	if err != nil {
+		t.Fatalf("dispatch after renewal: %v", err)
+	}
+	if state2 != store.HandedOff {
+		t.Fatalf("want the reply carried forward and delivered after renewal, got %s", state2)
+	}
+}
+
+// Regression for finding 3973918518 on PR #3: an oversized message rejected
+// before exec is ever attempted must be refunded (it never spent its budget
+// slot) but left terminally 'failed', not requeued — unlike a transient
+// never-attempted cause, its size will never shrink on retry, so requeuing
+// it would loop forever reproducing the identical rejection.
+func TestDispatchFailsPermanentlyRejectedWithoutRequeueLoop(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-permanent-reject", 1)
+	ctx := context.Background()
+
+	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
+		return fmt.Errorf("wrap: %w", dispatch.ErrPermanentlyRejected)
+	})
+	bridge := dispatch.New(db, transport)
+
+	e, err := bridge.Send(ctx, "conv-permanent-reject", "a", "b", "too big", nil)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Failed {
+		t.Fatalf("want failed (permanent rejection), got %s", state)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, "conv-permanent-reject")
+	tx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("current grant: %v", err)
+	}
+	if g.ExchangesUsed != 0 {
+		t.Fatalf("want the claimed budget slot refunded (never actually attempted), got exchanges_used=%d", g.ExchangesUsed)
+	}
+
+	state2, err := bridge.Dispatch(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("second dispatch: %v", err)
+	}
+	if state2 != store.Failed {
+		t.Fatalf("want it to remain failed, not silently re-attempted in a loop, got %s", state2)
+	}
+}
+
+// Regression for finding 3973918530 on PR #3: CarryForwardQueuedReplies
+// previously trusted a bare non-nil in_reply_to as proof of being a genuine
+// reply, but dispatch.Bridge.Send takes an arbitrary caller-supplied
+// inReplyTo with no validation — an ordinary send naming an unrelated
+// envelope (here, one that was never acked at all) must be cancelled by a
+// renewal like any other old-grant message, not silently carried forward as
+// if it were a real reply.
+func TestRenewDoesNotCarryForwardFakeReplyWithUnackedOriginal(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-fake-reply", 10)
+	ctx := context.Background()
+
+	transport := newFakeTransport()
+	bridge := dispatch.New(db, transport)
+
+	notActuallyAcked := "not-an-acked-envelope"
+	forged, err := bridge.Send(ctx, "conv-fake-reply", "a", "b", "pretending to be a reply", &notActuallyAcked)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	if _, err := ctrl.Renew(ctx, controller.RenewParams{Conversation: "conv-fake-reply", MaxExchanges: 10}); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, forged.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Cancelled {
+		t.Fatalf("want a fake reply (no acked original) cancelled by the renewal like any other old-grant message, got %s", state)
 	}
 }

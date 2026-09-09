@@ -48,6 +48,16 @@ var ErrBudgetExhausted = errors.New("grant budget exhausted")
 // claim again — claim cancels the row rather than leaving it queued forever.
 var ErrGrantExpired = errors.New("grant expired before dispatch")
 
+// ErrPermanentlyRejected marks a Transport.Deliver outcome where the host
+// was never invoked, and never will be no matter how many times this exact
+// envelope is retried — the content itself makes delivery impossible (e.g.
+// too large for the transport to ever send). Unlike ErrNoAttempt, refunding
+// the budget and requeuing would only reproduce the identical rejection on
+// the very next dispatch attempt, forever. Dispatch refunds the claimed
+// budget slot (it was never actually spent) but leaves the envelope
+// terminally 'failed' rather than requeuing it.
+var ErrPermanentlyRejected = errors.New("transport permanently rejected the message; retrying cannot help")
+
 // Transport is the one thing Bridge asks of a concrete adapter: hand this
 // envelope's text to the actual host (codex queue, a Channels notification)
 // and report whether it was accepted.
@@ -125,7 +135,15 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 			return store.Queued, err
 		}
 		if errors.Is(err, ErrGrantExpired) {
-			return store.Cancelled, err
+			// claim() leaves a reply's row untouched on expiry (so a future
+			// renewal can still carry it forward) but cancels an ordinary
+			// send outright — ask the row itself what actually happened
+			// rather than assuming which of the two this envelope was.
+			state, stateErr := b.currentState(ctx, envelopeID)
+			if stateErr != nil {
+				return "", stateErr
+			}
+			return state, err
 		}
 		return "", err
 	}
@@ -135,6 +153,7 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 
 	deliverErr := b.transport.Deliver(ctx, *claimedEnvelope)
 	noAttempt := errors.Is(deliverErr, ErrNoAttempt)
+	permanentlyRejected := errors.Is(deliverErr, ErrPermanentlyRejected)
 	finalState := store.HandedOff
 	switch {
 	case deliverErr == nil:
@@ -143,6 +162,8 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 		finalState = store.Uncertain
 	case noAttempt:
 		finalState = store.Queued
+	case permanentlyRejected:
+		finalState = store.Failed
 	default:
 		finalState = store.Failed
 	}
@@ -167,25 +188,81 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 		}
 	}()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if noAttempt {
+	switch {
+	case noAttempt:
 		// The host was never actually invoked: refund the budget slot
-		// claim() consumed and put the envelope back in 'queued' instead of
-		// terminally failing a message that was never at risk of duplicate
-		// delivery.
+		// claim() consumed. Whether the envelope can go back to 'queued'
+		// depends on whether the grant it was claimed under is still this
+		// conversation's current one — a revoke or renewal can have torn it
+		// down while Deliver was in flight.
 		if err := store.RefundExchange(recordCtx, tx, claimedEnvelope.Conversation, claimedEnvelope.GrantVersion); err != nil {
 			return "", err
 		}
-		if _, err := store.RequeueUnattempted(recordCtx, tx, envelopeID, now); err != nil {
+		version, ok, err := resolveRequeueVersion(recordCtx, tx, claimedEnvelope)
+		if err != nil {
 			return "", err
 		}
-	} else if err := store.SetState(recordCtx, tx, envelopeID, finalState, now); err != nil {
-		return "", err
+		if ok {
+			if _, err := store.RequeueUnattempted(recordCtx, tx, envelopeID, version, now); err != nil {
+				return "", err
+			}
+			finalState = store.Queued
+		} else {
+			if err := store.SetState(recordCtx, tx, envelopeID, store.Cancelled, now); err != nil {
+				return "", err
+			}
+			finalState = store.Cancelled
+		}
+	case permanentlyRejected:
+		// Also never attempted, so also refund — but retrying can only ever
+		// reproduce the same rejection, so this stays 'failed' rather than
+		// going back to 'queued'.
+		if err := store.RefundExchange(recordCtx, tx, claimedEnvelope.Conversation, claimedEnvelope.GrantVersion); err != nil {
+			return "", err
+		}
+		if err := store.SetState(recordCtx, tx, envelopeID, finalState, now); err != nil {
+			return "", err
+		}
+	default:
+		if err := store.SetState(recordCtx, tx, envelopeID, finalState, now); err != nil {
+			return "", err
+		}
 	}
 	if err := tx.Commit(recordCtx); err != nil {
 		return "", err
 	}
 	committed = true
 	return finalState, nil
+}
+
+// resolveRequeueVersion decides whether an unattempted envelope can go back
+// to 'queued', and under which grant_version. If the version it was claimed
+// under is still the conversation's current one, nothing changed underneath
+// it — reuse it unchanged. Otherwise a revoke or renewal committed while
+// Deliver was in flight: an ordinary send has no path back, the same rule
+// Renew already applies to any other row still queued under a superseded
+// version (store.CancelQueuedUnderVersion), so it is not requeued. A reply
+// is different — its source turn is already permanently 'acked' with no
+// live sender left to resubmit it — so it is worth rescuing onto whatever
+// grant is current now, provided that grant still permits its direction.
+func resolveRequeueVersion(ctx context.Context, tx *store.Tx, e *store.Envelope) (int64, bool, error) {
+	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
+	if err != nil {
+		if errors.Is(err, store.ErrNoActiveGrant) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if g.GrantVersion == e.GrantVersion {
+		return e.GrantVersion, true, nil
+	}
+	if e.InReplyTo == nil {
+		return 0, false, nil
+	}
+	if !g.Permits(e.FromPeer, e.ToPeer, time.Now().UTC()) {
+		return 0, false, nil
+	}
+	return g.GrantVersion, true, nil
 }
 
 // claim runs the atomic budget-claim + dispatching transition. Returns
@@ -218,8 +295,20 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 	if g.Expired(time.Now().UTC()) {
 		// A grant that expires while a message sits queued must not deliver
 		// it late — recheck at claim time, not only at accept time. Unlike
-		// budget exhaustion, expiry is permanent for this grant version, so
-		// leaving the row queued forever would never resolve; cancel it.
+		// budget exhaustion, expiry is permanent for this grant version.
+		//
+		// An ordinary send has no path back once cancelled, so cancel it —
+		// but a reply's source turn is already permanently 'acked' by
+		// IngestTurn, with no live sender left to notice a cancellation and
+		// resubmit. Expiry alone doesn't change the grant's row status (still
+		// 'active' until a Revoke/Renew says otherwise), so leaving the reply
+		// untouched in 'queued' under this same version means a future
+		// Renew's CarryForwardQueuedReplies (keyed on exactly this version,
+		// since it's still the current one) can still rescue it. This only
+		// blocks *this* dispatch attempt — the row itself is left as-is.
+		if e.InReplyTo != nil {
+			return nil, false, ErrGrantExpired
+		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		if err := store.SetState(ctx, tx, envelopeID, store.Cancelled, now); err != nil {
 			return nil, false, err
