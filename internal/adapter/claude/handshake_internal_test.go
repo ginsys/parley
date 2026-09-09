@@ -155,6 +155,65 @@ func TestOverlappingTimeoutRetrySkippedWhileSendInFlight(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3: begin() used to clear a single shared
+// "sending" bool unconditionally when starting a new generation, and the
+// completing send (from whichever generation) also cleared it
+// unconditionally. If a superseded generation's send was still in flight
+// when a newer generation started its own send, the older send's eventual
+// completion would wrongly clear the newer generation's in-flight flag,
+// letting the newer generation's own timeout stack a second concurrent send
+// on top of the one still running — the exact overlap the guard exists to
+// prevent, now crossing generations instead of staying within one.
+func TestStaleGenerationSendCompletionDoesNotCorruptNewGenerationInFlight(t *testing.T) {
+	type call struct {
+		nonce   string
+		release chan struct{}
+	}
+	calls := make(chan *call, 8)
+	probe := func(nonce string) error {
+		c := &call{nonce: nonce, release: make(chan struct{})}
+		calls <- c
+		<-c.release
+		return nil
+	}
+
+	hs := NewHandshake(probe, time.Hour)
+
+	done1 := make(chan error, 1)
+	go func() { done1 <- hs.Start() }()
+	call1 := <-calls
+	gen1 := hs.generation
+
+	done2 := make(chan error, 1)
+	go func() { done2 <- hs.Reset() }()
+	call2 := <-calls
+	gen2 := hs.generation
+	if gen2 == gen1 {
+		t.Fatalf("want Reset to bump the generation")
+	}
+
+	// gen1's send completes while gen2's send is still in flight.
+	close(call1.release)
+	if err := <-done1; err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// A stale/duplicate timeout for gen2 firing while gen2's own send is
+	// still in flight must be a no-op, not a second concurrent send.
+	hs.onTimeout(gen2)
+
+	select {
+	case extra := <-calls:
+		t.Fatalf("want no second concurrent send for generation %d while one is in flight, got nonce %q", gen2, extra.nonce)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(call2.release)
+	if err := <-done2; err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+}
+
 type recordingProbe struct {
 	nonces []string
 }

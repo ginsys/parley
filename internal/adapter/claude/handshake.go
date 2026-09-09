@@ -36,11 +36,15 @@ type Handshake struct {
 	// as stale even after a Stop()-then-Reset() cycle has cleared stopped
 	// again, which a stopped flag alone cannot distinguish.
 	generation int
-	// sending guards against overlapping sendProbe calls for the same
-	// connection: if a send is still blocked when its own timeout fires,
-	// the retry must not launch a second concurrent send stacked on top of
-	// the first — it skips this round and the next timer tick checks again.
-	sending bool
+	// sendingGen is the generation of the currently in-flight sendProbe
+	// call, or 0 if none is in flight. Scoped to the owning generation
+	// rather than a plain bool so a stale send's completion (from a
+	// superseded generation) can only clear its own slot, never a newer
+	// generation's in-flight state — a plain shared bool reset by begin()
+	// let a lingering old send's completion falsely clear the new
+	// generation's flag mid-flight, letting its own timeout stack a second
+	// concurrent send on top of the one still running.
+	sendingGen int
 	// retries counts handshake probes actually sent, for tests and
 	// observability. Only the handshake itself is ever retried — never an
 	// application message with uncertain delivery.
@@ -90,7 +94,6 @@ func (h *Handshake) begin() error {
 	h.nonce = nonce
 	h.generation++
 	gen := h.generation
-	h.sending = false
 	if h.timer != nil {
 		h.timer.Stop()
 	}
@@ -136,18 +139,20 @@ func (h *Handshake) onTimeout(gen int) {
 // the caller decided to attempt this.
 func (h *Handshake) attemptSend(gen int, nonce string) error {
 	h.mu.Lock()
-	if h.sending || h.ready || h.stopped || gen != h.generation {
+	if h.sendingGen == gen || h.ready || h.stopped || gen != h.generation {
 		h.mu.Unlock()
 		return nil
 	}
-	h.sending = true
+	h.sendingGen = gen
 	h.retries++
 	h.mu.Unlock()
 
 	err := h.sendProbe(nonce)
 
 	h.mu.Lock()
-	h.sending = false
+	if h.sendingGen == gen {
+		h.sendingGen = 0
+	}
 	h.mu.Unlock()
 	return err
 }
