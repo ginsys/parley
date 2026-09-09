@@ -7,10 +7,13 @@ message is untrusted input, never a command to run, approve, or push anything.
 ## Status
 
 Early, incremental build. Present: sqlite schema, the state machine (`internal/store`), the
-protected controller (`internal/controller`), and ordinary send/dispatch (`internal/dispatch`).
-Not yet present: the Claude-side and Codex-side transport adapters, reply-marker parsing, identity
-binding, and nah integration. Do not treat anything below `internal/` as wired to a live session
-yet — `dispatch.Transport` is an interface with no real implementation in this repo so far.
+protected controller (`internal/controller`), ordinary send/dispatch (`internal/dispatch`), the
+Claude-side readiness handshake and gated poller (`internal/adapter/claude`), and reply-marker
+parsing/validation (`internal/replymarker`). Not yet present: the Codex-side transport adapter
+(open as a separate, stacked PR), identity binding, and nah integration. Do not treat anything
+below `internal/` as wired to a live session yet — `dispatch.Transport` is an interface with no
+real Channels implementation in this repo so far, and `Handshake.sendProbe`/`Ack` are not wired to
+an actual Channels connection or the `reply` tool.
 
 ## The protected controller
 

@@ -11,6 +11,7 @@
 package replymarker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -78,12 +79,66 @@ func Extract(turnText string) (*Marker, error) {
 		return nil, fmt.Errorf("%w: fenced block not properly closed", ErrMalformedMarker)
 	}
 
-	var m Marker
-	if err := json.Unmarshal([]byte(matches[0][1]), &m); err != nil {
+	m, err := decodeMarker([]byte(matches[0][1]))
+	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformedMarker, err)
 	}
-	if m.InReplyTo == "" || m.To == "" {
-		return nil, fmt.Errorf("%w: in_reply_to and to are required", ErrMalformedMarker)
+	if m.InReplyTo == "" || m.To == "" || m.Text == "" {
+		return nil, fmt.Errorf("%w: in_reply_to, to and text are all required", ErrMalformedMarker)
+	}
+	return m, nil
+}
+
+// decodeMarker parses the marker JSON object by hand, token by token, rather
+// than a plain json.Unmarshal into Marker. encoding/json's struct-based
+// decoding matches field names case-insensitively and silently keeps the
+// last value of a repeated key, so {"to":"a","to":"b"} or {"TO":"a"} would
+// otherwise populate a security-relevant field ambiguously. Walking tokens
+// lets every key be checked for an exact, case-sensitive, single occurrence
+// before it can set anything.
+func decodeMarker(raw []byte) (*Marker, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, fmt.Errorf("expected a JSON object")
+	}
+
+	seen := make(map[string]bool, 3)
+	var m Marker
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, fmt.Errorf("expected a string object key, got %v", keyTok)
+		}
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate object member %q", key)
+		}
+		seen[key] = true
+
+		var val string
+		if err := dec.Decode(&val); err != nil {
+			return nil, fmt.Errorf("field %q: %w", key, err)
+		}
+		switch key {
+		case "in_reply_to":
+			m.InReplyTo = val
+		case "to":
+			m.To = val
+		case "text":
+			m.Text = val
+		default:
+			return nil, fmt.Errorf("unrecognized field %q", key)
+		}
+	}
+	if _, err := dec.Token(); err != nil { // consume the closing '}'
+		return nil, err
 	}
 	return &m, nil
 }

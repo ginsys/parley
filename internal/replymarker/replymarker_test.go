@@ -90,11 +90,61 @@ func TestExtractMalformedMarker(t *testing.T) {
 		"```BRIDGE-REPLY\nnot json at all\n```",
 		"```BRIDGE-REPLY\n{\"to\": \"claude-session-a\", \"text\": \"missing in_reply_to\"}\n```",
 		"```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"text\": \"missing to\"}\n```",
+		// Regression for a finding on PR #3: a marker with in_reply_to and to
+		// but no text must also be rejected, not accepted as an empty reply.
+		"```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\"}\n```",
 	}
 	for _, turn := range cases {
 		if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrMalformedMarker) {
 			t.Fatalf("turn %q: want ErrMalformedMarker, got %v", turn, err)
 		}
+	}
+}
+
+// Regression for a finding on PR #3: encoding/json's plain struct unmarshal
+// keeps the last value of a repeated JSON object key, so a marker repeating
+// a security-relevant field (e.g. "to") would resolve ambiguously instead
+// of being rejected outright.
+func TestExtractRejectsDuplicateObjectMember(t *testing.T) {
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"unexpected\", \"to\": \"expected\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrMalformedMarker) {
+		t.Fatalf("want ErrMalformedMarker, got %v", err)
+	}
+}
+
+// Regression for a finding on PR #3: encoding/json matches struct fields
+// case-insensitively, so a marker using "TO" instead of "to" would silently
+// populate the same security-relevant field. JSON member names are
+// case-sensitive; only the exact declared names are accepted.
+func TestExtractRejectsWrongCaseFieldName(t *testing.T) {
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"TO\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrMalformedMarker) {
+		t.Fatalf("want ErrMalformedMarker, got %v", err)
+	}
+}
+
+// Regression for a finding on PR #3: before the fences were anchored to
+// their own line, a four-backtick fence like "````BRIDGE-REPLY" could still
+// satisfy an unanchored opener/closer match by consuming three of its four
+// backticks, letting quoted protocol documentation be forwarded as if it
+// were a real marker. The current line-anchored patterns must not match a
+// four-backtick fence at all — it should read as ordinary conversation.
+func TestExtractIgnoresFourBacktickFence(t *testing.T) {
+	turn := "discussing the protocol:\n````BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n````"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a four-backtick fence, got %v", err)
+	}
+}
+
+// Regression for a finding on PR #3: a valid marker followed by a second,
+// truncated opener with no closing fence at all is ambiguous and must stop
+// delivery — it must not be treated as exactly one valid marker just
+// because only one block happens to close.
+func TestExtractRejectsTruncatedSecondOpener(t *testing.T) {
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"a\"}\n```\n" +
+		"and then i started another one but never finished:\n```BRIDGE-REPLY\noops"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrMultipleMarkers) {
+		t.Fatalf("want ErrMultipleMarkers, got %v", err)
 	}
 }
 

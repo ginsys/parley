@@ -30,22 +30,34 @@ func NewPoller(db *store.DB, bridge *dispatch.Bridge, handshake *Handshake, conv
 // reconnect (Reset/Stop) can revoke readiness mid-batch and the remaining
 // envelopes must stop being dispatched immediately, not finish the run.
 // Not ready is not an error — it means every such envelope correctly stays
-// queued. Returns the envelope ids actually dispatched, for tests.
+// queued. The generation captured at the start of the batch is also
+// rechecked before each dispatch: Ready() alone can't tell a still-current
+// connection from a brand new one that raced back to ready by the time this
+// loop gets to a later envelope, and only the connection that authorized
+// this batch may keep authorizing it. On the grant's budget running out,
+// the whole batch stops rather than continuing through the remaining
+// candidates, each of which would hit the same exhausted budget. Returns
+// the envelope ids actually dispatched, for tests.
 func (p *Poller) Tick(ctx context.Context) ([]string, error) {
 	if !p.handshake.Ready() {
 		return nil, nil
 	}
+	gen := p.handshake.Generation()
+
 	candidates, err := p.queuedForMe(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var attempted []string
 	for _, id := range candidates {
-		if !p.handshake.Ready() {
+		if !p.handshake.Ready() || p.handshake.Generation() != gen {
 			break
 		}
 		attempted = append(attempted, id)
-		if _, err := p.bridge.Dispatch(ctx, id); err != nil && !errors.Is(err, dispatch.ErrBudgetExhausted) {
+		if _, err := p.bridge.Dispatch(ctx, id); err != nil {
+			if errors.Is(err, dispatch.ErrBudgetExhausted) {
+				break
+			}
 			return attempted, err
 		}
 	}

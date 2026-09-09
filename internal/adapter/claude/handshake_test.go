@@ -330,6 +330,134 @@ func TestPollerStopsMidBatchWhenReadinessRevoked(t *testing.T) {
 	assertState(t, db, e2.ID, store.Queued)
 }
 
+// Regression for a finding on PR #3: Ready() alone can't distinguish the
+// connection that authorized this Tick's batch from a brand new one that
+// also happens to reach Ready() by the time the loop gets to a later
+// envelope. Without also checking Generation(), a reconnect completing and
+// re-acking mid-batch would let the new connection's readiness silently
+// authorize the rest of the old batch.
+func TestPollerStopsMidBatchWhenGenerationChangesDespiteReady(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-mid-batch-gen")
+	ctx := context.Background()
+
+	e1, err := bridge(t, db).Send(ctx, "conv-mid-batch-gen", "codex-thread-b", "claude-session-a", "first", nil)
+	if err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+	e2, err := bridge(t, db).Send(ctx, "conv-mid-batch-gen", "codex-thread-b", "claude-session-a", "second", nil)
+	if err != nil {
+		t.Fatalf("send 2: %v", err)
+	}
+
+	probe := &probeRecorder{}
+	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err := hs.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !hs.Ack(probe.last()) {
+		t.Fatalf("ack must succeed")
+	}
+
+	transport := &fakeTransport{}
+	transport.onDeliver = func(id string) {
+		if id != e1.ID {
+			return
+		}
+		// Simulate a reconnect completing and re-acking mid-batch: a brand
+		// new connection, a distinct generation, that also reaches Ready()
+		// before this Tick's loop gets to e2.
+		if err := hs.Reset(); err != nil {
+			t.Fatalf("reset: %v", err)
+		}
+		if !hs.Ack(probe.last()) {
+			t.Fatalf("ack on the new connection must succeed")
+		}
+	}
+	b := dispatch.New(db, transport)
+	poller := adapterclaude.NewPoller(db, b, hs, "conv-mid-batch-gen", "claude-session-a")
+
+	attempted, err := poller.Tick(ctx)
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(attempted) != 1 || attempted[0] != e1.ID {
+		t.Fatalf("want only %s attempted before the generation changed, got %v", e1.ID, attempted)
+	}
+	if !hs.Ready() {
+		t.Fatalf("the new connection should still be ready after Tick returns")
+	}
+	assertState(t, db, e1.ID, store.HandedOff)
+	assertState(t, db, e2.ID, store.Queued)
+}
+
+// Regression for a finding on PR #3: Tick silently continued through every
+// remaining candidate after the grant's budget was exhausted, repeating the
+// same failing claim transaction for each and reporting them all as
+// attempted even though exhaustion is meant to halt delivery pending human
+// action.
+func TestPollerStopsBatchOnBudgetExhaustion(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	conversation := "conv-budget-batch"
+	if _, err := ctrl.Grant(context.Background(), controller.GrantParams{
+		Conversation: conversation,
+		PeerAID:      "codex-thread-b",
+		PeerBID:      "claude-session-a",
+		Direction:    store.Bidirectional,
+		MaxExchanges: 1,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+	ctx := context.Background()
+
+	e1, err := bridge(t, db).Send(ctx, conversation, "codex-thread-b", "claude-session-a", "first", nil)
+	if err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+	e2, err := bridge(t, db).Send(ctx, conversation, "codex-thread-b", "claude-session-a", "second", nil)
+	if err != nil {
+		t.Fatalf("send 2: %v", err)
+	}
+	e3, err := bridge(t, db).Send(ctx, conversation, "codex-thread-b", "claude-session-a", "third", nil)
+	if err != nil {
+		t.Fatalf("send 3: %v", err)
+	}
+
+	probe := &probeRecorder{}
+	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err := hs.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !hs.Ack(probe.last()) {
+		t.Fatalf("ack must succeed")
+	}
+
+	transport := &fakeTransport{}
+	b := dispatch.New(db, transport)
+	poller := adapterclaude.NewPoller(db, b, hs, conversation, "claude-session-a")
+
+	// e1 consumes the only budget slot; e2 discovers the exhaustion (a
+	// genuine attempt that fails, so it's correctly counted as attempted);
+	// e3 must never be touched at all — that's what stopping the batch
+	// protects, not re-litigating the envelope that already found the
+	// exhausted budget.
+	attempted, err := poller.Tick(ctx)
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(attempted) != 2 || attempted[0] != e1.ID || attempted[1] != e2.ID {
+		t.Fatalf("want e1 and e2 attempted and the batch to stop before e3, got %v", attempted)
+	}
+	assertState(t, db, e1.ID, store.HandedOff)
+	assertState(t, db, e2.ID, store.Queued)
+	assertState(t, db, e3.ID, store.Queued)
+	if transport.count() != 1 {
+		t.Fatalf("want only 1 transport call (e1), got %d", transport.count())
+	}
+}
+
 func bridge(t *testing.T, db *store.DB) *dispatch.Bridge {
 	t.Helper()
 	return dispatch.New(db, &fakeTransport{})

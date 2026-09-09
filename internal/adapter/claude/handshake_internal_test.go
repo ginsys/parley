@@ -2,6 +2,7 @@ package claude
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -22,7 +23,7 @@ func TestStopPreventsRearmFromInFlightTimeout(t *testing.T) {
 	}
 
 	hs.Stop()
-	hs.onTimeout()
+	hs.onTimeout(hs.generation)
 	if calls != 1 {
 		t.Fatalf("want no additional probe once stopped, got %d calls", calls)
 	}
@@ -57,6 +58,100 @@ func TestNonceGenerationFailureClearsStaleNonce(t *testing.T) {
 	}
 	if hs.Ack(firstNonce) {
 		t.Fatalf("the prior connection's nonce must not remain ackable after a failed reset")
+	}
+}
+
+// Regression for a finding on PR #3: a timeout retry must resend the same
+// nonce, not mint a fresh one. Rotating the nonce on every retry meant a
+// genuine but slow acknowledgement for the original probe was rejected as
+// stale the moment a retry fired — under a round trip consistently longer
+// than the timeout, the handshake would never succeed even though the
+// connection was healthy.
+func TestTimeoutRetryPreservesNonce(t *testing.T) {
+	probe := &recordingProbe{}
+	hs := NewHandshake(probe.send, time.Hour)
+	if err := hs.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	firstNonce := probe.last()
+
+	hs.onTimeout(hs.generation)
+	if got := probe.last(); got != firstNonce {
+		t.Fatalf("want the retry to resend nonce %q, got %q", firstNonce, got)
+	}
+	if !hs.Ack(firstNonce) {
+		t.Fatalf("want the original nonce still ackable after a timeout retry")
+	}
+}
+
+// Regression for a finding on PR #3: a timer callback captured its
+// generation at schedule time. If that callback doesn't run until after
+// Stop() then a subsequent Reset() have both already happened, the stopped
+// flag alone can't tell it's stale — Reset() clears stopped as part of
+// starting the new connection. The generation check must still catch it.
+func TestStaleTimeoutCallbackIgnoredAfterStopAndReset(t *testing.T) {
+	probe := &recordingProbe{}
+	hs := NewHandshake(probe.send, time.Hour)
+	if err := hs.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	staleGen := hs.generation
+
+	hs.Stop()
+	if err := hs.Reset(); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	newNonce := probe.last()
+	sendsSoFar := len(probe.nonces)
+
+	// The old connection's timer callback, arriving late.
+	hs.onTimeout(staleGen)
+
+	if len(probe.nonces) != sendsSoFar {
+		t.Fatalf("want the stale callback to send nothing, got %d new sends", len(probe.nonces)-sendsSoFar)
+	}
+	if !hs.Ack(newNonce) {
+		t.Fatalf("want the new connection's nonce still ackable after the stale callback ran")
+	}
+}
+
+// Regression for a finding on PR #3: if sendProbe blocks longer than
+// timeout, the timer fires while the original send is still in flight. The
+// retry must not launch a second concurrent send stacked on the first —
+// that pileup grows unbounded for as long as the transport stays stalled.
+func TestOverlappingTimeoutRetrySkippedWhileSendInFlight(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls int32
+
+	hs := NewHandshake(func(string) error {
+		atomic.AddInt32(&calls, 1)
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		return nil
+	}, time.Hour)
+
+	done := make(chan error, 1)
+	go func() { done <- hs.Start() }()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("probe never started")
+	}
+
+	hs.onTimeout(hs.generation)
+
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("want no overlapping send while one is in flight, got %d total sends", got)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("start: %v", err)
 	}
 }
 
