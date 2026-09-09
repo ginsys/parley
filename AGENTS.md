@@ -67,10 +67,10 @@ the design plan's stated limitations before treating it as stronger than that.
   assesses correctness, scope, safety, evidence and documentation; resolve findings before seeking
   readiness or merge authorization.
 - Do not claim CI or a review passed unless it actually ran and you saw the result. Every PR runs
-  the `CI` workflow (`checks` context) and an advisory Claude review (`PR Review`) — see
-  [change and review workflow](CONTRIBUTING.md#change-and-review-workflow) for why neither is
-  currently a *required* check on this repo, and treat both as mandatory in practice anyway. Merges
-  use `gh pr merge --auto`. Changing PR readiness, merging, or changing branch protection requires
-  explicit owner authorization; the owner may merge their own PR after review.
+  the `CI` workflow (`checks` context) and an advisory Claude review (`PR Review`); both are
+  required checks of the `main-protection` ruleset — see
+  [change and review workflow](CONTRIBUTING.md#change-and-review-workflow). Merges go through a
+  merge queue via `gh pr merge --auto`. Changing PR readiness, merging, or changing branch
+  protection requires explicit owner authorization; the owner may merge their own PR after review.
 - Close issues only after specified evidence and artifacts have landed and acceptance has been
   assessed. An open draft PR or a local passing check alone is not closure evidence.
