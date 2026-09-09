@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/ginsys/parley/internal/store"
@@ -115,6 +116,64 @@ var (
 	htmlCommentClose = regexp.MustCompile(`-->`)
 )
 
+// commentStateAfterLine returns whether an HTML comment span remains open
+// after processing line, given whether one was already open entering it. A
+// line can contain several openers/closers, and only their relative order —
+// not merely whether each substring is present anywhere in the line —
+// determines the state at the end of it. A line like "--> <!--" or
+// "<!-- first --> <!-- second" contains both "<!--" and "-->", but the
+// trailing unmatched opener still leaves a comment open spanning subsequent
+// lines; checking presence alone (the previous implementation) gets exactly
+// this case backwards.
+func commentStateAfterLine(inComment bool, line string) bool {
+	type delim struct {
+		pos  int
+		open bool
+	}
+	var delims []delim
+	for _, m := range htmlCommentOpen.FindAllStringIndex(line, -1) {
+		delims = append(delims, delim{m[0], true})
+	}
+	for _, m := range htmlCommentClose.FindAllStringIndex(line, -1) {
+		delims = append(delims, delim{m[0], false})
+	}
+	sort.Slice(delims, func(i, j int) bool { return delims[i].pos < delims[j].pos })
+	for _, d := range delims {
+		inComment = d.open
+	}
+	return inComment
+}
+
+// rawHTMLBlockOpener pairs a CommonMark HTML block type 1 start tag
+// (script/pre/style/textarea) with its matching end tag. Per CommonMark,
+// everything from a line starting with one of these tags through the line
+// containing its case-insensitive closing tag is raw HTML, never parsed as
+// Markdown — the same reasoning as the comment span above, generalized to
+// every raw-HTML-block start condition CommonMark defines, not just
+// comments.
+type rawHTMLBlockOpener struct {
+	open  *regexp.Regexp
+	close *regexp.Regexp
+}
+
+var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
+	{regexp.MustCompile(`(?i)^ {0,3}<script(?:[\s>]|$)`), regexp.MustCompile(`(?i)</script\s*>`)},
+	{regexp.MustCompile(`(?i)^ {0,3}<pre(?:[\s>]|$)`), regexp.MustCompile(`(?i)</pre\s*>`)},
+	{regexp.MustCompile(`(?i)^ {0,3}<style(?:[\s>]|$)`), regexp.MustCompile(`(?i)</style\s*>`)},
+	{regexp.MustCompile(`(?i)^ {0,3}<textarea(?:[\s>]|$)`), regexp.MustCompile(`(?i)</textarea\s*>`)},
+}
+
+// matchRawHTMLBlockOpener reports whether line opens one of the raw HTML
+// block types above, returning the specific closing pattern to watch for.
+func matchRawHTMLBlockOpener(line string) (*regexp.Regexp, bool) {
+	for _, k := range rawHTMLBlockOpeners {
+		if k.open.MatchString(line) {
+			return k.close, true
+		}
+	}
+	return nil, false
+}
+
 // scanForMarker walks text line by line tracking at most one open fence at a
 // time — Markdown fences don't nest, so a line that looks like our opener
 // while a *different*, unrelated fence (a longer backtick run, a tilde
@@ -132,17 +191,33 @@ func scanForMarker(text string) markerScan {
 	var isOurs bool
 	var contentStart int
 	var inComment bool
+	var openRawHTMLClose *regexp.Regexp
 	for i, line := range lines {
 		trimmed := strings.TrimRight(line, " \t")
 		if inComment {
-			if htmlCommentClose.MatchString(trimmed) {
-				inComment = false
+			inComment = commentStateAfterLine(inComment, trimmed)
+			continue
+		}
+		if openRawHTMLClose != nil {
+			if openRawHTMLClose.MatchString(trimmed) {
+				openRawHTMLClose = nil
 			}
 			continue
 		}
 		if openRun == "" {
-			if htmlCommentOpen.MatchString(trimmed) && !htmlCommentClose.MatchString(trimmed) {
+			if commentStateAfterLine(false, trimmed) {
 				inComment = true
+				continue
+			}
+			if closer, ok := matchRawHTMLBlockOpener(trimmed); ok {
+				// A closer already present on this same opening line makes
+				// the block self-contained (CommonMark: start and end
+				// conditions on one line close it immediately) — do not
+				// enter the persistent open state, or every later line
+				// would stay hidden with nothing left to ever match it.
+				if !closer.MatchString(trimmed) {
+					openRawHTMLClose = closer
+				}
 				continue
 			}
 			if bridgeReplyOpener.MatchString(trimmed) {

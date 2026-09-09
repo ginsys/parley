@@ -243,6 +243,65 @@ func TestExtractIgnoresMarkerInsideHTMLComment(t *testing.T) {
 	}
 }
 
+// Regression for a finding on the merge-triggered review: a line containing
+// a "-->" before a later, unmatched "<!--" contains both substrings, so
+// checking presence alone (the previous implementation) leaves the comment
+// state closed even though the trailing opener starts a comment spanning
+// subsequent lines. The marker below sits entirely inside that trailing,
+// order-dependent span.
+func TestExtractIgnoresMarkerAfterTrailingUnmatchedCommentOpener(t *testing.T) {
+	turn := "closed already --> then reopened <!--\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n-->"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker after a trailing unmatched comment opener, got %v", err)
+	}
+}
+
+// Same order-sensitivity bug, with two openers and one close on the
+// triggering line: the second, unmatched opener must still start a comment.
+func TestExtractIgnoresMarkerAfterSecondUnmatchedCommentOpener(t *testing.T) {
+	turn := "<!-- first --> <!-- second\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n-->"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker after a second unmatched comment opener, got %v", err)
+	}
+}
+
+// Regression for a finding on the merge-triggered review: CommonMark defines
+// several raw-HTML block start conditions beyond comments — script, pre,
+// style, and textarea tags all suppress Markdown parsing (including our own
+// fence syntax) until their matching closing tag.
+func TestExtractIgnoresMarkerInsideScriptBlock(t *testing.T) {
+	turn := "hidden protocol notes:\n<script>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n</script>"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker nested inside a <script> block, got %v", err)
+	}
+}
+
+func TestExtractIgnoresMarkerInsidePreBlock(t *testing.T) {
+	turn := "example turn:\n<pre>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n</pre>"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker nested inside a <pre> block, got %v", err)
+	}
+}
+
+// A raw HTML block that opens and closes on the same line is self-contained
+// per CommonMark; it must not leave the scanner stuck permanently hidden
+// with no closing tag left to ever match.
+func TestExtractFindsMarkerAfterSelfContainedScriptLine(t *testing.T) {
+	turn := "<script>var x = 1;</script>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after a self-contained <script> line, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
 func TestExtractDuplicateMarkers(t *testing.T) {
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"first\"}\n```\n" +
 		"and also\n```BRIDGE-REPLY\n{\"in_reply_to\": \"env-2\", \"to\": \"claude-session-a\", \"text\": \"second\"}\n```"
