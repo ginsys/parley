@@ -1,0 +1,213 @@
+// Package dispatch implements Parley's ordinary bridge operations: Send
+// (either peer's adapter queues a message) and Dispatch (the single-process
+// step that claims budget, hands the message to a Transport, and records
+// the outcome). Unlike controller, nothing here writes a grant — Send only
+// ever reads the current grant to stamp grant_version and reject a
+// revoked/missing one.
+package dispatch
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/ginsys/parley/internal/store"
+)
+
+// ErrAmbiguous marks a Transport.Deliver outcome where whether the host
+// actually accepted the message can't be determined (e.g. a timeout after
+// the underlying call may already have committed). Bridge records this as
+// 'uncertain', never retries it automatically, and never releases its
+// budget claim — see the design plan's Delivery section.
+var ErrAmbiguous = errors.New("ambiguous transport outcome")
+
+// ErrBudgetExhausted is returned by Dispatch when the grant's max_exchanges
+// has already been reached. The envelope is left queued, untouched — per
+// the design plan, exhaustion halts delivery pending a human renewal, it
+// does not fail or cancel the message.
+var ErrBudgetExhausted = errors.New("grant budget exhausted")
+
+// Transport is the one thing Bridge asks of a concrete adapter: hand this
+// envelope's text to the actual host (codex queue, a Channels notification)
+// and report whether it was accepted.
+type Transport interface {
+	Deliver(ctx context.Context, e store.Envelope) error
+}
+
+type Bridge struct {
+	db        *store.DB
+	transport Transport
+}
+
+func New(db *store.DB, t Transport) *Bridge {
+	return &Bridge{db: db, transport: t}
+}
+
+// Send accepts a new message into the queue. It stamps grant_version from
+// whatever is current right now; a later renewal cancels this row if it's
+// still queued when the renewal commits (see controller.Renew). Send never
+// calls the transport itself — that's Dispatch's job — so a crash between
+// accept and delivery leaves the message safely queued, not lost.
+func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, inReplyTo *string) (*store.Envelope, error) {
+	tx, err := b.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback(ctx)
+		}
+	}()
+
+	g, err := store.CurrentGrant(ctx, tx, conversation)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	e := store.Envelope{
+		ID:           uuid.NewString(),
+		Conversation: conversation,
+		FromPeer:     from,
+		ToPeer:       to,
+		Text:         text,
+		GrantVersion: g.GrantVersion,
+		InReplyTo:    inReplyTo,
+		State:        store.Queued,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := store.InsertQueued(ctx, tx, e); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	committed = true
+	return &e, nil
+}
+
+// Dispatch attempts delivery of one queued envelope: claim its budget slot
+// and transition it to 'dispatching' in a single BEGIN IMMEDIATE
+// transaction, then call the transport outside that transaction, then
+// record the outcome. Returns the envelope's state after the attempt.
+//
+// If the envelope is no longer 'queued' (already claimed, cancelled by a
+// concurrent revoke/renew, or already terminal), Dispatch does nothing and
+// returns its current state with no error — this is the serialization the
+// design relies on, not a failure.
+func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.EnvelopeState, error) {
+	claimedEnvelope, claimed, err := b.claim(ctx, envelopeID)
+	if err != nil {
+		if errors.Is(err, ErrBudgetExhausted) {
+			return store.Queued, err
+		}
+		return "", err
+	}
+	if !claimed {
+		return b.currentState(ctx, envelopeID)
+	}
+
+	deliverErr := b.transport.Deliver(ctx, *claimedEnvelope)
+	finalState := store.HandedOff
+	switch {
+	case deliverErr == nil:
+		finalState = store.HandedOff
+	case errors.Is(deliverErr, ErrAmbiguous):
+		finalState = store.Uncertain
+	default:
+		finalState = store.Failed
+	}
+
+	tx, err := b.db.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("record dispatch outcome: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback(ctx)
+		}
+	}()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := store.SetState(ctx, tx, envelopeID, finalState, now); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	committed = true
+	return finalState, nil
+}
+
+// claim runs the atomic budget-claim + dispatching transition. Returns
+// claimed=false (no error) for either ErrBudgetExhausted's cause or a
+// concurrent state change — callers distinguish by re-reading state.
+func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope, bool, error) {
+	tx, err := b.db.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback(ctx)
+		}
+	}()
+
+	e, err := store.GetByID(ctx, tx, envelopeID)
+	if err != nil {
+		return nil, false, err
+	}
+	if e.State != store.Queued {
+		return nil, false, nil
+	}
+
+	ok, err := store.ClaimExchange(ctx, tx, e.Conversation, e.GrantVersion)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		// e.State was already confirmed 'queued' above under this exclusive
+		// transaction, so a revoke/renewal can't have raced us — any grant
+		// no longer active would already have cancelled this row instead.
+		// The only remaining reason ClaimExchange fails is budget
+		// exhaustion. Leave the row queued — do not cancel or fail it.
+		return nil, false, ErrBudgetExhausted
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	transitioned, err := store.TransitionToDispatching(ctx, tx, envelopeID, now)
+	if err != nil {
+		return nil, false, err
+	}
+	if !transitioned {
+		// Can't happen under a single BEGIN IMMEDIATE writer without a bug
+		// elsewhere, since nothing else could have changed this row between
+		// the two statements above within the same transaction.
+		return nil, false, fmt.Errorf("dispatch: envelope %s left queued state between claim and transition", envelopeID)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	committed = true
+	e.State = store.Dispatching
+	return e, true, nil
+}
+
+func (b *Bridge) currentState(ctx context.Context, envelopeID string) (store.EnvelopeState, error) {
+	tx, err := b.db.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+	e, err := store.GetByID(ctx, tx, envelopeID)
+	if err != nil {
+		return "", err
+	}
+	return e.State, nil
+}
