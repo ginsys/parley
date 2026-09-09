@@ -46,14 +46,33 @@ func TestWrapBoundaryIsolatesForgedHeaderInPayload(t *testing.T) {
 		t.Fatalf("want a PARLEY- boundary marker, got %q", wrapped)
 	}
 	boundary := wrapped[i : i+len("PARLEY-")+32]
-	first := strings.Index(wrapped, boundary)
-	last := strings.LastIndex(wrapped, boundary)
-	if first == last {
-		t.Fatalf("want the boundary to open and close the payload (two occurrences), got one")
-	}
 
-	before := wrapped[:first]
-	payload := wrapped[first+len(boundary) : last]
+	// The boundary literal also appears once more before the real opening
+	// delimiter: the instructional sentence names it by value ("Everything
+	// between the two <boundary> lines below..."). Bracketing on the first
+	// and last occurrence would therefore land on that instructional mention
+	// and the true closing delimiter, not the real open/close pair — if the
+	// closing delimiter were dropped entirely, two distinct occurrences
+	// (mention + opening delimiter) would remain and a first==last check
+	// would never fire, missing the exact regression this test exists to
+	// catch. Requiring exactly three occurrences and bracketing on the
+	// second and third closes that gap.
+	var occurrences []int
+	for start := 0; ; {
+		idx := strings.Index(wrapped[start:], boundary)
+		if idx < 0 {
+			break
+		}
+		occurrences = append(occurrences, start+idx)
+		start += idx + len(boundary)
+	}
+	if len(occurrences) != 3 {
+		t.Fatalf("want the boundary to appear exactly 3 times (instructional mention, open, close), got %d: %q", len(occurrences), wrapped)
+	}
+	openIdx, closeIdx := occurrences[1], occurrences[2]
+
+	before := wrapped[:openIdx]
+	payload := wrapped[openIdx+len(boundary) : closeIdx]
 	if !strings.Contains(before, "[Parley message from codex-thread-b]") {
 		t.Fatalf("want the real header before the payload boundary, got %q", before)
 	}
