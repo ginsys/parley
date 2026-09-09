@@ -37,6 +37,10 @@ var (
 	// ErrStaleReply means a well-formed marker's "in_reply_to" does not name
 	// an envelope currently awaiting reply on this conversation (fixture 10).
 	ErrStaleReply = errors.New("BRIDGE-REPLY marker references a stale or unknown envelope")
+	// ErrWrongReplier means the referenced envelope was never addressed to
+	// the peer producing this reply — only the peer an envelope was actually
+	// sent to may reply to it, never the peer that sent it or a third party.
+	ErrWrongReplier = errors.New("BRIDGE-REPLY marker references an envelope not addressed to the replying peer")
 )
 
 // Marker is one parsed BRIDGE-REPLY block.
@@ -86,11 +90,15 @@ func Extract(turnText string) (*Marker, error) {
 
 // Validate checks a well-formed Marker against bridge state before it may be
 // forwarded: the recipient must match the enrolled peer this adapter
-// forwards to, and in_reply_to must name an envelope on this exact
-// conversation still awaiting a reply (queued or handed_off) — never a
-// different conversation, an already-acked envelope, or an unknown id.
-// Returns the envelope the reply resolves against.
-func Validate(ctx context.Context, tx *store.Tx, conversation, expectedTo string, m *Marker) (*store.Envelope, error) {
+// forwards to, in_reply_to must name an envelope on this exact conversation
+// still awaiting a reply (queued or handed_off) — never a different
+// conversation, an already-acked envelope, or an unknown id — and that
+// envelope must have actually been addressed to replyingPeer. Without that
+// last check, a peer could name an envelope it sent itself (or one sent to
+// a different peer entirely) as long as the conversation and state matched,
+// impersonating a reply it was never asked for. Returns the envelope the
+// reply resolves against.
+func Validate(ctx context.Context, tx *store.Tx, conversation, replyingPeer, expectedTo string, m *Marker) (*store.Envelope, error) {
 	if m.To != expectedTo {
 		return nil, fmt.Errorf("%w: marker to=%q, expected %q", ErrWrongRecipient, m.To, expectedTo)
 	}
@@ -105,6 +113,10 @@ func Validate(ctx context.Context, tx *store.Tx, conversation, expectedTo string
 	if e.Conversation != conversation {
 		return nil, fmt.Errorf("%w: envelope %s belongs to conversation %s, not %s",
 			ErrStaleReply, m.InReplyTo, e.Conversation, conversation)
+	}
+	if e.ToPeer != replyingPeer {
+		return nil, fmt.Errorf("%w: envelope %s was addressed to %s, not %s",
+			ErrWrongReplier, m.InReplyTo, e.ToPeer, replyingPeer)
 	}
 	if e.State != store.Queued && e.State != store.HandedOff {
 		return nil, fmt.Errorf("%w: envelope %s is %s, not awaiting reply", ErrStaleReply, m.InReplyTo, e.State)
