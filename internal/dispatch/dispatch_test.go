@@ -233,6 +233,62 @@ func TestCrashAfterHandoffRecoversUncertain(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3 (poller.go's dispatch-lease fix): the
+// context passed to Deliver is also reused, unchanged, for the transaction
+// that records Deliver's outcome. A caller-side cancellation (e.g. a
+// deadline, or a Claude-side reconnect canceling an in-flight dispatch's
+// context) landing during Deliver used to also kill that recording
+// transaction, stranding the envelope in 'dispatching' forever — the exact
+// class of ambiguous, un-recorded outcome this design exists to prevent.
+// Deliver has already returned a definite answer by the time the recording
+// transaction runs; losing the ability to write it down is a bug, not a
+// faithful propagation of the cancellation.
+func TestDispatchRecordsOutcomeDespiteContextCanceledDuringDeliver(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-cancel-during-deliver", 5)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
+		cancel() // simulate the ctx being invalidated while Deliver is running
+		return errors.New("delivery refused")
+	})
+	bridge := dispatch.New(db, transport)
+
+	e, err := bridge.Send(context.Background(), "conv-cancel-during-deliver", "a", "b", "hi", nil)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Failed {
+		t.Fatalf("want failed, got %s", state)
+	}
+
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(context.Background())
+	got, err := store.GetByID(context.Background(), tx, e.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != store.Failed {
+		t.Fatalf("want the envelope durably recorded failed, not stuck at %s", got.State)
+	}
+}
+
+// transportFunc adapts a plain function to dispatch.Transport.
+type transportFunc func(ctx context.Context, e store.Envelope) error
+
+func (f transportFunc) Deliver(ctx context.Context, e store.Envelope) error {
+	return f(ctx, e)
+}
+
 // Fixture 6: stale grant version — a message accepted under version N,
 // dispatched after a renewal to N+1, must be cancelled by the renewal, not
 // dispatched under the new grant's terms.

@@ -8,6 +8,7 @@
 package claude
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -49,6 +50,20 @@ type Handshake struct {
 	// observability. Only the handshake itself is ever retried — never an
 	// application message with uncertain delivery.
 	retries int
+	// dispatchCtx is canceled the instant this generation is superseded
+	// (begin) or torn down (Stop). A caller authorizing a dispatch against a
+	// specific generation (see GenerationContext) derives its per-call
+	// context from this one, so a Reset/Stop that lands after the caller's
+	// own readiness check but before — or during — the transport's actual
+	// I/O still signals the in-flight call to abort, instead of leaving it
+	// to complete as if the connection it was authorized under were still
+	// live. This narrows, but per Go's context model cannot fully close,
+	// that window: the residual gap is bounded by how promptly the
+	// transport itself observes ctx.Done(), the same cooperative-signal
+	// limit already documented for other same-process controls in this
+	// design (see AGENTS.md).
+	dispatchCtx    context.Context
+	dispatchCancel context.CancelFunc
 }
 
 // NewHandshake builds a Handshake that calls sendProbe with a fresh nonce
@@ -94,6 +109,10 @@ func (h *Handshake) begin() error {
 	h.nonce = nonce
 	h.generation++
 	gen := h.generation
+	if h.dispatchCancel != nil {
+		h.dispatchCancel()
+	}
+	h.dispatchCtx, h.dispatchCancel = context.WithCancel(context.Background())
 	if h.timer != nil {
 		h.timer.Stop()
 	}
@@ -196,6 +215,25 @@ func (h *Handshake) Generation() int {
 	return h.generation
 }
 
+// GenerationContext returns the context tied to gen's connection lifecycle,
+// and whether gen is still the current, ready generation right now. ok
+// mirrors the same condition a caller would get from checking Ready() and
+// Generation() together, evaluated atomically under the same lock so the two
+// can't be read out of sync with each other. A caller about to perform a
+// gen-authorized operation whose own duration might outlast a concurrent
+// Reset/Stop (e.g. a transport delivery) should derive its own
+// context.Context from the returned one — via context.AfterFunc, not by
+// reading ok once and forgetting it — so the operation is signaled to abort
+// the instant this generation is superseded, rather than only being checked
+// before the operation started (see Poller.Tick). When ok is false the
+// returned context may already be canceled or may belong to a different
+// generation entirely; a caller must not use it to authorize anything.
+func (h *Handshake) GenerationContext(gen int) (context.Context, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.dispatchCtx, h.ready && !h.stopped && gen == h.generation
+}
+
 // Retries reports how many times the probe has actually been sent, for
 // tests. A retry skipped because a prior send was still in flight doesn't
 // count — this counts sends, not timeout firings.
@@ -220,6 +258,9 @@ func (h *Handshake) Stop() {
 	h.stopped = true
 	h.ready = false
 	h.nonce = ""
+	if h.dispatchCancel != nil {
+		h.dispatchCancel()
+	}
 	if h.timer != nil {
 		h.timer.Stop()
 	}

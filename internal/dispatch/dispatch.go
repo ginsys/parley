@@ -123,21 +123,30 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 		finalState = store.Failed
 	}
 
-	tx, err := b.db.Begin(ctx)
+	// Recording the outcome must survive ctx being canceled during Deliver
+	// (e.g. a caller-imposed deadline, or a Claude-side reconnect
+	// invalidating the connection an in-flight delivery was authorized
+	// under) — Deliver has already returned a definite answer by this
+	// point, and losing the ability to write it down would strand the
+	// envelope in 'dispatching' forever, exactly the ambiguous-outcome
+	// class this design exists to avoid. context.WithoutCancel detaches
+	// from ctx's cancellation/deadline while keeping any values.
+	recordCtx := context.WithoutCancel(ctx)
+	tx, err := b.db.Begin(recordCtx)
 	if err != nil {
 		return "", fmt.Errorf("record dispatch outcome: %w", err)
 	}
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(ctx)
+			tx.Rollback(recordCtx)
 		}
 	}()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if err := store.SetState(ctx, tx, envelopeID, finalState, now); err != nil {
+	if err := store.SetState(recordCtx, tx, envelopeID, finalState, now); err != nil {
 		return "", err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(recordCtx); err != nil {
 		return "", err
 	}
 	committed = true
