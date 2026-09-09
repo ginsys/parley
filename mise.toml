@@ -1,0 +1,71 @@
+[tools]
+# ci.yml installs from this list (jdx/mise-action); a bump here is the only edit needed.
+go = "1.27.1"
+actionlint = "1.7.12"
+shellcheck = "0.11.0"
+
+[tasks.lint]
+description = "actionlint on the workflows, shellcheck on the scripts"
+# SHELLCHECK_OPTS is cleared so a shell default such as --exclude=SC2086 cannot hide locally a
+# finding CI reports with a clean environment.
+run = """
+env -u SHELLCHECK_OPTS actionlint
+env -u SHELLCHECK_OPTS shellcheck scripts/ci/*.sh scripts/test/*.sh
+"""
+
+[tasks.test]
+description = "Fixture tests for scripts/ci/commit-lint.sh"
+run = "bash scripts/test/commit-lint-test.sh"
+
+[tasks.docs]
+description = "Documentation checks (needs Python 3.9+ with PyYAML 6)"
+run = "python3 scripts/verify-docs.py"
+
+[tasks.whitespace]
+description = "git diff --check over the whole tree at HEAD and over the working tree, as ci.yml's docs job does"
+run = """
+git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+git diff --check
+"""
+
+[tasks.commit-lint]
+description = "Conventional-commit subjects on this branch's commits since origin/main (fetch it first)"
+run = """
+base=$(git merge-base origin/main HEAD) || { echo "commit-lint: no merge-base with origin/main; fetch it first" >&2; exit 1; }
+scripts/ci/commit-lint.sh "$base" HEAD
+"""
+
+[tasks.go]
+description = "go build, go vet, go test, and a gofmt check (fails if any file is unformatted)"
+run = """
+go build ./...
+go vet ./...
+go test ./...
+unformatted=$(gofmt -l .)
+if [ -n "$unformatted" ]; then
+  echo "gofmt: the following files are not formatted:" >&2
+  echo "$unformatted" >&2
+  exit 1
+fi
+"""
+
+[tasks.upstream-sync]
+description = "Check out go-kure/.github into upstream/ (gitignored) at the commit ci.yml pins the action-pin checker to"
+# Single source of truth for the revision: the `check-action-pins@<sha>` pin in ci.yml, so the
+# local check and CI run the same checker. Bumping the pin there is the only edit needed.
+run = """
+sha=$(grep -oE 'check-action-pins@[0-9a-f]{40}' .github/workflows/ci.yml | head -1 | cut -d@ -f2)
+[ -n "$sha" ] || { echo "upstream-sync: no 40-char check-action-pins pin in .github/workflows/ci.yml" >&2; exit 1; }
+[ -d upstream/.git ] || git clone --quiet --no-checkout https://github.com/go-kure/.github upstream
+git -C upstream rev-parse --quiet --verify "$sha^{commit}" >/dev/null || git -C upstream fetch --quiet origin
+git -C upstream checkout --quiet --detach "$sha"
+"""
+
+[tasks.action-pins]
+description = "Every third-party action ref is a 40-char commit SHA (go-kure's checker, ginsys reusables admitted at @main)"
+depends = ["upstream-sync"]
+run = "FIRST_PARTY_WORKFLOW_RE='^(go-kure|ginsys)/[^/]+/\\.github/workflows/[^@]+@main$' bash upstream/scripts/check-action-pins.sh ."
+
+[tasks.verify]
+description = "Everything ci.yml runs: lint, tests, docs, whitespace, commit subjects, go, action pins"
+depends = ["lint", "test", "docs", "whitespace", "commit-lint", "go", "action-pins"]
