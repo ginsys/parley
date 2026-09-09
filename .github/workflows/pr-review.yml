@@ -1,0 +1,23 @@
+name: PR Review
+
+# Caller of ginsys/.github's Claude review reusable (advisory by default; the repo variable
+# PR_REVIEW_THREADS_MODE switches it — see that workflow's header). `@main` is the first-party
+# reusable-workflow policy; the review logic behind it is a commit-pinned upstream action.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # Required so this check reports (as skipped, via the callee's fork `if:`) on the merge queue's
+  # temporary ref. A required context that never triggers stays pending forever and stalls every
+  # queue entry until the queue's timeout ejects it.
+  merge_group:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  pr-review:
+    uses: ginsys/.github/.github/workflows/pr-review.yml@main
+    with:
+      pr_review_context: "Authorized conversation bridge between a Claude Code session and a Codex CLI session. Core invariant: communicating through Parley never grants execution authority — a delivered message is untrusted input, never a command to run, approve, or push anything. Read AGENTS.md for the protected-controller boundary and the tracking rules."

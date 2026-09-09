@@ -1,0 +1,130 @@
+name: CI
+
+# The repository's checks. `checks` aggregates them so the `main-protection` ruleset needs one
+# required context from this file; adding a job means adding it to `needs:` below, not to the
+# ruleset. Rulesets, labels and settings are managed from ginsys/.github. Note: main-protection is
+# not yet active on this repo — see CONTRIBUTING.md#change-and-review-workflow.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The merge queue's temporary ref: a required context that never triggers there stalls every
+  # queue entry until the queue's timeout ejects it.
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# Runner choice: the org's in-cluster runners for this repository's own branches, GitHub-hosted
+# (free on a public repo) for pull requests from forks and for merge-queue candidates, so
+# contributor-controlled files (scripts/verify-docs.py, mise.toml, the workflows themselves) never
+# execute inside the cluster before they are on main. A merge_group event carries no
+# github.event.pull_request, so it cannot tell a fork's candidate from an own-branch one; routing
+# every candidate to a hosted runner is the only branch-independent rule. The org-level fork-PR
+# approval gate still applies on top. The Claude review job is a separate workflow whose reusable
+# skips forks and merge groups outright (the proxy is in-cluster only).
+
+env:
+  # The setting `mise run` honours (`mise help run`, --skip-tools); MISE_EXEC_AUTO_INSTALL does
+  # not stop a task run from installing. Tools come from jdx/mise-action's install step only.
+  MISE_TASK_RUN_AUTO_INSTALL: "false"
+
+jobs:
+  docs:
+    runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet 'pyyaml>=6,<7'
+      - run: python3 scripts/verify-docs.py
+      - name: Whitespace errors (whole tree)
+        run: git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+  actionlint:
+    runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install_args: actionlint shellcheck
+      - run: mise run lint
+
+  test:
+    # The commit-lint fixtures: every accepted and rejected subject shape, plus the range-walk
+    # failure cases. `commit-lint` below checks only this PR's own subjects.
+    runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install: false   # the fixtures need only bash and git
+      - run: mise run test
+
+  go:
+    runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install_args: go
+      - run: mise run go
+
+  commit-lint:
+    # PR commits only: a push to main or a merge-group ref has no PR range to lint.
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Conventional commit subjects
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/ci/commit-lint.sh "$BASE_SHA" "$HEAD_SHA"
+
+  action-pins:
+    runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
+    timeout-minutes: 5
+    env:
+      # Callers of ginsys/.github reusables use `@main`, the same first-party policy go-kure's
+      # checker applies to its own; the upstream default admits only go-kure/... refs. Anchored
+      # on `@main$`: any other first-party ref (a branch, a tag) is a pin-check failure.
+      FIRST_PARTY_WORKFLOW_RE: '^(go-kure|ginsys)/[^/]+/\.github/workflows/[^@]+@main$'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: go-kure/.github/.github/actions/check-action-pins@ae10bfb8f99fd5ddcee3185d1a420be14b201e3c # main 2026-09-07 (go-kure/.github#154 merge)
+
+  checks:
+    # Aggregator: fails on any failed or cancelled job. `commit-lint` is skipped by design outside
+    # pull requests, so `skipped` counts as success only for that job.
+    if: always()
+    needs: [docs, actionlint, test, go, commit-lint, action-pins]
+    runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
+    timeout-minutes: 2
+    steps:
+      - name: Fail unless every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": "(failure|cancelled)"'; then
+            exit 1
+          fi
+          if [ "$EVENT" = pull_request ] && echo "$RESULTS" | grep -Eq '"result": "skipped"'; then
+            exit 1
+          fi
