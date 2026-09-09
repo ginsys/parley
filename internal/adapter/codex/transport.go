@@ -36,13 +36,25 @@ type ExecSender struct{}
 
 func (ExecSender) QueueMessage(ctx context.Context, threadID, text string) error {
 	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", threadID, "--message", text)
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("%w: %v", ErrQueueAmbiguous, err)
-		}
-		return fmt.Errorf("codex queue: %w", err)
+	return runAndClassify(ctx, cmd)
+}
+
+// runAndClassify runs cmd and classifies a failure. Only a context outcome
+// observed after the process actually started is ambiguous — cmd.Process is
+// set once exec successfully forks/execs it. A context already
+// canceled/expired before that point means the command never ran at all, so
+// nothing could have committed: a plain, safely retryable failure, not
+// 'uncertain'. Split out from QueueMessage so it can be exercised directly
+// against a real short-lived process, without depending on the codex binary.
+func runAndClassify(ctx context.Context, cmd *exec.Cmd) error {
+	err := cmd.Run()
+	if err == nil {
+		return nil
 	}
-	return nil
+	if ctx.Err() != nil && cmd.Process != nil {
+		return fmt.Errorf("%w: %v", ErrQueueAmbiguous, err)
+	}
+	return fmt.Errorf("codex queue: %w", err)
 }
 
 // Transport implements dispatch.Transport for one Codex thread. fromLabel is
