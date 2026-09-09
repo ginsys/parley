@@ -76,13 +76,19 @@ func TestQueueMessageAllowsTextAtLimit(t *testing.T) {
 }
 
 // Regression for a finding on review 5160464724's follow-up: an oversized
-// message is rejected before exec is ever called, so it must be classified
-// as never-attempted (refundable/requeueable), not a terminal failure that
-// permanently loses the message and its budget slot.
-func TestQueueMessageOversizedTextIsNeverAttempted(t *testing.T) {
+// message is rejected before exec is ever called, so its budget slot must be
+// refunded rather than permanently lost. Refined by a later finding (PR #3):
+// unlike a transient never-attempted cause (a canceled context), the size of
+// this exact message will never shrink on retry, so classifying it the same
+// as ErrQueueNotAttempted would refund-and-requeue it forever instead of
+// resolving. It must be its own permanent classification.
+func TestQueueMessageOversizedTextIsPermanentlyRejected(t *testing.T) {
 	oversized := strings.Repeat("x", maxMessageBytes+1)
 	err := ExecSender{}.QueueMessage(context.Background(), "thread-1", oversized)
-	if !errors.Is(err, ErrQueueNotAttempted) {
-		t.Fatalf("want ErrQueueNotAttempted for an oversized message, got %v", err)
+	if !errors.Is(err, ErrQueuePermanentlyRejected) {
+		t.Fatalf("want ErrQueuePermanentlyRejected for an oversized message, got %v", err)
+	}
+	if errors.Is(err, ErrQueueNotAttempted) {
+		t.Fatalf("oversized message must not also classify as ErrQueueNotAttempted (would requeue forever): %v", err)
 	}
 }

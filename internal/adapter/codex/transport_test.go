@@ -65,6 +65,19 @@ func TestTransportDeliverAmbiguous(t *testing.T) {
 	}
 }
 
+func TestTransportDeliverPermanentlyRejected(t *testing.T) {
+	sender := &fakeSender{err: codex.ErrQueuePermanentlyRejected}
+	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
+
+	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
+	if !errors.Is(err, dispatch.ErrPermanentlyRejected) {
+		t.Fatalf("want dispatch.ErrPermanentlyRejected, got %v", err)
+	}
+	if errors.Is(err, dispatch.ErrNoAttempt) {
+		t.Fatalf("permanently rejected must not also classify as ErrNoAttempt (would requeue forever): %v", err)
+	}
+}
+
 // Regression for a finding on PR #4: Deliver never checked that the
 // envelope's ToPeer matched the peer this Transport is bound to, so an
 // envelope addressed to some other peer (e.g. the Claude-side one) could be
