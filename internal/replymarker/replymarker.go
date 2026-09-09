@@ -44,6 +44,15 @@ var (
 	// the peer producing this reply — only the peer an envelope was actually
 	// sent to may reply to it, never the peer that sent it or a third party.
 	ErrWrongReplier = errors.New("BRIDGE-REPLY marker references an envelope not addressed to the replying peer")
+	// ErrDeliveryPending means a well-formed marker names an envelope still
+	// in the 'dispatching' state: dispatch's pre-attempt commit has landed
+	// (design plan §3's two-phase dispatch) but the outcome of the actual
+	// host call — success or failure — hasn't been recorded yet. The peer
+	// may already have genuinely received the message and be replying in
+	// good faith; this is a transient condition, not a stale or unknown
+	// reference, and the caller should retry Validate for this turn rather
+	// than treat it as a permanent rejection.
+	ErrDeliveryPending = errors.New("BRIDGE-REPLY marker references an envelope still being dispatched")
 )
 
 // Marker is one parsed BRIDGE-REPLY block.
@@ -57,11 +66,18 @@ type Marker struct {
 // anchored to its own line (^...$ under multiline mode) so a longer backtick
 // run (e.g. "````BRIDGE-REPLY") never satisfies it.
 //
+// bridgeReplyPrefix matches any line beginning with the reserved
+// "```BRIDGE-REPLY" literal, regardless of what follows — checked before
+// genericFenceLine so a malformed variant (e.g. a non-breaking space instead
+// of an ASCII space/tab after BRIDGE-REPLY) is recognized as an attempted
+// marker opener, not silently swallowed as unrelated quoted fence content.
+//
 // genericFenceLine matches any Markdown code-fence delimiter line: up to
 // three leading spaces, a run of three or more backticks or tildes, then the
 // rest of the line (an info string, for an opening line).
 var (
 	bridgeReplyOpener = regexp.MustCompile(`(?m)^` + "```" + `BRIDGE-REPLY[ \t]*$`)
+	bridgeReplyPrefix = regexp.MustCompile(`(?m)^` + "```" + `BRIDGE-REPLY`)
 	genericFenceLine  = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
 )
 
@@ -88,6 +104,17 @@ type markerScan struct {
 	closed      bool
 }
 
+// htmlCommentOpen/htmlCommentClose detect a CommonMark raw-HTML comment span
+// at top level. Per CommonMark, everything from an unclosed "<!--" through
+// the line containing its matching "-->" is raw HTML, never parsed as
+// Markdown — a fenced code block (including our own marker syntax) written
+// inside such a comment, e.g. as hidden documentation or prompt metadata,
+// never actually opens a live fence and must not be scanned as one.
+var (
+	htmlCommentOpen  = regexp.MustCompile(`<!--`)
+	htmlCommentClose = regexp.MustCompile(`-->`)
+)
+
 // scanForMarker walks text line by line tracking at most one open fence at a
 // time — Markdown fences don't nest, so a line that looks like our opener
 // while a *different*, unrelated fence (a longer backtick run, a tilde
@@ -104,14 +131,36 @@ func scanForMarker(text string) markerScan {
 	var openRun string
 	var isOurs bool
 	var contentStart int
+	var inComment bool
 	for i, line := range lines {
 		trimmed := strings.TrimRight(line, " \t")
+		if inComment {
+			if htmlCommentClose.MatchString(trimmed) {
+				inComment = false
+			}
+			continue
+		}
 		if openRun == "" {
+			if htmlCommentOpen.MatchString(trimmed) && !htmlCommentClose.MatchString(trimmed) {
+				inComment = true
+				continue
+			}
 			if bridgeReplyOpener.MatchString(trimmed) {
 				result.openerCount++
 				openRun = "```"
 				isOurs = true
 				contentStart = i + 1
+			} else if bridgeReplyPrefix.MatchString(trimmed) {
+				// Reserved prefix present but the strict opener pattern
+				// didn't match (invalid trailing characters) — a malformed
+				// opener attempt, not unrelated fenced content. Counted so
+				// the scan can never silently resolve to just some other,
+				// well-formed marker elsewhere in the text; still consumes
+				// its own "```" fence run so lines up to its close aren't
+				// misread as top-level content.
+				result.openerCount++
+				openRun = "```"
+				isOurs = false
 			} else if m := genericFenceLine.FindStringSubmatch(trimmed); m != nil {
 				openRun = m[1]
 				isOurs = false
@@ -234,7 +283,11 @@ func decodeMarker(raw []byte) (*Marker, error) {
 // replyingPeer. Without that last check, a peer could name an envelope it
 // sent itself (or one sent to a different peer entirely) as long as the
 // conversation and state matched, impersonating a reply it was never asked
-// for. Returns the envelope the reply resolves against.
+// for. A 'dispatching' envelope is neither: the peer could genuinely have
+// already received it before dispatch's own second transaction recorded the
+// outcome, so it returns ErrDeliveryPending rather than ErrStaleReply — a
+// transient condition the caller should retry, not a permanent rejection.
+// Returns the envelope the reply resolves against.
 func Validate(ctx context.Context, tx *store.Tx, conversation, replyingPeer, expectedTo string, m *Marker) (*store.Envelope, error) {
 	if m.To != expectedTo {
 		return nil, fmt.Errorf("%w: marker to=%q, expected %q", ErrWrongRecipient, m.To, expectedTo)
@@ -255,7 +308,12 @@ func Validate(ctx context.Context, tx *store.Tx, conversation, replyingPeer, exp
 		return nil, fmt.Errorf("%w: envelope %s was addressed to %s, not %s",
 			ErrWrongReplier, m.InReplyTo, e.ToPeer, replyingPeer)
 	}
-	if e.State != store.HandedOff {
+	switch e.State {
+	case store.HandedOff:
+		// eligible
+	case store.Dispatching:
+		return nil, fmt.Errorf("%w: envelope %s is still dispatching", ErrDeliveryPending, m.InReplyTo)
+	default:
 		return nil, fmt.Errorf("%w: envelope %s is %s, not awaiting reply", ErrStaleReply, m.InReplyTo, e.State)
 	}
 	return e, nil
