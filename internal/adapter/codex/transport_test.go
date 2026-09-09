@@ -32,7 +32,7 @@ func TestTransportDeliverWrapsAndSends(t *testing.T) {
 	sender := &fakeSender{}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", ToPeer: "codex-thread-b", Text: "hello there"})
+	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "hello there"})
 	if err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestTransportDeliverFailure(t *testing.T) {
 	sender := &fakeSender{err: errors.New("boom")}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", ToPeer: "codex-thread-b", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
 	if err == nil || errors.Is(err, dispatch.ErrAmbiguous) {
 		t.Fatalf("want a plain failure, got %v", err)
 	}
@@ -59,7 +59,7 @@ func TestTransportDeliverAmbiguous(t *testing.T) {
 	sender := &fakeSender{err: codex.ErrQueueAmbiguous}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", ToPeer: "codex-thread-b", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
 	if !errors.Is(err, dispatch.ErrAmbiguous) {
 		t.Fatalf("want dispatch.ErrAmbiguous, got %v", err)
 	}
@@ -74,11 +74,31 @@ func TestTransportDeliverRejectsWrongRecipient(t *testing.T) {
 	sender := &fakeSender{}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", ToPeer: "claude-session-a", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "claude-session-a", Text: "x"})
 	if !errors.Is(err, codex.ErrRecipientMismatch) {
 		t.Fatalf("want ErrRecipientMismatch, got %v", err)
 	}
 	if len(sender.sent) != 0 {
 		t.Fatalf("want no message queued for a mismatched recipient, got %v", sender.sent)
+	}
+}
+
+// Regression for a finding on PR #4: Deliver validated e.ToPeer against
+// t.toPeer but never e.FromPeer against t.fromLabel, so an envelope
+// originating from a different peer entirely (e.g. one enrolled in a
+// different conversation that also targets this same Codex thread) would
+// still be queued into this thread, stamped with this transport's own
+// fromLabel as if it came from the bound peer — the same misattribution
+// class the ToPeer check exists to prevent.
+func TestTransportDeliverRejectsWrongSender(t *testing.T) {
+	sender := &fakeSender{}
+	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
+
+	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "some-other-peer", ToPeer: "codex-thread-b", Text: "x"})
+	if !errors.Is(err, codex.ErrRecipientMismatch) {
+		t.Fatalf("want ErrRecipientMismatch, got %v", err)
+	}
+	if len(sender.sent) != 0 {
+		t.Fatalf("want no message queued for a mismatched sender, got %v", sender.sent)
 	}
 }
