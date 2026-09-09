@@ -222,13 +222,15 @@ func decodeMarker(raw []byte) (*Marker, error) {
 // Validate checks a well-formed Marker against bridge state before it may be
 // forwarded: the recipient must match the enrolled peer this adapter
 // forwards to, in_reply_to must name an envelope on this exact conversation
-// still awaiting a reply (queued or handed_off) — never a different
-// conversation, an already-acked envelope, or an unknown id — and that
-// envelope must have actually been addressed to replyingPeer. Without that
-// last check, a peer could name an envelope it sent itself (or one sent to
-// a different peer entirely) as long as the conversation and state matched,
-// impersonating a reply it was never asked for. Returns the envelope the
-// reply resolves against.
+// that has actually been handed off to replyingPeer — never a still-queued
+// envelope (replyingPeer cannot have seen a message the bridge hasn't
+// delivered yet, so acking it from Queued would retire a message that was
+// never sent), a different conversation, an already-acked envelope, or an
+// unknown id — and that envelope must have actually been addressed to
+// replyingPeer. Without that last check, a peer could name an envelope it
+// sent itself (or one sent to a different peer entirely) as long as the
+// conversation and state matched, impersonating a reply it was never asked
+// for. Returns the envelope the reply resolves against.
 func Validate(ctx context.Context, tx *store.Tx, conversation, replyingPeer, expectedTo string, m *Marker) (*store.Envelope, error) {
 	if m.To != expectedTo {
 		return nil, fmt.Errorf("%w: marker to=%q, expected %q", ErrWrongRecipient, m.To, expectedTo)
@@ -249,7 +251,7 @@ func Validate(ctx context.Context, tx *store.Tx, conversation, replyingPeer, exp
 		return nil, fmt.Errorf("%w: envelope %s was addressed to %s, not %s",
 			ErrWrongReplier, m.InReplyTo, e.ToPeer, replyingPeer)
 	}
-	if e.State != store.Queued && e.State != store.HandedOff {
+	if e.State != store.HandedOff {
 		return nil, fmt.Errorf("%w: envelope %s is %s, not awaiting reply", ErrStaleReply, m.InReplyTo, e.State)
 	}
 	return e, nil
