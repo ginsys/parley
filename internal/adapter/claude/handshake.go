@@ -21,7 +21,7 @@ import (
 // inherit a prior connection's ack; callers construct (or Reset) one
 // Handshake per connection, never reuse readiness across connections.
 type Handshake struct {
-	sendProbe func(nonce string) error
+	sendProbe func(ctx context.Context, nonce string) error
 	timeout   time.Duration
 
 	mu      sync.Mutex
@@ -72,7 +72,7 @@ type Handshake struct {
 // resends the same nonce rather than minting a new one, so a genuine but
 // slow acknowledgement for the original probe still lands; only Start/Reset
 // (a real new connection) ever rotates the nonce.
-func NewHandshake(sendProbe func(nonce string) error, timeout time.Duration) *Handshake {
+func NewHandshake(sendProbe func(ctx context.Context, nonce string) error, timeout time.Duration) *Handshake {
 	return &Handshake{sendProbe: sendProbe, timeout: timeout}
 }
 
@@ -122,13 +122,14 @@ func (h *Handshake) begin() error {
 		h.dispatchCancel()
 	}
 	h.dispatchCtx, h.dispatchCancel = context.WithCancel(context.Background())
+	ctx := h.dispatchCtx
 	if h.timer != nil {
 		h.timer.Stop()
 	}
 	h.timer = time.AfterFunc(h.timeout, func() { h.onTimeout(gen) })
 	h.mu.Unlock()
 
-	return h.attemptSend(gen, nonce)
+	return h.attemptSend(gen, ctx, nonce)
 }
 
 // onTimeout fires when a probe for generation gen hasn't been acked within
@@ -148,6 +149,7 @@ func (h *Handshake) onTimeout(gen int) {
 		return
 	}
 	nonce := h.nonce
+	ctx := h.dispatchCtx
 	h.timer = time.AfterFunc(h.timeout, func() { h.onTimeout(gen) })
 	h.mu.Unlock()
 
@@ -155,7 +157,7 @@ func (h *Handshake) onTimeout(gen int) {
 	// tries again. There is no application message to protect from a retry
 	// at this layer — that guarantee lives in the poller only dispatching
 	// once Ready() is true.
-	_ = h.attemptSend(gen, nonce)
+	_ = h.attemptSend(gen, ctx, nonce)
 }
 
 // attemptSend calls sendProbe outside h.mu, guarded so at most one send is
@@ -165,7 +167,17 @@ func (h *Handshake) onTimeout(gen int) {
 // the in-flight one completes. It also re-checks liveness (ready/stopped/
 // generation) immediately before sending, since time may have passed since
 // the caller decided to attempt this.
-func (h *Handshake) attemptSend(gen int, nonce string) error {
+//
+// ctx is gen's dispatchCtx, captured under the same lock that authorized this
+// attempt. A Stop/Reset landing after that lock is released but before (or
+// during) the sendProbe call below cancels ctx immediately — attemptSend
+// itself cannot observe that once it has already committed to the call, but
+// passing ctx through lets sendProbe's own implementation (once wired to a
+// real transport) abort a write already in flight for a superseded
+// generation, rather than completing it into a torn-down or replaced
+// connection. The same cooperative-signal limit already documented on
+// dispatchCtx applies here: this narrows the window, it does not close it.
+func (h *Handshake) attemptSend(gen int, ctx context.Context, nonce string) error {
 	h.mu.Lock()
 	if h.sendingGen == gen || h.ready || h.stopped || gen != h.generation {
 		h.mu.Unlock()
@@ -175,7 +187,7 @@ func (h *Handshake) attemptSend(gen int, nonce string) error {
 	h.retries++
 	h.mu.Unlock()
 
-	err := h.sendProbe(nonce)
+	err := h.sendProbe(ctx, nonce)
 
 	h.mu.Lock()
 	if h.sendingGen == gen {

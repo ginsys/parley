@@ -45,7 +45,7 @@ type probeRecorder struct {
 	nonces []string
 }
 
-func (p *probeRecorder) send(nonce string) error {
+func (p *probeRecorder) send(_ context.Context, nonce string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.nonces = append(p.nonces, nonce)
@@ -550,7 +550,7 @@ func TestPollerCancelsInFlightDispatchWhenGenerationInvalidatedMidDelivery(t *te
 func TestSendProbeRunsOutsideLock(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	hs := adapterclaude.NewHandshake(func(string) error {
+	hs := adapterclaude.NewHandshake(func(context.Context, string) error {
 		close(started)
 		<-release
 		return nil
@@ -584,7 +584,7 @@ func TestSendProbeRunsOutsideLock(t *testing.T) {
 
 func TestHandshakeStartPropagatesProbeError(t *testing.T) {
 	boom := errors.New("boom")
-	hs := adapterclaude.NewHandshake(func(string) error { return boom }, time.Hour)
+	hs := adapterclaude.NewHandshake(func(context.Context, string) error { return boom }, time.Hour)
 	if err := hs.Start(); !errors.Is(err, boom) {
 		t.Fatalf("want probe error propagated, got %v", err)
 	}

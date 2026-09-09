@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -14,7 +15,7 @@ import (
 // in-flight callback directly rather than relying on a real race window.
 func TestStopPreventsRearmFromInFlightTimeout(t *testing.T) {
 	calls := 0
-	hs := NewHandshake(func(string) error { calls++; return nil }, time.Hour)
+	hs := NewHandshake(func(context.Context, string) error { calls++; return nil }, time.Hour)
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -124,7 +125,7 @@ func TestOverlappingTimeoutRetrySkippedWhileSendInFlight(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
 
-	hs := NewHandshake(func(string) error {
+	hs := NewHandshake(func(context.Context, string) error {
 		atomic.AddInt32(&calls, 1)
 		select {
 		case started <- struct{}{}:
@@ -170,7 +171,7 @@ func TestStaleGenerationSendCompletionDoesNotCorruptNewGenerationInFlight(t *tes
 		release chan struct{}
 	}
 	calls := make(chan *call, 8)
-	probe := func(nonce string) error {
+	probe := func(_ context.Context, nonce string) error {
 		c := &call{nonce: nonce, release: make(chan struct{})}
 		calls <- c
 		<-c.release
@@ -248,7 +249,7 @@ type recordingProbe struct {
 	nonces []string
 }
 
-func (p *recordingProbe) send(nonce string) error {
+func (p *recordingProbe) send(_ context.Context, nonce string) error {
 	p.nonces = append(p.nonces, nonce)
 	return nil
 }
