@@ -98,11 +98,20 @@ func (h *Handshake) begin() error {
 	h.stopped = false
 	nonce, err := generateNonce()
 	if err != nil {
-		// Leave no stale nonce behind: a superseded connection's nonce must
-		// not remain ackable, and stopped guards against a leftover timer
-		// from a prior connection retrying into this failed state.
+		// Leave no stale nonce or live dispatch authorization behind: a
+		// superseded connection's nonce must not remain ackable, and any
+		// in-flight dispatch authorized under the previous generation must be
+		// signaled to abort exactly as Stop() would — this handshake is now
+		// stopped and not ready, so dispatchCtx must not stay live just
+		// because this failed before bumping the generation.
 		h.nonce = ""
 		h.stopped = true
+		if h.dispatchCancel != nil {
+			h.dispatchCancel()
+		}
+		if h.timer != nil {
+			h.timer.Stop()
+		}
 		h.mu.Unlock()
 		return fmt.Errorf("generate handshake nonce: %w", err)
 	}

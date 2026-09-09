@@ -214,6 +214,36 @@ func TestStaleGenerationSendCompletionDoesNotCorruptNewGenerationInFlight(t *tes
 	}
 }
 
+// Regression for a finding on PR #3: a failed Reset (nonce generation
+// erroring) left the previous generation's dispatchCtx live, contradicting
+// the documented invariant that it's canceled the instant a generation is
+// superseded or torn down. A dispatch already authorized under that
+// generation (see GenerationContext) would never be signaled to abort even
+// though the handshake is now stopped and not ready.
+func TestFailedResetCancelsPriorGenerationDispatchContext(t *testing.T) {
+	orig := generateNonce
+	t.Cleanup(func() { generateNonce = orig })
+
+	probe := &recordingProbe{}
+	hs := NewHandshake(probe.send, time.Hour)
+	if err := hs.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	gen := hs.generation
+	ctx, _ := hs.GenerationContext(gen)
+
+	generateNonce = func() (string, error) { return "", errors.New("entropy source down") }
+	if err := hs.Reset(); err == nil {
+		t.Fatalf("want the nonce-generation error propagated")
+	}
+
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatalf("want the prior generation's dispatch context canceled after a failed reset")
+	}
+}
+
 type recordingProbe struct {
 	nonces []string
 }
