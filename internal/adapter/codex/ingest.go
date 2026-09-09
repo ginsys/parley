@@ -17,6 +17,12 @@ import (
 // outcome, without importing replymarker directly.
 var ErrNoMarker = replymarker.ErrNoMarker
 
+// ErrDirectionNotPermitted means the current grant does not permit a
+// message from fromPeer to the marker's "to" — either because Direction is
+// one-directional and this is the disallowed way, or because one of the two
+// identities isn't the grant's enrolled pair at all.
+var ErrDirectionNotPermitted = errors.New("grant does not permit this message direction")
+
 // IngestTurn examines one Codex turn's final-answer text for a BRIDGE-REPLY
 // marker (internal/replymarker) and, if it validates, atomically marks the
 // envelope it replies to 'acked' and queues the reply as a new outbound
@@ -44,7 +50,7 @@ func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expec
 		}
 	}()
 
-	repliedTo, err := replymarker.Validate(ctx, tx, conversation, expectedTo, marker)
+	repliedTo, err := replymarker.Validate(ctx, tx, conversation, fromPeer, expectedTo, marker)
 	if err != nil {
 		return nil, err
 	}
@@ -52,6 +58,9 @@ func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expec
 	g, err := store.CurrentGrant(ctx, tx, conversation)
 	if err != nil {
 		return nil, err
+	}
+	if !g.Permits(fromPeer, marker.To) {
+		return nil, fmt.Errorf("%w: %s -> %s under grant version %d", ErrDirectionNotPermitted, fromPeer, marker.To, g.GrantVersion)
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
