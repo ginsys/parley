@@ -302,6 +302,48 @@ func TestExtractFindsMarkerAfterSelfContainedScriptLine(t *testing.T) {
 	}
 }
 
+// Regression for a finding on review 5160464724's follow-up: CommonMark's
+// raw-HTML block types extend beyond script/pre/style/textarea (type 1) to
+// block-level tags like <div> (type 6), which suppress Markdown parsing
+// until the next blank line rather than a specific closing tag.
+func TestExtractIgnoresMarkerInsideDivBlock(t *testing.T) {
+	turn := "hidden protocol notes:\n<div>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n</div>"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker nested inside a <div> block, got %v", err)
+	}
+}
+
+// A block-level tag block ends at the next blank line, not a specific
+// closing tag — a marker after that blank line is live again.
+func TestExtractFindsMarkerAfterBlankLineEndsDivBlock(t *testing.T) {
+	turn := "<div>\nhidden\n\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after the blank line closing the <div> block, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
+// Regression for a finding on review 5160464724's follow-up: a literal
+// "<!--" written as inline code (backtick-delimited) is CommonMark literal
+// text, never a real HTML comment opener, and must not swallow a later,
+// genuinely top-level marker.
+func TestExtractIgnoresCommentOpenerInsideCodeSpan(t *testing.T) {
+	turn := "the opener is `<!--` in Markdown\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after a code-span-quoted comment opener, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
 func TestExtractDuplicateMarkers(t *testing.T) {
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"first\"}\n```\n" +
 		"and also\n```BRIDGE-REPLY\n{\"in_reply_to\": \"env-2\", \"to\": \"claude-session-a\", \"text\": \"second\"}\n```"
