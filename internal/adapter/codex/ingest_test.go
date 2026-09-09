@@ -8,6 +8,7 @@ import (
 
 	"github.com/ginsys/parley/internal/adapter/codex"
 	"github.com/ginsys/parley/internal/controller"
+	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/replymarker"
 	"github.com/ginsys/parley/internal/store"
 )
@@ -228,3 +229,75 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 		t.Fatalf("rejected direction must not touch the original envelope's state, got %s", original.State)
 	}
 }
+
+// Verification for a finding on PR #4: IngestTurn's reply-queuing path
+// doesn't itself consult the grant's remaining exchange budget -- but this
+// isn't a gap unique to replies, since store.InsertQueued (Bridge.Send's own
+// path) doesn't either. store.ClaimExchange has exactly one call site,
+// dispatch.Bridge's claim(), so budget is enforced uniformly at Dispatch
+// time for every queued envelope regardless of how it was queued. This
+// proves a reply queued via IngestTurn is rejected at its own later
+// Dispatch once the grant's budget is spent, exactly like an ordinary one.
+func TestIngestTurnReplyRespectsExchangeBudgetAtDispatch(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	ctrl := controller.New(db)
+	conversation := "conv-reply-budget"
+
+	if _, err := ctrl.Grant(ctx, controller.GrantParams{
+		Conversation: conversation,
+		PeerAID:      "codex-thread-b",
+		PeerBID:      "claude-session-a",
+		Direction:    store.Bidirectional,
+		MaxExchanges: 1,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, conversation)
+	if err != nil {
+		t.Fatalf("current grant: %v", err)
+	}
+	original := store.Envelope{
+		ID:           "env-reply-budget",
+		Conversation: conversation,
+		FromPeer:     "claude-session-a",
+		ToPeer:       "codex-thread-b",
+		Text:         "please respond",
+		GrantVersion: g.GrantVersion,
+		State:        store.Queued,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+		UpdatedAt:    "2026-01-01T00:00:00Z",
+	}
+	if err := store.InsertQueued(ctx, tx, original); err != nil {
+		t.Fatalf("insert queued: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Spend the grant's only exchange slot dispatching the original
+	// envelope, before Codex ever replies.
+	bridge := dispatch.New(db, noopTransport{})
+	if _, err := bridge.Dispatch(ctx, original.ID); err != nil {
+		t.Fatalf("dispatch original: %v", err)
+	}
+
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"" + original.ID + "\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	reply, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+
+	if _, err := bridge.Dispatch(ctx, reply.ID); !errors.Is(err, dispatch.ErrBudgetExhausted) {
+		t.Fatalf("want ErrBudgetExhausted dispatching the reply, got %v", err)
+	}
+}
+
+type noopTransport struct{}
+
+func (noopTransport) Deliver(context.Context, store.Envelope) error { return nil }
