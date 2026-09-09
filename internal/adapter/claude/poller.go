@@ -25,23 +25,31 @@ func NewPoller(db *store.DB, bridge *dispatch.Bridge, handshake *Handshake, conv
 }
 
 // Tick attempts dispatch of every currently queued envelope addressed to
-// this adapter's peer, but only if the handshake is ready. Not ready is not
-// an error — it means every such envelope correctly stays queued. Returns
-// the envelope ids it attempted, for tests.
+// this adapter's peer, but only while the handshake is ready — re-checked
+// before each individual dispatch, not just once before the batch, since a
+// reconnect (Reset/Stop) can revoke readiness mid-batch and the remaining
+// envelopes must stop being dispatched immediately, not finish the run.
+// Not ready is not an error — it means every such envelope correctly stays
+// queued. Returns the envelope ids actually dispatched, for tests.
 func (p *Poller) Tick(ctx context.Context) ([]string, error) {
 	if !p.handshake.Ready() {
 		return nil, nil
 	}
-	ids, err := p.queuedForMe(ctx)
+	candidates, err := p.queuedForMe(ctx)
 	if err != nil {
 		return nil, err
 	}
-	for _, id := range ids {
+	var attempted []string
+	for _, id := range candidates {
+		if !p.handshake.Ready() {
+			break
+		}
+		attempted = append(attempted, id)
 		if _, err := p.bridge.Dispatch(ctx, id); err != nil && !errors.Is(err, dispatch.ErrBudgetExhausted) {
-			return ids, err
+			return attempted, err
 		}
 	}
-	return ids, nil
+	return attempted, nil
 }
 
 func (p *Poller) queuedForMe(ctx context.Context) ([]string, error) {

@@ -17,12 +17,20 @@ import (
 type fakeTransport struct {
 	mu        sync.Mutex
 	delivered []string
+	// onDeliver, if set, runs synchronously after recording delivery and
+	// before Deliver returns — used to simulate a reconnect happening
+	// mid-batch, between two envelopes in the same Poller.Tick call.
+	onDeliver func(id string)
 }
 
 func (f *fakeTransport) Deliver(ctx context.Context, e store.Envelope) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.delivered = append(f.delivered, e.ID)
+	hook := f.onDeliver
+	f.mu.Unlock()
+	if hook != nil {
+		hook(e.ID)
+	}
 	return nil
 }
 
@@ -245,6 +253,86 @@ func TestReconnectResetsReadiness(t *testing.T) {
 	if !hs.Ready() {
 		t.Fatalf("want ready after the new connection's own ack")
 	}
+}
+
+// Regression for a finding on PR #3: Stop() must clear readiness, not only
+// disarm the timer — a stopped connection is by definition no longer proven
+// ready, and a caller that only checks Ready() (Poller) must see that
+// immediately rather than keep dispatching into a dead transport.
+func TestStopClearsReadiness(t *testing.T) {
+	probe := &probeRecorder{}
+	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err := hs.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	nonce := probe.last()
+	if !hs.Ack(nonce) {
+		t.Fatalf("ack must succeed")
+	}
+	if !hs.Ready() {
+		t.Fatalf("want ready after ack")
+	}
+
+	hs.Stop()
+	if hs.Ready() {
+		t.Fatalf("want not ready immediately after Stop")
+	}
+	if hs.Ack(nonce) {
+		t.Fatalf("the stopped connection's own nonce must not re-ack it")
+	}
+}
+
+// Regression for a finding on PR #3: Tick must re-check readiness before
+// each dispatch, not just once before the batch — a reconnect revoking
+// readiness mid-batch must stop the remaining envelopes from being
+// dispatched, not let the batch finish.
+func TestPollerStopsMidBatchWhenReadinessRevoked(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-mid-batch")
+	ctx := context.Background()
+
+	e1, err := bridge(t, db).Send(ctx, "conv-mid-batch", "codex-thread-b", "claude-session-a", "first", nil)
+	if err != nil {
+		t.Fatalf("send 1: %v", err)
+	}
+	e2, err := bridge(t, db).Send(ctx, "conv-mid-batch", "codex-thread-b", "claude-session-a", "second", nil)
+	if err != nil {
+		t.Fatalf("send 2: %v", err)
+	}
+
+	probe := &probeRecorder{}
+	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err := hs.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !hs.Ack(probe.last()) {
+		t.Fatalf("ack must succeed")
+	}
+
+	transport := &fakeTransport{}
+	transport.onDeliver = func(id string) {
+		if id == e1.ID {
+			hs.Stop() // simulate a reconnect revoking readiness mid-batch
+		}
+	}
+	b := dispatch.New(db, transport)
+	poller := adapterclaude.NewPoller(db, b, hs, "conv-mid-batch", "claude-session-a")
+
+	attempted, err := poller.Tick(ctx)
+	if err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if len(attempted) != 1 || attempted[0] != e1.ID {
+		t.Fatalf("want only %s attempted before readiness was revoked, got %v", e1.ID, attempted)
+	}
+	assertState(t, db, e1.ID, store.HandedOff)
+	assertState(t, db, e2.ID, store.Queued)
+}
+
+func bridge(t *testing.T, db *store.DB) *dispatch.Bridge {
+	t.Helper()
+	return dispatch.New(db, &fakeTransport{})
 }
 
 func TestHandshakeStartPropagatesProbeError(t *testing.T) {

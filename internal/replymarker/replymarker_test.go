@@ -108,6 +108,18 @@ func TestExtractDuplicateMarkers(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3: two markers immediately adjacent, with
+// no other content between the first block's closing fence position and the
+// second block's opening fence, must still be rejected as a duplicate — the
+// second opener must never be consumed as the first block's closer.
+func TestExtractAdjacentMarkersRejectedAsDuplicate(t *testing.T) {
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"a\"}\n" +
+		"```BRIDGE-REPLY\n{\"in_reply_to\": \"env-2\", \"to\": \"claude-session-a\", \"text\": \"b\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrMultipleMarkers) {
+		t.Fatalf("want ErrMultipleMarkers, got %v", err)
+	}
+}
+
 // Fixture 9: wrong-recipient reply — a well-formed, parseable marker whose
 // "to" does not match the enrolled peer must be rejected, not forwarded on
 // the strength of syntax alone.
