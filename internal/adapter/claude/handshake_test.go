@@ -335,6 +335,45 @@ func bridge(t *testing.T, db *store.DB) *dispatch.Bridge {
 	return dispatch.New(db, &fakeTransport{})
 }
 
+// Regression for a finding on PR #3: sendProbe must run outside h.mu. A
+// probe that blocks on a slow transport send must not also block
+// Ready/Ack/Retries for the duration — reverting the fix (calling sendProbe
+// while still holding the lock) makes this test time out.
+func TestSendProbeRunsOutsideLock(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	hs := adapterclaude.NewHandshake(func(string) error {
+		close(started)
+		<-release
+		return nil
+	}, time.Hour)
+
+	done := make(chan error, 1)
+	go func() { done <- hs.Start() }()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("probe never started")
+	}
+
+	readyDone := make(chan struct{})
+	go func() {
+		hs.Ready()
+		close(readyDone)
+	}()
+	select {
+	case <-readyDone:
+	case <-time.After(time.Second):
+		t.Fatalf("Ready() blocked while sendProbe was in flight")
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("start: %v", err)
+	}
+}
+
 func TestHandshakeStartPropagatesProbeError(t *testing.T) {
 	boom := errors.New("boom")
 	hs := adapterclaude.NewHandshake(func(string) error { return boom }, time.Hour)

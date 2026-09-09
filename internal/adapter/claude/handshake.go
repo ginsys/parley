@@ -45,8 +45,12 @@ func NewHandshake(sendProbe func(nonce string) error, timeout time.Duration) *Ha
 // the timeout. Call once per connection.
 func (h *Handshake) Start() error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.startLocked()
+	nonce, err := h.armLocked()
+	h.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return h.sendProbe(nonce)
 }
 
 // Reset marks the handshake not-ready and starts a fresh one with a new
@@ -54,11 +58,22 @@ func (h *Handshake) Start() error {
 // ack must not carry over to the new one.
 func (h *Handshake) Reset() error {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.startLocked()
+	nonce, err := h.armLocked()
+	h.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return h.sendProbe(nonce)
 }
 
-func (h *Handshake) startLocked() error {
+// armLocked resets readiness state, generates a fresh nonce, and arms the
+// timeout timer, returning the nonce for the caller to send. Called with
+// h.mu held; the caller must release the lock before calling sendProbe —
+// the probe may block on a real transport send, and holding h.mu across it
+// would stall Ready/Ack/Retries for the duration and let a concurrent
+// onTimeout queue on the mutex and fire a redundant retry the instant the
+// blocked send returns.
+func (h *Handshake) armLocked() (string, error) {
 	h.ready = false
 	h.stopped = false
 	nonce, err := generateNonce()
@@ -68,7 +83,7 @@ func (h *Handshake) startLocked() error {
 		// from a prior connection retrying into this failed state.
 		h.nonce = ""
 		h.stopped = true
-		return fmt.Errorf("generate handshake nonce: %w", err)
+		return "", fmt.Errorf("generate handshake nonce: %w", err)
 	}
 	h.nonce = nonce
 	h.retries++
@@ -76,24 +91,29 @@ func (h *Handshake) startLocked() error {
 		h.timer.Stop()
 	}
 	h.timer = time.AfterFunc(h.timeout, h.onTimeout)
-	return h.sendProbe(nonce)
+	return nonce, nil
 }
 
 func (h *Handshake) onTimeout() {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	// stopped guards against a timer that had already fired (and is now
 	// merely blocked on h.mu) by the time Stop() ran and released the lock —
 	// time.Timer.Stop() cannot cancel a callback that already started
 	// running, only a future firing.
 	if h.ready || h.stopped {
+		h.mu.Unlock()
+		return
+	}
+	nonce, err := h.armLocked()
+	h.mu.Unlock()
+	if err != nil {
 		return
 	}
 	// Best-effort: a send failure here just means another timeout fires and
 	// tries again. There is no application message to protect from a retry
 	// at this layer — that guarantee lives in the poller only dispatching
 	// once Ready() is true.
-	_ = h.startLocked()
+	_ = h.sendProbe(nonce)
 }
 
 // Ack processes a candidate acknowledgement carrying nonce. Returns true

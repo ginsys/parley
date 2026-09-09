@@ -134,7 +134,7 @@ func TestValidateWrongRecipient(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	m := &replymarker.Marker{InReplyTo: id, To: "some-other-peer", Text: "hi"}
-	_, err = replymarker.Validate(ctx, tx, conversation, "claude-session-a", m)
+	_, err = replymarker.Validate(ctx, tx, conversation, "codex-thread-b", "claude-session-a", m)
 	if !errors.Is(err, replymarker.ErrWrongRecipient) {
 		t.Fatalf("want ErrWrongRecipient, got %v", err)
 	}
@@ -155,7 +155,7 @@ func TestValidateStaleReply(t *testing.T) {
 		}
 		defer tx.Rollback(ctx)
 		m := &replymarker.Marker{InReplyTo: "does-not-exist", To: "claude-session-a", Text: "hi"}
-		if _, err := replymarker.Validate(ctx, tx, conversation, "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
+		if _, err := replymarker.Validate(ctx, tx, conversation, "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
 			t.Fatalf("want ErrStaleReply, got %v", err)
 		}
 	})
@@ -167,7 +167,7 @@ func TestValidateStaleReply(t *testing.T) {
 		}
 		defer tx.Rollback(ctx)
 		m := &replymarker.Marker{InReplyTo: id, To: "claude-session-a", Text: "hi"}
-		if _, err := replymarker.Validate(ctx, tx, "a-different-conversation", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
+		if _, err := replymarker.Validate(ctx, tx, "a-different-conversation", "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
 			t.Fatalf("want ErrStaleReply, got %v", err)
 		}
 	})
@@ -191,7 +191,7 @@ func TestValidateStaleReply(t *testing.T) {
 		}
 		defer tx2.Rollback(ctx)
 		m := &replymarker.Marker{InReplyTo: id, To: "claude-session-a", Text: "hi"}
-		if _, err := replymarker.Validate(ctx, tx2, conversation, "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
+		if _, err := replymarker.Validate(ctx, tx2, conversation, "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
 			t.Fatalf("want ErrStaleReply, got %v", err)
 		}
 	})
@@ -208,11 +208,36 @@ func TestValidateAccepted(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	m := &replymarker.Marker{InReplyTo: id, To: "claude-session-a", Text: "hi"}
-	e, err := replymarker.Validate(ctx, tx, conversation, "claude-session-a", m)
+	e, err := replymarker.Validate(ctx, tx, conversation, "codex-thread-b", "claude-session-a", m)
 	if err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	if e.ID != id {
 		t.Fatalf("want envelope %s, got %s", id, e.ID)
+	}
+}
+
+// Regression for a finding on PR #3: Validate must reject a marker
+// referencing an envelope that was never addressed to the peer producing
+// the reply — otherwise a peer could name an envelope it sent itself (or
+// one sent to a different peer) as long as the conversation and state
+// happened to match, forging a reply nobody asked it for.
+func TestValidateRejectsReplyFromNonAddressee(t *testing.T) {
+	db := openTestDB(t)
+	conversation, id := queueOne(t, db)
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// queueOne's envelope was sent from claude-session-a to codex-thread-b.
+	// claude-session-a (the sender, not the addressee) must not be able to
+	// reply to its own outgoing envelope.
+	m := &replymarker.Marker{InReplyTo: id, To: "someone-else", Text: "hi"}
+	_, err = replymarker.Validate(ctx, tx, conversation, "claude-session-a", "someone-else", m)
+	if !errors.Is(err, replymarker.ErrWrongReplier) {
+		t.Fatalf("want ErrWrongReplier, got %v", err)
 	}
 }
