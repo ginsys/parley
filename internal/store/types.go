@@ -48,6 +48,17 @@ type Grant struct {
 	RevokedAt     *string
 }
 
+// Expired reports whether this grant's ExpiresAt has passed as of now. A
+// nil ExpiresAt never expires. An ExpiresAt that fails to parse is treated
+// as expired (fail closed), not ignored.
+func (g Grant) Expired(now time.Time) bool {
+	if g.ExpiresAt == nil {
+		return false
+	}
+	exp, err := time.Parse(time.RFC3339Nano, *g.ExpiresAt)
+	return err != nil || !now.Before(exp)
+}
+
 // Permits reports whether this grant allows a message from "from" to "to" at
 // "now" — both identities must be exactly the grant's enrolled pair (not a
 // third identity, and not swapped beyond what Direction allows), Direction
@@ -57,17 +68,13 @@ type Grant struct {
 // grants, so RevokedAt is never actually set here in practice today — but
 // Permits is the named authorization gate for this type, and a future caller
 // resolving a Grant some other way must not have to separately remember to
-// check RevokedAt or ExpiresAt itself. An ExpiresAt that fails to parse is
-// treated as expired (fail closed), not ignored.
+// check RevokedAt or ExpiresAt itself.
 func (g Grant) Permits(from, to string, now time.Time) bool {
 	if g.RevokedAt != nil {
 		return false
 	}
-	if g.ExpiresAt != nil {
-		exp, err := time.Parse(time.RFC3339Nano, *g.ExpiresAt)
-		if err != nil || !now.Before(exp) {
-			return false
-		}
+	if g.Expired(now) {
+		return false
 	}
 	switch {
 	case from == g.PeerAID && to == g.PeerBID:

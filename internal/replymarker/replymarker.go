@@ -79,8 +79,25 @@ type Marker struct {
 var (
 	bridgeReplyOpener = regexp.MustCompile(`(?m)^` + "```" + `BRIDGE-REPLY[ \t]*$`)
 	bridgeReplyPrefix = regexp.MustCompile(`(?m)^` + "```" + `BRIDGE-REPLY`)
-	genericFenceLine  = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
+	backtickFenceLine = regexp.MustCompile("^ {0,3}(`{3,})([^`]*)$")
+	tildeFenceLine    = regexp.MustCompile("^ {0,3}(~{3,})(.*)$")
 )
+
+// matchGenericFence reports whether line opens or closes some Markdown
+// fence (ours or unrelated), returning the fence run and the rest of the
+// line. Two separate patterns, not one alternation, because CommonMark's
+// info-string rule differs by fence character: a backtick fence's info
+// string must not itself contain a backtick (ambiguous with an inline code
+// span), while a tilde fence's info string has no such restriction.
+func matchGenericFence(line string) (run, rest string, ok bool) {
+	if m := backtickFenceLine.FindStringSubmatch(line); m != nil {
+		return m[1], m[2], true
+	}
+	if m := tildeFenceLine.FindStringSubmatch(line); m != nil {
+		return m[1], m[2], true
+	}
+	return "", "", false
+}
 
 // closesFence reports whether line closes a fence opened with run: the same
 // character, at least as long, and — per Markdown's own closing-fence rule —
@@ -90,11 +107,11 @@ var (
 // malformed closer like "``` " be accepted as a clean close instead of
 // rejected as ErrMalformedMarker.
 func closesFence(line, run string) bool {
-	m := genericFenceLine.FindStringSubmatch(line)
-	if m == nil {
+	fenceRun, rest, ok := matchGenericFence(line)
+	if !ok {
 		return false
 	}
-	return m[1][0] == run[0] && len(m[1]) >= len(run) && strings.Trim(m[2], " \t") == ""
+	return fenceRun[0] == run[0] && len(fenceRun) >= len(run) && strings.Trim(rest, " \t") == ""
 }
 
 // markerScan is the result of scanning a turn's text for BRIDGE-REPLY
@@ -220,8 +237,22 @@ var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
 	// at a blank line. Checked last so types 1-6's more specific tag names
 	// take their own termination rule instead of falling through to this
 	// blank-line-terminated catch-all.
-	{regexp.MustCompile(`^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*)?/?>\s*$`), nil},
+	{regexp.MustCompile(`^ {0,3}(?:` + htmlOpenTag + `|` + htmlCloseTag + `)\s*$`), nil},
 }
+
+// htmlAttrValue/htmlAttr/htmlOpenTag/htmlCloseTag approximate CommonMark's
+// HTML tag grammar for type 7's "complete tag alone on a line" check. A
+// quoted attribute value may itself contain '>' or '<' (e.g.
+// `<custom title="a > b">`), so an attribute-aware match is required here —
+// unlike type 6, whose opener regex only inspects the tag name itself and
+// never scans into the attribute list.
+const (
+	htmlAttrName  = `[A-Za-z_:][A-Za-z0-9_.:-]*`
+	htmlAttrValue = `"[^"]*"|'[^']*'|[^\s"'=<>` + "`" + `]+`
+	htmlAttr      = `\s+` + htmlAttrName + `(?:\s*=\s*(?:` + htmlAttrValue + `))?`
+	htmlOpenTag   = `<[A-Za-z][A-Za-z0-9-]*(?:` + htmlAttr + `)*\s*/?>`
+	htmlCloseTag  = `</[A-Za-z][A-Za-z0-9-]*\s*>`
+)
 
 // matchRawHTMLBlockOpener reports whether line opens one of the raw HTML
 // block types above, returning its termination rule: a specific closing
@@ -257,7 +288,11 @@ func scanForMarker(text string) markerScan {
 	for i, line := range lines {
 		trimmed := strings.TrimRight(line, " \t")
 		if inComment {
-			inComment = commentStateAfterLine(inComment, stripCodeSpans(trimmed))
+			// Do not strip code spans here: once inside raw HTML, backticks
+			// have no Markdown code-span meaning at all — a closer like
+			// "`-->`" still closes the comment, and stripping it as if it
+			// were a code span would leave inComment stuck true.
+			inComment = commentStateAfterLine(inComment, trimmed)
 			continue
 		}
 		if inRawHTMLBlock {
@@ -307,8 +342,8 @@ func scanForMarker(text string) markerScan {
 				result.openerCount++
 				openRun = "```"
 				isOurs = false
-			} else if m := genericFenceLine.FindStringSubmatch(trimmed); m != nil {
-				openRun = m[1]
+			} else if run, _, ok := matchGenericFence(trimmed); ok {
+				openRun = run
 				isOurs = false
 			}
 			continue

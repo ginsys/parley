@@ -105,3 +105,22 @@ func ClaimExchange(ctx context.Context, tx *Tx, conversation string, version int
 	}
 	return n == 1, nil
 }
+
+// RefundExchange reverses one ClaimExchange call for a grant version whose
+// claimed message was never actually attempted (the host process never
+// started, or the transport rejected it before ever calling the host) — the
+// budget slot was consumed for nothing and must not count against
+// max_exchanges. Safe regardless of the grant's current status (revoked,
+// superseded, or a since-expired active row): this only corrects the count
+// already recorded against a specific historical version, it does not
+// re-check eligibility. The exchanges_used > 0 guard makes a duplicate call
+// a no-op instead of driving the counter negative.
+func RefundExchange(ctx context.Context, tx *Tx, conversation string, version int64) error {
+	_, err := tx.Exec(ctx, `
+		UPDATE grants SET exchanges_used = exchanges_used - 1
+		WHERE conversation = ? AND grant_version = ? AND exchanges_used > 0`, conversation, version)
+	if err != nil {
+		return fmt.Errorf("refund exchange: %w", err)
+	}
+	return nil
+}

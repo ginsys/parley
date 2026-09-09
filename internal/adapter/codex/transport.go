@@ -22,6 +22,16 @@ import (
 // retries automatically (design plan §3).
 var ErrQueueAmbiguous = errors.New("codex queue outcome ambiguous")
 
+// ErrQueueNotAttempted marks a QueueMessage outcome where the codex process
+// definitely never started — the context was already canceled/expired
+// before exec forked it (cmd.Process stays nil in that case) — or the
+// message was rejected before exec was even attempted (ErrMessageTooLarge).
+// Transport.Deliver reports this as dispatch.ErrNoAttempt, which Dispatch
+// refunds and requeues rather than terminally failing (design plan §3/§4):
+// unlike ErrQueueAmbiguous, there is no possibility the host already saw
+// this message.
+var ErrQueueNotAttempted = errors.New("codex queue never attempted")
+
 // ErrRecipientMismatch marks an envelope whose ToPeer or FromPeer doesn't
 // match the peer identities this Transport is bound to. Nothing upstream of
 // Deliver (Bridge.Send, IngestTurn, Bridge.Dispatch) filters envelopes by
@@ -59,26 +69,32 @@ type ExecSender struct{}
 
 func (ExecSender) QueueMessage(ctx context.Context, threadID, text string) error {
 	if len(text) > maxMessageBytes {
-		return fmt.Errorf("%w: %d bytes > %d", ErrMessageTooLarge, len(text), maxMessageBytes)
+		return fmt.Errorf("%w: %d bytes > %d: %w", ErrMessageTooLarge, len(text), maxMessageBytes, ErrQueueNotAttempted)
 	}
 	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", threadID, "--message", text)
 	return runAndClassify(ctx, cmd)
 }
 
-// runAndClassify runs cmd and classifies a failure. Only a context outcome
+// runAndClassify runs cmd and classifies a failure. A context outcome
 // observed after the process actually started is ambiguous — cmd.Process is
 // set once exec successfully forks/execs it. A context already
-// canceled/expired before that point means the command never ran at all, so
-// nothing could have committed: a plain, safely retryable failure, not
-// 'uncertain'. Split out from QueueMessage so it can be exercised directly
-// against a real short-lived process, without depending on the codex binary.
+// canceled/expired *before* that point means the command never ran at all —
+// definitely not attempted, safely retryable without any risk of duplicate
+// delivery, not merely 'uncertain'. Any other failure (a real exit error,
+// binary not found with no context cancellation involved) is a plain
+// terminal failure. Split out from QueueMessage so it can be exercised
+// directly against a real short-lived process, without depending on the
+// codex binary.
 func runAndClassify(ctx context.Context, cmd *exec.Cmd) error {
 	err := cmd.Run()
 	if err == nil {
 		return nil
 	}
-	if ctx.Err() != nil && cmd.Process != nil {
-		return fmt.Errorf("%w: %v", ErrQueueAmbiguous, err)
+	if ctx.Err() != nil {
+		if cmd.Process != nil {
+			return fmt.Errorf("%w: %v", ErrQueueAmbiguous, err)
+		}
+		return fmt.Errorf("codex queue: %v: %w", err, ErrQueueNotAttempted)
 	}
 	return fmt.Errorf("codex queue: %w", err)
 }
@@ -112,6 +128,9 @@ func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
 	if err := t.sender.QueueMessage(ctx, t.threadID, wrapped); err != nil {
 		if errors.Is(err, ErrQueueAmbiguous) {
 			return fmt.Errorf("%w: %v", dispatch.ErrAmbiguous, err)
+		}
+		if errors.Is(err, ErrQueueNotAttempted) {
+			return fmt.Errorf("%w: %v", dispatch.ErrNoAttempt, err)
 		}
 		return err
 	}

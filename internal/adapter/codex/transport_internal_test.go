@@ -9,11 +9,13 @@ import (
 	"time"
 )
 
-// Regression for a finding on PR #4: a context already canceled/expired
-// before the process ever started must not be classified as an ambiguous
-// ('uncertain') outcome — nothing could have committed, so it's a plain,
-// safely retryable failure.
-func TestRunAndClassifyPreStartCancellationIsPlainFailure(t *testing.T) {
+// Regression for a finding on PR #4, refined by a later finding on PR #3: a
+// context already canceled/expired before the process ever started must not
+// be classified as an ambiguous ('uncertain') outcome — nothing could have
+// committed. It's not merely "not ambiguous" either: it's definitely never
+// attempted, so dispatch.Bridge refunds the budget claim and requeues it,
+// rather than leaving it as a terminal failure that loses the message.
+func TestRunAndClassifyPreStartCancellationIsNeverAttempted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -23,7 +25,10 @@ func TestRunAndClassifyPreStartCancellationIsPlainFailure(t *testing.T) {
 		t.Fatalf("want an error, got nil")
 	}
 	if errors.Is(err, ErrQueueAmbiguous) {
-		t.Fatalf("want a plain failure for a pre-start cancellation, got ambiguous: %v", err)
+		t.Fatalf("want never-attempted for a pre-start cancellation, got ambiguous: %v", err)
+	}
+	if !errors.Is(err, ErrQueueNotAttempted) {
+		t.Fatalf("want ErrQueueNotAttempted for a pre-start cancellation, got %v", err)
 	}
 	if cmd.Process != nil {
 		t.Fatalf("test premise violated: process must not have started")
@@ -67,5 +72,17 @@ func TestQueueMessageAllowsTextAtLimit(t *testing.T) {
 	err := ExecSender{}.QueueMessage(context.Background(), "thread-1", atLimit)
 	if errors.Is(err, ErrMessageTooLarge) {
 		t.Fatalf("want text exactly at the limit to pass the size check, got %v", err)
+	}
+}
+
+// Regression for a finding on review 5160464724's follow-up: an oversized
+// message is rejected before exec is ever called, so it must be classified
+// as never-attempted (refundable/requeueable), not a terminal failure that
+// permanently loses the message and its budget slot.
+func TestQueueMessageOversizedTextIsNeverAttempted(t *testing.T) {
+	oversized := strings.Repeat("x", maxMessageBytes+1)
+	err := ExecSender{}.QueueMessage(context.Background(), "thread-1", oversized)
+	if !errors.Is(err, ErrQueueNotAttempted) {
+		t.Fatalf("want ErrQueueNotAttempted for an oversized message, got %v", err)
 	}
 }

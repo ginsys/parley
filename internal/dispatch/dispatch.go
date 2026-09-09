@@ -24,11 +24,29 @@ import (
 // budget claim — see the design plan's Delivery section.
 var ErrAmbiguous = errors.New("ambiguous transport outcome")
 
+// ErrNoAttempt marks a Transport.Deliver outcome where the host was
+// definitely never invoked for this message — rejected before the host call
+// (e.g. an oversized payload) or the underlying process never started (e.g.
+// a context canceled before exec forked it). Unlike ErrAmbiguous, this is
+// not a maybe: the claimed budget slot was spent for nothing and the
+// message itself was never at risk of duplicate delivery, so Dispatch
+// refunds the slot and puts the envelope back in 'queued' rather than
+// terminally failing it.
+var ErrNoAttempt = errors.New("transport never attempted delivery")
+
 // ErrBudgetExhausted is returned by Dispatch when the grant's max_exchanges
 // has already been reached. The envelope is left queued, untouched — per
 // the design plan, exhaustion halts delivery pending a human renewal, it
 // does not fail or cancel the message.
 var ErrBudgetExhausted = errors.New("grant budget exhausted")
+
+// ErrGrantExpired is returned by Dispatch when the envelope's grant version
+// has passed its ExpiresAt by claim time, even though it hadn't expired when
+// the message was accepted (design plan §1's exact-version dispatch check
+// covers a stale *version*, not a grant that ages out while the message sat
+// queued). Unlike budget exhaustion, an expired grant version can never
+// claim again — claim cancels the row rather than leaving it queued forever.
+var ErrGrantExpired = errors.New("grant expired before dispatch")
 
 // Transport is the one thing Bridge asks of a concrete adapter: hand this
 // envelope's text to the actual host (codex queue, a Channels notification)
@@ -106,6 +124,9 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 		if errors.Is(err, ErrBudgetExhausted) {
 			return store.Queued, err
 		}
+		if errors.Is(err, ErrGrantExpired) {
+			return store.Cancelled, err
+		}
 		return "", err
 	}
 	if !claimed {
@@ -113,12 +134,15 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 	}
 
 	deliverErr := b.transport.Deliver(ctx, *claimedEnvelope)
+	noAttempt := errors.Is(deliverErr, ErrNoAttempt)
 	finalState := store.HandedOff
 	switch {
 	case deliverErr == nil:
 		finalState = store.HandedOff
 	case errors.Is(deliverErr, ErrAmbiguous):
 		finalState = store.Uncertain
+	case noAttempt:
+		finalState = store.Queued
 	default:
 		finalState = store.Failed
 	}
@@ -143,7 +167,18 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 		}
 	}()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if err := store.SetState(recordCtx, tx, envelopeID, finalState, now); err != nil {
+	if noAttempt {
+		// The host was never actually invoked: refund the budget slot
+		// claim() consumed and put the envelope back in 'queued' instead of
+		// terminally failing a message that was never at risk of duplicate
+		// delivery.
+		if err := store.RefundExchange(recordCtx, tx, claimedEnvelope.Conversation, claimedEnvelope.GrantVersion); err != nil {
+			return "", err
+		}
+		if _, err := store.RequeueUnattempted(recordCtx, tx, envelopeID, now); err != nil {
+			return "", err
+		}
+	} else if err := store.SetState(recordCtx, tx, envelopeID, finalState, now); err != nil {
 		return "", err
 	}
 	if err := tx.Commit(recordCtx); err != nil {
@@ -174,6 +209,26 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 	}
 	if e.State != store.Queued {
 		return nil, false, nil
+	}
+
+	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
+	if err != nil {
+		return nil, false, err
+	}
+	if g.Expired(time.Now().UTC()) {
+		// A grant that expires while a message sits queued must not deliver
+		// it late — recheck at claim time, not only at accept time. Unlike
+		// budget exhaustion, expiry is permanent for this grant version, so
+		// leaving the row queued forever would never resolve; cancel it.
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if err := store.SetState(ctx, tx, envelopeID, store.Cancelled, now); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, err
+		}
+		committed = true
+		return nil, false, ErrGrantExpired
 	}
 
 	ok, err := store.ClaimExchange(ctx, tx, e.Conversation, e.GrantVersion)

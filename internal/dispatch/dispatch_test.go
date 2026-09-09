@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/dispatch"
@@ -20,10 +21,11 @@ type fakeTransport struct {
 	delivered []string
 	fail      map[string]bool
 	ambiguous map[string]bool
+	noAttempt map[string]bool
 }
 
 func newFakeTransport() *fakeTransport {
-	return &fakeTransport{fail: map[string]bool{}, ambiguous: map[string]bool{}}
+	return &fakeTransport{fail: map[string]bool{}, ambiguous: map[string]bool{}, noAttempt: map[string]bool{}}
 }
 
 func (f *fakeTransport) Deliver(ctx context.Context, e store.Envelope) error {
@@ -31,6 +33,9 @@ func (f *fakeTransport) Deliver(ctx context.Context, e store.Envelope) error {
 	defer f.mu.Unlock()
 	if f.ambiguous[e.ID] {
 		return fmt.Errorf("wrap: %w", dispatch.ErrAmbiguous)
+	}
+	if f.noAttempt[e.ID] {
+		return fmt.Errorf("wrap: %w", dispatch.ErrNoAttempt)
 	}
 	if f.fail[e.ID] {
 		return errors.New("delivery refused")
@@ -362,5 +367,89 @@ func TestRenewCarriesForwardQueuedReplyInsteadOfCancelling(t *testing.T) {
 	}
 	if len(transport.delivered) != 1 || transport.delivered[0] != reply.ID {
 		t.Fatalf("want the reply delivered exactly once, got %v", transport.delivered)
+	}
+}
+
+// Regression for a finding on review 5160464724's follow-up: a reply
+// accepted (ingested) while the grant was still valid but not dispatched
+// until after ExpiresAt has passed must not be delivered late — expiry must
+// be rechecked atomically at claim time, not only at accept/ingest time.
+// Unlike budget exhaustion, an expired grant version can never claim again,
+// so the envelope is cancelled rather than left queued forever.
+func TestGrantExpiryRecheckedAtDispatch(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	ctx := context.Background()
+
+	past := time.Now().UTC().Add(-time.Hour)
+	if _, err := ctrl.Grant(ctx, controller.GrantParams{
+		Conversation: "conv-expiry-dispatch",
+		PeerAID:      "claude-session-a",
+		PeerBID:      "codex-thread-b",
+		Direction:    store.Bidirectional,
+		MaxExchanges: 10,
+		ExpiresAt:    &past,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	transport := newFakeTransport()
+	bridge := dispatch.New(db, transport)
+
+	e, err := bridge.Send(ctx, "conv-expiry-dispatch", "a", "b", "queued after expiry", nil)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, e.ID)
+	if !errors.Is(err, dispatch.ErrGrantExpired) {
+		t.Fatalf("want ErrGrantExpired, got %v", err)
+	}
+	if state != store.Cancelled {
+		t.Fatalf("want cancelled (expired grant), got %s", state)
+	}
+	if len(transport.delivered) != 0 {
+		t.Fatalf("transport must not have been called for an expired-grant envelope")
+	}
+}
+
+// Regression for a finding on review 5160464724's follow-up: a transport
+// outcome that definitely never reached the host (e.g. a canceled context
+// before the process started, or a payload rejected before ever calling the
+// host) must be requeued with its budget slot refunded, not left as a
+// terminal failure that permanently loses the message.
+func TestDispatchRequeuesAndRefundsNeverAttemptedDelivery(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-no-attempt", 1)
+
+	transport := newFakeTransport()
+	bridge := dispatch.New(db, transport)
+	ctx := context.Background()
+
+	e, err := bridge.Send(ctx, "conv-no-attempt", "a", "b", "never attempted", nil)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	transport.noAttempt[e.ID] = true
+
+	state, err := bridge.Dispatch(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Queued {
+		t.Fatalf("want the envelope back in queued, got %s", state)
+	}
+	delete(transport.noAttempt, e.ID)
+
+	got, err := bridge.Dispatch(ctx, e.ID)
+	if err != nil {
+		t.Fatalf("redispatch after refund: %v", err)
+	}
+	if got != store.HandedOff {
+		t.Fatalf("want the budget refund to allow a real retry to succeed, got %s", got)
+	}
+	if len(transport.delivered) != 1 || transport.delivered[0] != e.ID {
+		t.Fatalf("want exactly one real delivery after the refund, got %v", transport.delivered)
 	}
 }

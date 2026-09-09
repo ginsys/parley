@@ -104,6 +104,29 @@ func TransitionToDispatching(ctx context.Context, tx *Tx, id, updatedAt string) 
 	return n == 1, nil
 }
 
+// RequeueUnattempted reverts one 'dispatching' envelope back to 'queued'.
+// Used when a Transport reports it never actually attempted delivery (the
+// host process didn't start, or the transport rejected the message before
+// ever calling the host) — the claimed budget slot must be refunded by the
+// caller in the same transaction (store.RefundExchange) so an unattempted
+// message doesn't count against max_exchanges. Guarded to only affect a row
+// still 'dispatching': a concurrent state change (there shouldn't be one,
+// since nothing else touches a 'dispatching' row) is surfaced as false
+// rather than silently overwriting whatever it became.
+func RequeueUnattempted(ctx context.Context, tx *Tx, id, updatedAt string) (bool, error) {
+	res, err := tx.Exec(ctx, `
+		UPDATE envelopes SET state = 'queued', updated_at = ?
+		WHERE id = ? AND state = 'dispatching'`, updatedAt, id)
+	if err != nil {
+		return false, fmt.Errorf("requeue unattempted: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("requeue unattempted: rows affected: %w", err)
+	}
+	return n == 1, nil
+}
+
 // SetState sets an envelope's terminal (or acked) state outside the
 // dispatching transaction — after the host call returns, success, failure,
 // or ambiguous.
