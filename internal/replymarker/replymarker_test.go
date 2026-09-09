@@ -60,6 +60,11 @@ func queueOne(t *testing.T, db *store.DB) (conversation string, id string) {
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("insert queued: %v", err)
 	}
+	// Only a handed-off envelope is eligible for a reply to ack (Validate):
+	// replyingPeer cannot have seen a message the bridge never delivered.
+	if err := store.SetState(ctx, tx, e.ID, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
+		t.Fatalf("set handed off: %v", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
@@ -238,8 +243,65 @@ func TestValidateWrongRecipient(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #4: Validate used to accept a still-queued
+// envelope (never handed off to the peer) as eligible for a reply to ack —
+// replyingPeer cannot have seen a message the bridge never delivered, so
+// acking it would retire a message that was never sent. Only a handed-off
+// envelope may be acked.
+func TestValidateRejectsQueuedEnvelope(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	ctrl := controller.New(db)
+	conversation := "conv-never-dispatched"
+	if _, err := ctrl.Grant(ctx, controller.GrantParams{
+		Conversation: conversation,
+		PeerAID:      "codex-thread-b",
+		PeerBID:      "claude-session-a",
+		Direction:    store.Bidirectional,
+		MaxExchanges: 10,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, conversation)
+	if err != nil {
+		t.Fatalf("current grant: %v", err)
+	}
+	e := store.Envelope{
+		ID:           "env-never-dispatched",
+		Conversation: conversation,
+		FromPeer:     "claude-session-a",
+		ToPeer:       "codex-thread-b",
+		Text:         "please respond",
+		GrantVersion: g.GrantVersion,
+		State:        store.Queued,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+		UpdatedAt:    "2026-01-01T00:00:00Z",
+	}
+	if err := store.InsertQueued(ctx, tx, e); err != nil {
+		t.Fatalf("insert queued: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	tx2, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx2.Rollback(ctx)
+	m := &replymarker.Marker{InReplyTo: e.ID, To: "claude-session-a", Text: "hi"}
+	if _, err := replymarker.Validate(ctx, tx2, conversation, "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
+		t.Fatalf("want ErrStaleReply for a still-queued (never handed off) envelope, got %v", err)
+	}
+}
+
 // Fixture 10: stale reply — a well-formed marker whose in_reply_to names an
-// envelope that isn't currently queued/handed_off awaiting reply on that
+// envelope that isn't currently handed off and awaiting reply on that
 // conversation must be rejected, not forwarded.
 func TestValidateStaleReply(t *testing.T) {
 	db := openTestDB(t)
