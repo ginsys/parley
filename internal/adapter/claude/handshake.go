@@ -61,8 +61,13 @@ func (h *Handshake) Reset() error {
 func (h *Handshake) startLocked() error {
 	h.ready = false
 	h.stopped = false
-	nonce, err := newNonce()
+	nonce, err := generateNonce()
 	if err != nil {
+		// Leave no stale nonce behind: a superseded connection's nonce must
+		// not remain ackable, and stopped guards against a leftover timer
+		// from a prior connection retrying into this failed state.
+		h.nonce = ""
+		h.stopped = true
 		return fmt.Errorf("generate handshake nonce: %w", err)
 	}
 	h.nonce = nonce
@@ -124,20 +129,30 @@ func (h *Handshake) Retries() int {
 	return h.retries
 }
 
-// Stop disarms the timeout timer without changing readiness, and prevents a
-// timeout callback that was already running (blocked on the same lock) from
-// re-arming a fresh probe once Stop returns — time.Timer.Stop cannot cancel
-// a callback that has already started. Call when tearing down a connection
-// so a stale timer can't fire a probe into a dead transport. A subsequent
-// Start or Reset clears the stopped flag, since that begins a new lifecycle.
+// Stop disarms the timeout timer and clears readiness — a stopped
+// connection is by definition no longer proven ready, so a caller that only
+// checks Ready() (e.g. Poller) must see false immediately, not keep
+// dispatching into a dead transport until a future Reset(). It also
+// prevents a timeout callback that was already running (blocked on the same
+// lock) from re-arming a fresh probe once Stop returns — time.Timer.Stop
+// cannot cancel a callback that has already started. Call when tearing down
+// a connection. A subsequent Start or Reset clears the stopped flag, since
+// that begins a new lifecycle.
 func (h *Handshake) Stop() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.stopped = true
+	h.ready = false
+	h.nonce = ""
 	if h.timer != nil {
 		h.timer.Stop()
 	}
 }
+
+// generateNonce is a variable, not a direct call to newNonce, purely so
+// tests can simulate a crypto/rand failure without depending on an actual
+// entropy-source outage.
+var generateNonce = newNonce
 
 func newNonce() (string, error) {
 	b := make([]byte, 16)

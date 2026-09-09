@@ -46,18 +46,32 @@ type Marker struct {
 	Text      string `json:"text"`
 }
 
-var fencePattern = regexp.MustCompile("(?s)```BRIDGE-REPLY\\s*\\n(.*?)\\n```")
+// Both patterns anchor the opening and closing fences to their own line
+// (^...$ under multiline mode). A prior version matched the closing fence
+// as a bare "\n```" substring, so two adjacent markers like
+// "```BRIDGE-REPLY\n{a}\n```BRIDGE-REPLY\n{b}\n```" had the second block's
+// opener consumed as the first block's closer, yielding one match instead
+// of a rejected duplicate. Counting openers independently of the
+// fence-extraction regex catches that case even if the extraction regex
+// itself were ever loosened again.
+var (
+	openerPattern = regexp.MustCompile("(?m)^```BRIDGE-REPLY[ \\t]*$")
+	fencePattern  = regexp.MustCompile("(?sm)^```BRIDGE-REPLY[ \\t]*\\n(.*?)\\n^```[ \\t]*$")
+)
 
 // Extract finds the single BRIDGE-REPLY marker in a turn's text and parses
 // it. It never guesses: zero, more than one, or an unparseable/incomplete
 // block are all distinct errors, none of which yield a usable Marker.
 func Extract(turnText string) (*Marker, error) {
-	matches := fencePattern.FindAllStringSubmatch(turnText, -1)
-	if len(matches) == 0 {
+	if openers := openerPattern.FindAllString(turnText, -1); len(openers) == 0 {
 		return nil, ErrNoMarker
-	}
-	if len(matches) > 1 {
+	} else if len(openers) > 1 {
 		return nil, ErrMultipleMarkers
+	}
+
+	matches := fencePattern.FindAllStringSubmatch(turnText, -1)
+	if len(matches) != 1 {
+		return nil, fmt.Errorf("%w: fenced block not properly closed", ErrMalformedMarker)
 	}
 
 	var m Marker
