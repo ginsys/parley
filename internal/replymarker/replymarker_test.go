@@ -123,6 +123,18 @@ func TestExtractRejectsWrongCaseFieldName(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3: decodeMarker consumed only the first
+// JSON value in the fenced block, so a second value smuggled in right after
+// the first object's closing brace was silently discarded rather than
+// rejected — the block must contain exactly one JSON value, not merely start
+// with one.
+func TestExtractRejectsTrailingContent(t *testing.T) {
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"} {\"to\": \"attacker\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrMalformedMarker) {
+		t.Fatalf("want ErrMalformedMarker, got %v", err)
+	}
+}
+
 // Regression for a finding on PR #3: before the fences were anchored to
 // their own line, a four-backtick fence like "````BRIDGE-REPLY" could still
 // satisfy an unanchored opener/closer match by consuming three of its four

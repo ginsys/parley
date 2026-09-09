@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 
 	"github.com/ginsys/parley/internal/store"
@@ -139,6 +140,14 @@ func decodeMarker(raw []byte) (*Marker, error) {
 	}
 	if _, err := dec.Token(); err != nil { // consume the closing '}'
 		return nil, err
+	}
+	// The fence-extraction regex captures everything between the fences, so a
+	// second JSON value smuggled in after the first object's closing brace
+	// (e.g. "{...} {\"to\":\"attacker\"}") would otherwise be silently
+	// discarded rather than rejected — decoding only the first value is not
+	// the same as requiring the whole block be exactly one value.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("trailing content after marker object")
 	}
 	return &m, nil
 }
