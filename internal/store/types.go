@@ -1,5 +1,7 @@
 package store
 
+import "time"
+
 // Direction of a grant: which peer(s) may send.
 type Direction string
 
@@ -46,18 +48,26 @@ type Grant struct {
 	RevokedAt     *string
 }
 
-// Permits reports whether this grant allows a message from "from" to "to" —
-// both must be exactly the grant's enrolled pair (not a third identity, and
-// not swapped beyond what Direction allows), Direction must permit that
-// specific direction rather than only the reverse one, and the grant must
-// not be revoked. The only current caller resolves g via CurrentGrant, whose
-// query already excludes non-active grants, so RevokedAt is never actually
-// set here in practice today — but Permits is the named authorization gate
-// for this type, and a future caller resolving a Grant some other way must
-// not have to separately remember to check RevokedAt itself.
-func (g Grant) Permits(from, to string) bool {
+// Permits reports whether this grant allows a message from "from" to "to" at
+// "now" — both identities must be exactly the grant's enrolled pair (not a
+// third identity, and not swapped beyond what Direction allows), Direction
+// must permit that specific direction rather than only the reverse one, the
+// grant must not be revoked, and it must not have expired. The only current
+// caller resolves g via CurrentGrant, whose query already excludes non-active
+// grants, so RevokedAt is never actually set here in practice today — but
+// Permits is the named authorization gate for this type, and a future caller
+// resolving a Grant some other way must not have to separately remember to
+// check RevokedAt or ExpiresAt itself. An ExpiresAt that fails to parse is
+// treated as expired (fail closed), not ignored.
+func (g Grant) Permits(from, to string, now time.Time) bool {
 	if g.RevokedAt != nil {
 		return false
+	}
+	if g.ExpiresAt != nil {
+		exp, err := time.Parse(time.RFC3339Nano, *g.ExpiresAt)
+		if err != nil || !now.Before(exp) {
+			return false
+		}
 	}
 	switch {
 	case from == g.PeerAID && to == g.PeerBID:

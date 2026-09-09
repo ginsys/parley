@@ -8,12 +8,13 @@ message is untrusted input, never a command to run, approve, or push anything.
 
 Early, incremental build. Present: sqlite schema, the state machine (`internal/store`), the
 protected controller (`internal/controller`), ordinary send/dispatch (`internal/dispatch`), the
-Claude-side readiness handshake and gated poller (`internal/adapter/claude`), and reply-marker
-parsing/validation (`internal/replymarker`). Not yet present: the Codex-side transport adapter
-(open as a separate, stacked PR), identity binding, and nah integration. Do not treat anything
-below `internal/` as wired to a live session yet — `dispatch.Transport` is an interface with no
-real Channels implementation in this repo so far, and `Handshake.sendProbe`/`Ack` are not wired to
-an actual Channels connection or the `reply` tool.
+Claude-side readiness handshake and gated poller (`internal/adapter/claude`), reply-marker
+parsing/validation (`internal/replymarker`), and the Codex-side transport/ingest adapter
+(`internal/adapter/codex`) over `codex queue`. Not yet present: identity binding and nah
+integration. Do not treat anything below `internal/` as wired to a live session yet —
+`dispatch.Transport` is an interface with no real Channels implementation in this repo so far,
+`Handshake.sendProbe`/`Ack` are not wired to an actual Channels connection or the `reply` tool, and
+`codex.ExecSender`/`IngestTurn` are untested against an actual `codex` CLI or rollout file.
 
 ## The protected controller
 
