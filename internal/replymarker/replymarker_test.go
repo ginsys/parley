@@ -201,6 +201,19 @@ func TestExtractAcceptsCRLFLineEndings(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3: a closing fence line with trailing
+// non-ASCII whitespace (e.g. U+00A0 NBSP) or a control character outside
+// " \t" (e.g. '\v') must not be accepted as a clean close — strings.TrimSpace
+// treats both as blank, but the opener's own "[ \t]*" rule permits only
+// ASCII space and tab, so a closer this malformed must stop delivery instead
+// of silently succeeding.
+func TestExtractRejectsClosingFenceWithNonASCIIWhitespace(t *testing.T) {
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n``` "
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrMalformedMarker) {
+		t.Fatalf("want ErrMalformedMarker for a closing fence with trailing NBSP, got %v", err)
+	}
+}
+
 // Fixture 8: duplicate reply markers — two well-formed markers in one turn
 // must stop delivery, not pick one arbitrarily.
 func TestExtractDuplicateMarkers(t *testing.T) {

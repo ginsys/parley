@@ -67,13 +67,17 @@ var (
 
 // closesFence reports whether line closes a fence opened with run: the same
 // character, at least as long, and — per Markdown's own closing-fence rule —
-// no trailing info string.
+// no trailing info string. The trailing check trims only ASCII space and tab,
+// matching bridgeReplyOpener's own "[ \t]*" — strings.TrimSpace additionally
+// strips other Unicode whitespace (e.g. U+00A0 NBSP, '\v'), which would let a
+// malformed closer like "``` " be accepted as a clean close instead of
+// rejected as ErrMalformedMarker.
 func closesFence(line, run string) bool {
 	m := genericFenceLine.FindStringSubmatch(line)
 	if m == nil {
 		return false
 	}
-	return m[1][0] == run[0] && len(m[1]) >= len(run) && strings.TrimSpace(m[2]) == ""
+	return m[1][0] == run[0] && len(m[1]) >= len(run) && strings.Trim(m[2], " \t") == ""
 }
 
 // markerScan is the result of scanning a turn's text for BRIDGE-REPLY
