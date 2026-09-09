@@ -144,34 +144,95 @@ func commentStateAfterLine(inComment bool, line string) bool {
 	return inComment
 }
 
-// rawHTMLBlockOpener pairs a CommonMark HTML block type 1 start tag
-// (script/pre/style/textarea) with its matching end tag. Per CommonMark,
-// everything from a line starting with one of these tags through the line
-// containing its case-insensitive closing tag is raw HTML, never parsed as
-// Markdown — the same reasoning as the comment span above, generalized to
-// every raw-HTML-block start condition CommonMark defines, not just
-// comments.
+// codeSpanBackticks matches a run of one or more backticks, the delimiter
+// CommonMark uses for an inline code span.
+var codeSpanBackticks = regexp.MustCompile("`+")
+
+// stripCodeSpans removes the contents of inline code spans from line before
+// comment-delimiter detection runs, so a literal "<!--" written as
+// inline code (e.g. “ `<!--` “) is never mistaken for a real HTML comment
+// opener — CommonMark specifies inline code span content as literal text,
+// never parsed as raw HTML. Spans are matched by equal-length backtick runs,
+// per CommonMark's own code-span rule; an unmatched trailing backtick run is
+// left as-is; it isn't a code span.
+func stripCodeSpans(line string) string {
+	matches := codeSpanBackticks.FindAllStringIndex(line, -1)
+	if len(matches) < 2 {
+		return line
+	}
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(matches); i++ {
+		open := matches[i]
+		runLen := open[1] - open[0]
+		closeIdx := -1
+		for j := i + 1; j < len(matches); j++ {
+			if matches[j][1]-matches[j][0] == runLen {
+				closeIdx = j
+				break
+			}
+		}
+		if closeIdx == -1 {
+			break
+		}
+		b.WriteString(line[last:open[0]])
+		last = matches[closeIdx][1]
+		i = closeIdx
+	}
+	b.WriteString(line[last:])
+	return b.String()
+}
+
+// rawHTMLBlockOpener pairs a CommonMark HTML block start condition with how
+// it ends: close matches a specific end token appearing later in the text
+// (types 1/3/4/5); a nil close means the block instead ends at the next
+// blank line (types 6/7). Per CommonMark, everything between is raw HTML,
+// never parsed as Markdown — the same reasoning as the comment span above
+// (type 2), generalized to every other raw-HTML-block start condition
+// CommonMark defines.
 type rawHTMLBlockOpener struct {
 	open  *regexp.Regexp
 	close *regexp.Regexp
 }
 
+// blockLevelTags is CommonMark's fixed list of tag names that start an HTML
+// block type 6 (ends at the next blank line, not a specific closing tag).
+const blockLevelTags = `address|article|aside|base|basefont|blockquote|body|caption|center|col|` +
+	`colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|` +
+	`frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|` +
+	`ol|optgroup|option|p|param|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul`
+
 var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
+	// Type 1: script/pre/style/textarea, ends at its specific closing tag.
 	{regexp.MustCompile(`(?i)^ {0,3}<script(?:[\s>]|$)`), regexp.MustCompile(`(?i)</script\s*>`)},
 	{regexp.MustCompile(`(?i)^ {0,3}<pre(?:[\s>]|$)`), regexp.MustCompile(`(?i)</pre\s*>`)},
 	{regexp.MustCompile(`(?i)^ {0,3}<style(?:[\s>]|$)`), regexp.MustCompile(`(?i)</style\s*>`)},
 	{regexp.MustCompile(`(?i)^ {0,3}<textarea(?:[\s>]|$)`), regexp.MustCompile(`(?i)</textarea\s*>`)},
+	// Type 3: processing instruction, ends at "?>".
+	{regexp.MustCompile(`^ {0,3}<\?`), regexp.MustCompile(`\?>`)},
+	// Type 4: declaration, ends at ">".
+	{regexp.MustCompile(`^ {0,3}<![A-Za-z]`), regexp.MustCompile(`>`)},
+	// Type 5: CDATA section, ends at "]]>".
+	{regexp.MustCompile(`^ {0,3}<!\[CDATA\[`), regexp.MustCompile(`]]>`)},
+	// Type 6: a fixed list of block-level tag names, ends at a blank line.
+	{regexp.MustCompile(`(?i)^ {0,3}</?(?:` + blockLevelTags + `)(?:[\s>]|/>|$)`), nil},
+	// Type 7: any other complete open/close tag alone on its own line, ends
+	// at a blank line. Checked last so types 1-6's more specific tag names
+	// take their own termination rule instead of falling through to this
+	// blank-line-terminated catch-all.
+	{regexp.MustCompile(`^ {0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*)?/?>\s*$`), nil},
 }
 
 // matchRawHTMLBlockOpener reports whether line opens one of the raw HTML
-// block types above, returning the specific closing pattern to watch for.
-func matchRawHTMLBlockOpener(line string) (*regexp.Regexp, bool) {
+// block types above, returning its termination rule: a specific closing
+// pattern to watch for, or nil for "ends at the next blank line".
+func matchRawHTMLBlockOpener(line string) (close *regexp.Regexp, blankTerminated, ok bool) {
 	for _, k := range rawHTMLBlockOpeners {
 		if k.open.MatchString(line) {
-			return k.close, true
+			return k.close, k.close == nil, true
 		}
 	}
-	return nil, false
+	return nil, false, false
 }
 
 // scanForMarker walks text line by line tracking at most one open fence at a
@@ -192,30 +253,40 @@ func scanForMarker(text string) markerScan {
 	var contentStart int
 	var inComment bool
 	var openRawHTMLClose *regexp.Regexp
+	var inRawHTMLBlock bool
 	for i, line := range lines {
 		trimmed := strings.TrimRight(line, " \t")
 		if inComment {
-			inComment = commentStateAfterLine(inComment, trimmed)
+			inComment = commentStateAfterLine(inComment, stripCodeSpans(trimmed))
 			continue
 		}
-		if openRawHTMLClose != nil {
-			if openRawHTMLClose.MatchString(trimmed) {
-				openRawHTMLClose = nil
+		if inRawHTMLBlock {
+			if openRawHTMLClose != nil {
+				if openRawHTMLClose.MatchString(trimmed) {
+					inRawHTMLBlock = false
+					openRawHTMLClose = nil
+				}
+			} else if strings.TrimSpace(trimmed) == "" {
+				inRawHTMLBlock = false
 			}
 			continue
 		}
 		if openRun == "" {
-			if commentStateAfterLine(false, trimmed) {
+			scanLine := stripCodeSpans(trimmed)
+			if commentStateAfterLine(false, scanLine) {
 				inComment = true
 				continue
 			}
-			if closer, ok := matchRawHTMLBlockOpener(trimmed); ok {
+			if closer, blankTerminated, ok := matchRawHTMLBlockOpener(trimmed); ok {
 				// A closer already present on this same opening line makes
 				// the block self-contained (CommonMark: start and end
 				// conditions on one line close it immediately) — do not
 				// enter the persistent open state, or every later line
 				// would stay hidden with nothing left to ever match it.
-				if !closer.MatchString(trimmed) {
+				if blankTerminated {
+					inRawHTMLBlock = true
+				} else if !closer.MatchString(trimmed) {
+					inRawHTMLBlock = true
 					openRawHTMLClose = closer
 				}
 				continue
