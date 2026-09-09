@@ -463,6 +463,86 @@ func bridge(t *testing.T, db *store.DB) *dispatch.Bridge {
 	return dispatch.New(db, &fakeTransport{})
 }
 
+// transportFunc adapts a plain function to dispatch.Transport, for tests
+// that need to inspect or act on the per-call context Poller passes in.
+type transportFunc func(ctx context.Context, e store.Envelope) error
+
+func (f transportFunc) Deliver(ctx context.Context, e store.Envelope) error {
+	return f(ctx, e)
+}
+
+// Regression for a finding on PR #3: Tick's per-iteration readiness check
+// runs before Dispatch, not around it — a Reset/Stop landing after that
+// check passes but before (or during) the transport call it just authorized
+// used to let that delivery complete as if the connection were still live.
+// The check was a time-of-check, not a lease held across the actual I/O.
+// This proves the fix: the context passed into the transport is derived
+// from the handshake's per-generation context and is observably canceled
+// the instant Stop() invalidates the generation this dispatch was
+// authorized under, even though Stop() runs strictly after Tick's own
+// check already passed.
+func TestPollerCancelsInFlightDispatchWhenGenerationInvalidatedMidDelivery(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-cancel-mid-delivery")
+	ctx := context.Background()
+
+	e, err := bridge(t, db).Send(ctx, "conv-cancel-mid-delivery", "codex-thread-b", "claude-session-a", "hi", nil)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	probe := &probeRecorder{}
+	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err := hs.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if !hs.Ack(probe.last()) {
+		t.Fatalf("ack must succeed")
+	}
+
+	started := make(chan struct{})
+	var sawCancel bool
+	transport := transportFunc(func(dctx context.Context, _ store.Envelope) error {
+		close(started)
+		select {
+		case <-dctx.Done():
+			sawCancel = true
+		case <-time.After(2 * time.Second):
+		}
+		return dctx.Err()
+	})
+	b := dispatch.New(db, transport)
+	poller := adapterclaude.NewPoller(db, b, hs, "conv-cancel-mid-delivery", "claude-session-a")
+
+	done := make(chan struct{})
+	go func() {
+		poller.Tick(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatalf("transport never called")
+	}
+
+	// Lands strictly after Tick's own readiness/generation check already
+	// passed for this envelope — exactly the window being closed.
+	hs.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatalf("Tick did not return after Stop canceled the in-flight dispatch")
+	}
+
+	if !sawCancel {
+		t.Fatalf("want the in-flight transport call's context canceled when Stop invalidated its generation")
+	}
+	assertState(t, db, e.ID, store.Failed)
+}
+
 // Regression for a finding on PR #3: sendProbe must run outside h.mu. A
 // probe that blocks on a slow transport send must not also block
 // Ready/Ack/Retries for the duration — reverting the fix (calling sendProbe
