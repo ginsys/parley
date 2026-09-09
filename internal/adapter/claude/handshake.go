@@ -23,10 +23,11 @@ type Handshake struct {
 	sendProbe func(nonce string) error
 	timeout   time.Duration
 
-	mu    sync.Mutex
-	nonce string
-	ready bool
-	timer *time.Timer
+	mu      sync.Mutex
+	nonce   string
+	ready   bool
+	stopped bool
+	timer   *time.Timer
 	// retries counts handshake (re)sends, for tests and observability. Only
 	// the handshake itself is ever retried — never an application message
 	// with uncertain delivery.
@@ -59,6 +60,7 @@ func (h *Handshake) Reset() error {
 
 func (h *Handshake) startLocked() error {
 	h.ready = false
+	h.stopped = false
 	nonce, err := newNonce()
 	if err != nil {
 		return fmt.Errorf("generate handshake nonce: %w", err)
@@ -75,7 +77,11 @@ func (h *Handshake) startLocked() error {
 func (h *Handshake) onTimeout() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.ready {
+	// stopped guards against a timer that had already fired (and is now
+	// merely blocked on h.mu) by the time Stop() ran and released the lock —
+	// time.Timer.Stop() cannot cancel a callback that already started
+	// running, only a future firing.
+	if h.ready || h.stopped {
 		return
 	}
 	// Best-effort: a send failure here just means another timeout fires and
@@ -118,12 +124,16 @@ func (h *Handshake) Retries() int {
 	return h.retries
 }
 
-// Stop disarms the timeout timer without changing readiness. Call when
-// tearing down a connection so a stale timer can't fire a probe into a dead
-// transport.
+// Stop disarms the timeout timer without changing readiness, and prevents a
+// timeout callback that was already running (blocked on the same lock) from
+// re-arming a fresh probe once Stop returns — time.Timer.Stop cannot cancel
+// a callback that has already started. Call when tearing down a connection
+// so a stale timer can't fire a probe into a dead transport. A subsequent
+// Start or Reset clears the stopped flag, since that begins a new lifecycle.
 func (h *Handshake) Stop() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.stopped = true
 	if h.timer != nil {
 		h.timer.Stop()
 	}
