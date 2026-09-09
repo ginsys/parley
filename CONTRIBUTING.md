@@ -72,14 +72,13 @@ not closure evidence.
 
 Every PR runs the `CI` workflow (documentation checks, `actionlint`, `go build`/`go vet`/`go
 test`/`gofmt`, conventional-commit subjects, action pins; aggregated as the `checks` context) and an
-advisory Claude review (`PR Review`). **Neither is currently a required check:** `parley` is a
-private repository on the organization's Free GitHub plan, which does not support rulesets or
-required status checks on private repos, so `main-protection` is not active here and there is no
-merge queue. Treat `checks` and `PR Review` as mandatory in practice — do not merge with either red
-or unreviewed — until the ruleset can be enabled (see the `github_repos.parley` entry in
-[ginsys/.github](https://github.com/ginsys/.github)'s settings policy). Merges use
-`gh pr merge --auto`, which merges directly once conditions are met rather than entering a queue.
-Do not claim CI success without an actual run result. Review and merge are separate actions.
+advisory Claude review (`PR Review`). Both are **required checks**: the `main-protection` ruleset
+(defined in the `github_repos.parley` entry in [ginsys/.github](https://github.com/ginsys/.github)'s
+settings policy) requires `checks` and `pr-review / AI Code Review`, blocks direct pushes and
+deletion of `main`, requires linear history, and requires every review thread resolved. Merges go
+through a **merge queue** (REBASE, one entry at a time): `gh pr merge --auto` enqueues the PR rather
+than merging it directly. Do not claim CI success without an actual run result. Review and merge are
+separate actions.
 
 ## Documentation checks
 

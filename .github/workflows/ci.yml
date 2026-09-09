@@ -2,8 +2,7 @@ name: CI
 
 # The repository's checks. `checks` aggregates them so the `main-protection` ruleset needs one
 # required context from this file; adding a job means adding it to `needs:` below, not to the
-# ruleset. Rulesets, labels and settings are managed from ginsys/.github. Note: main-protection is
-# not yet active on this repo — see CONTRIBUTING.md#change-and-review-workflow.
+# ruleset. Rulesets, labels and settings are managed from ginsys/.github.
 
 on:
   pull_request:
