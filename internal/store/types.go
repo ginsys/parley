@@ -46,6 +46,21 @@ type Grant struct {
 	RevokedAt     *string
 }
 
+// Permits reports whether this grant allows a message from "from" to "to" —
+// both must be exactly the grant's enrolled pair (not a third identity, and
+// not swapped beyond what Direction allows), and Direction must permit that
+// specific direction rather than only the reverse one.
+func (g Grant) Permits(from, to string) bool {
+	switch {
+	case from == g.PeerAID && to == g.PeerBID:
+		return g.Direction == Bidirectional || g.Direction == AToB
+	case from == g.PeerBID && to == g.PeerAID:
+		return g.Direction == Bidirectional || g.Direction == BToA
+	default:
+		return false
+	}
+}
+
 // Envelope is one message, durable from the moment Send accepts it.
 type Envelope struct {
 	ID           string

@@ -71,7 +71,10 @@ func NewTransport(sender QueueSender, threadID, fromLabel string) *Transport {
 }
 
 func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
-	wrapped := bridgetext.Wrap(t.fromLabel, e.Text)
+	wrapped, err := bridgetext.Wrap(t.fromLabel, e.Text)
+	if err != nil {
+		return err
+	}
 	if err := t.sender.QueueMessage(ctx, t.threadID, wrapped); err != nil {
 		if errors.Is(err, ErrQueueAmbiguous) {
 			return fmt.Errorf("%w: %v", dispatch.ErrAmbiguous, err)
