@@ -71,8 +71,10 @@ not closure evidence.
    or change branch protection.
 
 Every PR runs the `CI` workflow (documentation checks, `actionlint`, `go build`/`go vet`/`go
-test`/`gofmt`, conventional-commit subjects, action pins; aggregated as the `checks` context) and an
-advisory Claude review (`PR Review`). Both are **required checks**: the `main-protection` ruleset
+test`/`gofmt`, conventional-commit subjects, action pins; aggregated as the `checks` context) and a
+Claude review (`PR Review`) whose findings are advisory (`PR_REVIEW_THREADS_MODE` is unset, so it
+posts one comment and creates no resolvable threads) but whose completion is a **required check**:
+the `main-protection` ruleset
 (defined in the `github_repos.parley` entry in [ginsys/.github](https://github.com/ginsys/.github)'s
 settings policy) requires `checks` and `pr-review / AI Code Review`, blocks direct pushes and
 deletion of `main`, requires linear history, and requires every review thread resolved. Merges go
