@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,5 +47,25 @@ func TestRunAndClassifyMidRunExpiryIsAmbiguous(t *testing.T) {
 	}
 	if cmd.Process == nil {
 		t.Fatalf("test premise violated: process must have started")
+	}
+}
+
+// Regression for a finding on the merge-triggered review: a wrapped message
+// too large for a single exec argv element (Linux's MAX_ARG_STRLEN, 128 KiB)
+// must be rejected with a clear error before ever calling exec, not left to
+// fail deep inside it with an opaque E2BIG.
+func TestQueueMessageRejectsOversizedText(t *testing.T) {
+	oversized := strings.Repeat("x", maxMessageBytes+1)
+	err := ExecSender{}.QueueMessage(context.Background(), "thread-1", oversized)
+	if !errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("want ErrMessageTooLarge, got %v", err)
+	}
+}
+
+func TestQueueMessageAllowsTextAtLimit(t *testing.T) {
+	atLimit := strings.Repeat("x", maxMessageBytes)
+	err := ExecSender{}.QueueMessage(context.Background(), "thread-1", atLimit)
+	if errors.Is(err, ErrMessageTooLarge) {
+		t.Fatalf("want text exactly at the limit to pass the size check, got %v", err)
 	}
 }

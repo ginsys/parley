@@ -59,11 +59,12 @@ func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expec
 	if err != nil {
 		return nil, err
 	}
-	if !g.Permits(fromPeer, marker.To) {
+	nowTime := time.Now().UTC()
+	if !g.Permits(fromPeer, marker.To, nowTime) {
 		return nil, fmt.Errorf("%w: %s -> %s under grant version %d", ErrDirectionNotPermitted, fromPeer, marker.To, g.GrantVersion)
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := nowTime.Format(time.RFC3339Nano)
 	if err := store.SetState(ctx, tx, repliedTo.ID, store.Acked, now); err != nil {
 		return nil, fmt.Errorf("ack %s: %w", repliedTo.ID, err)
 	}

@@ -32,6 +32,19 @@ var ErrQueueAmbiguous = errors.New("codex queue outcome ambiguous")
 // if it came from the bound peer, regardless of who it actually came from.
 var ErrRecipientMismatch = errors.New("envelope addressed to or from a different peer than this transport is bound to")
 
+// maxMessageBytes bounds the wrapped text ExecSender ever puts in a single
+// argv element. Linux caps a single exec argument at MAX_ARG_STRLEN (128
+// KiB); `codex queue --help` offers no stdin or file-based alternative to
+// --message, so a message any larger fails deep inside exec with an opaque
+// E2BIG rather than a message this package can classify. This limit stays
+// safely under that kernel ceiling so oversized text is rejected here, with
+// a clear error, before ever calling exec.
+const maxMessageBytes = 96 * 1024
+
+// ErrMessageTooLarge marks a wrapped message that would risk exceeding
+// Linux's per-argument exec limit if handed to `codex queue --message`.
+var ErrMessageTooLarge = errors.New("message exceeds codex queue's argv size limit")
+
 // QueueSender is the one host operation this adapter needs: hand text to a
 // specific thread's queue. ExecSender is the real implementation; tests use
 // a fake.
@@ -45,6 +58,9 @@ type QueueSender interface {
 type ExecSender struct{}
 
 func (ExecSender) QueueMessage(ctx context.Context, threadID, text string) error {
+	if len(text) > maxMessageBytes {
+		return fmt.Errorf("%w: %d bytes > %d", ErrMessageTooLarge, len(text), maxMessageBytes)
+	}
 	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", threadID, "--message", text)
 	return runAndClassify(ctx, cmd)
 }
@@ -89,7 +105,7 @@ func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
 	if e.FromPeer != t.fromLabel {
 		return fmt.Errorf("%w: envelope from %q, transport bound to %q", ErrRecipientMismatch, e.FromPeer, t.fromLabel)
 	}
-	wrapped, err := bridgetext.Wrap(t.fromLabel, e.Text)
+	wrapped, err := bridgetext.Wrap(e.ID, t.fromLabel, e.Text)
 	if err != nil {
 		return err
 	}

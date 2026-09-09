@@ -173,9 +173,6 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 	if err := store.SetGrantStatus(ctx, tx, p.Conversation, current.GrantVersion, store.GrantSuperseded, now); err != nil {
 		return nil, err
 	}
-	if _, err := store.CancelQueuedUnderVersion(ctx, tx, p.Conversation, current.GrantVersion, now); err != nil {
-		return nil, err
-	}
 
 	maxExchanges := p.MaxExchanges
 	if maxExchanges == 0 {
@@ -186,9 +183,10 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 		expiresAt = current.ExpiresAt
 	}
 
+	newVersion := current.GrantVersion + 1
 	next := store.Grant{
 		Conversation: p.Conversation,
-		GrantVersion: current.GrantVersion + 1,
+		GrantVersion: newVersion,
 		PeerAID:      current.PeerAID,
 		PeerBID:      current.PeerBID,
 		Direction:    current.Direction,
@@ -197,6 +195,18 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 		ExpiresAt:    expiresAt,
 	}
 	if err := store.InsertGrant(ctx, tx, next); err != nil {
+		return nil, err
+	}
+	// Carry forward queued replies to the new version before cancelling
+	// whatever's left queued under the old one — a reply has no live sender
+	// left to resubmit it if cancelled (see CarryForwardQueuedReplies).
+	// Must run after InsertGrant: envelopes(conversation, grant_version) has
+	// an immediate foreign key against grants, so newVersion must already
+	// exist as a row before any envelope can reference it.
+	if _, err := store.CarryForwardQueuedReplies(ctx, tx, p.Conversation, current.GrantVersion, newVersion, now); err != nil {
+		return nil, err
+	}
+	if _, err := store.CancelQueuedUnderVersion(ctx, tx, p.Conversation, current.GrantVersion, now); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {

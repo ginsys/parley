@@ -55,6 +55,28 @@ func CancelQueuedUnderVersion(ctx context.Context, tx *Tx, conversation string, 
 		`conversation = ? AND grant_version = ? AND state = 'queued'`, updatedAt, conversation, version)
 }
 
+// CarryForwardQueuedReplies re-stamps queued reply rows (in_reply_to set)
+// from oldVersion to newVersion instead of letting CancelQueuedUnderVersion
+// cancel them. A reply's own originating envelope was already
+// unconditionally marked 'acked' by IngestTurn before the reply was queued,
+// so unlike a fresh Send, there is no live sender left to notice the
+// cancellation and resubmit — cancelling a reply here would strand its
+// content with no path back to delivery, even though the whole point of a
+// renewal is to let an already-in-progress exchange continue. Must run
+// after the new grant_version row exists (InsertGrant), since
+// envelopes(conversation, grant_version) has an immediate foreign key
+// against grants.
+func CarryForwardQueuedReplies(ctx context.Context, tx *Tx, conversation string, oldVersion, newVersion int64, updatedAt string) (int64, error) {
+	res, err := tx.Exec(ctx, `
+		UPDATE envelopes SET grant_version = ?, updated_at = ?
+		WHERE conversation = ? AND grant_version = ? AND state = 'queued' AND in_reply_to IS NOT NULL`,
+		newVersion, updatedAt, conversation, oldVersion)
+	if err != nil {
+		return 0, fmt.Errorf("carry forward queued replies: %w", err)
+	}
+	return res.RowsAffected()
+}
+
 func cancelQueuedWhere(ctx context.Context, tx *Tx, where, updatedAt string, args ...any) (int64, error) {
 	execArgs := append([]any{updatedAt}, args...)
 	res, err := tx.Exec(ctx, `UPDATE envelopes SET state = 'cancelled', updated_at = ? WHERE `+where, execArgs...)

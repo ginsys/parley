@@ -324,3 +324,43 @@ func TestStaleGrantVersionCancelledByRenewal(t *testing.T) {
 		t.Fatalf("transport must not have been called for a stale-version envelope")
 	}
 }
+
+// Regression for a finding on the merge-triggered review: a reply queued
+// under a grant version that gets renewed before it's dispatched must be
+// carried forward to the new version, not cancelled — the reply's own
+// originating envelope is already permanently 'acked' by IngestTurn, so
+// unlike an ordinary Send, there's no live sender left to resubmit it if
+// cancelled.
+func TestRenewCarriesForwardQueuedReplyInsteadOfCancelling(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-reply-renew", 10)
+
+	transport := newFakeTransport()
+	bridge := dispatch.New(db, transport)
+	ctx := context.Background()
+
+	original := "original-envelope-id"
+	reply, err := bridge.Send(ctx, "conv-reply-renew", "b", "a", "reply text", &original)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if reply.GrantVersion != 1 {
+		t.Fatalf("want grant_version 1, got %d", reply.GrantVersion)
+	}
+
+	if _, err := ctrl.Renew(ctx, controller.RenewParams{Conversation: "conv-reply-renew", MaxExchanges: 20}); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, reply.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.HandedOff {
+		t.Fatalf("want the reply carried forward and dispatched under the new grant, got %s", state)
+	}
+	if len(transport.delivered) != 1 || transport.delivered[0] != reply.ID {
+		t.Fatalf("want the reply delivered exactly once, got %v", transport.delivered)
+	}
+}
