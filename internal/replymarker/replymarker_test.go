@@ -216,6 +216,33 @@ func TestExtractRejectsClosingFenceWithNonASCIIWhitespace(t *testing.T) {
 
 // Fixture 8: duplicate reply markers — two well-formed markers in one turn
 // must stop delivery, not pick one arbitrarily.
+// Regression for a finding on PR #3: a valid marker followed by a second
+// block whose opener has our reserved "```BRIDGE-REPLY" prefix but an
+// invalid suffix (e.g. a non-breaking space instead of an ASCII space/tab)
+// must still count as an opener attempt, not fall through to genericFenceLine
+// and be silently treated as unrelated quoted content — which would let
+// Extract return the first marker as if the malformed second attempt never
+// existed.
+func TestExtractRejectsMalformedReservedOpener(t *testing.T) {
+	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"first\"}\n```\n" +
+		"and then:\n```BRIDGE-REPLY \nnot a real opener\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrMultipleMarkers) {
+		t.Fatalf("want ErrMultipleMarkers for a well-formed marker plus a malformed reserved-opener attempt, got %v", err)
+	}
+}
+
+// Regression for a finding on PR #3: a marker's exact syntax placed inside a
+// multi-line HTML comment (`<!-- ... -->`) must not be extracted — per
+// CommonMark, an HTML comment block is raw HTML, never parsed as Markdown, so
+// a fenced code block written inside one never actually opens.
+func TestExtractIgnoresMarkerInsideHTMLComment(t *testing.T) {
+	turn := "hidden protocol notes:\n<!--\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n-->"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker nested inside an HTML comment, got %v", err)
+	}
+}
+
 func TestExtractDuplicateMarkers(t *testing.T) {
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"first\"}\n```\n" +
 		"and also\n```BRIDGE-REPLY\n{\"in_reply_to\": \"env-2\", \"to\": \"claude-session-a\", \"text\": \"second\"}\n```"
@@ -310,6 +337,72 @@ func TestValidateRejectsQueuedEnvelope(t *testing.T) {
 	m := &replymarker.Marker{InReplyTo: e.ID, To: "claude-session-a", Text: "hi"}
 	if _, err := replymarker.Validate(ctx, tx2, conversation, "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
 		t.Fatalf("want ErrStaleReply for a still-queued (never handed off) envelope, got %v", err)
+	}
+}
+
+// Regression for a finding on PR #3: a reply arriving while the envelope is
+// still 'dispatching' (dispatch's pre-attempt commit has landed but the
+// second transaction recording the host call's outcome hasn't) must not be
+// treated the same as a permanently stale reference — the peer could
+// genuinely have already received it. Validate must distinguish this
+// transient case (ErrDeliveryPending) from a real stale/unknown envelope
+// (ErrStaleReply).
+func TestValidateDispatchingIsPendingNotStale(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	ctrl := controller.New(db)
+	conversation := "conv-mid-dispatch"
+	if _, err := ctrl.Grant(ctx, controller.GrantParams{
+		Conversation: conversation,
+		PeerAID:      "codex-thread-b",
+		PeerBID:      "claude-session-a",
+		Direction:    store.Bidirectional,
+		MaxExchanges: 10,
+	}); err != nil {
+		t.Fatalf("grant: %v", err)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, conversation)
+	if err != nil {
+		t.Fatalf("current grant: %v", err)
+	}
+	e := store.Envelope{
+		ID:           "env-mid-dispatch",
+		Conversation: conversation,
+		FromPeer:     "claude-session-a",
+		ToPeer:       "codex-thread-b",
+		Text:         "please respond",
+		GrantVersion: g.GrantVersion,
+		State:        store.Queued,
+		CreatedAt:    "2026-01-01T00:00:00Z",
+		UpdatedAt:    "2026-01-01T00:00:00Z",
+	}
+	if err := store.InsertQueued(ctx, tx, e); err != nil {
+		t.Fatalf("insert queued: %v", err)
+	}
+	if err := store.SetState(ctx, tx, e.ID, store.Dispatching, "2026-01-01T00:00:01Z"); err != nil {
+		t.Fatalf("set dispatching: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	tx2, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx2.Rollback(ctx)
+	m := &replymarker.Marker{InReplyTo: e.ID, To: "claude-session-a", Text: "hi"}
+	_, err = replymarker.Validate(ctx, tx2, conversation, "codex-thread-b", "claude-session-a", m)
+	if !errors.Is(err, replymarker.ErrDeliveryPending) {
+		t.Fatalf("want ErrDeliveryPending for a still-dispatching envelope, got %v", err)
+	}
+	if errors.Is(err, replymarker.ErrStaleReply) {
+		t.Fatalf("a still-dispatching envelope must not also be classified as permanently stale")
 	}
 }
 
