@@ -1,0 +1,71 @@
+name: Work item
+description: Define an investigation, decision, specification, implementation or validation item.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Scope and acceptance live in this issue; blockers live in native GitHub dependencies.
+        During triage, apply the type/* label matching the selected work type. The dropdown does not apply labels automatically.
+        Leave unassigned until someone accepts responsibility.
+        Investigations must describe alternatives and the decision enabled before triage is complete.
+  - type: dropdown
+    id: work-type
+    attributes:
+      label: Work type
+      options:
+        - Investigation
+        - Decision
+        - Specification
+        - Implementation
+        - Validation
+    validations:
+      required: true
+  - type: textarea
+    id: objective
+    attributes:
+      label: Objective and design references
+      description: State the outcome and link the relevant current design/specification sections.
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and exclusions
+      description: State what is included and excluded; identify assumptions or detail that still needs refinement.
+    validations:
+      required: true
+  - type: textarea
+    id: deliverables
+    attributes:
+      label: Deliverables
+      description: Identify the repository artifacts, evidence and documentation to land.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: State observable completion criteria, including relevant rejection, interruption and recovery cases.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification method
+      description: Describe reproducible checks and the evidence the owner or designated reviewer will assess.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and decision enabled
+      description: Required during investigation triage; list alternatives and the decision the evidence will enable. Other work types may leave this blank.
+    validations:
+      required: false
+  - type: textarea
+    id: outcome-links
+    attributes:
+      label: Outcome links
+      description: Optionally link decisions or artifacts this work enables. Record blockers only in native GitHub dependencies.
+    validations:
+      required: false
