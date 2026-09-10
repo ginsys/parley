@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/dispatch"
@@ -55,6 +56,17 @@ const maxMessageBytes = 96 * 1024
 // Linux's per-argument exec limit if handed to `codex queue --message`.
 var ErrMessageTooLarge = errors.New("message exceeds codex queue's argv size limit")
 
+// ErrMessageContainsNUL marks a wrapped message containing a NUL byte.
+// os/exec rejects a NUL-containing argv element before ever forking the
+// process, leaving cmd.Process nil — indistinguishable, to runAndClassify,
+// from any other exec-start failure, and so classified as
+// ErrQueueNotAttempted (transient, safely retryable) by default. That's
+// wrong here: a NUL byte is immutable content of this exact envelope, not a
+// transient host condition, so retrying would reproduce the identical
+// rejection forever. Checked and classified permanent here, before exec is
+// ever attempted, the same way ErrMessageTooLarge is.
+var ErrMessageContainsNUL = errors.New("message contains a NUL byte, which os/exec cannot pass as an argument")
+
 // ErrQueuePermanentlyRejected marks a QueueMessage outcome that is rejected
 // before exec is ever called, for a reason the message's own content
 // guarantees will still hold on every future retry (currently: size).
@@ -80,6 +92,9 @@ type ExecSender struct{}
 func (ExecSender) QueueMessage(ctx context.Context, threadID, text string) error {
 	if len(text) > maxMessageBytes {
 		return fmt.Errorf("%w: %d bytes > %d: %w", ErrMessageTooLarge, len(text), maxMessageBytes, ErrQueuePermanentlyRejected)
+	}
+	if strings.ContainsRune(text, 0) {
+		return fmt.Errorf("%w: %w", ErrMessageContainsNUL, ErrQueuePermanentlyRejected)
 	}
 	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", threadID, "--message", text)
 	return runAndClassify(ctx, cmd)

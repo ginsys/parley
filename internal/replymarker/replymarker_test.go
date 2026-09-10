@@ -835,3 +835,71 @@ func TestExtractFindsMarkerAfterCustomTagCannotInterruptIndentedCodeContinuation
 		t.Fatalf("want text hi, got %q", m.Text)
 	}
 }
+
+// Regression for a finding on PR #3's fifth review round: <search> is part
+// of CommonMark's fixed type-6 block-level tag list, missing from
+// blockLevelTags even after the earlier <source> fix. Same pattern as
+// TestExtractIgnoresMarkerInsideSourceBlock, for the other missing tag.
+func TestExtractIgnoresMarkerInsideSearchBlock(t *testing.T) {
+	turn := "<search>\nhidden\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker nested inside a <search> block, got %v", err)
+	}
+}
+
+func TestExtractFindsMarkerAfterBlankLineEndsSearchBlock(t *testing.T) {
+	turn := "<search>\nhidden\n\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after the blank line closing the <search> block, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
+// Regression for a finding on PR #3's fifth review round: CommonMark's type-4
+// declaration start condition requires an uppercase ASCII letter after "<!"
+// specifically — a lowercase "<!foo" never opens a type-4 block, and must
+// stay ordinary text, letting a following marker on the very next line (no
+// blank line needed, since it was never a raw HTML block at all) be found.
+func TestExtractFindsMarkerAfterLowercaseDeclarationLookalike(t *testing.T) {
+	turn := "<!foo\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want the marker to be found (\"<!foo\" is not a type-4 declaration opener, lowercase doesn't qualify), got %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text hi, got %q", m.Text)
+	}
+}
+
+// An uppercase declaration opener still behaves as type 4, ending only at
+// its own ">" — unchanged behavior, asserted here as the companion case to
+// the lowercase fix above.
+func TestExtractIgnoresMarkerInsideUppercaseDeclaration(t *testing.T) {
+	turn := "<!FOO\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker inside an unterminated type-4 declaration, got %v", err)
+	}
+}
+
+// Regression for a finding on PR #3's fifth review round: a Setext heading's
+// "=" underline (e.g. "title\n===") closes the paragraph it turns into a
+// heading — the underline itself is never a paragraph, so a following type-7
+// tag must still be gated as "cannot interrupt a paragraph" only by the text
+// line before the underline, not by the underline line itself remaining
+// "open". A following reply fence must therefore be found: the custom tag
+// opens a fresh type-7 block (no paragraph precedes it), hiding its own
+// content but not touching the marker on the line after it.
+func TestExtractIgnoresMarkerInsideCustomTagAfterSetextHeading(t *testing.T) {
+	turn := "title\n===\n<custom>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker inside a type-7 block opened right after a Setext heading underline (not a paragraph), got %v", err)
+	}
+}
