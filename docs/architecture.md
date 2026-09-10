@@ -78,7 +78,9 @@ Acceptance inserts a `queued` envelope without calling a host. Dispatch uses thr
 `handed_off` is host acceptance, not proof the recipient processed the message. Valid ingestion
 atomically moves the original from `handed_off` to `acked` and queues its trusted reply. Competing
 acknowledgements fail the expected-state transition. Settlement cannot overwrite a newer retry
-or refund twice, even if the same grant remains active.
+or refund twice, even if the same grant remains active. If outcome storage fails, dispatch
+returns an error with an empty/unknown state and no uncommitted diagnostic values; it preserves
+whether this call attempted transport delivery. The row may still be `dispatching`.
 
 The Codex transport distinguishes failure to start from abnormal termination after startup.
 It uses controlled subprocess tests; the meaning of ordinary nonzero CLI exits remains a host
