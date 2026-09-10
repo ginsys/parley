@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -179,6 +180,9 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 	if err != nil {
 		return nil, err
 	}
+	if err := validatePeerIDs(current.PeerAID, current.PeerBID); err != nil {
+		return nil, err
+	}
 
 	now := nowRFC3339()
 	if err := store.SetGrantStatus(ctx, tx, p.Conversation, current.GrantVersion, store.GrantSuperseded, now); err != nil {
@@ -255,11 +259,23 @@ func validateGrant(p GrantParams) error {
 	if strings.TrimSpace(p.Conversation) == "" || strings.TrimSpace(p.PeerAID) == "" || strings.TrimSpace(p.PeerBID) == "" || p.PeerAID == p.PeerBID || p.MaxExchanges <= 0 {
 		return fmt.Errorf("grant requires conversation, distinct peers and positive budget")
 	}
+	if err := validatePeerIDs(p.PeerAID, p.PeerBID); err != nil {
+		return err
+	}
 	if p.Direction != store.Bidirectional && p.Direction != store.AToB && p.Direction != store.BToA {
 		return fmt.Errorf("invalid grant direction %q", p.Direction)
 	}
 	if p.ExpiresAt != nil && !p.ExpiresAt.After(time.Now()) {
 		return fmt.Errorf("explicit expiry must be in the future")
+	}
+	return nil
+}
+
+func validatePeerIDs(ids ...string) error {
+	for _, id := range ids {
+		if err := bridgetext.ValidateMetadata(id); err != nil {
+			return fmt.Errorf("peer identifier: %w", err)
+		}
 	}
 	return nil
 }

@@ -153,7 +153,12 @@ starving later queued messages. It is process-local and resets when the poller i
 ## Exact identifiers
 
 Conversation names and peer IDs are opaque exact keys. Whitespace-only values are invalid;
-leading/trailing whitespace is preserved, and administrator output quotes identifiers so it is
-visible. Do not silently trim keys during grant/revoke/renew: existing spaced and unspaced names
+permitted leading/trailing whitespace is preserved, and administrator output quotes identifiers
+so it is visible. Peer IDs must also satisfy the wrapper's shared metadata validation: no control
+or Unicode format characters, U+2028 or U+2029. Check both peers before grant storage and CLI
+storage access, and before renewing historical grants. Historical IDs are never rewritten and
+unusable historical grants remain revocable. This rejects unusable enrollment at its source
+instead of accepting grants whose messages will always fail wrapping. Do not silently trim keys
+during grant/revoke/renew: existing spaced and unspaced names
 can coexist, and normalization could retarget an operation or strand a historical grant. Any
 future canonicalization requires an identity policy and migration design, not CLI-only cleanup.

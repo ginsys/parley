@@ -78,6 +78,24 @@ func TestHelpAndInvalidArgumentsNeverOpenDatabase(t *testing.T) {
 	}
 }
 
+func TestUnsafePeerIdentifiersRejectedBeforeStorage(t *testing.T) {
+	for _, id := range []string{"peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
+		for _, flag := range []string{"-peer-a", "-peer-b"} {
+			t.Run(flag+id, func(t *testing.T) {
+				args := []string{"grant", "-conversation", "fixture", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2", flag, id}
+				var out, errOut bytes.Buffer
+				factory := func(context.Context, string) (controllerAPI, io.Closer, error) {
+					t.Fatal("opened storage for unsafe peer identifier")
+					return nil, nil, nil
+				}
+				if code := run(args, "unused.db", &out, &errOut, factory); code != 2 {
+					t.Fatalf("exit=%d: %s", code, &errOut)
+				}
+			})
+		}
+	}
+}
+
 func TestRoutingUsesValidatedParametersAndClosesStorage(t *testing.T) {
 	for _, operation := range []string{"grant", "renew", "revoke"} {
 		for _, fails := range []bool{false, true} {

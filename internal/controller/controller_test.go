@@ -2,11 +2,90 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"github.com/ginsys/parley/internal/store"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestUnsafePeerIdentifiersNeverCreateGrants(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "peers.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctrl := New(db)
+	for _, id := range []string{"peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
+		for _, side := range []string{"a", "b"} {
+			t.Run(fmt.Sprintf("%s/%q", side, id), func(t *testing.T) {
+				p := GrantParams{Conversation: t.Name(), PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2}
+				if side == "a" {
+					p.PeerAID = id
+				} else {
+					p.PeerBID = id
+				}
+				if _, err := ctrl.Grant(ctx, p); err == nil {
+					t.Error("accepted an undeliverable peer identifier")
+				}
+			})
+		}
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"conversations", "grants"} {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&count); err != nil || count != 0 {
+			t.Errorf("%s rows=%d: %v", table, count, err)
+		}
+	}
+}
+
+func TestRenewRejectsLegacyUnsafePeersWithoutChangingHistory(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "legacy-peers.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "c", "c", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertGrant(ctx, tx, store.Grant{Conversation: "c", GrantVersion: 1, PeerAID: "a\n", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	ctrl := New(db)
+	if _, err := ctrl.Renew(ctx, RenewParams{Conversation: "c", MaxExchanges: 3}); err == nil {
+		t.Error("renewed unusable legacy peers")
+	}
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, "c")
+	if err != nil || g.GrantVersion != 1 || g.MaxExchanges != 2 || g.PeerAID != "a\n" {
+		t.Errorf("legacy grant changed: %+v: %v", g, err)
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM grants").Scan(&count); err != nil || count != 1 {
+		t.Errorf("history rows=%d: %v", count, err)
+	}
+	tx.Rollback()
+	if _, err := ctrl.Revoke(ctx, "c"); err != nil {
+		t.Fatalf("legacy grant cannot be revoked: %v", err)
+	}
+}
 
 func TestInvalidGrantAndRenewLeaveStateUnchanged(t *testing.T) {
 	ctx := context.Background()

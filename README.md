@@ -72,7 +72,10 @@ expiry relative to now. Zero means no expiry for a new grant and preserves expir
 negative budgets and durations are invalid. Required names and IDs must be nonempty and peers
 must differ. Identifiers are preserved and compared exactly: `"x"` and `" x"` are different
 conversation names, just as `"a"` and `"a "` are different peer IDs. Whitespace-only identifiers are
-invalid. Administrator output quotes identifiers to make whitespace visible; use the exact name
+invalid. Peer IDs also reject control characters, Unicode format characters and the U+2028/U+2029
+line separators, matching delivery-wrapper validation. An existing grant with such a peer cannot
+be renewed but remains revocable; its stored identifiers are not rewritten.
+Administrator output quotes identifiers to make whitespace visible; use the exact name
 for later operations. Unknown commands, malformed flags and positional arguments fail before
 storage opens.
 

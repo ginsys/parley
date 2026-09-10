@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/store"
 )
@@ -79,6 +80,11 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	if c.name == "grant" {
 		if strings.TrimSpace(c.peerA) == "" || strings.TrimSpace(c.peerB) == "" || c.peerA == c.peerB || c.budget == 0 {
 			return c, fmt.Errorf("grant requires distinct nonempty peers and -max-exchanges > 0")
+		}
+		for _, id := range []string{c.peerA, c.peerB} {
+			if err := bridgetext.ValidateMetadata(id); err != nil {
+				return c, fmt.Errorf("peer identifier: %w", err)
+			}
 		}
 		switch c.direction {
 		case store.Bidirectional, store.AToB, store.BToA:
