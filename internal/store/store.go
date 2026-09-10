@@ -49,7 +49,68 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		sqlDB.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(ctx, sqlDB); err != nil {
+		sqlDB.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &DB{sql: sqlDB}, nil
+}
+
+// migrate applies schema changes that CREATE TABLE IF NOT EXISTS cannot: it
+// is a no-op against an existing table, so a column added to schema.sql
+// after a database was first created (e.g. envelopes.is_trusted_reply) would
+// otherwise silently never appear on that database, and every query naming
+// the new column would fail with "no such column" against it. Each step
+// checks column presence via PRAGMA table_info before adding it, so this
+// stays a no-op both on a freshly created database (schema already has the
+// column) and on one that's already been migrated once.
+func migrate(ctx context.Context, sqlDB *sql.DB) error {
+	steps := []struct {
+		table  string
+		column string
+		ddl    string
+	}{
+		{"envelopes", "is_trusted_reply",
+			"ALTER TABLE envelopes ADD COLUMN is_trusted_reply INTEGER NOT NULL DEFAULT 0 CHECK (is_trusted_reply IN (0, 1))"},
+	}
+	for _, s := range steps {
+		has, err := hasColumn(ctx, sqlDB, s.table, s.column)
+		if err != nil {
+			return fmt.Errorf("check %s.%s: %w", s.table, s.column, err)
+		}
+		if has {
+			continue
+		}
+		if _, err := sqlDB.ExecContext(ctx, s.ddl); err != nil {
+			return fmt.Errorf("add %s.%s: %w", s.table, s.column, err)
+		}
+	}
+	return nil
+}
+
+func hasColumn(ctx context.Context, sqlDB *sql.DB, table, column string) (bool, error) {
+	rows, err := sqlDB.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			ctype      string
+			notNull    int
+			dfltValue  sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dfltValue, &primaryKey); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (d *DB) Close() error { return d.sql.Close() }

@@ -172,6 +172,15 @@ var codeSpanBackticks = regexp.MustCompile("`+")
 // never parsed as raw HTML. Spans are matched by equal-length backtick runs,
 // per CommonMark's own code-span rule; an unmatched trailing backtick run is
 // left as-is; it isn't a code span.
+//
+// A removed span is replaced with a single space, not deleted outright: the
+// text immediately before and after the span are otherwise unrelated
+// fragments that were never adjacent in the source (e.g. literal "<!" then a
+// code span then literal "--"), and closing the gap between them can
+// synthesize a comment delimiter ("<!--") that was never actually present.
+// A space can't itself participate in either delimiter, so it can't create
+// a false one, and it can't destroy a real one either — a genuine "<!--"
+// never has a code span spliced into the middle of it.
 func stripCodeSpans(line string) string {
 	matches := codeSpanBackticks.FindAllStringIndex(line, -1)
 	if len(matches) < 2 {
@@ -193,6 +202,7 @@ func stripCodeSpans(line string) string {
 			break
 		}
 		b.WriteString(line[last:open[0]])
+		b.WriteString(" ")
 		last = matches[closeIdx][1]
 		i = closeIdx
 	}
@@ -207,9 +217,15 @@ func stripCodeSpans(line string) string {
 // never parsed as Markdown — the same reasoning as the comment span above
 // (type 2), generalized to every other raw-HTML-block start condition
 // CommonMark defines.
+// interruptsParagraph is CommonMark's own distinction: types 1-6 can start a
+// raw HTML block even immediately after an open paragraph (no blank line
+// needed first); type 7 (a generic complete tag alone on a line) cannot —
+// while a paragraph is open, a line that only matches type 7's grammar stays
+// ordinary paragraph text instead.
 type rawHTMLBlockOpener struct {
-	open  *regexp.Regexp
-	close *regexp.Regexp
+	open                *regexp.Regexp
+	close               *regexp.Regexp
+	interruptsParagraph bool
 }
 
 // blockLevelTags is CommonMark's fixed list of tag names that start an HTML
@@ -224,23 +240,24 @@ var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
 	// CommonMark's end condition is the exact literal string (case-
 	// insensitive) with no internal whitespace — "</script >" does not
 	// close it, unlike type 7's general tag grammar elsewhere in this file.
-	{regexp.MustCompile(`(?i)^ {0,3}<script(?:[\s>]|$)`), regexp.MustCompile(`(?i)</script>`)},
-	{regexp.MustCompile(`(?i)^ {0,3}<pre(?:[\s>]|$)`), regexp.MustCompile(`(?i)</pre>`)},
-	{regexp.MustCompile(`(?i)^ {0,3}<style(?:[\s>]|$)`), regexp.MustCompile(`(?i)</style>`)},
-	{regexp.MustCompile(`(?i)^ {0,3}<textarea(?:[\s>]|$)`), regexp.MustCompile(`(?i)</textarea>`)},
+	{regexp.MustCompile(`(?i)^ {0,3}<script(?:[\s>]|$)`), regexp.MustCompile(`(?i)</script>`), true},
+	{regexp.MustCompile(`(?i)^ {0,3}<pre(?:[\s>]|$)`), regexp.MustCompile(`(?i)</pre>`), true},
+	{regexp.MustCompile(`(?i)^ {0,3}<style(?:[\s>]|$)`), regexp.MustCompile(`(?i)</style>`), true},
+	{regexp.MustCompile(`(?i)^ {0,3}<textarea(?:[\s>]|$)`), regexp.MustCompile(`(?i)</textarea>`), true},
 	// Type 3: processing instruction, ends at "?>".
-	{regexp.MustCompile(`^ {0,3}<\?`), regexp.MustCompile(`\?>`)},
+	{regexp.MustCompile(`^ {0,3}<\?`), regexp.MustCompile(`\?>`), true},
 	// Type 4: declaration, ends at ">".
-	{regexp.MustCompile(`^ {0,3}<![A-Za-z]`), regexp.MustCompile(`>`)},
+	{regexp.MustCompile(`^ {0,3}<![A-Za-z]`), regexp.MustCompile(`>`), true},
 	// Type 5: CDATA section, ends at "]]>".
-	{regexp.MustCompile(`^ {0,3}<!\[CDATA\[`), regexp.MustCompile(`]]>`)},
+	{regexp.MustCompile(`^ {0,3}<!\[CDATA\[`), regexp.MustCompile(`]]>`), true},
 	// Type 6: a fixed list of block-level tag names, ends at a blank line.
-	{regexp.MustCompile(`(?i)^ {0,3}</?(?:` + blockLevelTags + `)(?:[\s>]|/>|$)`), nil},
+	{regexp.MustCompile(`(?i)^ {0,3}</?(?:` + blockLevelTags + `)(?:[\s>]|/>|$)`), nil, true},
 	// Type 7: any other complete open/close tag alone on its own line, ends
 	// at a blank line. Checked last so types 1-6's more specific tag names
 	// take their own termination rule instead of falling through to this
-	// blank-line-terminated catch-all.
-	{regexp.MustCompile(`^ {0,3}(?:` + htmlOpenTag + `|` + htmlCloseTag + `)\s*$`), nil},
+	// blank-line-terminated catch-all. Per CommonMark, type 7 alone cannot
+	// interrupt an open paragraph — interruptsParagraph is false only here.
+	{regexp.MustCompile(`^ {0,3}(?:` + htmlOpenTag + `|` + htmlCloseTag + `)\s*$`), nil, false},
 }
 
 // htmlAttrValue/htmlAttr/htmlOpenTag/htmlCloseTag approximate CommonMark's
@@ -260,8 +277,15 @@ const (
 // matchRawHTMLBlockOpener reports whether line opens one of the raw HTML
 // block types above, returning its termination rule: a specific closing
 // pattern to watch for, or nil for "ends at the next blank line".
-func matchRawHTMLBlockOpener(line string) (close *regexp.Regexp, blankTerminated, ok bool) {
+// paragraphOpen gates type 7 only (interruptsParagraph == false): per
+// CommonMark, a generic complete tag alone on a line never starts a raw HTML
+// block while a paragraph is already open — it's just paragraph text — but
+// types 1-6 start one regardless.
+func matchRawHTMLBlockOpener(line string, paragraphOpen bool) (close *regexp.Regexp, blankTerminated, ok bool) {
 	for _, k := range rawHTMLBlockOpeners {
+		if !k.interruptsParagraph && paragraphOpen {
+			continue
+		}
 		if k.open.MatchString(line) {
 			return k.close, k.close == nil, true
 		}
@@ -288,6 +312,13 @@ func scanForMarker(text string) markerScan {
 	var inComment bool
 	var openRawHTMLClose *regexp.Regexp
 	var inRawHTMLBlock bool
+	// paragraphOpen tracks CommonMark's paragraph-interruption rule: true
+	// once a line of ordinary top-level text has been seen with nothing
+	// since to close it (a blank line, or a block that consumes the line).
+	// Only used to gate type 7's raw-HTML-block check (matchRawHTMLBlockOpener);
+	// types 1-6 and fences can interrupt a paragraph unconditionally, so
+	// none of their branches below need to consult it before matching.
+	var paragraphOpen bool
 	for i, line := range lines {
 		trimmed := strings.TrimRight(line, " \t")
 		if inComment {
@@ -317,17 +348,27 @@ func scanForMarker(text string) markerScan {
 			continue
 		}
 		if openRun == "" {
-			scanLine := stripCodeSpans(trimmed)
-			if commentStateAfterLine(false, scanLine) {
-				inComment = true
+			if strings.Trim(trimmed, " \t") == "" {
+				// ASCII space/tab only — see the matching note in the
+				// inRawHTMLBlock branch above for why not strings.TrimSpace.
+				paragraphOpen = false
 				continue
 			}
-			if closer, blankTerminated, ok := matchRawHTMLBlockOpener(trimmed); ok {
+			// Raw-HTML-block recognition runs before the generic comment
+			// check, matching CommonMark's own type-1-before-type-2 start-
+			// condition ordering: a self-contained type-1 block whose
+			// content happens to contain a literal "<!--" (e.g.
+			// <script>const s = "<!--";</script>) must be recognized and
+			// closed as type 1 on this same line, not misread as an
+			// unclosed HTML comment because the comment check ran first and
+			// never saw the type-1 opener at all.
+			if closer, blankTerminated, ok := matchRawHTMLBlockOpener(trimmed, paragraphOpen); ok {
 				// A closer already present on this same opening line makes
 				// the block self-contained (CommonMark: start and end
 				// conditions on one line close it immediately) — do not
 				// enter the persistent open state, or every later line
 				// would stay hidden with nothing left to ever match it.
+				paragraphOpen = false
 				if blankTerminated {
 					inRawHTMLBlock = true
 				} else if !closer.MatchString(trimmed) {
@@ -336,11 +377,18 @@ func scanForMarker(text string) markerScan {
 				}
 				continue
 			}
+			scanLine := stripCodeSpans(trimmed)
+			if commentStateAfterLine(false, scanLine) {
+				inComment = true
+				paragraphOpen = false
+				continue
+			}
 			if bridgeReplyOpener.MatchString(trimmed) {
 				result.openerCount++
 				openRun = "```"
 				isOurs = true
 				contentStart = i + 1
+				paragraphOpen = false
 			} else if bridgeReplyPrefix.MatchString(trimmed) {
 				// Reserved prefix present but the strict opener pattern
 				// didn't match (invalid trailing characters) — a malformed
@@ -352,9 +400,15 @@ func scanForMarker(text string) markerScan {
 				result.openerCount++
 				openRun = "```"
 				isOurs = false
+				paragraphOpen = false
 			} else if run, _, ok := matchGenericFence(trimmed); ok {
 				openRun = run
 				isOurs = false
+				paragraphOpen = false
+			} else {
+				// Ordinary text: neither a blank line nor any recognized
+				// block-start condition — continues or opens a paragraph.
+				paragraphOpen = true
 			}
 			continue
 		}
@@ -369,6 +423,7 @@ func scanForMarker(text string) markerScan {
 			}
 			openRun = ""
 			isOurs = false
+			paragraphOpen = false
 		}
 	}
 	return result

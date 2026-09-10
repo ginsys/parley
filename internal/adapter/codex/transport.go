@@ -124,6 +124,11 @@ func NewTransport(sender QueueSender, threadID, fromLabel, toPeer string) *Trans
 	return &Transport{sender: sender, threadID: threadID, fromLabel: fromLabel, toPeer: toPeer}
 }
 
+// wrapMessage is bridgetext.Wrap, indirected so a test can force its one
+// failure mode (a crypto/rand read error) without depending on actually
+// exhausting system randomness.
+var wrapMessage = bridgetext.Wrap
+
 func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
 	// A recipient/sender mismatch is rejected before QueueMessage is ever
 	// called — the host was never at risk of duplicate delivery — and it is
@@ -139,9 +144,15 @@ func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
 	if e.FromPeer != t.fromLabel {
 		return fmt.Errorf("%w: %w: envelope from %q, transport bound to %q", dispatch.ErrPermanentlyRejected, ErrRecipientMismatch, e.FromPeer, t.fromLabel)
 	}
-	wrapped, err := bridgetext.Wrap(e.ID, t.fromLabel, e.Text)
+	wrapped, err := wrapMessage(e.ID, t.fromLabel, e.Text)
 	if err != nil {
-		return err
+		// Wrap only fails on a crypto/rand read error generating the
+		// boundary — QueueMessage is never reached, and unlike the
+		// recipient/sender mismatch above, the failure isn't a property of
+		// this envelope that a retry would keep reproducing. Report it as
+		// dispatch.ErrNoAttempt so Dispatch refunds and requeues it rather
+		// than terminally failing on a transient host condition.
+		return fmt.Errorf("%w: %v", dispatch.ErrNoAttempt, err)
 	}
 	if err := t.sender.QueueMessage(ctx, t.threadID, wrapped); err != nil {
 		if errors.Is(err, ErrQueueAmbiguous) {
