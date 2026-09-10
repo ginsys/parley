@@ -8,6 +8,7 @@ import (
 )
 
 var ErrEnvelopeNotFound = errors.New("envelope not found")
+var ErrStateConflict = errors.New("envelope is not in the expected state")
 
 // InsertQueued writes a new envelope in the queued state. GrantVersion must
 // already be stamped by the caller from CurrentGrant at accept time.
@@ -30,7 +31,7 @@ func InsertQueued(ctx context.Context, tx *sql.Tx, e Envelope) error {
 func ListQueued(ctx context.Context, tx *sql.Tx, conversation string) ([]Envelope, error) {
 	rows, err := tx.QueryContext(ctx, `
 		SELECT id, conversation, from_peer, to_peer, text, grant_version, in_reply_to,
-		       is_trusted_reply, state, created_at, updated_at
+		       is_trusted_reply, state, created_at, updated_at, dispatch_attempt, error_code, error_detail
 		FROM envelopes
 		WHERE conversation = ? AND state = 'queued'
 		ORDER BY created_at ASC`, conversation)
@@ -120,7 +121,7 @@ func cancelQueuedWhere(ctx context.Context, tx *sql.Tx, where, updatedAt string,
 // the serialization this design relies on.
 func TransitionToDispatching(ctx context.Context, tx *sql.Tx, id, updatedAt string) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
-		UPDATE envelopes SET state = 'dispatching', updated_at = ?
+		UPDATE envelopes SET state = 'dispatching', dispatch_attempt=dispatch_attempt+1, error_code='', error_detail='', updated_at = ?
 		WHERE id = ? AND state = 'queued'`, updatedAt, id)
 	if err != nil {
 		return false, fmt.Errorf("transition to dispatching: %w", err)
@@ -132,45 +133,11 @@ func TransitionToDispatching(ctx context.Context, tx *sql.Tx, id, updatedAt stri
 	return n == 1, nil
 }
 
-// RequeueUnattempted reverts one 'dispatching' envelope back to 'queued'
-// under grantVersion. Used when a Transport reports it never actually
-// attempted delivery (the host process didn't start, or the transport
-// rejected the message before ever calling the host) — the claimed budget
-// slot must be refunded by the caller in the same transaction
-// (store.RefundExchange) so an unattempted message doesn't count against
-// max_exchanges. grantVersion lets the caller re-stamp the row onto whatever
-// grant is current now, rather than blindly restoring the version it was
-// claimed under: a revoke or renewal that committed while delivery was in
-// flight can make that original version no longer active, and a row left
-// 'queued' under a dead version can never be claimed again (ClaimExchange
-// requires status = 'active') or picked up by a later renewal's
-// CarryForwardQueuedReplies (which only ever matches the version it is
-// itself superseding) — it would be silently stranded forever. Callers that
-// confirm the version is still current simply pass it back unchanged.
-// Guarded to only affect a row still 'dispatching': a concurrent state
-// change (there shouldn't be one, since nothing else touches a 'dispatching'
-// row) is surfaced as false rather than silently overwriting whatever it
-// became.
-func RequeueUnattempted(ctx context.Context, tx *sql.Tx, id string, grantVersion int64, updatedAt string) (bool, error) {
-	res, err := tx.ExecContext(ctx, `
-		UPDATE envelopes SET state = 'queued', grant_version = ?, updated_at = ?
-		WHERE id = ? AND state = 'dispatching'`, grantVersion, updatedAt, id)
-	if err != nil {
-		return false, fmt.Errorf("requeue unattempted: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("requeue unattempted: rows affected: %w", err)
-	}
-	return n == 1, nil
-}
-
-// SetState sets an envelope's terminal (or acked) state outside the
-// dispatching transaction — after the host call returns, success, failure,
-// or ambiguous.
-func SetState(ctx context.Context, tx *sql.Tx, id string, state EnvelopeState, updatedAt string) error {
-	res, err := tx.ExecContext(ctx, `UPDATE envelopes SET state = ?, updated_at = ? WHERE id = ?`,
-		string(state), updatedAt, id)
+// SetState changes a known prior state, for cancellation or acknowledgement.
+// Dispatch outcomes use SettleDispatch to also match the attempt token.
+func SetState(ctx context.Context, tx *sql.Tx, id string, expected, state EnvelopeState, updatedAt string) error {
+	res, err := tx.ExecContext(ctx, `UPDATE envelopes SET state = ?, updated_at = ? WHERE id = ? AND state = ?`,
+		string(state), updatedAt, id, string(expected))
 	if err != nil {
 		return fmt.Errorf("set envelope state: %w", err)
 	}
@@ -179,7 +146,7 @@ func SetState(ctx context.Context, tx *sql.Tx, id string, state EnvelopeState, u
 		return fmt.Errorf("set envelope state: rows affected: %w", err)
 	}
 	if n == 0 {
-		return ErrEnvelopeNotFound
+		return ErrStateConflict
 	}
 	return nil
 }
@@ -188,12 +155,12 @@ func SetState(ctx context.Context, tx *sql.Tx, id string, state EnvelopeState, u
 func GetByID(ctx context.Context, tx *sql.Tx, id string) (*Envelope, error) {
 	row := tx.QueryRowContext(ctx, `
 		SELECT id, conversation, from_peer, to_peer, text, grant_version, in_reply_to,
-		       is_trusted_reply, state, created_at, updated_at
+		       is_trusted_reply, state, created_at, updated_at, dispatch_attempt, error_code, error_detail
 		FROM envelopes WHERE id = ?`, id)
 	var e Envelope
 	var state string
 	if err := row.Scan(&e.ID, &e.Conversation, &e.FromPeer, &e.ToPeer, &e.Text,
-		&e.GrantVersion, &e.InReplyTo, &e.TrustedReply, &state, &e.CreatedAt, &e.UpdatedAt); err != nil {
+		&e.GrantVersion, &e.InReplyTo, &e.TrustedReply, &state, &e.CreatedAt, &e.UpdatedAt, &e.DispatchAttempt, &e.ErrorCode, &e.ErrorDetail); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrEnvelopeNotFound
 		}
@@ -209,7 +176,7 @@ func scanEnvelopes(rows *sql.Rows) ([]Envelope, error) {
 		var e Envelope
 		var state string
 		if err := rows.Scan(&e.ID, &e.Conversation, &e.FromPeer, &e.ToPeer, &e.Text,
-			&e.GrantVersion, &e.InReplyTo, &e.TrustedReply, &state, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			&e.GrantVersion, &e.InReplyTo, &e.TrustedReply, &state, &e.CreatedAt, &e.UpdatedAt, &e.DispatchAttempt, &e.ErrorCode, &e.ErrorDetail); err != nil {
 			return nil, fmt.Errorf("scan envelope: %w", err)
 		}
 		e.State = EnvelopeState(state)
@@ -239,4 +206,16 @@ func CanCarryReply(ctx context.Context, tx *sql.Tx, e *Envelope, target int64) (
 	var blockers int
 	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM grants WHERE conversation=? AND grant_version>=? AND grant_version<=? AND (status='revoked' OR (grant_version>? AND cancel_pending_replies=1))`, e.Conversation, e.GrantVersion, target, e.GrantVersion).Scan(&blockers)
 	return blockers == 0, err
+}
+
+// SettleDispatch is conditional on the exact attempt, preventing an old
+// settlement from changing a newer retry (even under the same grant version).
+func SettleDispatch(ctx context.Context, tx *sql.Tx, claimed *Envelope, state EnvelopeState, version int64, code, detail, now string) (bool, error) {
+	res, err := tx.ExecContext(ctx, `UPDATE envelopes SET state=?,grant_version=?,error_code=?,error_detail=?,updated_at=?
+ WHERE id=? AND state='dispatching' AND grant_version=? AND dispatch_attempt=?`, state, version, code, detail, now, claimed.ID, claimed.GrantVersion, claimed.DispatchAttempt)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }

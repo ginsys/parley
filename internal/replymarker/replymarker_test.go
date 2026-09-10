@@ -63,7 +63,7 @@ func queueOne(t *testing.T, db *store.DB) (conversation string, id string) {
 	}
 	// Only a handed-off envelope is eligible for a reply to ack (Validate):
 	// replyingPeer cannot have seen a message the bridge never delivered.
-	if err := store.SetState(ctx, tx, e.ID, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
+	if err := store.SetState(ctx, tx, e.ID, store.Queued, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
 		t.Fatalf("set handed off: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -567,7 +567,7 @@ func TestValidateDispatchingIsPendingNotStale(t *testing.T) {
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("insert queued: %v", err)
 	}
-	if err := store.SetState(ctx, tx, e.ID, store.Dispatching, "2026-01-01T00:00:01Z"); err != nil {
+	if err := store.SetState(ctx, tx, e.ID, store.Queued, store.Dispatching, "2026-01-01T00:00:01Z"); err != nil {
 		t.Fatalf("set dispatching: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -626,7 +626,7 @@ func TestValidateStaleReply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		if err := store.SetState(ctx, tx, id, store.Acked, "2026-01-01T00:01:00Z"); err != nil {
+		if err := store.SetState(ctx, tx, id, store.HandedOff, store.Acked, "2026-01-01T00:01:00Z"); err != nil {
 			tx.Rollback()
 			t.Fatalf("set acked: %v", err)
 		}

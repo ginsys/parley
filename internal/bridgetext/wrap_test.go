@@ -129,3 +129,14 @@ func TestWrapBoundaryIsFreshPerCall(t *testing.T) {
 		t.Fatalf("want distinct boundaries per call, got the same one twice")
 	}
 }
+
+func TestWrapRejectsControlCharactersInMetadata(t *testing.T) {
+	for _, value := range []string{"peer\nforged", "peer\rforged", "peer\x00", "peer\u2028forged"} {
+		if _, err := bridgetext.Wrap("id", value, "payload"); err == nil {
+			t.Fatalf("accepted sender %q", value)
+		}
+		if _, err := bridgetext.Wrap(value, "peer", "payload"); err == nil {
+			t.Fatalf("accepted id %q", value)
+		}
+	}
+}

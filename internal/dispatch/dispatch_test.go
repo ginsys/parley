@@ -211,7 +211,7 @@ func TestCrashAfterHandoffRecoversUncertain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	if err := store.SetState(ctx, tx, e.ID, store.Dispatching, "2026-01-01T00:00:00Z"); err != nil {
+	if err := store.SetState(ctx, tx, e.ID, store.Queued, store.Dispatching, "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("set dispatching: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -356,7 +356,7 @@ func ackEnvelope(t *testing.T, db *store.DB, conversation, id string, grantVersi
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("insert original: %v", err)
 	}
-	if err := store.SetState(ctx, tx, id, store.Acked, now); err != nil {
+	if err := store.SetState(ctx, tx, id, store.Queued, store.Acked, now); err != nil {
 		t.Fatalf("ack original: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -717,11 +717,7 @@ func TestDispatchCancelsUnattemptedReplyWhenNoActiveGrantSurvives(t *testing.T) 
 	})
 	bridge := dispatch.New(db, transport)
 
-	original := "original-envelope-id"
-	reply, err := bridge.Send(ctx, "conv-reply-revoked", "codex-thread-b", "claude-session-a", "reply text", &original)
-	if err != nil {
-		t.Fatalf("send: %v", err)
-	}
+	reply := sendTrustedReply(t, db, "conv-reply-revoked", "codex-thread-b", "claude-session-a", "reply text", "original-envelope-id", 1)
 
 	state, err := bridge.Dispatch(ctx, reply.ID)
 	if err != nil {

@@ -1,0 +1,172 @@
+package dispatch
+
+import (
+	"context"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ginsys/parley/internal/controller"
+	"github.com/ginsys/parley/internal/store"
+)
+
+type testTransport struct{}
+
+func (testTransport) Deliver(context.Context, store.Envelope) error { return nil }
+
+func setupSettlement(t *testing.T) (*store.DB, *Bridge, *store.Envelope, string) {
+	t.Helper()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "settle.db")
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := controller.New(db).Grant(ctx, controller.GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 5}); err != nil {
+		t.Fatal(err)
+	}
+	bridge := New(db, testTransport{})
+	e, err := bridge.Send(ctx, "c", "a", "b", "message", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, bridge, e, path
+}
+
+func TestSettlementCannotRefundOrOverwriteANewerAttempt(t *testing.T) {
+	db, b, e, _ := setupSettlement(t)
+	ctx := context.Background()
+	first, ok, err := b.claim(ctx, e.ID)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := b.settle(ctx, first, ErrNoAttempt); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := b.claim(ctx, e.ID)
+	if err != nil || !ok {
+		t.Fatalf("claim 2: %v", err)
+	}
+	if second.DispatchAttempt <= first.DispatchAttempt {
+		t.Fatal("attempt token did not advance")
+	}
+	if _, err := b.settle(ctx, first, ErrNoAttempt); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, "c")
+	if err != nil || g.ExchangesUsed != 1 {
+		t.Fatalf("new claim refunded: %+v %v", g, err)
+	}
+	tx.Rollback()
+	if _, err := b.settle(ctx, second, nil); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := b.settle(ctx, second, ErrNoAttempt)
+	if err != nil || outcome.State != store.HandedOff {
+		t.Fatalf("terminal overwritten: %+v %v", outcome, err)
+	}
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	g, err = store.CurrentGrant(ctx, tx, "c")
+	if err != nil || g.ExchangesUsed != 1 {
+		t.Fatalf("double refund: %+v %v", g, err)
+	}
+}
+
+func TestDiagnosticsPersistWithoutTransportSecrets(t *testing.T) {
+	db, b, e, _ := setupSettlement(t)
+	ctx := context.Background()
+	claimed, _, err := b.claim(ctx, e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.settle(ctx, claimed, errors.New("token=private-fixture-value\nmessage payload")); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	saved, err := store.GetByID(ctx, tx, e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.ErrorCode != "failed" || saved.ErrorDetail == "" || strings.Contains(saved.ErrorDetail, "private-fixture") {
+		t.Fatalf("diagnostics=%+v", saved)
+	}
+}
+
+func TestCrashAfterHandoffRecoversUncertainWithoutReplay(t *testing.T) {
+	db, _, e, path := setupSettlement(t)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestCrashHandoffHelper$")
+	cmd.Env = append(os.Environ(), "PARLEY_CRASH_HELPER_DB="+path, "PARLEY_CRASH_HELPER_ID="+e.ID)
+	var exitErr *exec.ExitError
+	if err := cmd.Run(); !errors.As(err, &exitErr) || exitErr.ExitCode() != 23 {
+		t.Fatalf("helper exit: %v", err)
+	}
+	if content, err := os.ReadFile(path + ".handoff"); err != nil || string(content) != e.ID {
+		t.Fatalf("handoff evidence: %q %v", content, err)
+	}
+	count, err := db.RecoverUncertain(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("recover=%d %v", count, err)
+	}
+	b := New(db, testTransport{})
+	outcome, err := b.DispatchOutcome(context.Background(), e.ID)
+	if err != nil || outcome.State != store.Uncertain || outcome.Attempted {
+		t.Fatalf("replayed uncertain: %+v %v", outcome, err)
+	}
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	grant, err := store.CurrentGrant(context.Background(), tx, "c")
+	if err != nil || grant.ExchangesUsed != 1 {
+		t.Fatalf("crash accounting=%+v %v", grant, err)
+	}
+}
+
+func TestCrashHandoffHelper(t *testing.T) {
+	path := os.Getenv("PARLEY_CRASH_HELPER_DB")
+	if path == "" {
+		return
+	}
+	ctx := context.Background()
+	db, err := store.Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := New(db, testTransport{})
+	e, ok, err := b.claim(ctx, os.Getenv("PARLEY_CRASH_HELPER_ID"))
+	if err != nil || !ok {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := b.transport.Deliver(ctx, *e); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".handoff", []byte(e.ID), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Exit after host return, before any outcome transaction or deferred cleanup.
+	os.Exit(23)
+}

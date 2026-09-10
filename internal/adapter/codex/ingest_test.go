@@ -63,7 +63,7 @@ func queueOne(t *testing.T, db *store.DB) (conversation, id string) {
 	}
 	// Only a handed-off envelope is eligible for a reply to ack (Validate):
 	// replyingPeer cannot have seen a message the bridge never delivered.
-	if err := store.SetState(ctx, tx, e.ID, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
+	if err := store.SetState(ctx, tx, e.ID, store.Queued, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
 		t.Fatalf("set handed off: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -213,7 +213,7 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 	}
 	// Only a handed-off envelope is eligible for a reply to ack (Validate):
 	// replyingPeer cannot have seen a message the bridge never delivered.
-	if err := store.SetState(ctx, tx, e.ID, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
+	if err := store.SetState(ctx, tx, e.ID, store.Queued, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
 		t.Fatalf("set handed off: %v", err)
 	}
 	if err := tx.Commit(); err != nil {

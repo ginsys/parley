@@ -101,13 +101,16 @@ func (g Grant) PermitsDirection(from, to string) bool {
 
 // Envelope is one message, durable from the moment Send accepts it.
 type Envelope struct {
-	ID           string
-	Conversation string
-	FromPeer     string
-	ToPeer       string
-	Text         string
-	GrantVersion int64
-	InReplyTo    *string
+	DispatchAttempt int64
+	ErrorCode       string
+	ErrorDetail     string
+	ID              string
+	Conversation    string
+	FromPeer        string
+	ToPeer          string
+	Text            string
+	GrantVersion    int64
+	InReplyTo       *string
 	// TrustedReply is set only by codex.IngestTurn, the one path that
 	// atomically acks the original envelope and validates in_reply_to
 	// against it (replymarker.Validate) before queuing this row. Send has no

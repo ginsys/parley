@@ -14,7 +14,7 @@ import (
 
 // Each numbered step and user_version update commits in the same immediate
 // transaction. Only version-zero adoption examines historical column layouts.
-var migrations = []func(context.Context, *sql.Tx) error{adoptLegacySchema, addRenewalPolicy}
+var migrations = []func(context.Context, *sql.Tx) error{adoptLegacySchema, addRenewalPolicy, addDeliveryOutcomes}
 
 func migrate(ctx context.Context, db *sql.DB) error {
 	tx, err := beginMigration(ctx, db)
@@ -175,5 +175,12 @@ func beginMigration(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
 
 func addRenewalPolicy(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.ExecContext(ctx, "ALTER TABLE grants ADD COLUMN cancel_pending_replies INTEGER NOT NULL DEFAULT 0 CHECK(cancel_pending_replies IN (0,1))")
+	return err
+}
+
+func addDeliveryOutcomes(ctx context.Context, tx *sql.Tx) error {
+	_, err := tx.ExecContext(ctx, `ALTER TABLE envelopes ADD COLUMN dispatch_attempt INTEGER NOT NULL DEFAULT 0;
+ ALTER TABLE envelopes ADD COLUMN error_code TEXT NOT NULL DEFAULT '';
+ ALTER TABLE envelopes ADD COLUMN error_detail TEXT NOT NULL DEFAULT '';`)
 	return err
 }

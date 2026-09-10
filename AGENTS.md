@@ -132,3 +132,12 @@ Inline comment openers do not start HTML blocks; a type-2 block ends on the firs
 its closing delimiter. Earlier tests incorrectly extended those comments over subsequent fences.
 Goldmark is an exact-pinned MIT dependency with no module dependencies at this version; module
 checksums and dependency review are separate from GitHub Action pin validation.
+
+## Delivery settlement
+
+Each dispatch claim increments a durable attempt token. Outcome settlement matches the envelope,
+its original grant version, its attempt token and `dispatching` state before applying any refund
+in the same transaction. This prevents duplicate or stale results from refunding a later attempt.
+Abnormal termination after process startup and interrupted dispatch recovery remain `uncertain`;
+there is no automatic retry. Diagnostics use fixed codes and summaries, never transport error
+strings or message bodies. Tests use controlled child processes for crash-after-handoff coverage.
