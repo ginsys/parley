@@ -96,21 +96,7 @@ func (p *Poller) queuedForMe(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The deferred Rollback must survive ctx being canceled between Begin
-	// and here (e.g. a caller-imposed deadline, or a reconnect canceling
-	// this generation's context mid-Tick): tx wraps a manually issued
-	// "BEGIN IMMEDIATE" on a pinned connection, not a database/sql.Tx, so
-	// the pool has no idea a transaction is open on it. If ROLLBACK's own
-	// ExecContext were given the already-canceled ctx, it can return
-	// without the statement ever reaching sqlite, and Tx.Rollback still
-	// unconditionally closes/releases the connection regardless — handing
-	// it back to the pool (SetMaxOpenConns(1) guarantees the very next
-	// Begin reuses this exact connection) with its BEGIN IMMEDIATE still
-	// open, so that next Begin's own "BEGIN IMMEDIATE" fails until the
-	// process restarts. context.WithoutCancel detaches from ctx's
-	// cancellation/deadline while keeping any values, the same fix already
-	// applied to dispatch.Bridge.Dispatch's own outcome-recording rollback.
-	defer tx.Rollback(context.WithoutCancel(ctx))
+	defer tx.Rollback()
 	envs, err := store.ListQueued(ctx, tx, p.conversation)
 	if err != nil {
 		return nil, err

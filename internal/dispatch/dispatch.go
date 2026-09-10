@@ -8,6 +8,7 @@ package dispatch
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -87,7 +88,7 @@ func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, 
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(ctx)
+			tx.Rollback()
 		}
 	}()
 
@@ -112,7 +113,7 @@ func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, 
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	committed = true
@@ -184,7 +185,7 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(recordCtx)
+			tx.Rollback()
 		}
 	}()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -228,7 +229,7 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 			return "", err
 		}
 	}
-	if err := tx.Commit(recordCtx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return "", err
 	}
 	committed = true
@@ -264,7 +265,7 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 // the first place. Direction permission (peer_a/peer_b, revoked-ness) is
 // still checked — an expired-but-otherwise-permitted grant is a valid
 // requeue target, a grant that never permitted this direction at all is not.
-func resolveRequeueVersion(ctx context.Context, tx *store.Tx, e *store.Envelope) (int64, bool, error) {
+func resolveRequeueVersion(ctx context.Context, tx *sql.Tx, e *store.Envelope) (int64, bool, error) {
 	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
 	if err != nil {
 		if errors.Is(err, store.ErrNoActiveGrant) {
@@ -295,7 +296,7 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(ctx)
+			tx.Rollback()
 		}
 	}()
 
@@ -338,7 +339,7 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 		if err := store.SetState(ctx, tx, envelopeID, store.Cancelled, now); err != nil {
 			return nil, false, err
 		}
-		if err := tx.Commit(ctx); err != nil {
+		if err := tx.Commit(); err != nil {
 			return nil, false, err
 		}
 		committed = true
@@ -369,7 +370,7 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 		// the two statements above within the same transaction.
 		return nil, false, fmt.Errorf("dispatch: envelope %s left queued state between claim and transition", envelopeID)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, false, err
 	}
 	committed = true
@@ -382,7 +383,7 @@ func (b *Bridge) currentState(ctx context.Context, envelopeID string) (store.Env
 	if err != nil {
 		return "", err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 	e, err := store.GetByID(ctx, tx, envelopeID)
 	if err != nil {
 		return "", err

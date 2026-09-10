@@ -10,6 +10,7 @@ package controller
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -49,7 +50,7 @@ func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, er
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(ctx)
+			tx.Rollback()
 		}
 	}()
 
@@ -76,7 +77,7 @@ func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, er
 	if err := store.InsertGrant(ctx, tx, g); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	committed = true
@@ -106,7 +107,7 @@ func (c *Controller) Revoke(ctx context.Context, conversation string) (*RevokeRe
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(ctx)
+			tx.Rollback()
 		}
 	}()
 
@@ -132,7 +133,7 @@ func (c *Controller) Revoke(ctx context.Context, conversation string) (*RevokeRe
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	committed = true
@@ -160,7 +161,7 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(ctx)
+			tx.Rollback()
 		}
 	}()
 
@@ -209,7 +210,7 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 	if _, err := store.CancelQueuedUnderVersion(ctx, tx, p.Conversation, current.GrantVersion, now); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	committed = true
@@ -217,8 +218,8 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 	return &next, nil
 }
 
-func countByState(ctx context.Context, tx *store.Tx, conversation string, state store.EnvelopeState) (int64, error) {
-	row := tx.QueryRow(ctx,
+func countByState(ctx context.Context, tx *sql.Tx, conversation string, state store.EnvelopeState) (int64, error) {
+	row := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM envelopes WHERE conversation = ? AND state = ?`, conversation, string(state))
 	var n int64
 	if err := row.Scan(&n); err != nil {

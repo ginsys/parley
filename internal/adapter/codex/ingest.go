@@ -46,7 +46,7 @@ func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expec
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(ctx)
+			tx.Rollback()
 		}
 	}()
 
@@ -86,7 +86,7 @@ func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expec
 	if err := store.InsertQueued(ctx, tx, reply); err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	committed = true

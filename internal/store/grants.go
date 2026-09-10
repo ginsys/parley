@@ -14,8 +14,8 @@ var ErrNoActiveGrant = errors.New("no active grant for conversation")
 // CurrentGrant returns the conversation's active grant. Callers must hold a
 // Tx so the read is part of the same serialized transaction as whatever
 // decision it feeds (send, revoke, renew) — this is not a passive read.
-func CurrentGrant(ctx context.Context, tx *Tx, conversation string) (*Grant, error) {
-	row := tx.QueryRow(ctx, `
+func CurrentGrant(ctx context.Context, tx *sql.Tx, conversation string) (*Grant, error) {
+	row := tx.QueryRowContext(ctx, `
 		SELECT conversation, grant_version, peer_a_id, peer_b_id, direction,
 		       max_exchanges, exchanges_used, granted_at, expires_at, status, revoked_at
 		FROM grants
@@ -37,8 +37,8 @@ func CurrentGrant(ctx context.Context, tx *Tx, conversation string) (*Grant, err
 
 // EnsureConversation inserts the conversation row if it doesn't already
 // exist. Idempotent so the controller can call it on every Grant.
-func EnsureConversation(ctx context.Context, tx *Tx, id, name, createdAt string) error {
-	_, err := tx.Exec(ctx, `
+func EnsureConversation(ctx context.Context, tx *sql.Tx, id, name, createdAt string) error {
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO conversations (id, name, created_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT (id) DO NOTHING`, id, name, createdAt)
@@ -52,8 +52,8 @@ func EnsureConversation(ctx context.Context, tx *Tx, id, name, createdAt string)
 // partial index (one active row per conversation) rejects this if the
 // caller failed to supersede/revoke the prior active grant first — a bug in
 // the controller, not a race, since both run under the same Tx.
-func InsertGrant(ctx context.Context, tx *Tx, g Grant) error {
-	_, err := tx.Exec(ctx, `
+func InsertGrant(ctx context.Context, tx *sql.Tx, g Grant) error {
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO grants (conversation, grant_version, peer_a_id, peer_b_id, direction,
 		                     max_exchanges, exchanges_used, granted_at, expires_at, status, revoked_at)
 		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'active', NULL)`,
@@ -69,8 +69,8 @@ func InsertGrant(ctx context.Context, tx *Tx, g Grant) error {
 // (revoked or superseded). timestamp is stored as revoked_at regardless of
 // which of the two statuses is being set, since both mean "no longer live"
 // for anything reading revoked_at.
-func SetGrantStatus(ctx context.Context, tx *Tx, conversation string, version int64, status GrantStatus, timestamp string) error {
-	res, err := tx.Exec(ctx, `
+func SetGrantStatus(ctx context.Context, tx *sql.Tx, conversation string, version int64, status GrantStatus, timestamp string) error {
+	res, err := tx.ExecContext(ctx, `
 		UPDATE grants SET status = ?, revoked_at = ?
 		WHERE conversation = ? AND grant_version = ? AND status = 'active'`,
 		string(status), timestamp, conversation, version)
@@ -91,8 +91,8 @@ func SetGrantStatus(ctx context.Context, tx *Tx, conversation string, version in
 // version, but only if it's still active and under max_exchanges. The
 // affected-rows count is the budget check: 0 means exhausted or the version
 // is no longer active, and the caller must treat that as a hard stop.
-func ClaimExchange(ctx context.Context, tx *Tx, conversation string, version int64) (bool, error) {
-	res, err := tx.Exec(ctx, `
+func ClaimExchange(ctx context.Context, tx *sql.Tx, conversation string, version int64) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
 		UPDATE grants SET exchanges_used = exchanges_used + 1
 		WHERE conversation = ? AND grant_version = ? AND status = 'active'
 		  AND exchanges_used < max_exchanges`, conversation, version)
@@ -115,8 +115,8 @@ func ClaimExchange(ctx context.Context, tx *Tx, conversation string, version int
 // already recorded against a specific historical version, it does not
 // re-check eligibility. The exchanges_used > 0 guard makes a duplicate call
 // a no-op instead of driving the counter negative.
-func RefundExchange(ctx context.Context, tx *Tx, conversation string, version int64) error {
-	_, err := tx.Exec(ctx, `
+func RefundExchange(ctx context.Context, tx *sql.Tx, conversation string, version int64) error {
+	_, err := tx.ExecContext(ctx, `
 		UPDATE grants SET exchanges_used = exchanges_used - 1
 		WHERE conversation = ? AND grant_version = ? AND exchanges_used > 0`, conversation, version)
 	if err != nil {
