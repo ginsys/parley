@@ -65,7 +65,7 @@ func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expec
 	}
 
 	now := nowTime.Format(time.RFC3339Nano)
-	if err := store.SetState(ctx, tx, repliedTo.ID, store.Acked, now); err != nil {
+	if err := store.SetState(ctx, tx, repliedTo.ID, store.HandedOff, store.Acked, now); err != nil {
 		return nil, fmt.Errorf("ack %s: %w", repliedTo.ID, err)
 	}
 

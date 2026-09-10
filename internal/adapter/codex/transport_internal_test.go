@@ -195,3 +195,12 @@ func TestQueueMessageRejectsNULByteAsPermanentlyRejected(t *testing.T) {
 type fakeQueueSender struct{}
 
 func (fakeQueueSender) QueueMessage(ctx context.Context, threadID, text string) error { return nil }
+
+func TestSignalTerminationAfterStartIsAmbiguous(t *testing.T) {
+	ctx := context.Background()
+	cmd := exec.CommandContext(ctx, "sh", "-c", "kill -KILL $$")
+	err := runAndClassify(ctx, cmd)
+	if !errors.Is(err, ErrQueueAmbiguous) {
+		t.Fatalf("started=%v signal result=%v", cmd.Process != nil, err)
+	}
+}

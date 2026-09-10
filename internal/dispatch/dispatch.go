@@ -138,7 +138,27 @@ func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, 
 // concurrent revoke/renew, or already terminal), Dispatch does nothing and
 // returns its current state with no error — this is the serialization the
 // design relies on, not a failure.
+// Outcome exposes delivery state and bounded diagnostics without treating
+// a queued/budget-exhausted candidate as a host attempt.
+type Outcome struct {
+	ID          string
+	State       store.EnvelopeState
+	Attempted   bool
+	ErrorCode   string
+	ErrorDetail string
+}
+
 func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.EnvelopeState, error) {
+	outcome, err := b.DispatchOutcome(ctx, envelopeID)
+	return outcome.State, err
+}
+func (b *Bridge) DispatchOutcome(ctx context.Context, envelopeID string) (Outcome, error) {
+	outcome := Outcome{ID: envelopeID}
+	state, err := b.dispatch(ctx, envelopeID, &outcome)
+	outcome.State = state
+	return outcome, err
+}
+func (b *Bridge) dispatch(ctx context.Context, envelopeID string, outcome *Outcome) (store.EnvelopeState, error) {
 	claimedEnvelope, claimed, err := b.claim(ctx, envelopeID)
 	if err != nil {
 		if errors.Is(err, ErrBudgetExhausted) {
@@ -162,87 +182,75 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 	}
 
 	deliverErr := b.transport.Deliver(ctx, *claimedEnvelope)
-	noAttempt := errors.Is(deliverErr, ErrNoAttempt)
-	permanentlyRejected := errors.Is(deliverErr, ErrPermanentlyRejected)
-	finalState := store.HandedOff
+	settled, err := b.settle(context.WithoutCancel(ctx), claimedEnvelope, deliverErr)
+	*outcome = settled
+	return settled.State, err
+}
+
+func (b *Bridge) settle(ctx context.Context, claimed *store.Envelope, deliverErr error) (Outcome, error) {
+	ambiguous := errors.Is(deliverErr, ErrAmbiguous)
+	noAttempt := !ambiguous && errors.Is(deliverErr, ErrNoAttempt)
+	permanent := !ambiguous && errors.Is(deliverErr, ErrPermanentlyRejected)
+	outcome := Outcome{ID: claimed.ID, State: store.HandedOff, Attempted: !noAttempt && !permanent}
 	switch {
 	case deliverErr == nil:
-		finalState = store.HandedOff
 	case errors.Is(deliverErr, ErrAmbiguous):
-		finalState = store.Uncertain
+		outcome.State = store.Uncertain
+		outcome.ErrorCode = "ambiguous"
+		outcome.ErrorDetail = "Host acceptance could not be established; automatic retry is disabled."
 	case noAttempt:
-		finalState = store.Queued
-	case permanentlyRejected:
-		finalState = store.Failed
+		outcome.State = store.Queued
+		outcome.ErrorCode = "not_attempted"
+		outcome.ErrorDetail = "Transport did not attempt host delivery."
+	case permanent:
+		outcome.State = store.Failed
+		outcome.ErrorCode = "rejected"
+		outcome.ErrorDetail = "Message was rejected before host delivery."
 	default:
-		finalState = store.Failed
+		outcome.State = store.Failed
+		outcome.ErrorCode = "failed"
+		outcome.ErrorDetail = "Transport reported a delivery failure."
 	}
-
-	// Recording the outcome must survive ctx being canceled during Deliver
-	// (e.g. a caller-imposed deadline, or a Claude-side reconnect
-	// invalidating the connection an in-flight delivery was authorized
-	// under) — Deliver has already returned a definite answer by this
-	// point, and losing the ability to write it down would strand the
-	// envelope in 'dispatching' forever, exactly the ambiguous-outcome
-	// class this design exists to avoid. context.WithoutCancel detaches
-	// from ctx's cancellation/deadline while keeping any values.
-	recordCtx := context.WithoutCancel(ctx)
-	tx, err := b.db.Begin(recordCtx)
+	tx, err := b.db.Begin(ctx)
 	if err != nil {
-		return "", fmt.Errorf("record dispatch outcome: %w", err)
+		return outcome, fmt.Errorf("record dispatch outcome: %w", err)
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			tx.Rollback()
-		}
-	}()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	switch {
-	case noAttempt:
-		// The host was never actually invoked: refund the budget slot
-		// claim() consumed. Whether the envelope can go back to 'queued'
-		// depends on whether the grant it was claimed under is still this
-		// conversation's current one — a revoke or renewal can have torn it
-		// down while Deliver was in flight.
-		if err := store.RefundExchange(recordCtx, tx, claimedEnvelope.Conversation, claimedEnvelope.GrantVersion); err != nil {
-			return "", err
-		}
-		version, ok, err := resolveRequeueVersion(recordCtx, tx, claimedEnvelope)
+	defer tx.Rollback()
+	version := claimed.GrantVersion
+	if noAttempt {
+		target, ok, err := resolveRequeueVersion(ctx, tx, claimed)
 		if err != nil {
-			return "", err
+			return outcome, err
 		}
 		if ok {
-			if _, err := store.RequeueUnattempted(recordCtx, tx, envelopeID, version, now); err != nil {
-				return "", err
-			}
-			finalState = store.Queued
+			version = target
 		} else {
-			if err := store.SetState(recordCtx, tx, envelopeID, store.Cancelled, now); err != nil {
-				return "", err
-			}
-			finalState = store.Cancelled
+			outcome.State = store.Cancelled
 		}
-	case permanentlyRejected:
-		// Also never attempted, so also refund — but retrying can only ever
-		// reproduce the same rejection, so this stays 'failed' rather than
-		// going back to 'queued'.
-		if err := store.RefundExchange(recordCtx, tx, claimedEnvelope.Conversation, claimedEnvelope.GrantVersion); err != nil {
-			return "", err
+	}
+	changed, err := store.SettleDispatch(ctx, tx, claimed, outcome.State, version, outcome.ErrorCode, outcome.ErrorDetail, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return outcome, err
+	}
+	if !changed {
+		current, err := store.GetByID(ctx, tx, claimed.ID)
+		if err != nil {
+			return outcome, err
 		}
-		if err := store.SetState(recordCtx, tx, envelopeID, finalState, now); err != nil {
-			return "", err
-		}
-	default:
-		if err := store.SetState(recordCtx, tx, envelopeID, finalState, now); err != nil {
-			return "", err
+		outcome.State = current.State
+		outcome.ErrorCode = current.ErrorCode
+		outcome.ErrorDetail = current.ErrorDetail
+		return outcome, nil
+	}
+	if noAttempt || permanent {
+		if err := store.RefundExchange(ctx, tx, claimed.Conversation, claimed.GrantVersion); err != nil {
+			return outcome, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return "", err
+		return outcome, err
 	}
-	committed = true
-	return finalState, nil
+	return outcome, nil
 }
 
 // resolveRequeueVersion decides whether an unattempted envelope can go back
@@ -324,7 +332,7 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 		if errors.Is(authErr, ErrGrantExpired) && e.TrustedReply {
 			return nil, false, authErr
 		}
-		if err := store.SetState(ctx, tx, e.ID, store.Cancelled, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if err := store.SetState(ctx, tx, e.ID, store.Queued, store.Cancelled, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return nil, false, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -368,6 +376,7 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 	}
 	committed = true
 	e.State = store.Dispatching
+	e.DispatchAttempt++
 	return e, true, nil
 }
 

@@ -100,7 +100,7 @@ func (d *DB) RecoverUncertain(ctx context.Context) (int64, error) {
 		}
 	}()
 	res, err := tx.ExecContext(ctx, `
-		UPDATE envelopes SET state = 'uncertain', updated_at = ?
+		UPDATE envelopes SET state = 'uncertain', error_code='interrupted', error_detail='Dispatch was interrupted; host acceptance is unknown and automatic retry is disabled.', updated_at = ?
 		WHERE state = 'dispatching'`, time.Now().UTC().Format(time.RFC3339Nano))
 	if err != nil {
 		return 0, fmt.Errorf("recover uncertain: %w", err)

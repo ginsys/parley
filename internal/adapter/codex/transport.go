@@ -116,7 +116,9 @@ func (s ExecSender) QueueMessage(ctx context.Context, threadID, text string) err
 // it, or because exec itself failed to start the process at all (binary not
 // found, not executable, argv too large): neither case ever reached the
 // host. Any other failure (a real exit error from a process that did start)
-// is a plain terminal failure. Split out from QueueMessage so it can be
+// is a plain terminal failure only for a normal nonzero exit. Signals are
+// ambiguous because the process may have committed before termination. Split
+// out from QueueMessage so it can be
 // exercised directly against a real short-lived process, without depending
 // on the codex binary.
 func runAndClassify(ctx context.Context, cmd *exec.Cmd) error {
@@ -127,7 +129,7 @@ func runAndClassify(ctx context.Context, cmd *exec.Cmd) error {
 	if cmd.Process == nil {
 		return fmt.Errorf("codex queue: %v: %w", err, ErrQueueNotAttempted)
 	}
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || cmd.ProcessState == nil || cmd.ProcessState.ExitCode() < 0 {
 		return fmt.Errorf("%w: %v", ErrQueueAmbiguous, err)
 	}
 	return fmt.Errorf("codex queue: %w", err)
@@ -170,6 +172,9 @@ func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
 	}
 	wrapped, err := wrapMessage(e.ID, t.fromLabel, e.Text)
 	if err != nil {
+		if errors.Is(err, bridgetext.ErrInvalidMetadata) {
+			return fmt.Errorf("%w: %w", dispatch.ErrPermanentlyRejected, err)
+		}
 		// Wrap only fails on a crypto/rand read error generating the
 		// boundary — QueueMessage is never reached, and unlike the
 		// recipient/sender mismatch above, the failure isn't a property of
