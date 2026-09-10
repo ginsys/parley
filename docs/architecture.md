@@ -116,7 +116,9 @@ precision; equal timestamps sort by envelope ID. `Tick` returns `dispatch.Outcom
 state, attempted flag and diagnostics, and stops on budget exhaustion with its explicit error.
 An exhausted candidate is never reported as a host attempt. A process-local cursor advances
 between serialized ticks and wraps at the tail so retryable old rows do not starve a later
-backlog. Restarting the poller resets the cursor; it does not change durable message state.
+backlog. Dispatch errors, including budget exhaustion, preserve the blocked position so renewal
+resumes there; retryable transport outcomes still advance. Restarting the poller resets the cursor;
+it does not change durable message state.
 
 ## Reply syntax
 

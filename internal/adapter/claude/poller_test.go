@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
 	adapterclaude "github.com/ginsys/parley/internal/adapter/claude"
+	"github.com/ginsys/parley/internal/adapter/codex"
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
@@ -94,5 +96,55 @@ func TestRollbackSurvivesCallerCancellation(t *testing.T) {
 	}
 	if err := tx2.Rollback(); err != nil {
 		t.Fatalf("rollback: %v", err)
+	}
+}
+
+func TestPollerResumesAtBudgetBlockedReplyAfterRenewal(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	ctrl := controller.New(db)
+	if _, err := ctrl.Grant(ctx, controller.GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 4}); err != nil {
+		t.Fatal(err)
+	}
+	b := dispatch.New(db, &fakeTransport{})
+	var replies []string
+	for i := 0; i < 3; i++ {
+		original, err := b.Send(ctx, "c", "b", "a", "original", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Dispatch(ctx, original.ID); err != nil {
+			t.Fatal(err)
+		}
+		marker := fmt.Sprintf("```BRIDGE-REPLY\n{\"in_reply_to\":%q,\"to\":\"b\",\"text\":\"reply\"}\n```", original.ID)
+		reply, err := codex.IngestTurn(ctx, db, "c", "a", "b", marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replies = append(replies, reply.ID)
+	}
+	probe := &probeRecorder{}
+	hs, err := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hs.Stop()
+	if err := hs.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if !hs.Ack(probe.last()) {
+		t.Fatal("ack")
+	}
+	poller := adapterclaude.NewPoller(db, b, hs, "c", "b")
+	first, err := poller.Tick(ctx)
+	if !errors.Is(err, dispatch.ErrBudgetExhausted) || len(first) != 2 || first[1].ID != replies[1] || first[1].Attempted {
+		t.Fatalf("budget outcomes: %+v %v", first, err)
+	}
+	if _, err := ctrl.Renew(ctx, controller.RenewParams{Conversation: "c", MaxExchanges: 4}); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := poller.Tick(ctx)
+	if err != nil || len(resumed) != 2 || resumed[0].ID != replies[1] || resumed[1].ID != replies[2] {
+		t.Fatalf("skipped budget-blocked reply after renewal: %+v %v", resumed, err)
 	}
 }
