@@ -233,7 +233,7 @@ type rawHTMLBlockOpener struct {
 const blockLevelTags = `address|article|aside|base|basefont|blockquote|body|caption|center|col|` +
 	`colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|` +
 	`frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|` +
-	`ol|optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul`
+	`ol|optgroup|option|p|param|search|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul`
 
 var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
 	// Type 1: script/pre/style/textarea, ends at its specific closing tag.
@@ -246,8 +246,11 @@ var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
 	{regexp.MustCompile(`(?i)^ {0,3}<textarea(?:[\s>]|$)`), regexp.MustCompile(`(?i)</textarea>`), true},
 	// Type 3: processing instruction, ends at "?>".
 	{regexp.MustCompile(`^ {0,3}<\?`), regexp.MustCompile(`\?>`), true},
-	// Type 4: declaration, ends at ">".
-	{regexp.MustCompile(`^ {0,3}<![A-Za-z]`), regexp.MustCompile(`>`), true},
+	// Type 4: declaration, ends at ">". CommonMark's start condition
+	// requires an uppercase ASCII letter specifically (e.g. <!DOCTYPE) —
+	// unlike types 1/6's tag-name checks, this one must not be
+	// case-insensitive: a lowercase "<!foo" does not open a type-4 block.
+	{regexp.MustCompile(`^ {0,3}<![A-Z]`), regexp.MustCompile(`>`), true},
 	// Type 5: CDATA section, ends at "]]>".
 	{regexp.MustCompile(`^ {0,3}<!\[CDATA\[`), regexp.MustCompile(`]]>`), true},
 	// Type 6: a fixed list of block-level tag names, ends at a blank line.
@@ -285,6 +288,13 @@ var (
 	atxHeading        = regexp.MustCompile(`^ {0,3}#{1,6}(?:[ \t]|$)`)
 	thematicBreak     = regexp.MustCompile(`^ {0,3}(?:-[ \t]*){3,}$|^ {0,3}(?:_[ \t]*){3,}$|^ {0,3}(?:\*[ \t]*){3,}$`)
 	indentedCodeBlock = regexp.MustCompile(`^(?: {4}|\t)`)
+	// setextHeadingUnderline recognizes a Setext heading's "=" underline —
+	// its "-" underline is already covered by thematicBreak above (a bare
+	// run of 3+ dashes reads as "not a paragraph" either way, whichever of
+	// the two CommonMark actually means by it). Per CommonMark, this line
+	// closes whatever paragraph precedes it, turning it into a heading; the
+	// underline itself is never a paragraph.
+	setextHeadingUnderline = regexp.MustCompile(`^ {0,3}=+[ \t]*$`)
 )
 
 // matchRawHTMLBlockOpener reports whether line opens one of the raw HTML
@@ -418,11 +428,12 @@ func scanForMarker(text string) markerScan {
 				openRun = run
 				isOurs = false
 				paragraphOpen = false
-			} else if atxHeading.MatchString(trimmed) || thematicBreak.MatchString(trimmed) {
-				// A heading or thematic break is its own block, not a
-				// paragraph, and (per CommonMark) can interrupt an open one
-				// without a blank line first — so a following line is never
-				// gated by a paragraph this line might have followed.
+			} else if atxHeading.MatchString(trimmed) || thematicBreak.MatchString(trimmed) || setextHeadingUnderline.MatchString(trimmed) {
+				// A heading (ATX or Setext underline) or thematic break is
+				// its own block, not a paragraph — a Setext underline in
+				// fact consumes whatever paragraph precedes it, turning it
+				// into a heading — so a following line is never gated by a
+				// paragraph this line might have followed.
 				paragraphOpen = false
 			} else if indentedCodeBlock.MatchString(trimmed) && !paragraphOpen {
 				// An indented-looking line only starts a code block when it

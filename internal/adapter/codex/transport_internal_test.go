@@ -144,6 +144,27 @@ func TestTransportDeliverClassifiesWrapFailureAsNoAttempt(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3's fifth review round: os/exec rejects a
+// NUL-containing argv element before ever forking the process, leaving
+// cmd.Process nil — indistinguishable from any other exec-start failure to
+// runAndClassify, so without an explicit pre-check this was classified
+// ErrQueueNotAttempted (transient, safely retryable) even though a NUL byte
+// is immutable content of this exact message and every retry would
+// reproduce the identical rejection. Must classify permanent instead, the
+// same as an oversized message, and before exec is ever attempted.
+func TestQueueMessageRejectsNULByteAsPermanentlyRejected(t *testing.T) {
+	err := ExecSender{}.QueueMessage(context.Background(), "thread-1", "hello\x00world")
+	if !errors.Is(err, ErrMessageContainsNUL) {
+		t.Fatalf("want ErrMessageContainsNUL, got %v", err)
+	}
+	if !errors.Is(err, ErrQueuePermanentlyRejected) {
+		t.Fatalf("want ErrQueuePermanentlyRejected for a NUL byte, got %v", err)
+	}
+	if errors.Is(err, ErrQueueNotAttempted) {
+		t.Fatalf("a NUL byte must not also classify as ErrQueueNotAttempted (would requeue forever): %v", err)
+	}
+}
+
 type fakeQueueSender struct{}
 
 func (fakeQueueSender) QueueMessage(ctx context.Context, threadID, text string) error { return nil }
