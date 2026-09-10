@@ -87,7 +87,7 @@ func (d *DB) Begin(ctx context.Context) (*sql.Tx, error) { return d.sql.BeginTx(
 // found here means a prior process died between the host call returning and
 // its outcome being recorded (fixture: crash-after-handoff). It is never
 // auto-retried or auto-resolved past this point — an operator resolves each
-// uncertain row by hand, per the design plan.
+// uncertain row by hand, as documented in docs/architecture.md.
 func (d *DB) RecoverUncertain(ctx context.Context) (int64, error) {
 	tx, err := d.Begin(ctx)
 	if err != nil {

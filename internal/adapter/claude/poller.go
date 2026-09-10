@@ -2,16 +2,19 @@ package claude
 
 import (
 	"context"
+	"sync"
 
 	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
 )
 
 // Poller drives ordinary Dispatch for one conversation's envelopes addressed
-// to this adapter's peer, gated on the current connection's Handshake. Per
-// the design plan, a message accepted before readiness must stay queued,
+// to this adapter's peer, gated on the current connection's Handshake.
+// Under the readiness contract, a message accepted before readiness must stay queued,
 // never advance to dispatching, until the handshake's nonce is acknowledged.
 type Poller struct {
+	tickMu       sync.Mutex
+	after        *store.QueueCursor
 	db           *store.DB
 	bridge       *dispatch.Bridge
 	handshake    *Handshake
@@ -23,7 +26,7 @@ func NewPoller(db *store.DB, bridge *dispatch.Bridge, handshake *Handshake, conv
 	return &Poller{db: db, bridge: bridge, handshake: handshake, conversation: conversation, toPeer: toPeer}
 }
 
-// Tick attempts dispatch of every currently queued envelope addressed to
+// Tick attempts a bounded page of currently queued envelopes addressed to
 // this adapter's peer, but only while the handshake is ready — re-checked
 // before each individual dispatch, not just once before the batch, since a
 // reconnect (Reset/Stop) can revoke readiness mid-batch and the remaining
@@ -47,9 +50,14 @@ func NewPoller(db *store.DB, bridge *dispatch.Bridge, handshake *Handshake, conv
 //
 // On the grant's budget running out, the whole batch stops rather than
 // continuing through the remaining candidates, each of which would hit the
-// same exhausted budget. Returns explicit outcomes, including the unattempted exhausted candidate,
+// same exhausted budget. Returns explicit outcomes, including the unattempted
+// exhausted candidate,
 // and ErrBudgetExhausted. Each tick considers at most store.MaxQueueBatch rows.
+// A process-local cursor advances between ticks and wraps at the queue tail,
+// so retryable oldest rows cannot starve later messages. Ticks are serialized.
 func (p *Poller) Tick(ctx context.Context) ([]dispatch.Outcome, error) {
+	p.tickMu.Lock()
+	defer p.tickMu.Unlock()
 	if !p.handshake.Ready() {
 		return nil, nil
 	}
@@ -65,7 +73,8 @@ func (p *Poller) Tick(ctx context.Context) ([]dispatch.Outcome, error) {
 		if !ok {
 			break
 		}
-		outcome, err := p.dispatchOne(ctx, genCtx, id)
+		outcome, err := p.dispatchOne(ctx, genCtx, id.ID)
+		p.after = &id
 		outcomes = append(outcomes, outcome)
 		if err != nil {
 			return outcomes, err
@@ -87,11 +96,16 @@ func (p *Poller) dispatchOne(ctx, genCtx context.Context, id string) (dispatch.O
 	return p.bridge.DispatchOutcome(dispatchCtx, id)
 }
 
-func (p *Poller) queuedForMe(ctx context.Context) ([]string, error) {
+func (p *Poller) queuedForMe(ctx context.Context) ([]store.QueueCursor, error) {
 	tx, err := p.db.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	return store.ListQueuedIDs(ctx, tx, p.conversation, p.toPeer, store.MaxQueueBatch)
+	rows, err := store.ListQueuedIDs(ctx, tx, p.conversation, p.toPeer, store.MaxQueueBatch, p.after)
+	if err == nil && len(rows) == 0 && p.after != nil {
+		p.after = nil
+		return store.ListQueuedIDs(ctx, tx, p.conversation, p.toPeer, store.MaxQueueBatch, nil)
+	}
+	return rows, err
 }

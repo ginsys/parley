@@ -1,13 +1,12 @@
 // Package replymarker implements the explicit bridge-reply selection rule
-// from the design plan's §1b: a peer's ordinary turn output is never
+// described in docs/architecture.md: a peer's ordinary turn output is never
 // forwarded on a timing guess. Exactly one machine-parseable marker must be
 // present, naming the envelope it replies to and the intended recipient;
 // anything else stops delivery rather than guessing.
 //
 // Concrete syntax: a fenced block opened with "```BRIDGE-REPLY" and closed
 // with "```", containing a JSON object with string fields "in_reply_to",
-// "to", and "text". JSON was chosen over the plan's illustrative
-// unquoted-key notation so parsing has no ambiguous edge cases.
+// "to", and "text". Strict JSON rejects ambiguous object members.
 package replymarker
 
 import (
@@ -50,7 +49,7 @@ var (
 	ErrWrongReplier = errors.New("BRIDGE-REPLY marker references an envelope not addressed to the replying peer")
 	// ErrDeliveryPending means a well-formed marker names an envelope still
 	// in the 'dispatching' state: dispatch's pre-attempt commit has landed
-	// (design plan §3's two-phase dispatch) but the outcome of the actual
+	// (the claim/host/settlement sequence) but the outcome of the actual
 	// host call — success or failure — hasn't been recorded yet. The peer
 	// may already have genuinely received the message and be replying in
 	// good faith; this is a transient condition, not a stale or unknown
@@ -217,7 +216,7 @@ func decodeMarker(raw []byte) (*Marker, error) {
 	if _, err := dec.Token(); err != nil { // consume the closing '}'
 		return nil, err
 	}
-	// The fence-extraction regex captures everything between the fences, so a
+	// Fence extraction captures everything between the fences, so a
 	// second JSON value smuggled in after the first object's closing brace
 	// (e.g. "{...} {\"to\":\"attacker\"}") would otherwise be silently
 	// discarded rather than rejected — decoding only the first value is not

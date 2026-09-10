@@ -1,5 +1,6 @@
 -- Parley durable state. One sqlite db per bridge instance (dotfile-scale).
--- See the design plan (private) for the full spec, invariants, and probe evidence.
+-- Frozen version-1 schema for legacy adoption. Later versions live in migrations.go.
+-- See docs/architecture.md for current contracts and limitations.
 
 CREATE TABLE IF NOT EXISTS conversations (
     id         TEXT PRIMARY KEY,
@@ -7,7 +8,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at TEXT NOT NULL
 );
 
--- Grants are versioned, never mutated in place except for revoked_at/status.
+-- Grants are versioned; only accounting and lifecycle status mutate in place.
 -- Exactly one row per conversation has status='active' at a time; a renewal
 -- supersedes the prior active row instead of overwriting it, so history is
 -- never destroyed.
@@ -26,13 +27,13 @@ CREATE TABLE IF NOT EXISTS grants (
     PRIMARY KEY (conversation, grant_version)
 );
 
--- Enforces "exactly one active grant per conversation" at the schema level,
+-- Enforces "at most one active grant per conversation" at the schema level,
 -- not just by controller discipline.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_grants_one_active
     ON grants(conversation)
     WHERE status = 'active';
 
--- One row per envelope, append-only except for the state/updated_at columns.
+-- One row per envelope; state/accounting and eligible reply grant versions can change.
 -- state machine: queued -> dispatching -> handed_off -> (acked)
 --                                       -> failed
 --                                       -> uncertain (crash between host call and commit)

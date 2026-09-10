@@ -10,8 +10,7 @@ Early, incremental build. Present: sqlite schema, the state machine (`internal/s
 protected controller (`internal/controller`), ordinary send/dispatch (`internal/dispatch`), the
 Claude-side readiness handshake and gated poller (`internal/adapter/claude`), reply-marker
 parsing/validation (`internal/replymarker`), and the Codex-side transport/ingest adapter
-(`internal/adapter/codex`) over `codex queue`. Not yet present: identity binding and nah
-integration. Do not treat anything below `internal/` as wired to a live session yet —
+(`internal/adapter/codex`) over `codex queue`. Not yet present: identity binding and a runnable bridge. Do not treat anything below `internal/` as wired to a live session yet —
 `dispatch.Transport` is an interface with no real Channels implementation in this repo so far,
 `Handshake.sendProbe`/`Ack` are not wired to an actual Channels connection or the `reply` tool, and
 `codex.ExecSender`/`IngestTurn` are untested against an actual `codex` CLI or rollout file.
@@ -22,14 +21,13 @@ integration. Do not treat anything below `internal/` as wired to a live session 
 to be run directly by a human in their own shell — **never invoke it as a tool call from an agent
 session**, and never let an agent construct or approve the grant/revoke/renew arguments on a
 human's behalf. This is a cooperative-policy boundary, not a proven impersonation-proof one: see
-the design plan's stated limitations before treating it as stronger than that.
+[the architecture limitations](docs/architecture.md#authority-boundary) before treating it as stronger than that.
 
 ## Start from the work item
 
 - Read the issue, its native GitHub dependencies, and existing code before changing anything. This
-  repository has no in-tree design/specification document yet; the [Status](#status) section above
-  and the [Authority table](CONTRIBUTING.md#authority) are the current source of what is built,
-  what is not, and where deeper context (the private design plan) lives.
+  repository documents current contracts in [Architecture](docs/architecture.md); also read
+  [Status](#status) and the [Authority table](CONTRIBUTING.md#authority).
 - The issue owns scope, acceptance criteria, ownership and completion. Native GitHub dependencies
   alone own blocking relationships — do not maintain a second blocker list in the issue body.
 - Leave issues unassigned until someone accepts responsibility. Do not implement an issue carrying
@@ -39,13 +37,13 @@ the design plan's stated limitations before treating it as stronger than that.
 
 ## Record evidence and decisions
 
-- Keep permanent decisions in `AGENTS.md` (or the private design plan, for anything it owns), with
+- Keep permanent decisions in `AGENTS.md` and [Architecture](docs/architecture.md), with
   rationale and alternatives. Update the relevant document in the same change as its
   implementation. Do not leave decisions only in chat or create parallel status checklists.
 - Investigations record pinned tool versions, synthetic inputs, reproduction commands,
   expected/observed outcomes, failure cases, alternatives, limitations and the decision enabled.
   Never use real credentials in fixtures or ordinary evidence.
-- Every fixture named in the design plan — impersonation, approval-forgery command shapes, budget
+- Every live-connection fixture — impersonation, approval-forgery command shapes, budget
   exhaustion, revoke-vs-dispatch, crash-after-handoff, stale grant version, reply-marker
   malformed/duplicate/wrong-recipient/stale, readiness handshake delayed/timeout/reconnect — must
   have a passing test before any live session is connected through Parley. Passing fixtures gate
@@ -148,4 +146,6 @@ Schema version 4 preserves textual envelope timestamps and backfills numeric nan
 one immediate migration transaction. Invalid or unrepresentable timestamps abort the migration.
 Delivery order is numeric creation time then envelope ID. Polling selects at most 100 queued IDs
 for the exact conversation and recipient using a covering index; it returns explicit outcomes
-and budget exhaustion without labelling an unattempted candidate as a host call.
+and budget exhaustion without labelling an unattempted candidate as a host call. A cursor
+advances between serialized ticks and wraps at the tail, preventing retryable old rows from
+starving later queued messages. It is process-local and resets when the poller is recreated.

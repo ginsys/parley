@@ -129,12 +129,12 @@ func TestQueueIDsAreRecipientFilteredAndBounded(t *testing.T) {
 			}
 		}
 	}
-	ids, err := ListQueuedIDs(ctx, tx, "c", "b", 100)
-	if err != nil || len(ids) != 100 || ids[0] != "b-000" || ids[99] != "b-099" {
+	ids, err := ListQueuedIDs(ctx, tx, "c", "b", 100, nil)
+	if err != nil || len(ids) != 100 || ids[0].ID != "b-000" || ids[99].ID != "b-099" {
 		t.Fatalf("IDs=%v %v", ids, err)
 	}
 	for _, limit := range []int{0, -1, 101} {
-		if _, err := ListQueuedIDs(ctx, tx, "c", "b", limit); err == nil {
+		if _, err := ListQueuedIDs(ctx, tx, "c", "b", limit, nil); err == nil {
 			t.Fatalf("accepted limit %d", limit)
 		}
 	}

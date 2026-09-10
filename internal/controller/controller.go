@@ -1,11 +1,7 @@
-// Package controller is Parley's single protected write path for
-// membership: Grant, Revoke, and Renew are the only code that ever writes a
-// grant row. Per the design plan (§1), this package is meant to be invoked
-// directly by a human in their own shell — cmd/parleyctl — never called as a
-// tool by either peer session. Nothing here enforces that from inside the
-// process; the protection is nah's hook-directory block on the state file
-// path plus the Bash-classifier extension described in the plan, both
-// external to this code.
+// Package controller is the protected membership write path used by the
+// human-operated cmd/parleyctl administrator. Ordinary adapters never invoke
+// Grant, Revoke or Renew. This is a cooperative boundary, not enforced OS
+// isolation; see docs/architecture.md for the implemented limits.
 package controller
 
 import (
@@ -96,7 +92,7 @@ func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, er
 }
 
 // RevokeResult is the exact split Revoke reports — never a bare "revoked",
-// per the design plan's requirement that revocation's scope be stated
+// so revocation's limited scope can be stated
 // plainly (it stops the bridge, not every path either peer could use).
 type RevokeResult struct {
 	Cancelled          int64
