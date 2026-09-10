@@ -134,7 +134,7 @@ func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, 
 type Outcome struct {
 	ID          string
 	State       store.EnvelopeState
-	Attempted   bool
+	Attempted   bool // This call may have reached the host; not historical row state.
 	ErrorCode   string
 	ErrorDetail string
 }

@@ -89,6 +89,9 @@ acknowledgements fail the expected-state transition. A missing envelope returns
 or refund twice, even if the same grant remains active. If outcome storage fails, dispatch
 returns an error with an empty/unknown state and no uncommitted diagnostic values; it preserves
 whether this call attempted transport delivery. The row may still be `dispatching`.
+`Outcome.Attempted` always describes this invocation, including stale settlement and no-claim
+paths; it is not inferred from historical row state. Reading an already `handed_off` envelope
+returns that durable state with `Attempted=false`, because this call did not invoke the host.
 
 The Codex transport distinguishes failure to start from abnormal termination after startup.
 It uses controlled subprocess tests; the meaning of ordinary nonzero CLI exits remains a host
