@@ -78,3 +78,10 @@ the design plan's stated limitations before treating it as stronger than that.
   protection requires explicit owner authorization; the owner may merge their own PR after review.
 - Close issues only after specified evidence and artifacts have landed and acceptance has been
   assessed. An open draft PR or a local passing check alone is not closure evidence.
+
+## Test isolation
+
+Ordinary tests use synthetic databases and controlled subprocesses. Process creation in the Codex
+sender is injectable so size-boundary tests cannot launch an installed host CLI or pass merely
+because a real thread is missing. Cancellation tests synchronize with child startup rather than
+assuming a timeout is longer than process creation. Live compatibility needs separate evidence.
