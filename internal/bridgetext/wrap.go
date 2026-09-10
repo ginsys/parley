@@ -1,4 +1,4 @@
-// Package bridgetext implements the design plan's §2 requirement: every
+// Package bridgetext implements the untrusted-message requirement: every
 // delivered message is wrapped in a labeled block naming the bridge-assigned
 // sender and stating explicitly that it grants no execution authority. This
 // is a convention read by the receiving peer's model, not an enforcement
@@ -29,7 +29,7 @@ var ErrInvalidMetadata = errors.New("invalid message metadata")
 //
 // id is the envelope's own id, stated outside the payload boundary as
 // trusted wrapper metadata — without it the receiving peer has no value to
-// put in a BRIDGE-REPLY marker's in_reply_to field (§1b), since that field
+// put in a BRIDGE-REPLY marker's in_reply_to field , since that field
 // must name this exact envelope, not a timing guess.
 func Wrap(id, from, text string) (string, error) {
 	for _, value := range []string{id, from} {

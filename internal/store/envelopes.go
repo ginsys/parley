@@ -12,20 +12,34 @@ var ErrStateConflict = errors.New("envelope is not in the expected state")
 
 const MaxQueueBatch = 100
 
+// QueueCursor contains only the stable sort key; no message body is loaded.
+type QueueCursor struct {
+	ID          string
+	CreatedAtNS int64
+}
+
 // ListQueuedIDs bounds work and avoids reading bodies for other recipients.
-func ListQueuedIDs(ctx context.Context, tx *sql.Tx, conversation, toPeer string, limit int) ([]string, error) {
+func ListQueuedIDs(ctx context.Context, tx *sql.Tx, conversation, toPeer string, limit int, after *QueueCursor) ([]QueueCursor, error) {
 	if limit < 1 || limit > MaxQueueBatch {
 		return nil, fmt.Errorf("queue limit must be between 1 and %d", MaxQueueBatch)
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM envelopes WHERE conversation=? AND state='queued' AND to_peer=? ORDER BY created_at_ns ASC, id ASC LIMIT ?`, conversation, toPeer, limit)
+	query := `SELECT id,created_at_ns FROM envelopes WHERE conversation=? AND state='queued' AND to_peer=?`
+	args := []any{conversation, toPeer}
+	if after != nil {
+		query += ` AND (created_at_ns,id)>(?,?)`
+		args = append(args, after.CreatedAtNS, after.ID)
+	}
+	query += ` ORDER BY created_at_ns ASC, id ASC LIMIT ?`
+	args = append(args, limit)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var ids []string
+	var ids []QueueCursor
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var id QueueCursor
+		if err := rows.Scan(&id.ID, &id.CreatedAtNS); err != nil {
 			return nil, err
 		}
 		ids = append(ids, id)

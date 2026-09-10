@@ -1,5 +1,5 @@
-// Package codex will hold Parley's Codex-side adapter: a Transport that
-// hands text to a Codex thread via `codex queue` (Probe A), and a reply
+// Package codex implements Parley's Codex-side adapter: a Transport that
+// hands text to a Codex thread via `codex queue`, and a reply
 // ingester that reads a thread's turns for BRIDGE-REPLY markers
 // (internal/replymarker).
 package codex
@@ -20,7 +20,7 @@ import (
 // underlying `codex queue` write actually committed can't be determined
 // (e.g. a context deadline during the call) — Transport.Deliver reports this
 // as dispatch.ErrAmbiguous, which Bridge records as 'uncertain' and never
-// retries automatically (design plan §3).
+// retries automatically (see docs/architecture.md).
 var ErrQueueAmbiguous = errors.New("codex queue outcome ambiguous")
 
 // ErrQueueNotAttempted marks a QueueMessage outcome where the codex process
@@ -28,16 +28,14 @@ var ErrQueueAmbiguous = errors.New("codex queue outcome ambiguous")
 // before exec forked it (cmd.Process stays nil in that case) — or the
 // message was rejected before exec was even attempted (ErrMessageTooLarge).
 // Transport.Deliver reports this as dispatch.ErrNoAttempt, which Dispatch
-// refunds and requeues rather than terminally failing (design plan §3/§4):
+// refunds and requeues rather than terminally failing:
 // unlike ErrQueueAmbiguous, there is no possibility the host already saw
 // this message.
 var ErrQueueNotAttempted = errors.New("codex queue never attempted")
 
 // ErrRecipientMismatch marks an envelope whose ToPeer or FromPeer doesn't
-// match the peer identities this Transport is bound to. Nothing upstream of
-// Deliver (Bridge.Send, IngestTurn, Bridge.Dispatch) filters envelopes by
-// peer before calling a Transport, so a single Codex Transport wired into a
-// Bridge alongside other peers' envelopes must reject a misdirected or
+// match the peer identities this Transport is bound to. The bridge authorizes the grant pair; this concrete transport must also
+// reject a misdirected or
 // misattributed one itself — a FromPeer mismatch would otherwise queue a
 // message into this thread stamped with this transport's own fromLabel as
 // if it came from the bound peer, regardless of who it actually came from.
@@ -69,7 +67,7 @@ var ErrMessageContainsNUL = errors.New("message contains a NUL byte, which os/ex
 
 // ErrQueuePermanentlyRejected marks a QueueMessage outcome that is rejected
 // before exec is ever called, for a reason the message's own content
-// guarantees will still hold on every future retry (currently: size).
+// guarantees will still hold on every future retry (size or NUL bytes).
 // Transport.Deliver reports this as dispatch.ErrPermanentlyRejected, which
 // Dispatch refunds but never requeues — unlike ErrQueueNotAttempted's
 // transient causes (a canceled context), retrying an oversized message can
@@ -137,7 +135,7 @@ func runAndClassify(ctx context.Context, cmd *exec.Cmd) error {
 
 // Transport implements dispatch.Transport for one Codex thread, bound to
 // exactly the one peer identity (toPeer) that thread represents. fromLabel is
-// the bridge-assigned sender name stamped on every wrapped message (§2), not
+// the bridge-assigned sender name stamped on every wrapped message , not
 // a free-text field the message content can override.
 type Transport struct {
 	sender    QueueSender

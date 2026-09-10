@@ -167,7 +167,7 @@ func TestCrashAfterHandoffRecoversUncertainWithoutReplay(t *testing.T) {
 	}
 	b := New(db, testTransport{})
 	outcome, err := b.DispatchOutcome(context.Background(), e.ID)
-	if err != nil || outcome.State != store.Uncertain || outcome.Attempted {
+	if err != nil || outcome.State != store.Uncertain || outcome.Attempted || outcome.ErrorCode != "interrupted" {
 		t.Fatalf("replayed uncertain: %+v %v", outcome, err)
 	}
 	tx, err := db.Begin(context.Background())

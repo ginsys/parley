@@ -11,12 +11,12 @@ incomplete work before implementation; an issue's existence is not implementatio
 | Work scope, acceptance criteria, ownership and completion | GitHub issue |
 | Blocking relationships | Native GitHub dependencies |
 | Core invariants and the protected-controller boundary | [AGENTS.md](AGENTS.md) |
-| Full spec, invariants and probe evidence | The linked design plan (private, not part of this repository — see [README.md](README.md)) |
+| Implemented contracts, architecture and limitations | [Architecture](docs/architecture.md) |
 
 Do not maintain parallel status checklists in repository documents or chat. Issue acceptance
 criteria belong in the issue; native dependencies alone define blockers. Permanent decisions must
 not exist only in chat. Accepted design changes that affect this repository's invariants update
-`AGENTS.md` in the same change as their implementation.
+`AGENTS.md` and the architecture document in the same change as their implementation.
 
 ## Triage and labels
 
@@ -60,7 +60,7 @@ not closure evidence.
 1. Prepare a scoped change on a feature branch; preserve unrelated work and keep the default branch
    unchanged.
 2. Run the [documentation checks](#documentation-checks) and any checks required by the issue, then
-   review the actual diff against `AGENTS.md` and the linked design plan. Record exact checks and
+   review the actual diff against `AGENTS.md` and `docs/architecture.md`. Record exact checks and
    limitations.
 3. Open a draft PR stating the problem, scope, linked issues, validation evidence and outstanding
    limitations.

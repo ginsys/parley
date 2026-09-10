@@ -31,8 +31,8 @@ var ErrDirectionNotPermitted = errors.New("grant does not permit this message di
 // common case, not a failure the caller needs to alarm on.
 //
 // expectedTo is the enrolled peer this conversation forwards replies to
-// (the Claude-side identity) — a marker addressed elsewhere is rejected
-// (§1b), never forwarded on the strength of syntax alone.
+// (the Claude-side identity) — a marker addressed elsewhere is rejected,
+// never forwarded on the strength of syntax alone.
 func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expectedTo, turnText string) (*store.Envelope, error) {
 	marker, err := replymarker.Extract(turnText)
 	if err != nil {

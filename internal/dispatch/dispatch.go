@@ -22,7 +22,7 @@ import (
 // actually accepted the message can't be determined (e.g. a timeout after
 // the underlying call may already have committed). Bridge records this as
 // 'uncertain', never retries it automatically, and never releases its
-// budget claim — see the design plan's Delivery section.
+// budget claim — see docs/architecture.md.
 var ErrAmbiguous = errors.New("ambiguous transport outcome")
 
 // ErrNoAttempt marks a Transport.Deliver outcome where the host was
@@ -37,13 +37,13 @@ var ErrNoAttempt = errors.New("transport never attempted delivery")
 
 // ErrBudgetExhausted is returned by Dispatch when the grant's max_exchanges
 // has already been reached. The envelope is left queued, untouched — per
-// the design plan, exhaustion halts delivery pending a human renewal, it
+// the delivery contract, exhaustion halts delivery pending a human renewal, it
 // does not fail or cancel the message.
 var ErrBudgetExhausted = errors.New("grant budget exhausted")
 
 // ErrGrantExpired is returned by Dispatch when the envelope's grant version
 // has passed its ExpiresAt by claim time, even though it hadn't expired when
-// the message was accepted (design plan §1's exact-version dispatch check
+// the message was accepted (the exact-version dispatch check
 // covers a stale *version*, not a grant that ages out while the message sat
 // queued). Unlike budget exhaustion, an expired grant version can never
 // claim again — claim cancels the row rather than leaving it queued forever.
@@ -129,15 +129,6 @@ func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, 
 	return &e, nil
 }
 
-// Dispatch attempts delivery of one queued envelope: claim its budget slot
-// and transition it to 'dispatching' in a single BEGIN IMMEDIATE
-// transaction, then call the transport outside that transaction, then
-// record the outcome. Returns the envelope's state after the attempt.
-//
-// If the envelope is no longer 'queued' (already claimed, cancelled by a
-// concurrent revoke/renew, or already terminal), Dispatch does nothing and
-// returns its current state with no error — this is the serialization the
-// design relies on, not a failure.
 // Outcome exposes delivery state and bounded diagnostics without treating
 // a queued/budget-exhausted candidate as a host attempt.
 type Outcome struct {
@@ -148,6 +139,15 @@ type Outcome struct {
 	ErrorDetail string
 }
 
+// Dispatch attempts delivery of one queued envelope: claim its budget slot
+// and transition it to 'dispatching' in a single BEGIN IMMEDIATE
+// transaction, then call the transport outside that transaction, then
+// record the outcome. Returns the envelope's state after the attempt.
+//
+// If the envelope is no longer 'queued' (already claimed, cancelled by a
+// concurrent revoke/renew, or already terminal), Dispatch does nothing and
+// returns its current state with no error — this is the serialization the
+// design relies on, not a failure.
 func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.EnvelopeState, error) {
 	outcome, err := b.DispatchOutcome(ctx, envelopeID)
 	return outcome.State, err
@@ -162,6 +162,8 @@ func (b *Bridge) dispatch(ctx context.Context, envelopeID string, outcome *Outco
 	claimedEnvelope, claimed, err := b.claim(ctx, envelopeID)
 	if err != nil {
 		if errors.Is(err, ErrBudgetExhausted) {
+			outcome.ErrorCode = "budget_exhausted"
+			outcome.ErrorDetail = "Grant budget is exhausted; delivery awaits human renewal."
 			return store.Queued, err
 		}
 		if errors.Is(err, ErrGrantExpired) || errors.Is(err, ErrNotPermitted) || errors.Is(err, ErrStaleGrantVersion) || errors.Is(err, store.ErrNoActiveGrant) {
@@ -169,16 +171,19 @@ func (b *Bridge) dispatch(ctx context.Context, envelopeID string, outcome *Outco
 			// renewal can still carry it forward) but cancels an ordinary
 			// send outright — ask the row itself what actually happened
 			// rather than assuming which of the two this envelope was.
-			state, stateErr := b.currentState(ctx, envelopeID)
+			current, stateErr := b.currentOutcome(ctx, envelopeID)
 			if stateErr != nil {
 				return "", stateErr
 			}
-			return state, err
+			*outcome = current
+			return current.State, err
 		}
 		return "", err
 	}
 	if !claimed {
-		return b.currentState(ctx, envelopeID)
+		current, err := b.currentOutcome(ctx, envelopeID)
+		*outcome = current
+		return current.State, err
 	}
 
 	deliverErr := b.transport.Deliver(ctx, *claimedEnvelope)
@@ -380,17 +385,17 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 	return e, true, nil
 }
 
-func (b *Bridge) currentState(ctx context.Context, envelopeID string) (store.EnvelopeState, error) {
+func (b *Bridge) currentOutcome(ctx context.Context, envelopeID string) (Outcome, error) {
 	tx, err := b.db.Begin(ctx)
 	if err != nil {
-		return "", err
+		return Outcome{ID: envelopeID}, err
 	}
 	defer tx.Rollback()
 	e, err := store.GetByID(ctx, tx, envelopeID)
 	if err != nil {
-		return "", err
+		return Outcome{ID: envelopeID}, err
 	}
-	return e.State, nil
+	return Outcome{ID: e.ID, State: e.State, ErrorCode: e.ErrorCode, ErrorDetail: e.ErrorDetail}, nil
 }
 
 func authorizeEnvelope(g *store.Grant, e *store.Envelope, now time.Time) error {
