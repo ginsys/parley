@@ -5,10 +5,12 @@ prompt state/session generation; the recorder cannot infer either from terminal 
 """
 
 import errno
+import json
 import os
 import pty
 import selectors
 import signal
+import tempfile
 import time
 from dataclasses import dataclass, field
 
@@ -81,6 +83,9 @@ class PtyProcess:
         self.fd = None
         self.pid = None
         self.eof = False
+        self.wait_status = None
+        self.exit_code = None
+        self.cleanup_requested = False
         self.selector = selectors.DefaultSelector()
         try:
             pid, fd = pty.fork()
@@ -137,23 +142,26 @@ class PtyProcess:
         return written
 
     def close(self):
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
-        self.selector.close()
         if self.pid is not None:
-            # pty.fork makes the child a session/process-group leader. Terminate its
-            # whole disposable group, including children which inherited the PTY.
+            # Inspect without reaping: keep the PID reserved while killing any
+            # descendants in the disposable group. Preserve a natural exit status.
+            ended = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            self.cleanup_requested = ended is None
             try:
                 os.killpg(self.pid, signal.SIGKILL)
             except ProcessLookupError:
-                # Child may not have completed forkpty session setup yet.
+                # forkpty session setup may not have finished in the child yet.
                 try:
                     os.kill(self.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            os.waitpid(self.pid, 0)
+            _, self.wait_status = os.waitpid(self.pid, 0)
+            self.exit_code = os.waitstatus_to_exitcode(self.wait_status)
             self.pid = None
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+        self.selector.close()
 
     def __enter__(self):
         return self
@@ -162,12 +170,33 @@ class PtyProcess:
         self.close()
 
 
+def publish_record(destination, record):
+    """Publish complete JSON atomically without replacing another capture.
+
+    A hard link is the no-replace atomic publication operation available in the
+    standard library on Linux; exists()+rename would race and overwrite evidence.
+    The temporary file lives beside its destination, on the same filesystem.
+    """
+    directory = os.path.dirname(os.path.abspath(destination))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=directory,
+                                         prefix='.parley-capture-', suffix='.tmp', delete=False) as stream:
+            temporary = stream.name
+            json.dump(record, stream, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, destination)
+    finally:
+        if temporary is not None:
+            os.unlink(temporary)
+
+
 def main():
     """Passively record a disposable command; injection requires an explicit observer."""
     import argparse
     import datetime
-    import json
-    import tempfile
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=float, default=10)
@@ -177,26 +206,49 @@ def main():
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command or not 0 < args.seconds <= 1020:
         parser.error('command and duration in (0, 1020] required')
-    # Opening with x prevents overwriting an earlier observation. HOME/cwd have no
-    # host authentication. No credential copying or implicit live session enrollment.
-    with open(args.output, 'x', encoding='utf-8') as output, tempfile.TemporaryDirectory(prefix='parley-probe-') as home:
-        record = {'utc': datetime.datetime.now(datetime.UTC).isoformat(),
-                  'command': command, 'duration': args.seconds,
-                  'kind': 'passive_capture', 'delivery_claim': None}
-        with PtyProcess(command, cwd=home, env={'HOME': home, 'PATH': os.environ.get('PATH', os.defpath),
-                                              'TERM': 'dumb'}, generation='disposable') as child:
-            record['started'] = time.monotonic()
+    if os.path.lexists(args.output):
+        raise FileExistsError(args.output)
+    record = {'utc': datetime.datetime.now(datetime.UTC).isoformat(),
+              'command': command, 'duration': args.seconds, 'started': time.monotonic(),
+              'kind': 'passive_capture', 'delivery_claim': None, 'events': [],
+              'eof': False, 'error': None, 'wait_status': None, 'exit_code': None,
+              'cleanup_requested': False, 'capture_status': 'failed', 'stop_reason': 'startup'}
+    result = 0
+    child = None
+    # No final file exists until a complete (possibly interrupted/failed) record
+    # is ready. HOME/cwd never inherit host authentication.
+    with tempfile.TemporaryDirectory(prefix='parley-probe-') as home:
+        try:
+            child = PtyProcess(command, cwd=home,
+                               env={'HOME': home, 'PATH': os.environ.get('PATH', os.defpath), 'TERM': 'dumb'},
+                               generation='disposable')
             deadline = record['started'] + args.seconds
-            error = None
-            try:
-                while not child.eof and time.monotonic() < deadline:
-                    child.read(min(.1, max(0, deadline - time.monotonic())))
-            except (OSError, ValueError) as exc:
-                error = str(exc)
-            record.update(events=child.events, eof=child.eof, error=error, ended=time.monotonic())
-            json.dump(record, output, indent=2)
-            output.write('\n')
-        return 1 if error else 0
+            record['stop_reason'] = 'capture'
+            while not child.eof and time.monotonic() < deadline:
+                child.read(min(.1, max(0, deadline - time.monotonic())))
+            record['stop_reason'] = 'eof' if child.eof else 'deadline'
+        except BaseException as exc:
+            record['error'] = type(exc).__name__
+            result = 130 if isinstance(exc, KeyboardInterrupt) else 1
+            record['capture_status'] = 'interrupted' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'failed'
+        finally:
+            if child is not None:
+                child.close()
+                record.update(events=child.events, eof=child.eof, wait_status=child.wait_status,
+                              exit_code=child.exit_code, cleanup_requested=child.cleanup_requested)
+            record['ended'] = time.monotonic()
+        if record['error'] is None:
+            if child.exit_code > 0 or (child.exit_code < 0 and
+                                       (not child.cleanup_requested or child.exit_code != -signal.SIGKILL)):
+                # 127 includes failed exec; a program can also deliberately return
+                # 127, so it is not proof of which startup stage failed. Neither is
+                # valid negative wake evidence. Record the exact status, fail closed.
+                record.update(capture_status='failed', error='child_exit_nonzero')
+                result = 1
+            else:
+                record['capture_status'] = 'stopped' if child.cleanup_requested else 'complete'
+        publish_record(args.output, record)
+    return result
 
 
 if __name__ == '__main__':
