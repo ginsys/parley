@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -66,14 +67,28 @@ type Handshake struct {
 	dispatchCancel context.CancelFunc
 }
 
+// ErrInvalidTimeout is returned by NewHandshake when timeout is not
+// positive. time.AfterFunc treats a zero or negative duration as "fire
+// immediately", and every onTimeout firing re-arms another AfterFunc(timeout,
+// ...) with the same non-positive duration before attempting its (skipped,
+// since a send is already in flight, or immediately-failing) probe send —
+// producing an unbounded hot retry loop rather than a bounded one, with no
+// caller-visible symptom beyond runaway CPU and probe-send volume.
+var ErrInvalidTimeout = errors.New("handshake timeout must be positive")
+
 // NewHandshake builds a Handshake that calls sendProbe with a fresh nonce
 // each time it (re)starts, and retries the probe — never an application
 // message — if no matching Ack arrives within timeout. A timeout retry
 // resends the same nonce rather than minting a new one, so a genuine but
 // slow acknowledgement for the original probe still lands; only Start/Reset
-// (a real new connection) ever rotates the nonce.
-func NewHandshake(sendProbe func(ctx context.Context, nonce string) error, timeout time.Duration) *Handshake {
-	return &Handshake{sendProbe: sendProbe, timeout: timeout}
+// (a real new connection) ever rotates the nonce. timeout must be positive;
+// a zero or negative value is rejected here rather than left to arm a
+// same-instant, ever-repeating timer.
+func NewHandshake(sendProbe func(ctx context.Context, nonce string) error, timeout time.Duration) (*Handshake, error) {
+	if timeout <= 0 {
+		return nil, fmt.Errorf("%w: got %s", ErrInvalidTimeout, timeout)
+	}
+	return &Handshake{sendProbe: sendProbe, timeout: timeout}, nil
 }
 
 // Start begins the handshake: generates a nonce, sends the probe, and arms

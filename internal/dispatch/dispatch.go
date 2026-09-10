@@ -244,14 +244,26 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 // version (store.CancelQueuedUnderVersion), so it is not requeued. A reply
 // is different — its source turn is already permanently 'acked' with no
 // live sender left to resubmit it — so it is worth rescuing onto whatever
-// grant is current now, provided that grant still permits its direction.
-// "Is a reply" is judged by e.TrustedReply, not merely e.InReplyTo != nil:
-// TrustedReply is set only by codex.IngestTurn, which validates in_reply_to
-// against the specific original envelope it atomically acks before queuing
-// this one. dispatch.Bridge.Send accepts an arbitrary caller-supplied
-// inReplyTo with no validation, so an ordinary send naming any envelope's
-// id — even a genuinely acked one — must not qualify for this rescue path
-// either; it has to be cancelled like any other old-grant message.
+// grant is current now. "Is a reply" is judged by e.TrustedReply, not merely
+// e.InReplyTo != nil: TrustedReply is set only by codex.IngestTurn, which
+// validates in_reply_to against the specific original envelope it atomically
+// acks before queuing this one. dispatch.Bridge.Send accepts an arbitrary
+// caller-supplied inReplyTo with no validation, so an ordinary send naming
+// any envelope's id — even a genuinely acked one — must not qualify for this
+// rescue path either; it has to be cancelled like any other old-grant
+// message.
+//
+// A trusted reply is re-stamped onto the successor version even if that
+// grant is already expired, mirroring CarryForwardQueuedReplies's own
+// expiry-agnostic carry-forward for rows still 'queued' under the old
+// version: rejecting it here on expiry would discard a genuine reply outright
+// when the row could instead sit 'queued' under the new version and let
+// claim()'s own expiry check (which leaves a trusted reply's row untouched
+// rather than cancelling it) keep it recoverable for whatever grant comes
+// next, exactly as it already would have been had it never left 'queued' in
+// the first place. Direction permission (peer_a/peer_b, revoked-ness) is
+// still checked — an expired-but-otherwise-permitted grant is a valid
+// requeue target, a grant that never permitted this direction at all is not.
 func resolveRequeueVersion(ctx context.Context, tx *store.Tx, e *store.Envelope) (int64, bool, error) {
 	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
 	if err != nil {
@@ -266,7 +278,7 @@ func resolveRequeueVersion(ctx context.Context, tx *store.Tx, e *store.Envelope)
 	if !e.TrustedReply {
 		return 0, false, nil
 	}
-	if !g.Permits(e.FromPeer, e.ToPeer, time.Now().UTC()) {
+	if !g.PermitsDirection(e.FromPeer, e.ToPeer) {
 		return 0, false, nil
 	}
 	return g.GrantVersion, true, nil

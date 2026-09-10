@@ -15,7 +15,10 @@ import (
 // in-flight callback directly rather than relying on a real race window.
 func TestStopPreventsRearmFromInFlightTimeout(t *testing.T) {
 	calls := 0
-	hs := NewHandshake(func(context.Context, string) error { calls++; return nil }, time.Hour)
+	hs, err := NewHandshake(func(context.Context, string) error { calls++; return nil }, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -33,6 +36,20 @@ func TestStopPreventsRearmFromInFlightTimeout(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3's fourth review round: time.AfterFunc
+// treats a zero or negative duration as "fire immediately", and every
+// onTimeout firing re-arms another AfterFunc with that same non-positive
+// duration before attempting its probe send — an unbounded hot retry loop
+// with no caller-visible symptom beyond runaway CPU and probe-send volume.
+// NewHandshake must reject this at construction, before any timer is armed.
+func TestNewHandshakeRejectsNonpositiveTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		if _, err := NewHandshake(func(context.Context, string) error { return nil }, timeout); !errors.Is(err, ErrInvalidTimeout) {
+			t.Fatalf("timeout %s: want ErrInvalidTimeout, got %v", timeout, err)
+		}
+	}
+}
+
 // Regression for a finding on PR #3: a nonce-generation failure must not
 // leave a prior connection's nonce in place and ackable. Simulated via
 // generateNonce, since crypto/rand failing is not something a test can
@@ -42,7 +59,10 @@ func TestNonceGenerationFailureClearsStaleNonce(t *testing.T) {
 	t.Cleanup(func() { generateNonce = orig })
 
 	probe := &recordingProbe{}
-	hs := NewHandshake(probe.send, time.Hour)
+	hs, err := NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -70,7 +90,10 @@ func TestNonceGenerationFailureClearsStaleNonce(t *testing.T) {
 // connection was healthy.
 func TestTimeoutRetryPreservesNonce(t *testing.T) {
 	probe := &recordingProbe{}
-	hs := NewHandshake(probe.send, time.Hour)
+	hs, err := NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -92,7 +115,10 @@ func TestTimeoutRetryPreservesNonce(t *testing.T) {
 // starting the new connection. The generation check must still catch it.
 func TestStaleTimeoutCallbackIgnoredAfterStopAndReset(t *testing.T) {
 	probe := &recordingProbe{}
-	hs := NewHandshake(probe.send, time.Hour)
+	hs, err := NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -125,7 +151,7 @@ func TestOverlappingTimeoutRetrySkippedWhileSendInFlight(t *testing.T) {
 	release := make(chan struct{})
 	var calls int32
 
-	hs := NewHandshake(func(context.Context, string) error {
+	hs, err := NewHandshake(func(context.Context, string) error {
 		atomic.AddInt32(&calls, 1)
 		select {
 		case started <- struct{}{}:
@@ -134,6 +160,9 @@ func TestOverlappingTimeoutRetrySkippedWhileSendInFlight(t *testing.T) {
 		<-release
 		return nil
 	}, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- hs.Start() }()
@@ -178,7 +207,10 @@ func TestStaleGenerationSendCompletionDoesNotCorruptNewGenerationInFlight(t *tes
 		return nil
 	}
 
-	hs := NewHandshake(probe, time.Hour)
+	hs, err := NewHandshake(probe, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 
 	done1 := make(chan error, 1)
 	go func() { done1 <- hs.Start() }()
@@ -226,7 +258,10 @@ func TestFailedResetCancelsPriorGenerationDispatchContext(t *testing.T) {
 	t.Cleanup(func() { generateNonce = orig })
 
 	probe := &recordingProbe{}
-	hs := NewHandshake(probe.send, time.Hour)
+	hs, err := NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}

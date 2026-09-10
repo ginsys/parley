@@ -233,7 +233,7 @@ type rawHTMLBlockOpener struct {
 const blockLevelTags = `address|article|aside|base|basefont|blockquote|body|caption|center|col|` +
 	`colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|` +
 	`frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|` +
-	`ol|optgroup|option|p|param|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul`
+	`ol|optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul`
 
 var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
 	// Type 1: script/pre/style/textarea, ends at its specific closing tag.
@@ -272,6 +272,19 @@ const (
 	htmlAttr      = `\s+` + htmlAttrName + `(?:\s*=\s*(?:` + htmlAttrValue + `))?`
 	htmlOpenTag   = `<[A-Za-z][A-Za-z0-9-]*(?:` + htmlAttr + `)*\s*/?>`
 	htmlCloseTag  = `</[A-Za-z][A-Za-z0-9-]*\s*>`
+)
+
+// atxHeading, thematicBreak and indentedCodeBlock recognize CommonMark block
+// types that are not paragraphs, so scanForMarker's paragraphOpen tracking
+// (which gates type 7's interruption rule) doesn't mistake one of these for
+// open paragraph text. atxHeading and thematicBreak can themselves interrupt
+// a paragraph without a blank line first; indentedCodeBlock deliberately
+// cannot (see its use below) — a line this pattern matches straight after an
+// open paragraph is CommonMark's lazy-continuation text, not a new block.
+var (
+	atxHeading        = regexp.MustCompile(`^ {0,3}#{1,6}(?:[ \t]|$)`)
+	thematicBreak     = regexp.MustCompile(`^ {0,3}(?:-[ \t]*){3,}$|^ {0,3}(?:_[ \t]*){3,}$|^ {0,3}(?:\*[ \t]*){3,}$`)
+	indentedCodeBlock = regexp.MustCompile(`^(?: {4}|\t)`)
 )
 
 // matchRawHTMLBlockOpener reports whether line opens one of the raw HTML
@@ -405,9 +418,23 @@ func scanForMarker(text string) markerScan {
 				openRun = run
 				isOurs = false
 				paragraphOpen = false
+			} else if atxHeading.MatchString(trimmed) || thematicBreak.MatchString(trimmed) {
+				// A heading or thematic break is its own block, not a
+				// paragraph, and (per CommonMark) can interrupt an open one
+				// without a blank line first — so a following line is never
+				// gated by a paragraph this line might have followed.
+				paragraphOpen = false
+			} else if indentedCodeBlock.MatchString(trimmed) && !paragraphOpen {
+				// An indented-looking line only starts a code block when it
+				// isn't continuing an already-open paragraph — CommonMark:
+				// indented code cannot interrupt a paragraph, so straight
+				// after paragraph text this is lazy continuation of that
+				// paragraph, not a new block, and paragraphOpen must stay
+				// true (the final else branch below handles that case).
+				paragraphOpen = false
 			} else {
-				// Ordinary text: neither a blank line nor any recognized
-				// block-start condition — continues or opens a paragraph.
+				// Ordinary text, or an indented line continuing an already-
+				// open paragraph: continues or opens a paragraph.
 				paragraphOpen = true
 			}
 			continue

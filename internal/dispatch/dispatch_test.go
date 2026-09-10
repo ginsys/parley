@@ -634,6 +634,71 @@ func TestDispatchRescuesUnattemptedReplyOntoRenewedGrantVersion(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3's fourth review round: rescuing a
+// trusted reply onto a renewed grant must not itself check the successor
+// grant's expiry — an expired-but-otherwise-permitted successor is still a
+// valid requeue target, with claim()'s own expiry check (which leaves a
+// trusted reply's row untouched rather than cancelling it) governing whether
+// it can actually dispatch. Rejecting it here instead would discard the
+// reply outright the moment the renewal itself was already-expired at
+// commit time, rather than leaving it queued and rescuable by a further
+// renewal exactly as TestGrantExpiryPreservesQueuedReplyForRenewal already
+// guarantees for a row that never left 'queued' at all.
+func TestDispatchRescuesUnattemptedReplyOntoAlreadyExpiredSuccessorGrant(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-reply-rescue-expired", 5)
+	ackEnvelope(t, db, "conv-reply-rescue-expired", "original-envelope-id", 1)
+	ctx := context.Background()
+
+	renewed := false
+	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
+		if !renewed {
+			renewed = true
+			past := time.Now().UTC().Add(-time.Hour)
+			if _, err := ctrl.Renew(context.Background(), controller.RenewParams{
+				Conversation: "conv-reply-rescue-expired", MaxExchanges: 5, ExpiresAt: &past,
+			}); err != nil {
+				t.Fatalf("renew during deliver: %v", err)
+			}
+			return dispatch.ErrNoAttempt
+		}
+		return nil
+	})
+	bridge := dispatch.New(db, transport)
+
+	reply := sendTrustedReply(t, db, "conv-reply-rescue-expired", "codex-thread-b", "claude-session-a", "reply text", "original-envelope-id", 1)
+
+	state, err := bridge.Dispatch(ctx, reply.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Queued {
+		t.Fatalf("want the reply rescued back to queued under the already-expired successor grant, got %s", state)
+	}
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	got, err := store.GetByID(ctx, tx, reply.ID)
+	tx.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.GrantVersion != 2 {
+		t.Fatalf("want the reply re-stamped onto the successor grant version 2 despite its expiry, got %d", got.GrantVersion)
+	}
+
+	state2, err := bridge.Dispatch(ctx, reply.ID)
+	if !errors.Is(err, dispatch.ErrGrantExpired) {
+		t.Fatalf("want ErrGrantExpired dispatching against the expired successor, got %v", err)
+	}
+	if state2 != store.Queued {
+		t.Fatalf("want the reply left queued (rescuable by a further renewal), got %s", state2)
+	}
+}
+
 // Companion to the rescue test above: when the grant is torn down mid-flight
 // by a revoke rather than a renewal, there is no successor grant to rescue
 // the reply onto — it must be cancelled, the same terminal outcome a
