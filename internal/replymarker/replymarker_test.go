@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ginsys/parley/internal/controller"
@@ -243,27 +244,16 @@ func TestExtractIgnoresMarkerInsideHTMLComment(t *testing.T) {
 	}
 }
 
-// Regression for a finding on the merge-triggered review: a line containing
-// a "-->" before a later, unmatched "<!--" contains both substrings, so
-// checking presence alone (the previous implementation) leaves the comment
-// state closed even though the trailing opener starts a comment spanning
-// subsequent lines. The marker below sits entirely inside that trailing,
-// order-dependent span.
-func TestExtractIgnoresMarkerAfterTrailingUnmatchedCommentOpener(t *testing.T) {
-	turn := "closed already --> then reopened <!--\n```BRIDGE-REPLY\n" +
-		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n-->"
-	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
-		t.Fatalf("want ErrNoMarker for a marker after a trailing unmatched comment opener, got %v", err)
-	}
-}
-
-// Same order-sensitivity bug, with two openers and one close on the
-// triggering line: the second, unmatched opener must still start a comment.
-func TestExtractIgnoresMarkerAfterSecondUnmatchedCommentOpener(t *testing.T) {
-	turn := "<!-- first --> <!-- second\n```BRIDGE-REPLY\n" +
-		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```\n-->"
-	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
-		t.Fatalf("want ErrNoMarker for a marker after a second unmatched comment opener, got %v", err)
+// An inline comment opener does not turn a paragraph into an HTML block.
+// A type-2 HTML block ends on its first line containing -->; a second
+// opener on that consumed line does not extend it onto the next line.
+func TestExtractFindsMarkerAfterInlineOrClosedBlockComment(t *testing.T) {
+	for _, prefix := range []string{"closed already --> then reopened <!--", "<!-- first --> <!-- second", "Paragraph <!--", "` unmatched ``<!--``"} {
+		turn := prefix + "\n```BRIDGE-REPLY\n" + `{"in_reply_to":"env-1","to":"claude-session-a","text":"hi"}` + "\n```\n-->"
+		marker, err := replymarker.Extract(turn)
+		if err != nil || marker.Text != "hi" {
+			t.Fatalf("prefix=%q marker=%+v error=%v", prefix, marker, err)
+		}
 	}
 }
 
@@ -901,5 +891,61 @@ func TestExtractIgnoresMarkerInsideCustomTagAfterSetextHeading(t *testing.T) {
 		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
 	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
 		t.Fatalf("want ErrNoMarker for a marker inside a type-7 block opened right after a Setext heading underline (not a paragraph), got %v", err)
+	}
+}
+
+func TestExtractIgnoresMarkerInHTMLAfterShortSetextHeading(t *testing.T) {
+	for _, underline := range []string{"-", "--"} {
+		turn := "Heading\n" + underline + "\n<custom>\n```BRIDGE-REPLY\n{\"in_reply_to\":\"env-1\",\"to\":\"claude-session-a\",\"text\":\"hidden\"}\n```\n</custom>"
+		if marker, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+			t.Fatalf("underline=%q marker=%+v error=%v", underline, marker, err)
+		}
+	}
+}
+
+func TestExtractRequiresTopLevelColumnZeroFence(t *testing.T) {
+	marker := "```BRIDGE-REPLY\n" + `{"in_reply_to":"env-1","to":"claude-session-a","text":"hi"}` + "\n```"
+	for _, prefix := range []string{"> ", "  ", "    "} {
+		wrapped := prefix + strings.ReplaceAll(marker, "\n", "\n"+prefix)
+		if _, err := replymarker.Extract(wrapped); !errors.Is(err, replymarker.ErrNoMarker) {
+			t.Fatalf("prefix=%q error=%v", prefix, err)
+		}
+	}
+	nested := "- item\n\n  " + strings.ReplaceAll(marker, "\n", "\n  ")
+	if _, err := replymarker.Extract(nested); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("list marker: %v", err)
+	}
+}
+
+func FuzzExtractQuotedContentNeverBecomesReply(f *testing.F) {
+	f.Add("```BRIDGE-REPLY\n{}\n```")
+	f.Add("Heading\n-\n<custom>\n```BRIDGE-REPLY\n{}\n```")
+	f.Fuzz(func(t *testing.T, input string) {
+		if len(input) > 65536 {
+			t.Skip()
+		}
+		input = strings.ReplaceAll(input, "\r", "\n")
+		quoted := "> " + strings.ReplaceAll(input, "\n", "\n> ")
+		if marker, err := replymarker.Extract(quoted); !errors.Is(err, replymarker.ErrNoMarker) {
+			t.Fatalf("quoted content extracted: %+v %v", marker, err)
+		}
+	})
+}
+
+func TestMalformedReservedHeadingCannotHideBeforeValidMarker(t *testing.T) {
+	turn := "```BRIDGE-REPLY`\n---\n\n```BRIDGE-REPLY\n" + `{"in_reply_to":"env-1","to":"claude-session-a","text":"hi"}` + "\n```"
+	if marker, err := replymarker.Extract(turn); err == nil {
+		t.Fatalf("malformed reserved heading ignored: %+v", marker)
+	}
+}
+
+func TestIndentedMalformedReservedPrefixRemainsIneligible(t *testing.T) {
+	prefix := "  ```BRIDGE-REPLY`\n\n"
+	if _, err := replymarker.Extract(prefix); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("indented prefix: %v", err)
+	}
+	turn := prefix + "```BRIDGE-REPLY\n" + `{"in_reply_to":"env-1","to":"claude-session-a","text":"hi"}` + "\n```"
+	if marker, err := replymarker.Extract(turn); err != nil || marker.Text != "hi" {
+		t.Fatalf("marker=%+v error=%v", marker, err)
 	}
 }

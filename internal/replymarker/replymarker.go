@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/ginsys/parley/internal/store"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/ast"
+	gmtext "github.com/yuin/goldmark/text"
 )
 
 var (
@@ -64,408 +66,77 @@ type Marker struct {
 	Text      string `json:"text"`
 }
 
-// bridgeReplyOpener matches our own marker's exact opening fence line,
-// anchored to its own line (^...$ under multiline mode) so a longer backtick
-// run (e.g. "````BRIDGE-REPLY") never satisfies it.
-//
-// bridgeReplyPrefix matches any line beginning with the reserved
-// "```BRIDGE-REPLY" literal, regardless of what follows — checked before
-// genericFenceLine so a malformed variant (e.g. a non-breaking space instead
-// of an ASCII space/tab after BRIDGE-REPLY) is recognized as an attempted
-// marker opener, not silently swallowed as unrelated quoted fence content.
-//
-// genericFenceLine matches any Markdown code-fence delimiter line: up to
-// three leading spaces, a run of three or more backticks or tildes, then the
-// rest of the line (an info string, for an opening line).
-var (
-	bridgeReplyOpener = regexp.MustCompile(`(?m)^` + "```" + `BRIDGE-REPLY[ \t]*$`)
-	bridgeReplyPrefix = regexp.MustCompile(`(?m)^` + "```" + `BRIDGE-REPLY`)
-	backtickFenceLine = regexp.MustCompile("^ {0,3}(`{3,})([^`]*)$")
-	tildeFenceLine    = regexp.MustCompile("^ {0,3}(~{3,})(.*)$")
-)
+// Markdown determines block membership. The wire contract is deliberately
+// narrower: direct document-child fences, exactly three backticks at column
+// zero, the exact reserved info string, and an explicit closing fence.
+var bridgeReplyOpener = regexp.MustCompile("^```BRIDGE-REPLY[ \t]*$")
+var bridgeReplyCloser = regexp.MustCompile("^ {0,3}`{3,}[ \t]*$")
 
-// matchGenericFence reports whether line opens or closes some Markdown
-// fence (ours or unrelated), returning the fence run and the rest of the
-// line. Two separate patterns, not one alternation, because CommonMark's
-// info-string rule differs by fence character: a backtick fence's info
-// string must not itself contain a backtick (ambiguous with an inline code
-// span), while a tilde fence's info string has no such restriction.
-func matchGenericFence(line string) (run, rest string, ok bool) {
-	if m := backtickFenceLine.FindStringSubmatch(line); m != nil {
-		return m[1], m[2], true
-	}
-	if m := tildeFenceLine.FindStringSubmatch(line); m != nil {
-		return m[1], m[2], true
-	}
-	return "", "", false
-}
+const reservedPrefix = "```BRIDGE-REPLY"
 
-// closesFence reports whether line closes a fence opened with run: the same
-// character, at least as long, and — per Markdown's own closing-fence rule —
-// no trailing info string. The trailing check trims only ASCII space and tab,
-// matching bridgeReplyOpener's own "[ \t]*" — strings.TrimSpace additionally
-// strips other Unicode whitespace (e.g. U+00A0 NBSP, '\v'), which would let a
-// malformed closer like "``` " be accepted as a clean close instead of
-// rejected as ErrMalformedMarker.
-func closesFence(line, run string) bool {
-	fenceRun, rest, ok := matchGenericFence(line)
-	if !ok {
-		return false
-	}
-	return fenceRun[0] == run[0] && len(fenceRun) >= len(run) && strings.Trim(rest, " \t") == ""
-}
-
-// markerScan is the result of scanning a turn's text for BRIDGE-REPLY
-// fences.
 type markerScan struct {
 	openerCount int
 	content     string
 	closed      bool
 }
 
-// htmlCommentOpen/htmlCommentClose detect a CommonMark raw-HTML comment span
-// at top level. Per CommonMark, everything from an unclosed "<!--" through
-// the line containing its matching "-->" is raw HTML, never parsed as
-// Markdown — a fenced code block (including our own marker syntax) written
-// inside such a comment, e.g. as hidden documentation or prompt metadata,
-// never actually opens a live fence and must not be scanned as one.
-var (
-	htmlCommentOpen  = regexp.MustCompile(`<!--`)
-	htmlCommentClose = regexp.MustCompile(`-->`)
-)
-
-// commentStateAfterLine returns whether an HTML comment span remains open
-// after processing line, given whether one was already open entering it. A
-// line can contain several openers/closers, and only their relative order —
-// not merely whether each substring is present anywhere in the line —
-// determines the state at the end of it. A line like "--> <!--" or
-// "<!-- first --> <!-- second" contains both "<!--" and "-->", but the
-// trailing unmatched opener still leaves a comment open spanning subsequent
-// lines; checking presence alone (the previous implementation) gets exactly
-// this case backwards.
-func commentStateAfterLine(inComment bool, line string) bool {
-	type delim struct {
-		pos  int
-		open bool
-	}
-	var delims []delim
-	for _, m := range htmlCommentOpen.FindAllStringIndex(line, -1) {
-		delims = append(delims, delim{m[0], true})
-	}
-	for _, m := range htmlCommentClose.FindAllStringIndex(line, -1) {
-		delims = append(delims, delim{m[0], false})
-	}
-	sort.Slice(delims, func(i, j int) bool { return delims[i].pos < delims[j].pos })
-	for _, d := range delims {
-		inComment = d.open
-	}
-	return inComment
-}
-
-// codeSpanBackticks matches a run of one or more backticks, the delimiter
-// CommonMark uses for an inline code span.
-var codeSpanBackticks = regexp.MustCompile("`+")
-
-// stripCodeSpans removes the contents of inline code spans from line before
-// comment-delimiter detection runs, so a literal "<!--" written as
-// inline code (e.g. “ `<!--` “) is never mistaken for a real HTML comment
-// opener — CommonMark specifies inline code span content as literal text,
-// never parsed as raw HTML. Spans are matched by equal-length backtick runs,
-// per CommonMark's own code-span rule; an unmatched trailing backtick run is
-// left as-is; it isn't a code span.
-//
-// A removed span is replaced with a single space, not deleted outright: the
-// text immediately before and after the span are otherwise unrelated
-// fragments that were never adjacent in the source (e.g. literal "<!" then a
-// code span then literal "--"), and closing the gap between them can
-// synthesize a comment delimiter ("<!--") that was never actually present.
-// A space can't itself participate in either delimiter, so it can't create
-// a false one, and it can't destroy a real one either — a genuine "<!--"
-// never has a code span spliced into the middle of it.
-func stripCodeSpans(line string) string {
-	matches := codeSpanBackticks.FindAllStringIndex(line, -1)
-	if len(matches) < 2 {
-		return line
-	}
-	var b strings.Builder
-	last := 0
-	for i := 0; i < len(matches); i++ {
-		open := matches[i]
-		runLen := open[1] - open[0]
-		closeIdx := -1
-		for j := i + 1; j < len(matches); j++ {
-			if matches[j][1]-matches[j][0] == runLen {
-				closeIdx = j
-				break
-			}
-		}
-		if closeIdx == -1 {
-			break
-		}
-		b.WriteString(line[last:open[0]])
-		b.WriteString(" ")
-		last = matches[closeIdx][1]
-		i = closeIdx
-	}
-	b.WriteString(line[last:])
-	return b.String()
-}
-
-// rawHTMLBlockOpener pairs a CommonMark HTML block start condition with how
-// it ends: close matches a specific end token appearing later in the text
-// (types 1/3/4/5); a nil close means the block instead ends at the next
-// blank line (types 6/7). Per CommonMark, everything between is raw HTML,
-// never parsed as Markdown — the same reasoning as the comment span above
-// (type 2), generalized to every other raw-HTML-block start condition
-// CommonMark defines.
-// interruptsParagraph is CommonMark's own distinction: types 1-6 can start a
-// raw HTML block even immediately after an open paragraph (no blank line
-// needed first); type 7 (a generic complete tag alone on a line) cannot —
-// while a paragraph is open, a line that only matches type 7's grammar stays
-// ordinary paragraph text instead.
-type rawHTMLBlockOpener struct {
-	open                *regexp.Regexp
-	close               *regexp.Regexp
-	interruptsParagraph bool
-}
-
-// blockLevelTags is CommonMark's fixed list of tag names that start an HTML
-// block type 6 (ends at the next blank line, not a specific closing tag).
-const blockLevelTags = `address|article|aside|base|basefont|blockquote|body|caption|center|col|` +
-	`colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|` +
-	`frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|` +
-	`ol|optgroup|option|p|param|search|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul`
-
-var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
-	// Type 1: script/pre/style/textarea, ends at its specific closing tag.
-	// CommonMark's end condition is the exact literal string (case-
-	// insensitive) with no internal whitespace — "</script >" does not
-	// close it, unlike type 7's general tag grammar elsewhere in this file.
-	{regexp.MustCompile(`(?i)^ {0,3}<script(?:[\s>]|$)`), regexp.MustCompile(`(?i)</script>`), true},
-	{regexp.MustCompile(`(?i)^ {0,3}<pre(?:[\s>]|$)`), regexp.MustCompile(`(?i)</pre>`), true},
-	{regexp.MustCompile(`(?i)^ {0,3}<style(?:[\s>]|$)`), regexp.MustCompile(`(?i)</style>`), true},
-	{regexp.MustCompile(`(?i)^ {0,3}<textarea(?:[\s>]|$)`), regexp.MustCompile(`(?i)</textarea>`), true},
-	// Type 3: processing instruction, ends at "?>".
-	{regexp.MustCompile(`^ {0,3}<\?`), regexp.MustCompile(`\?>`), true},
-	// Type 4: declaration, ends at ">". CommonMark's start condition
-	// requires an uppercase ASCII letter specifically (e.g. <!DOCTYPE) —
-	// unlike types 1/6's tag-name checks, this one must not be
-	// case-insensitive: a lowercase "<!foo" does not open a type-4 block.
-	{regexp.MustCompile(`^ {0,3}<![A-Z]`), regexp.MustCompile(`>`), true},
-	// Type 5: CDATA section, ends at "]]>".
-	{regexp.MustCompile(`^ {0,3}<!\[CDATA\[`), regexp.MustCompile(`]]>`), true},
-	// Type 6: a fixed list of block-level tag names, ends at a blank line.
-	{regexp.MustCompile(`(?i)^ {0,3}</?(?:` + blockLevelTags + `)(?:[\s>]|/>|$)`), nil, true},
-	// Type 7: any other complete open/close tag alone on its own line, ends
-	// at a blank line. Checked last so types 1-6's more specific tag names
-	// take their own termination rule instead of falling through to this
-	// blank-line-terminated catch-all. Per CommonMark, type 7 alone cannot
-	// interrupt an open paragraph — interruptsParagraph is false only here.
-	{regexp.MustCompile(`^ {0,3}(?:` + htmlOpenTag + `|` + htmlCloseTag + `)\s*$`), nil, false},
-}
-
-// htmlAttrValue/htmlAttr/htmlOpenTag/htmlCloseTag approximate CommonMark's
-// HTML tag grammar for type 7's "complete tag alone on a line" check. A
-// quoted attribute value may itself contain '>' or '<' (e.g.
-// `<custom title="a > b">`), so an attribute-aware match is required here —
-// unlike type 6, whose opener regex only inspects the tag name itself and
-// never scans into the attribute list.
-const (
-	htmlAttrName  = `[A-Za-z_:][A-Za-z0-9_.:-]*`
-	htmlAttrValue = `"[^"]*"|'[^']*'|[^\s"'=<>` + "`" + `]+`
-	htmlAttr      = `\s+` + htmlAttrName + `(?:\s*=\s*(?:` + htmlAttrValue + `))?`
-	htmlOpenTag   = `<[A-Za-z][A-Za-z0-9-]*(?:` + htmlAttr + `)*\s*/?>`
-	htmlCloseTag  = `</[A-Za-z][A-Za-z0-9-]*\s*>`
-)
-
-// atxHeading, thematicBreak and indentedCodeBlock recognize CommonMark block
-// types that are not paragraphs, so scanForMarker's paragraphOpen tracking
-// (which gates type 7's interruption rule) doesn't mistake one of these for
-// open paragraph text. atxHeading and thematicBreak can themselves interrupt
-// a paragraph without a blank line first; indentedCodeBlock deliberately
-// cannot (see its use below) — a line this pattern matches straight after an
-// open paragraph is CommonMark's lazy-continuation text, not a new block.
-var (
-	atxHeading        = regexp.MustCompile(`^ {0,3}#{1,6}(?:[ \t]|$)`)
-	thematicBreak     = regexp.MustCompile(`^ {0,3}(?:-[ \t]*){3,}$|^ {0,3}(?:_[ \t]*){3,}$|^ {0,3}(?:\*[ \t]*){3,}$`)
-	indentedCodeBlock = regexp.MustCompile(`^(?: {4}|\t)`)
-	// setextHeadingUnderline recognizes a Setext heading's "=" underline —
-	// its "-" underline is already covered by thematicBreak above (a bare
-	// run of 3+ dashes reads as "not a paragraph" either way, whichever of
-	// the two CommonMark actually means by it). Per CommonMark, this line
-	// closes whatever paragraph precedes it, turning it into a heading; the
-	// underline itself is never a paragraph.
-	setextHeadingUnderline = regexp.MustCompile(`^ {0,3}=+[ \t]*$`)
-)
-
-// matchRawHTMLBlockOpener reports whether line opens one of the raw HTML
-// block types above, returning its termination rule: a specific closing
-// pattern to watch for, or nil for "ends at the next blank line".
-// paragraphOpen gates type 7 only (interruptsParagraph == false): per
-// CommonMark, a generic complete tag alone on a line never starts a raw HTML
-// block while a paragraph is already open — it's just paragraph text — but
-// types 1-6 start one regardless.
-func matchRawHTMLBlockOpener(line string, paragraphOpen bool) (close *regexp.Regexp, blankTerminated, ok bool) {
-	for _, k := range rawHTMLBlockOpeners {
-		if !k.interruptsParagraph && paragraphOpen {
-			continue
-		}
-		if k.open.MatchString(line) {
-			return k.close, k.close == nil, true
-		}
-	}
-	return nil, false, false
-}
-
-// scanForMarker walks text line by line tracking at most one open fence at a
-// time — Markdown fences don't nest, so a line that looks like our opener
-// while a *different*, unrelated fence (a longer backtick run, a tilde
-// fence, or a same-length fence with another info string) is still open is
-// just quoted example text, never a live marker. A second BRIDGE-REPLY-
-// looking line nested inside our *own* still-open block is a different,
-// already-seen case (adjacent markers where the second opener would
-// otherwise be consumed as the first block's closer): that still counts
-// toward openerCount, so it's rejected as ambiguous rather than silently
-// merged into the first block's content.
-func scanForMarker(text string) markerScan {
-	lines := strings.Split(text, "\n")
+func scanForMarker(input string) markerScan {
+	source := []byte(input)
+	document := goldmark.New().Parser().Parse(gmtext.NewReader(source))
 	var result markerScan
-	var openRun string
-	var isOurs bool
-	var contentStart int
-	var inComment bool
-	var openRawHTMLClose *regexp.Regexp
-	var inRawHTMLBlock bool
-	// paragraphOpen tracks CommonMark's paragraph-interruption rule: true
-	// once a line of ordinary top-level text has been seen with nothing
-	// since to close it (a blank line, or a block that consumes the line).
-	// Only used to gate type 7's raw-HTML-block check (matchRawHTMLBlockOpener);
-	// types 1-6 and fences can interrupt a paragraph unconditionally, so
-	// none of their branches below need to consult it before matching.
-	var paragraphOpen bool
-	for i, line := range lines {
-		trimmed := strings.TrimRight(line, " \t")
-		if inComment {
-			// Do not strip code spans here: once inside raw HTML, backticks
-			// have no Markdown code-span meaning at all — a closer like
-			// "`-->`" still closes the comment, and stripping it as if it
-			// were a code span would leave inComment stuck true.
-			inComment = commentStateAfterLine(inComment, trimmed)
-			continue
-		}
-		if inRawHTMLBlock {
-			if openRawHTMLClose != nil {
-				if openRawHTMLClose.MatchString(trimmed) {
-					inRawHTMLBlock = false
-					openRawHTMLClose = nil
+	// Never descend into lists, block quotes, HTML or unrelated fenced blocks.
+	for node := document.FirstChild(); node != nil; node = node.NextSibling() {
+		fence, ok := node.(*ast.FencedCodeBlock)
+		if !ok {
+			// Backticks in an invalid info string can make a reserved opener a
+			// paragraph or heading instead of a fence. It must still fail closed, not vanish.
+			if node.Kind() == ast.KindParagraph || node.Kind() == ast.KindHeading {
+				for i := 0; i < node.Lines().Len(); i++ {
+					segment := node.Lines().At(i)
+					start := bytes.LastIndexByte(source[:segment.Start], '\n') + 1
+					line := string(source[start:lineEnd(source, start)])
+					if strings.HasPrefix(line, reservedPrefix) {
+						result.openerCount++
+					}
 				}
-			} else if strings.Trim(trimmed, " \t") == "" {
-				// ASCII space/tab only, matching closesFence's own rule above:
-				// CommonMark defines a blank line as containing nothing but
-				// spaces/tabs, not general Unicode whitespace. strings.TrimSpace
-				// would also strip e.g. U+00A0 NBSP, wrongly treating a
-				// visually-blank-looking line as ending a blank-line-terminated
-				// raw HTML block (types 6/7) one line early, exposing a marker
-				// on the next line that should still be hidden inside it.
-				inRawHTMLBlock = false
 			}
 			continue
 		}
-		if openRun == "" {
-			if strings.Trim(trimmed, " \t") == "" {
-				// ASCII space/tab only — see the matching note in the
-				// inRawHTMLBlock branch above for why not strings.TrimSpace.
-				paragraphOpen = false
-				continue
-			}
-			// Raw-HTML-block recognition runs before the generic comment
-			// check, matching CommonMark's own type-1-before-type-2 start-
-			// condition ordering: a self-contained type-1 block whose
-			// content happens to contain a literal "<!--" (e.g.
-			// <script>const s = "<!--";</script>) must be recognized and
-			// closed as type 1 on this same line, not misread as an
-			// unclosed HTML comment because the comment check ran first and
-			// never saw the type-1 opener at all.
-			if closer, blankTerminated, ok := matchRawHTMLBlockOpener(trimmed, paragraphOpen); ok {
-				// A closer already present on this same opening line makes
-				// the block self-contained (CommonMark: start and end
-				// conditions on one line close it immediately) — do not
-				// enter the persistent open state, or every later line
-				// would stay hidden with nothing left to ever match it.
-				paragraphOpen = false
-				if blankTerminated {
-					inRawHTMLBlock = true
-				} else if !closer.MatchString(trimmed) {
-					inRawHTMLBlock = true
-					openRawHTMLClose = closer
-				}
-				continue
-			}
-			scanLine := stripCodeSpans(trimmed)
-			if commentStateAfterLine(false, scanLine) {
-				inComment = true
-				paragraphOpen = false
-				continue
-			}
-			if bridgeReplyOpener.MatchString(trimmed) {
+		if fence.Info == nil {
+			continue
+		}
+		start := bytes.LastIndexByte(source[:fence.Info.Segment.Start], '\n') + 1
+		end := lineEnd(source, start)
+		opener := string(source[start:end])
+		if !strings.HasPrefix(opener, reservedPrefix) {
+			continue
+		}
+		result.openerCount++
+		if !bridgeReplyOpener.MatchString(opener) {
+			continue
+		}
+		var content strings.Builder
+		closeStart := end + 1
+		for i := 0; i < fence.Lines().Len(); i++ {
+			segment := fence.Lines().At(i)
+			line := string(segment.Value(source))
+			if bridgeReplyOpener.MatchString(strings.TrimSuffix(line, "\n")) {
 				result.openerCount++
-				openRun = "```"
-				isOurs = true
-				contentStart = i + 1
-				paragraphOpen = false
-			} else if bridgeReplyPrefix.MatchString(trimmed) {
-				// Reserved prefix present but the strict opener pattern
-				// didn't match (invalid trailing characters) — a malformed
-				// opener attempt, not unrelated fenced content. Counted so
-				// the scan can never silently resolve to just some other,
-				// well-formed marker elsewhere in the text; still consumes
-				// its own "```" fence run so lines up to its close aren't
-				// misread as top-level content.
-				result.openerCount++
-				openRun = "```"
-				isOurs = false
-				paragraphOpen = false
-			} else if run, _, ok := matchGenericFence(trimmed); ok {
-				openRun = run
-				isOurs = false
-				paragraphOpen = false
-			} else if atxHeading.MatchString(trimmed) || thematicBreak.MatchString(trimmed) || setextHeadingUnderline.MatchString(trimmed) {
-				// A heading (ATX or Setext underline) or thematic break is
-				// its own block, not a paragraph — a Setext underline in
-				// fact consumes whatever paragraph precedes it, turning it
-				// into a heading — so a following line is never gated by a
-				// paragraph this line might have followed.
-				paragraphOpen = false
-			} else if indentedCodeBlock.MatchString(trimmed) && !paragraphOpen {
-				// An indented-looking line only starts a code block when it
-				// isn't continuing an already-open paragraph — CommonMark:
-				// indented code cannot interrupt a paragraph, so straight
-				// after paragraph text this is lazy continuation of that
-				// paragraph, not a new block, and paragraphOpen must stay
-				// true (the final else branch below handles that case).
-				paragraphOpen = false
-			} else {
-				// Ordinary text, or an indented line continuing an already-
-				// open paragraph: continues or opens a paragraph.
-				paragraphOpen = true
 			}
-			continue
+			content.WriteString(line)
+			closeStart = segment.Stop
 		}
-		if isOurs && bridgeReplyOpener.MatchString(trimmed) {
-			result.openerCount++
-			continue
-		}
-		if closesFence(trimmed, openRun) {
-			if isOurs {
-				result.content = strings.Join(lines[contentStart:i], "\n")
-				result.closed = true
-			}
-			openRun = ""
-			isOurs = false
-			paragraphOpen = false
-		}
+		result.content = content.String()
+		result.closed = closeStart < len(source) && bridgeReplyCloser.Match(source[closeStart:lineEnd(source, closeStart)])
 	}
 	return result
+}
+
+func lineEnd(source []byte, start int) int {
+	if i := bytes.IndexByte(source[start:], '\n'); i >= 0 {
+		return start + i
+	}
+	return len(source)
 }
 
 // Extract finds the single BRIDGE-REPLY marker in a turn's text and parses

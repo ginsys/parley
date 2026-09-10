@@ -311,3 +311,26 @@ func TestIngestTurnReplyRespectsExchangeBudgetAtDispatch(t *testing.T) {
 type noopTransport struct{}
 
 func (noopTransport) Deliver(context.Context, store.Envelope) error { return nil }
+
+func TestIngestHiddenHTMLReplyDoesNotAcknowledgeOrQueue(t *testing.T) {
+	db := openTestDB(t)
+	conversation, id := queueOne(t, db)
+	ctx := context.Background()
+	turn := "Heading\n-\n<custom>\n```BRIDGE-REPLY\n{\"in_reply_to\":\"" + id + "\",\"to\":\"claude-session-a\",\"text\":\"hidden\"}\n```\n</custom>"
+	if _, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn); !errors.Is(err, codex.ErrNoMarker) {
+		t.Fatalf("hidden reply accepted: %v", err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	original, err := store.GetByID(ctx, tx, id)
+	if err != nil || original.State != store.HandedOff {
+		t.Fatalf("original=%+v: %v", original, err)
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM envelopes").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("rows=%d: %v", count, err)
+	}
+}
