@@ -27,6 +27,10 @@ The [accepted runtime direction](docs/architecture.md#accepted-runtime-direction
 owner-approved move to server-owned storage and authenticated human administration, with dedicated
 production accounts. It is a target contract, not an implemented exception to the restrictions above.
 
+The [accepted membership model](docs/architecture.md#accepted-membership-model) uses versioned
+members and open/lead-only/directed policies. Initial runtime/inbox APIs translate to the existing
+pair storage; members-table creation and backfill belong to the later room migration.
+
 ## Start from the work item
 
 - Read the issue, its native GitHub dependencies, and existing code before changing anything. This
