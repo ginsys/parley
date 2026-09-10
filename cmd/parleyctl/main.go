@@ -68,6 +68,8 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	if fs.NArg() != 0 {
 		return c, fmt.Errorf("unexpected positional arguments")
 	}
+	// Identifiers are opaque exact keys. TrimSpace checks emptiness only;
+	// normalization could retarget existing grants.
 	if strings.TrimSpace(c.conversation) == "" {
 		return c, fmt.Errorf("%s requires -conversation", c.name)
 	}
@@ -127,19 +129,19 @@ func run(args []string, dbPath string, stdout, stderr io.Writer, factory control
 		g, opErr := ctrl.Grant(ctx, controller.GrantParams{Conversation: c.conversation, PeerAID: c.peerA, PeerBID: c.peerB, Direction: c.direction, MaxExchanges: c.budget, ExpiresAt: expiresAt})
 		err = opErr
 		if err == nil {
-			fmt.Fprintf(stdout, "granted %s v%d: %s <-> %s, %s, budget %d, expires %s\n", g.Conversation, g.GrantVersion, g.PeerAID, g.PeerBID, g.Direction, g.MaxExchanges, orNever(g.ExpiresAt))
+			fmt.Fprintf(stdout, "granted %q v%d: %q <-> %q, %s, budget %d, expires %s\n", g.Conversation, g.GrantVersion, g.PeerAID, g.PeerBID, g.Direction, g.MaxExchanges, orNever(g.ExpiresAt))
 		}
 	case "renew":
 		g, opErr := ctrl.Renew(ctx, controller.RenewParams{Conversation: c.conversation, MaxExchanges: c.budget, ExpiresAt: expiresAt, CancelPendingReplies: c.cancelReplies})
 		err = opErr
 		if err == nil {
-			fmt.Fprintf(stdout, "renewed %s to v%d: budget %d, expires %s\n", g.Conversation, g.GrantVersion, g.MaxExchanges, orNever(g.ExpiresAt))
+			fmt.Fprintf(stdout, "renewed %q to v%d: budget %d, expires %s\n", g.Conversation, g.GrantVersion, g.MaxExchanges, orNever(g.ExpiresAt))
 		}
 	case "revoke":
 		result, opErr := ctrl.Revoke(ctx, c.conversation)
 		err = opErr
 		if err == nil {
-			fmt.Fprintf(stdout, "revoked %s: %d cancelled, %d already dispatching, %d already handed off\n", c.conversation, result.Cancelled, result.AlreadyDispatching, result.AlreadyHandedOff)
+			fmt.Fprintf(stdout, "revoked %q: %d cancelled, %d already dispatching, %d already handed off\n", c.conversation, result.Cancelled, result.AlreadyDispatching, result.AlreadyHandedOff)
 			fmt.Fprintln(stdout, "This stops Parley's own delivery only; other communication paths remain possible.")
 		}
 	}

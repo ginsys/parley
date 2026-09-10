@@ -151,3 +151,37 @@ func TestDatabaseOpenFailureAndDefaultPath(t *testing.T) {
 		t.Fatalf("exit=%d: %s %s", code, &out, &errOut)
 	}
 }
+
+func TestCLIIdentifiersRemainExactAndVisible(t *testing.T) {
+	for _, operation := range []string{"grant", "renew", "revoke"} {
+		t.Run(operation, func(t *testing.T) {
+			fake := &fakeController{}
+			factory := func(context.Context, string) (controllerAPI, io.Closer, error) { return fake, fake, nil }
+			args := []string{operation, "-conversation", " x"}
+			if operation == "grant" {
+				args = append(args, "-peer-a", "a", "-peer-b", "a ", "-max-exchanges", "1")
+			}
+			var out, errOut bytes.Buffer
+			if code := run(args, "unused", &out, &errOut, factory); code != 0 {
+				t.Fatalf("exit %d: %s", code, &errOut)
+			}
+			if !strings.Contains(out.String(), `" x"`) {
+				t.Fatalf("identifier whitespace hidden: %s", &out)
+			}
+			switch operation {
+			case "grant":
+				if fake.grant.Conversation != " x" || fake.grant.PeerAID != "a" || fake.grant.PeerBID != "a " || !strings.Contains(out.String(), `"a" <-> "a "`) {
+					t.Fatalf("grant identity changed: %+v %s", fake.grant, &out)
+				}
+			case "renew":
+				if fake.renew.Conversation != " x" {
+					t.Fatalf("renew identity changed: %+v", fake.renew)
+				}
+			case "revoke":
+				if fake.revoke != " x" {
+					t.Fatalf("revoke identity changed: %q", fake.revoke)
+				}
+			}
+		})
+	}
+}
