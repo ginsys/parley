@@ -16,6 +16,57 @@ identity, database credential or proven protection against a peer with the same 
 permissions. Session identifiers are not yet bound to authenticated live sessions. Optional host
 policy tools can supplement these boundaries but are neither implemented nor required here.
 
+## Accepted runtime direction
+
+The owner-approved roadmap changes the target deployment, not the current behavior above.
+The decision provenance and remaining protocol ruling are recorded in
+[control-plane decision #19](https://github.com/ginsys/parley/issues/19).
+
+A standing server will own SQLite. `parleyctl` will become a deterministic client of authenticated
+administration handlers, with no direct-database fallback. Those handlers may grant, renew and
+revoke membership; agent-facing requests may not. Neither surface carries process spawning or
+host execution approval. This explicitly replaces the original runtime prohibition on membership
+administration once the specified implementation lands. Current protected CLI restrictions remain.
+
+For production on this workstation the owner requires dedicated accounts: trusted server/admin
+and non-sudo agent accounts, separate HOME/config/authentication/worktrees, and a trusted admin
+login path. A human provisions and validates them. Development and CI use temporary synthetic data
+under the current account; production isolation is not claimed from those tests. Separate socket
+names alone cannot distinguish a human from an agent under the same account. The production
+validation issue owns explicit privilege-route evidence; it does not block ordinary development.
+
+The server will serialize writes through one immediate-transaction connection and use at most
+four separate read-only deferred connections for pure queries. Authorization reads stay with the
+mutation in a writer transaction. Bounded reads have a five-second deadline including connection
+acquisition, materialize results and close rows/transactions before network I/O. Subscriptions
+retain no connection during waits or client I/O. Readers open after writer initialization,
+numbered migrations and recovery; online migrations are excluded.
+
+Keep the store-owned writer `databaseDSN` and add an internal sibling `readerDSN` with shared path
+normalization, `mode=ro`, `_txlock=deferred`, `_query_only=on`, `_busy_timeout=5000` and foreign-key
+settings. Keep the caller DSN allowlist: do not expose a locking override through it. The VFS
+read-only mode and connection query-only pragma protect different layers; both remain enabled.
+Opening readers before a database exists fails. The pinned SQLite driver supports these options.
+
+Server startup will accept ordinary filesystem paths only, rejecting memory databases and URI
+connection strings before locking. Acquire nonblocking exclusive flock on a persistent lock file
+adjacent to the canonical DB path before `store.Open`, migration/recovery and listeners. Hold its
+close-on-exec descriptor until workers and both pools stop; do not unlink on normal release.
+Contention rejects the second startup before either SQLite retry path, while legitimate database
+busy retries remain. Concurrency tests must use temporary file-backed WAL databases.
+
+`PARLEY_DB` will become server-only; the control spec defines client endpoint configuration. Help
+and validation remain server-independent. Migration documentation must cover human-controlled
+stopped-service consistent backup/relocation, WAL/SHM and ownership, and must not silently create a
+replacement database at a new location.
+
+Unix-first NDJSON JSON-RPC remains a proposal. Membership representation and session authentication
+remain owner-reviewed decisions; protocol v1 must use the decided membership model even for a
+two-member-only implementation. Unsupported larger topologies must fail explicitly. Future TCP
+transport should preserve application semantics; its implementation is outside the first milestone.
+The product sequence is two-peer runtime, durable inbox, then shared rooms. GitHub owns scopes,
+acceptance and native dependencies; this section records architectural direction only.
+
 ## Components
 
 | Package | Responsibility |
