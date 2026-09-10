@@ -11,13 +11,14 @@ var ErrEnvelopeNotFound = errors.New("envelope not found")
 
 // InsertQueued writes a new envelope in the queued state. GrantVersion must
 // already be stamped by the caller from CurrentGrant at accept time.
+// TrustedReply must only ever be true when the caller is codex.IngestTurn.
 func InsertQueued(ctx context.Context, tx *Tx, e Envelope) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO envelopes (id, conversation, from_peer, to_peer, text, grant_version,
-		                        in_reply_to, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+		                        in_reply_to, is_trusted_reply, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
 		e.ID, e.Conversation, e.FromPeer, e.ToPeer, e.Text, e.GrantVersion,
-		e.InReplyTo, e.CreatedAt, e.CreatedAt)
+		e.InReplyTo, e.TrustedReply, e.CreatedAt, e.CreatedAt)
 	if err != nil {
 		return fmt.Errorf("insert queued envelope: %w", err)
 	}
@@ -29,7 +30,7 @@ func InsertQueued(ctx context.Context, tx *Tx, e Envelope) error {
 func ListQueued(ctx context.Context, tx *Tx, conversation string) ([]Envelope, error) {
 	rows, err := tx.Query(ctx, `
 		SELECT id, conversation, from_peer, to_peer, text, grant_version, in_reply_to,
-		       state, created_at, updated_at
+		       is_trusted_reply, state, created_at, updated_at
 		FROM envelopes
 		WHERE conversation = ? AND state = 'queued'
 		ORDER BY created_at ASC`, conversation)
@@ -67,22 +68,21 @@ func CancelQueuedUnderVersion(ctx context.Context, tx *Tx, conversation string, 
 // envelopes(conversation, grant_version) has an immediate foreign key
 // against grants.
 //
-// A row only qualifies if in_reply_to names an envelope that this same
-// conversation has actually acked — the exact state IngestTurn puts the
-// original in, atomically, before inserting the reply
-// (replymarker.Validate requires it to have been 'handed_off' first). Bare
-// "in_reply_to IS NOT NULL" is not provenance: dispatch.Bridge.Send takes an
-// arbitrary caller-supplied inReplyTo with no validation at all, so any
-// ordinary send could otherwise claim reply status and get silently carried
-// across a renewal instead of cancelled like every other old-grant message.
+// A row only qualifies if is_trusted_reply was set at insert time — which
+// only codex.IngestTurn ever does, atomically, after validating in_reply_to
+// against the specific original it just acked (replymarker.Validate). Bare
+// "in_reply_to IS NOT NULL" (or even "in_reply_to names some envelope this
+// conversation has acked") is not provenance: dispatch.Bridge.Send takes an
+// arbitrary caller-supplied inReplyTo with no validation at all, so an
+// ordinary send naming any acked envelope's id — not necessarily the one it
+// is actually replying to — could otherwise claim reply status and get
+// silently carried across a renewal instead of cancelled like every other
+// old-grant message.
 func CarryForwardQueuedReplies(ctx context.Context, tx *Tx, conversation string, oldVersion, newVersion int64, updatedAt string) (int64, error) {
 	res, err := tx.Exec(ctx, `
 		UPDATE envelopes SET grant_version = ?, updated_at = ?
-		WHERE conversation = ? AND grant_version = ? AND state = 'queued'
-		  AND in_reply_to IN (
-		      SELECT id FROM envelopes WHERE conversation = ? AND state = 'acked'
-		  )`,
-		newVersion, updatedAt, conversation, oldVersion, conversation)
+		WHERE conversation = ? AND grant_version = ? AND state = 'queued' AND is_trusted_reply = 1`,
+		newVersion, updatedAt, conversation, oldVersion)
 	if err != nil {
 		return 0, fmt.Errorf("carry forward queued replies: %w", err)
 	}
@@ -172,12 +172,12 @@ func SetState(ctx context.Context, tx *Tx, id string, state EnvelopeState, updat
 func GetByID(ctx context.Context, tx *Tx, id string) (*Envelope, error) {
 	row := tx.QueryRow(ctx, `
 		SELECT id, conversation, from_peer, to_peer, text, grant_version, in_reply_to,
-		       state, created_at, updated_at
+		       is_trusted_reply, state, created_at, updated_at
 		FROM envelopes WHERE id = ?`, id)
 	var e Envelope
 	var state string
 	if err := row.Scan(&e.ID, &e.Conversation, &e.FromPeer, &e.ToPeer, &e.Text,
-		&e.GrantVersion, &e.InReplyTo, &state, &e.CreatedAt, &e.UpdatedAt); err != nil {
+		&e.GrantVersion, &e.InReplyTo, &e.TrustedReply, &state, &e.CreatedAt, &e.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrEnvelopeNotFound
 		}
@@ -193,7 +193,7 @@ func scanEnvelopes(rows *sql.Rows) ([]Envelope, error) {
 		var e Envelope
 		var state string
 		if err := rows.Scan(&e.ID, &e.Conversation, &e.FromPeer, &e.ToPeer, &e.Text,
-			&e.GrantVersion, &e.InReplyTo, &state, &e.CreatedAt, &e.UpdatedAt); err != nil {
+			&e.GrantVersion, &e.InReplyTo, &e.TrustedReply, &state, &e.CreatedAt, &e.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan envelope: %w", err)
 		}
 		e.State = EnvelopeState(state)

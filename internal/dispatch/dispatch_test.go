@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
@@ -362,6 +364,42 @@ func ackEnvelope(t *testing.T, db *store.DB, conversation, id string, grantVersi
 	}
 }
 
+// sendTrustedReply inserts a queued reply envelope with TrustedReply set,
+// standing in for what codex.IngestTurn does atomically (ack the original,
+// then queue this reply) — dispatch.Bridge.Send has no parameter for this
+// column and can never produce one, by design (see the finding
+// 3973918513/3973918530-follow-up regression tests below), so tests that
+// need a genuine reply for the carry-forward/rescue paths must construct one
+// directly rather than through Send.
+func sendTrustedReply(t *testing.T, db *store.DB, conversation, from, to, text, inReplyTo string, grantVersion int64) *store.Envelope {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback(ctx)
+		}
+	}()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	e := store.Envelope{
+		ID: uuid.NewString(), Conversation: conversation, FromPeer: from, ToPeer: to, Text: text,
+		GrantVersion: grantVersion, InReplyTo: &inReplyTo, TrustedReply: true, State: store.Queued,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.InsertQueued(ctx, tx, e); err != nil {
+		t.Fatalf("insert trusted reply: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	committed = true
+	return &e
+}
+
 // Regression for a finding on the merge-triggered review: a reply queued
 // under a grant version that gets renewed before it's dispatched must be
 // carried forward to the new version, not cancelled — the reply's own
@@ -378,11 +416,7 @@ func TestRenewCarriesForwardQueuedReplyInsteadOfCancelling(t *testing.T) {
 	bridge := dispatch.New(db, transport)
 	ctx := context.Background()
 
-	original := "original-envelope-id"
-	reply, err := bridge.Send(ctx, "conv-reply-renew", "b", "a", "reply text", &original)
-	if err != nil {
-		t.Fatalf("send: %v", err)
-	}
+	reply := sendTrustedReply(t, db, "conv-reply-renew", "b", "a", "reply text", "original-envelope-id", 1)
 	if reply.GrantVersion != 1 {
 		t.Fatalf("want grant_version 1, got %d", reply.GrantVersion)
 	}
@@ -568,11 +602,7 @@ func TestDispatchRescuesUnattemptedReplyOntoRenewedGrantVersion(t *testing.T) {
 	})
 	bridge := dispatch.New(db, transport)
 
-	original := "original-envelope-id"
-	reply, err := bridge.Send(ctx, "conv-reply-rescue", "codex-thread-b", "claude-session-a", "reply text", &original)
-	if err != nil {
-		t.Fatalf("send: %v", err)
-	}
+	reply := sendTrustedReply(t, db, "conv-reply-rescue", "codex-thread-b", "claude-session-a", "reply text", "original-envelope-id", 1)
 
 	state, err := bridge.Dispatch(ctx, reply.ID)
 	if err != nil {
@@ -667,11 +697,7 @@ func TestGrantExpiryPreservesQueuedReplyForRenewal(t *testing.T) {
 	transport := newFakeTransport()
 	bridge := dispatch.New(db, transport)
 
-	original := "original-envelope-id"
-	reply, err := bridge.Send(ctx, "conv-expiry-reply", "codex-thread-b", "claude-session-a", "reply after expiry", &original)
-	if err != nil {
-		t.Fatalf("send: %v", err)
-	}
+	reply := sendTrustedReply(t, db, "conv-expiry-reply", "codex-thread-b", "claude-session-a", "reply after expiry", "original-envelope-id", 1)
 
 	state, err := bridge.Dispatch(ctx, reply.ID)
 	if !errors.Is(err, dispatch.ErrGrantExpired) {
@@ -781,5 +807,76 @@ func TestRenewDoesNotCarryForwardFakeReplyWithUnackedOriginal(t *testing.T) {
 	}
 	if state != store.Cancelled {
 		t.Fatalf("want a fake reply (no acked original) cancelled by the renewal like any other old-grant message, got %s", state)
+	}
+}
+
+// Regression for a follow-up finding on PR #3 (3973918513/3973918530's
+// re-review): the acked-original check above is still not real provenance —
+// it only proved the referenced envelope was acked *somewhere*, not that
+// this row was the one atomically produced by IngestTurn for it. When the
+// conversation already contains a genuinely acked envelope (e.g. from an
+// earlier real exchange), an ordinary Send naming that same id in
+// InReplyTo must still be cancelled by a renewal like any other old-grant
+// message, not carried forward just because the id happens to resolve.
+func TestRenewDoesNotCarryForwardOrdinarySendEvenNamingAGenuinelyAckedOriginal(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-fake-reply-real-target", 10)
+	ackEnvelope(t, db, "conv-fake-reply-real-target", "genuinely-acked-envelope", 1)
+	ctx := context.Background()
+
+	transport := newFakeTransport()
+	bridge := dispatch.New(db, transport)
+
+	target := "genuinely-acked-envelope"
+	forged, err := bridge.Send(ctx, "conv-fake-reply-real-target", "a", "b", "pretending to be a reply", &target)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	if _, err := ctrl.Renew(ctx, controller.RenewParams{Conversation: "conv-fake-reply-real-target", MaxExchanges: 10}); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, forged.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Cancelled {
+		t.Fatalf("want an ordinary send cancelled by the renewal even though its InReplyTo names a genuinely acked envelope, got %s", state)
+	}
+}
+
+// Companion to the above for the never-attempted rescue path
+// (resolveRequeueVersion): the same insufficient check — any InReplyTo that
+// resolves to an acked envelope — must not let an ordinary send get rescued
+// onto a renewed grant version either.
+func TestDispatchDoesNotRescueOrdinarySendEvenNamingAGenuinelyAckedOriginal(t *testing.T) {
+	db := openTestDB(t)
+	ctrl := controller.New(db)
+	grantOne(t, ctrl, "conv-fake-rescue-real-target", 5)
+	ackEnvelope(t, db, "conv-fake-rescue-real-target", "genuinely-acked-envelope", 1)
+	ctx := context.Background()
+
+	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
+		if _, err := ctrl.Renew(context.Background(), controller.RenewParams{Conversation: "conv-fake-rescue-real-target", MaxExchanges: 5}); err != nil {
+			t.Fatalf("renew during deliver: %v", err)
+		}
+		return dispatch.ErrNoAttempt
+	})
+	bridge := dispatch.New(db, transport)
+
+	target := "genuinely-acked-envelope"
+	forged, err := bridge.Send(ctx, "conv-fake-rescue-real-target", "a", "b", "pretending to be a reply", &target)
+	if err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	state, err := bridge.Dispatch(ctx, forged.ID)
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	if state != store.Cancelled {
+		t.Fatalf("want an ordinary send cancelled rather than rescued, even though its InReplyTo names a genuinely acked envelope, got %s", state)
 	}
 }

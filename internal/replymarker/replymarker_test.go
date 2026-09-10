@@ -314,6 +314,23 @@ func TestExtractIgnoresMarkerInsideDivBlock(t *testing.T) {
 	}
 }
 
+// Regression for finding 3974111038 on PR #3's follow-up round: CommonMark's
+// type-1 raw HTML block (script/pre/style/textarea) ends only at the exact
+// literal closing tag ("</script>", case-insensitive) — internal whitespace
+// like "</script >" does not close it, unlike type 7's general tag grammar.
+// Verified against the reference CommonMark implementation: the whole rest
+// of the document, including a real BRIDGE-REPLY fence, stays inert raw HTML
+// when the only "closer" present has that extra space. A permissive \s*
+// match would wrongly treat the block as closed there and expose the marker.
+func TestExtractIgnoresMarkerAfterScriptBlockWithNonExactClosingTag(t *testing.T) {
+	turn := "<script>\nhidden\n</script >\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	_, err := replymarker.Extract(turn)
+	if !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker (marker still hidden inside the unclosed <script> block), got %v", err)
+	}
+}
+
 // A block-level tag block ends at the next blank line, not a specific
 // closing tag — a marker after that blank line is live again.
 func TestExtractFindsMarkerAfterBlankLineEndsDivBlock(t *testing.T) {

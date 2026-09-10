@@ -125,11 +125,19 @@ func NewTransport(sender QueueSender, threadID, fromLabel, toPeer string) *Trans
 }
 
 func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
+	// A recipient/sender mismatch is rejected before QueueMessage is ever
+	// called — the host was never at risk of duplicate delivery — and it is
+	// permanent for this exact envelope: it is bound to the wrong peers
+	// regardless of how many times it's retried, unlike a transient
+	// never-attempted cause. Wrapping it as dispatch.ErrPermanentlyRejected
+	// (not a plain error) tells Dispatch to refund the claimed budget slot
+	// rather than burning it on a routing mistake that was never going to
+	// reach the host.
 	if e.ToPeer != t.toPeer {
-		return fmt.Errorf("%w: envelope to %q, transport bound to %q", ErrRecipientMismatch, e.ToPeer, t.toPeer)
+		return fmt.Errorf("%w: %w: envelope to %q, transport bound to %q", dispatch.ErrPermanentlyRejected, ErrRecipientMismatch, e.ToPeer, t.toPeer)
 	}
 	if e.FromPeer != t.fromLabel {
-		return fmt.Errorf("%w: envelope from %q, transport bound to %q", ErrRecipientMismatch, e.FromPeer, t.fromLabel)
+		return fmt.Errorf("%w: %w: envelope from %q, transport bound to %q", dispatch.ErrPermanentlyRejected, ErrRecipientMismatch, e.FromPeer, t.fromLabel)
 	}
 	wrapped, err := bridgetext.Wrap(e.ID, t.fromLabel, e.Text)
 	if err != nil {

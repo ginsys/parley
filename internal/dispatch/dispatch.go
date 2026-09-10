@@ -245,6 +245,13 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 // is different — its source turn is already permanently 'acked' with no
 // live sender left to resubmit it — so it is worth rescuing onto whatever
 // grant is current now, provided that grant still permits its direction.
+// "Is a reply" is judged by e.TrustedReply, not merely e.InReplyTo != nil:
+// TrustedReply is set only by codex.IngestTurn, which validates in_reply_to
+// against the specific original envelope it atomically acks before queuing
+// this one. dispatch.Bridge.Send accepts an arbitrary caller-supplied
+// inReplyTo with no validation, so an ordinary send naming any envelope's
+// id — even a genuinely acked one — must not qualify for this rescue path
+// either; it has to be cancelled like any other old-grant message.
 func resolveRequeueVersion(ctx context.Context, tx *store.Tx, e *store.Envelope) (int64, bool, error) {
 	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
 	if err != nil {
@@ -256,7 +263,7 @@ func resolveRequeueVersion(ctx context.Context, tx *store.Tx, e *store.Envelope)
 	if g.GrantVersion == e.GrantVersion {
 		return e.GrantVersion, true, nil
 	}
-	if e.InReplyTo == nil {
+	if !e.TrustedReply {
 		return 0, false, nil
 	}
 	if !g.Permits(e.FromPeer, e.ToPeer, time.Now().UTC()) {
@@ -298,7 +305,7 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 		// budget exhaustion, expiry is permanent for this grant version.
 		//
 		// An ordinary send has no path back once cancelled, so cancel it —
-		// but a reply's source turn is already permanently 'acked' by
+		// but a genuine reply's source turn is already permanently 'acked' by
 		// IngestTurn, with no live sender left to notice a cancellation and
 		// resubmit. Expiry alone doesn't change the grant's row status (still
 		// 'active' until a Revoke/Renew says otherwise), so leaving the reply
@@ -306,7 +313,13 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 		// Renew's CarryForwardQueuedReplies (keyed on exactly this version,
 		// since it's still the current one) can still rescue it. This only
 		// blocks *this* dispatch attempt — the row itself is left as-is.
-		if e.InReplyTo != nil {
+		//
+		// e.TrustedReply, not e.InReplyTo != nil: only codex.IngestTurn ever
+		// sets it, after validating in_reply_to against the exact original it
+		// atomically acked. A caller-supplied InReplyTo on an ordinary Send
+		// is not proof of a genuine reply and must be cancelled like any
+		// other expired ordinary message, not preserved.
+		if e.TrustedReply {
 			return nil, false, ErrGrantExpired
 		}
 		now := time.Now().UTC().Format(time.RFC3339Nano)

@@ -78,6 +78,7 @@ func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expec
 		Text:         marker.Text,
 		GrantVersion: g.GrantVersion,
 		InReplyTo:    &inReplyTo,
+		TrustedReply: true,
 		State:        store.Queued,
 		CreatedAt:    now,
 		UpdatedAt:    now,
