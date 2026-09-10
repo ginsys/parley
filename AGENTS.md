@@ -117,3 +117,18 @@ The human may opt out with `-cancel-pending-replies`; the successor stores this 
 late never-attempted settlement cannot bypass a cancellation across intervening renewals.
 Revocation is never a carry-forward boundary. Re-enrollment creates a new historical version
 without reviving cancelled messages. Expired trusted replies wait without delivery for renewal.
+
+## Reply fence grammar
+
+Reply block membership uses Goldmark v1.8.6 without extensions. Only a fenced code block that is a
+direct child of the document is eligible, with the original column-zero `BRIDGE-REPLY` opener
+(exactly three backticks, optional trailing ASCII spaces/tabs) and an explicit closing fence.
+Lists, block quotes, HTML and foreign fences remain ineligible; introducing a CommonMark parser
+must not broaden the wire syntax. Strict JSON and envelope provenance are separate checks.
+
+The short Setext underline followed by custom HTML regression must remain covered through both
+extraction and ingestion: hidden content cannot acknowledge an original or queue a reply.
+Inline comment openers do not start HTML blocks; a type-2 block ends on the first line containing
+its closing delimiter. Earlier tests incorrectly extended those comments over subsequent fences.
+Goldmark is an exact-pinned MIT dependency with no module dependencies at this version; module
+checksums and dependency review are separate from GitHub Action pin validation.
