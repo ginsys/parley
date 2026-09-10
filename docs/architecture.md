@@ -60,12 +60,61 @@ and validation remain server-independent. Migration documentation must cover hum
 stopped-service consistent backup/relocation, WAL/SHM and ownership, and must not silently create a
 replacement database at a new location.
 
-Unix-first NDJSON JSON-RPC remains a proposal. Membership representation and session authentication
-remain owner-reviewed decisions; protocol v1 must use the decided membership model even for a
-two-member-only implementation. Unsupported larger topologies must fail explicitly. Future TCP
+Unix-first NDJSON JSON-RPC remains a proposal, and session authentication still needs an owner
+decision. Protocol v1 must use the accepted membership model below even for a two-member-only
+implementation. Unsupported larger topologies must fail explicitly. Future TCP
 transport should preserve application semantics; its implementation is outside the first milestone.
 The product sequence is two-peer runtime, durable inbox, then shared rooms. GitHub owns scopes,
 acceptance and native dependencies; this section records architectural direction only.
+
+## Accepted membership model
+
+The owner approved [decision #17](https://github.com/ginsys/parley/issues/17) on 2026-09-10.
+These are target contracts; the implemented core still uses the pair representation described below.
+
+Grants have immutable versioned members (one exact peer ID and role per version) and a policy:
+
+| Policy | Permitted communication between distinct enrolled members |
+| --- | --- |
+| `open` | Every member to every other member |
+| `lead_only` | Exactly one lead; lead-to-member and member-to-lead, never member-to-member |
+| `directed` | Explicit listed edges only; no implied reverse edge |
+
+Legacy `bidirectional` maps to `open` with members A and B; `a_to_b` maps to the single directed
+A-to-B edge; `b_to_a` maps to B-to-A. These preserve the exact existing permitted edges, with no
+widening. A one-way grant must not become `lead_only`, which would also permit a reverse message.
+Self-send remains forbidden. `lead_only` is named so administrator intent survives member changes
+without re-enumerating edges: adding a developer establishes only lead/developer communication.
+The `directed` policy never adds edges implicitly when a member joins.
+
+**The first runtime and two-peer inbox retain the current positional grant storage.** A
+members-shaped API translates the supported two-member policies to that representation and rejects
+unsupported requests explicitly. The members/policies/edges tables and historical backfill appear
+only in the later room migration, after the inbox. The membership specification defines both
+stages; runtime ownership and administration do not require a members table. The room migration
+uses numbered atomic `user_version` steps, preserves every historical conversation/version key and
+envelope provenance, and retires positional storage without concurrent dual writers. Frozen
+legacy-adoption SQL remains unchanged. Enforce unique members and schema-level self-send/self-edge
+rejection where sender/recipient columns exist; controller validation alone is insufficient.
+
+Member, role or policy changes create a successor version through human administration. Preserve
+ordinary queued-message cancellation and default carry-forward of proven replies only while the
+members, edge, provenance and intervening version history still permit it. Revocation and explicit
+cancel-pending-replies boundaries remain barriers. Removed-member/edge replies are cancelled and
+reported; acknowledged originals are not reset or replayed. Already-dispatching/handed-off messages
+cannot be recalled; late never-attempted settlement must revalidate successor history.
+
+Keep one shared exchange budget per active conversation grant. Successors retain today's renewal
+semantics: zero used exchanges and an explicit or retained maximum. A chatty member can exhaust
+that shared budget for every participant, including a lead-only room. This is an accepted
+consequence; the model provides no per-member fairness, quota or reservation.
+
+Fresh sends explicitly name conversation and one recipient, with sender derived from authenticated
+binding. Replies derive conversation from the original envelope ID, retain explicit recipient and
+original sender/recipient provenance checks, and require current authorization. An eligible new
+reply may reference an older delivered original; it cannot revive a cancelled queued reply.
+No implicit broadcast is introduced. Session authentication, control framing and inbox disposition
+permissions remain separate contracts.
 
 ## Components
 
