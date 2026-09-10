@@ -75,6 +75,9 @@ func New(db *store.DB, t Transport) *Bridge {
 	return &Bridge{db: db, transport: t}
 }
 
+var ErrNotPermitted = errors.New("grant does not permit this peer pair or direction")
+var ErrStaleGrantVersion = errors.New("envelope grant version is no longer current")
+
 // Send accepts a new message into the queue. It stamps grant_version from
 // whatever is current right now; a later renewal cancels this row if it's
 // still queued when the renewal commits (see controller.Renew). Send never
@@ -97,6 +100,12 @@ func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, 
 		return nil, err
 	}
 
+	if g.Expired(time.Now()) {
+		return nil, ErrGrantExpired
+	}
+	if !g.Permits(from, to, time.Now()) {
+		return nil, ErrNotPermitted
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	e := store.Envelope{
 		ID:           uuid.NewString(),
@@ -135,7 +144,7 @@ func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.Envelop
 		if errors.Is(err, ErrBudgetExhausted) {
 			return store.Queued, err
 		}
-		if errors.Is(err, ErrGrantExpired) {
+		if errors.Is(err, ErrGrantExpired) || errors.Is(err, ErrNotPermitted) || errors.Is(err, ErrStaleGrantVersion) || errors.Is(err, store.ErrNoActiveGrant) {
 			// claim() leaves a reply's row untouched on expiry (so a future
 			// renewal can still carry it forward) but cancels an ordinary
 			// send outright — ask the row itself what actually happened
@@ -276,13 +285,8 @@ func resolveRequeueVersion(ctx context.Context, tx *sql.Tx, e *store.Envelope) (
 	if g.GrantVersion == e.GrantVersion {
 		return e.GrantVersion, true, nil
 	}
-	if !e.TrustedReply {
-		return 0, false, nil
-	}
-	if !g.PermitsDirection(e.FromPeer, e.ToPeer) {
-		return 0, false, nil
-	}
-	return g.GrantVersion, true, nil
+	ok, err := store.CanCarryReply(ctx, tx, e, g.GrantVersion)
+	return g.GrantVersion, ok, err
 }
 
 // claim runs the atomic budget-claim + dispatching transition. Returns
@@ -309,41 +313,25 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 	}
 
 	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
-	if err != nil {
-		return nil, false, err
+	authErr := err
+	if err == nil {
+		authErr = authorizeEnvelope(g, e, time.Now())
 	}
-	if g.Expired(time.Now().UTC()) {
-		// A grant that expires while a message sits queued must not deliver
-		// it late — recheck at claim time, not only at accept time. Unlike
-		// budget exhaustion, expiry is permanent for this grant version.
-		//
-		// An ordinary send has no path back once cancelled, so cancel it —
-		// but a genuine reply's source turn is already permanently 'acked' by
-		// IngestTurn, with no live sender left to notice a cancellation and
-		// resubmit. Expiry alone doesn't change the grant's row status (still
-		// 'active' until a Revoke/Renew says otherwise), so leaving the reply
-		// untouched in 'queued' under this same version means a future
-		// Renew's CarryForwardQueuedReplies (keyed on exactly this version,
-		// since it's still the current one) can still rescue it. This only
-		// blocks *this* dispatch attempt — the row itself is left as-is.
-		//
-		// e.TrustedReply, not e.InReplyTo != nil: only codex.IngestTurn ever
-		// sets it, after validating in_reply_to against the exact original it
-		// atomically acked. A caller-supplied InReplyTo on an ordinary Send
-		// is not proof of a genuine reply and must be cancelled like any
-		// other expired ordinary message, not preserved.
-		if e.TrustedReply {
-			return nil, false, ErrGrantExpired
+	if authErr != nil {
+		if !errors.Is(authErr, store.ErrNoActiveGrant) && !errors.Is(authErr, ErrGrantExpired) && !errors.Is(authErr, ErrNotPermitted) && !errors.Is(authErr, ErrStaleGrantVersion) {
+			return nil, false, authErr
 		}
-		now := time.Now().UTC().Format(time.RFC3339Nano)
-		if err := store.SetState(ctx, tx, envelopeID, store.Cancelled, now); err != nil {
+		if errors.Is(authErr, ErrGrantExpired) && e.TrustedReply {
+			return nil, false, authErr
+		}
+		if err := store.SetState(ctx, tx, e.ID, store.Cancelled, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return nil, false, err
 		}
 		if err := tx.Commit(); err != nil {
 			return nil, false, err
 		}
 		committed = true
-		return nil, false, ErrGrantExpired
+		return nil, false, authErr
 	}
 
 	ok, err := store.ClaimExchange(ctx, tx, e.Conversation, e.GrantVersion)
@@ -351,12 +339,17 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 		return nil, false, err
 	}
 	if !ok {
-		// e.State was already confirmed 'queued' above under this exclusive
-		// transaction, so a revoke/renewal can't have raced us — any grant
-		// no longer active would already have cancelled this row instead.
-		// The only remaining reason ClaimExchange fails is budget
-		// exhaustion. Leave the row queued — do not cancel or fail it.
-		return nil, false, ErrBudgetExhausted
+		current, err := store.CurrentGrant(ctx, tx, e.Conversation)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := authorizeEnvelope(current, e, time.Now()); err != nil {
+			return nil, false, err
+		}
+		if current.ExchangesUsed >= current.MaxExchanges {
+			return nil, false, ErrBudgetExhausted
+		}
+		return nil, false, fmt.Errorf("budget claim failed without exhaustion")
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -389,4 +382,17 @@ func (b *Bridge) currentState(ctx context.Context, envelopeID string) (store.Env
 		return "", err
 	}
 	return e.State, nil
+}
+
+func authorizeEnvelope(g *store.Grant, e *store.Envelope, now time.Time) error {
+	if e.GrantVersion != g.GrantVersion {
+		return ErrStaleGrantVersion
+	}
+	if !g.PermitsDirection(e.FromPeer, e.ToPeer) {
+		return ErrNotPermitted
+	}
+	if g.Expired(now) {
+		return ErrGrantExpired
+	}
+	return nil
 }

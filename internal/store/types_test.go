@@ -15,6 +15,7 @@ import (
 func TestGrantPermitsRejectsRevokedGrant(t *testing.T) {
 	revokedAt := "2026-01-01T00:00:00Z"
 	g := store.Grant{
+		Status:    store.GrantActive,
 		PeerAID:   "codex-thread-b",
 		PeerBID:   "claude-session-a",
 		Direction: store.Bidirectional,
@@ -31,6 +32,7 @@ func TestGrantPermitsRejectsRevokedGrant(t *testing.T) {
 
 func TestGrantPermitsAllowsActiveGrant(t *testing.T) {
 	g := store.Grant{
+		Status:    store.GrantActive,
 		PeerAID:   "codex-thread-b",
 		PeerBID:   "claude-session-a",
 		Direction: store.Bidirectional,
@@ -47,6 +49,7 @@ func TestGrantPermitsAllowsActiveGrant(t *testing.T) {
 func TestGrantPermitsRejectsExpiredGrant(t *testing.T) {
 	expiresAt := "2026-01-01T00:00:00Z"
 	g := store.Grant{
+		Status:    store.GrantActive,
 		PeerAID:   "codex-thread-b",
 		PeerBID:   "claude-session-a",
 		Direction: store.Bidirectional,
@@ -64,6 +67,7 @@ func TestGrantPermitsRejectsExpiredGrant(t *testing.T) {
 func TestGrantPermitsAllowsUnexpiredGrant(t *testing.T) {
 	expiresAt := "2026-01-01T00:00:00Z"
 	g := store.Grant{
+		Status:    store.GrantActive,
 		PeerAID:   "codex-thread-b",
 		PeerBID:   "claude-session-a",
 		Direction: store.Bidirectional,

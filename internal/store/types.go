@@ -35,17 +35,18 @@ const (
 
 // Grant is one versioned membership record for a conversation.
 type Grant struct {
-	Conversation  string
-	GrantVersion  int64
-	PeerAID       string
-	PeerBID       string
-	Direction     Direction
-	MaxExchanges  int64
-	ExchangesUsed int64
-	GrantedAt     string
-	ExpiresAt     *string
-	Status        GrantStatus
-	RevokedAt     *string
+	Conversation         string
+	GrantVersion         int64
+	PeerAID              string
+	PeerBID              string
+	Direction            Direction
+	MaxExchanges         int64
+	ExchangesUsed        int64
+	GrantedAt            string
+	ExpiresAt            *string
+	Status               GrantStatus
+	RevokedAt            *string
+	CancelPendingReplies bool
 }
 
 // Expired reports whether this grant's ExpiresAt has passed as of now. A
@@ -85,7 +86,7 @@ func (g Grant) Permits(from, to string, now time.Time) bool {
 // expiry check governs whether it can actually dispatch — while a grant that
 // never permitted this direction/pair at all is not, regardless of expiry.
 func (g Grant) PermitsDirection(from, to string) bool {
-	if g.RevokedAt != nil {
+	if g.Status != GrantActive || g.RevokedAt != nil {
 		return false
 	}
 	switch {

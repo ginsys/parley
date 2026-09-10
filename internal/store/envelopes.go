@@ -79,12 +79,28 @@ func CancelQueuedUnderVersion(ctx context.Context, tx *sql.Tx, conversation stri
 // silently carried across a renewal instead of cancelled like every other
 // old-grant message.
 func CarryForwardQueuedReplies(ctx context.Context, tx *sql.Tx, conversation string, oldVersion, newVersion int64, updatedAt string) (int64, error) {
-	res, err := tx.ExecContext(ctx, `
-		UPDATE envelopes SET grant_version = ?, updated_at = ?
-		WHERE conversation = ? AND grant_version = ? AND state = 'queued' AND is_trusted_reply = 1`,
-		newVersion, updatedAt, conversation, oldVersion)
+	g, err := CurrentGrant(ctx, tx, conversation)
 	if err != nil {
-		return 0, fmt.Errorf("carry forward queued replies: %w", err)
+		return 0, err
+	}
+	if g.GrantVersion != newVersion || g.CancelPendingReplies || g.RevokedAt != nil {
+		return 0, nil
+	}
+	res, err := tx.ExecContext(ctx, `
+ UPDATE envelopes AS reply SET grant_version=?,updated_at=?
+ WHERE conversation=? AND grant_version=? AND state='queued' AND is_trusted_reply=1
+ AND ((from_peer=? AND to_peer=? AND ? IN ('bidirectional','a_to_b'))
+   OR (from_peer=? AND to_peer=? AND ? IN ('bidirectional','b_to_a')))
+ AND EXISTS (SELECT 1 FROM envelopes AS original WHERE original.id=reply.in_reply_to
+   AND original.conversation=reply.conversation AND original.state='acked'
+   AND original.from_peer=reply.to_peer AND original.to_peer=reply.from_peer)
+ AND NOT EXISTS (SELECT 1 FROM grants AS history WHERE history.conversation=reply.conversation
+   AND history.grant_version>=? AND history.grant_version<=?
+   AND (history.status='revoked' OR (history.grant_version>? AND history.cancel_pending_replies=1)))`,
+		newVersion, updatedAt, conversation, oldVersion,
+		g.PeerAID, g.PeerBID, string(g.Direction), g.PeerBID, g.PeerAID, string(g.Direction), oldVersion, newVersion, oldVersion)
+	if err != nil {
+		return 0, err
 	}
 	return res.RowsAffected()
 }
@@ -200,4 +216,27 @@ func scanEnvelopes(rows *sql.Rows) ([]Envelope, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// CanCarryReply validates provenance and every crossed renewal boundary. A
+// cancellation choice or revocation cannot be bypassed by a later renewal.
+func CanCarryReply(ctx context.Context, tx *sql.Tx, e *Envelope, target int64) (bool, error) {
+	if !e.TrustedReply || e.InReplyTo == nil || target <= e.GrantVersion {
+		return false, nil
+	}
+	g, err := CurrentGrant(ctx, tx, e.Conversation)
+	if err != nil {
+		return false, err
+	}
+	if g.GrantVersion != target || !g.PermitsDirection(e.FromPeer, e.ToPeer) {
+		return false, nil
+	}
+	var valid int
+	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM envelopes WHERE id=? AND conversation=? AND state='acked' AND from_peer=? AND to_peer=?`, *e.InReplyTo, e.Conversation, e.ToPeer, e.FromPeer).Scan(&valid)
+	if err != nil || valid != 1 {
+		return false, err
+	}
+	var blockers int
+	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM grants WHERE conversation=? AND grant_version>=? AND grant_version<=? AND (status='revoked' OR (grant_version>? AND cancel_pending_replies=1))`, e.Conversation, e.GrantVersion, target, e.GrantVersion).Scan(&blockers)
+	return blockers == 0, err
 }

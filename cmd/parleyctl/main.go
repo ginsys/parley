@@ -55,6 +55,9 @@ func runGrant(ctx context.Context, ctrl *controller.Controller, args []string) {
 	maxExchanges := fs.Int64("max-exchanges", 0, "exchange budget for this grant (required, >0)")
 	expiresIn := fs.Duration("expires-in", 0, "optional TTL, e.g. 24h")
 	fs.Parse(args)
+	if *expiresIn < 0 {
+		fatalf("expires-in must not be negative")
+	}
 
 	if *conversation == "" || *peerA == "" || *peerB == "" || *maxExchanges <= 0 {
 		fatalf("grant requires -conversation, -peer-a, -peer-b, and -max-exchanges > 0")
@@ -102,7 +105,11 @@ func runRenew(ctx context.Context, ctrl *controller.Controller, args []string) {
 	conversation := fs.String("conversation", "", "conversation name (required)")
 	maxExchanges := fs.Int64("max-exchanges", 0, "new exchange budget (0 keeps the current value)")
 	expiresIn := fs.Duration("expires-in", 0, "new TTL from now (0 keeps the current expiry)")
+	cancelReplies := fs.Bool("cancel-pending-replies", false, "cancel queued replies instead of carrying them forward")
 	fs.Parse(args)
+	if *expiresIn < 0 || *maxExchanges < 0 {
+		fatalf("expiry and budget must not be negative")
+	}
 	if *conversation == "" {
 		fatalf("renew requires -conversation")
 	}
@@ -113,9 +120,10 @@ func runRenew(ctx context.Context, ctrl *controller.Controller, args []string) {
 	}
 
 	g, err := ctrl.Renew(ctx, controller.RenewParams{
-		Conversation: *conversation,
-		MaxExchanges: *maxExchanges,
-		ExpiresAt:    expiresAt,
+		Conversation:         *conversation,
+		CancelPendingReplies: *cancelReplies,
+		MaxExchanges:         *maxExchanges,
+		ExpiresAt:            expiresAt,
 	})
 	if err != nil {
 		fatalf("renew: %v", err)
@@ -136,7 +144,7 @@ func usage() {
 Usage:
   parleyctl grant  -conversation NAME -peer-a ID -peer-b ID -max-exchanges N [-direction bidirectional|a_to_b|b_to_a] [-expires-in DURATION]
   parleyctl revoke -conversation NAME
-  parleyctl renew  -conversation NAME [-max-exchanges N] [-expires-in DURATION]
+  parleyctl renew  -conversation NAME [-max-exchanges N] [-expires-in DURATION] [-cancel-pending-replies]
 
 Database path: $PARLEY_DB (default ./parley.db)`)
 }

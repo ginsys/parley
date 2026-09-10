@@ -104,3 +104,16 @@ DDL, including comments inside CREATE statements. Later steps use versions, not 
 Unknown layouts or future versions fail without partial schema changes. Before any migration SQL
 runs, BEGIN retries busy and shared-cache writer contention within a five-second retry window,
 respecting context cancellation; migration statements themselves are never replayed.
+
+## Grant acceptance and renewal
+
+Ordinary acceptance and the atomic dispatch claim both validate the active grant's exact peer
+pair, direction and expiry. Claims also require an exact current version. A failed budget update
+is classified from current grant state; it is not assumed to mean exhaustion.
+
+Renewal cancels ordinary old-version messages but carries proven replies by default: ingestion
+already acknowledged their originals, leaving no sender able to resubmit a cancelled response.
+The human may opt out with `-cancel-pending-replies`; the successor stores this policy so even
+late never-attempted settlement cannot bypass a cancellation across intervening renewals.
+Revocation is never a carry-forward boundary. Re-enrollment creates a new historical version
+without reviving cancelled messages. Expired trusted replies wait without delivery for renewal.
