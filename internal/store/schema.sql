@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS envelopes (
     text          TEXT    NOT NULL,
     grant_version INTEGER NOT NULL,
     in_reply_to   TEXT,
+    -- Set only by the trusted ingestion path (codex.IngestTurn), which
+    -- atomically acks the original envelope and queues this reply as one
+    -- transaction, having already validated in_reply_to against that exact
+    -- original via replymarker.Validate. dispatch.Bridge.Send has no
+    -- parameter for this column and always leaves it 0/false — an ordinary
+    -- send cannot claim reply status just by naming some other envelope's id
+    -- (even a genuinely acked one) in in_reply_to.
+    is_trusted_reply INTEGER NOT NULL DEFAULT 0 CHECK (is_trusted_reply IN (0, 1)),
     state         TEXT    NOT NULL CHECK (
         state IN ('queued', 'dispatching', 'handed_off', 'acked', 'failed', 'cancelled', 'uncertain')
     ),

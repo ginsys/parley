@@ -221,10 +221,13 @@ const blockLevelTags = `address|article|aside|base|basefont|blockquote|body|capt
 
 var rawHTMLBlockOpeners = []rawHTMLBlockOpener{
 	// Type 1: script/pre/style/textarea, ends at its specific closing tag.
-	{regexp.MustCompile(`(?i)^ {0,3}<script(?:[\s>]|$)`), regexp.MustCompile(`(?i)</script\s*>`)},
-	{regexp.MustCompile(`(?i)^ {0,3}<pre(?:[\s>]|$)`), regexp.MustCompile(`(?i)</pre\s*>`)},
-	{regexp.MustCompile(`(?i)^ {0,3}<style(?:[\s>]|$)`), regexp.MustCompile(`(?i)</style\s*>`)},
-	{regexp.MustCompile(`(?i)^ {0,3}<textarea(?:[\s>]|$)`), regexp.MustCompile(`(?i)</textarea\s*>`)},
+	// CommonMark's end condition is the exact literal string (case-
+	// insensitive) with no internal whitespace — "</script >" does not
+	// close it, unlike type 7's general tag grammar elsewhere in this file.
+	{regexp.MustCompile(`(?i)^ {0,3}<script(?:[\s>]|$)`), regexp.MustCompile(`(?i)</script>`)},
+	{regexp.MustCompile(`(?i)^ {0,3}<pre(?:[\s>]|$)`), regexp.MustCompile(`(?i)</pre>`)},
+	{regexp.MustCompile(`(?i)^ {0,3}<style(?:[\s>]|$)`), regexp.MustCompile(`(?i)</style>`)},
+	{regexp.MustCompile(`(?i)^ {0,3}<textarea(?:[\s>]|$)`), regexp.MustCompile(`(?i)</textarea>`)},
 	// Type 3: processing instruction, ends at "?>".
 	{regexp.MustCompile(`^ {0,3}<\?`), regexp.MustCompile(`\?>`)},
 	// Type 4: declaration, ends at ">".

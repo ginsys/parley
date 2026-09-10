@@ -91,6 +91,14 @@ func TestTransportDeliverRejectsWrongRecipient(t *testing.T) {
 	if !errors.Is(err, codex.ErrRecipientMismatch) {
 		t.Fatalf("want ErrRecipientMismatch, got %v", err)
 	}
+	// Regression for finding 3973918518-adjacent PR #3 finding: a routing
+	// mistake caught before QueueMessage is ever called must refund its
+	// claimed budget slot like any other permanent pre-host rejection,
+	// rather than burning the human-approved budget on repeated
+	// misconfiguration.
+	if !errors.Is(err, dispatch.ErrPermanentlyRejected) {
+		t.Fatalf("want dispatch.ErrPermanentlyRejected (refundable), got %v", err)
+	}
 	if len(sender.sent) != 0 {
 		t.Fatalf("want no message queued for a mismatched recipient, got %v", sender.sent)
 	}
@@ -110,6 +118,9 @@ func TestTransportDeliverRejectsWrongSender(t *testing.T) {
 	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "some-other-peer", ToPeer: "codex-thread-b", Text: "x"})
 	if !errors.Is(err, codex.ErrRecipientMismatch) {
 		t.Fatalf("want ErrRecipientMismatch, got %v", err)
+	}
+	if !errors.Is(err, dispatch.ErrPermanentlyRejected) {
+		t.Fatalf("want dispatch.ErrPermanentlyRejected (refundable), got %v", err)
 	}
 	if len(sender.sent) != 0 {
 		t.Fatalf("want no message queued for a mismatched sender, got %v", sender.sent)
