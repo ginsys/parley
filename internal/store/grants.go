@@ -17,14 +17,14 @@ var ErrNoActiveGrant = errors.New("no active grant for conversation")
 func CurrentGrant(ctx context.Context, tx *sql.Tx, conversation string) (*Grant, error) {
 	row := tx.QueryRowContext(ctx, `
 		SELECT conversation, grant_version, peer_a_id, peer_b_id, direction,
-		       max_exchanges, exchanges_used, granted_at, expires_at, status, revoked_at
+		       max_exchanges, exchanges_used, granted_at, expires_at, status, revoked_at, cancel_pending_replies
 		FROM grants
 		WHERE conversation = ? AND status = 'active'`, conversation)
 
 	var g Grant
 	var direction, status string
 	if err := row.Scan(&g.Conversation, &g.GrantVersion, &g.PeerAID, &g.PeerBID, &direction,
-		&g.MaxExchanges, &g.ExchangesUsed, &g.GrantedAt, &g.ExpiresAt, &status, &g.RevokedAt); err != nil {
+		&g.MaxExchanges, &g.ExchangesUsed, &g.GrantedAt, &g.ExpiresAt, &status, &g.RevokedAt, &g.CancelPendingReplies); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNoActiveGrant
 		}
@@ -55,10 +55,10 @@ func EnsureConversation(ctx context.Context, tx *sql.Tx, id, name, createdAt str
 func InsertGrant(ctx context.Context, tx *sql.Tx, g Grant) error {
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO grants (conversation, grant_version, peer_a_id, peer_b_id, direction,
-		                     max_exchanges, exchanges_used, granted_at, expires_at, status, revoked_at)
-		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'active', NULL)`,
+		                     max_exchanges, exchanges_used, granted_at, expires_at, status, revoked_at, cancel_pending_replies)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'active', NULL, ?)`,
 		g.Conversation, g.GrantVersion, g.PeerAID, g.PeerBID, string(g.Direction),
-		g.MaxExchanges, g.GrantedAt, g.ExpiresAt)
+		g.MaxExchanges, g.GrantedAt, g.ExpiresAt, g.CancelPendingReplies)
 	if err != nil {
 		return fmt.Errorf("insert grant: %w", err)
 	}

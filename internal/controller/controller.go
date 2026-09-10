@@ -11,7 +11,9 @@ package controller
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ginsys/parley/internal/store"
@@ -40,9 +42,12 @@ type GrantParams struct {
 	ExpiresAt    *time.Time
 }
 
-// Grant creates the first (version 1) grant for a conversation. It fails if
+// Grant creates the next historical version for a conversation. It fails if
 // the conversation already has an active grant — use Renew for that.
 func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, error) {
+	if err := validateGrant(p); err != nil {
+		return nil, err
+	}
 	tx, err := c.db.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -60,13 +65,17 @@ func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, er
 	}
 	if _, err := store.CurrentGrant(ctx, tx, p.Conversation); err == nil {
 		return nil, fmt.Errorf("conversation %q already has an active grant; use Renew", p.Conversation)
-	} else if err != store.ErrNoActiveGrant {
+	} else if !errors.Is(err, store.ErrNoActiveGrant) {
 		return nil, err
 	}
 
+	var nextVersion int64
+	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(grant_version),0)+1 FROM grants WHERE conversation=?", p.Conversation).Scan(&nextVersion); err != nil {
+		return nil, err
+	}
 	g := store.Grant{
 		Conversation: p.Conversation,
-		GrantVersion: 1,
+		GrantVersion: nextVersion,
 		PeerAID:      p.PeerAID,
 		PeerBID:      p.PeerBID,
 		Direction:    p.Direction,
@@ -143,17 +152,22 @@ func (c *Controller) Revoke(ctx context.Context, conversation string) (*RevokeRe
 // RenewParams updates the budget and/or expiry of a conversation's grant by
 // creating a new version. Zero MaxExchanges means "keep the current value".
 type RenewParams struct {
-	Conversation string
-	MaxExchanges int64
-	ExpiresAt    *time.Time
+	CancelPendingReplies bool
+	Conversation         string
+	MaxExchanges         int64
+	ExpiresAt            *time.Time
 }
 
-// Renew supersedes the current active grant with a new version. Any
-// envelope still queued under the old version is cancelled in the same
-// transaction — a peer that still wants that content sent resubmits it
-// fresh under the new grant, per the design plan's explicit rule against
-// silently carrying old-grant messages forward.
+// Renew creates a successor grant. Ordinary queued messages are cancelled;
+// proven replies carry by default because their originals were acknowledged.
+// CancelPendingReplies explicitly opts out, including late unattempted rescue.
 func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, error) {
+	if strings.TrimSpace(p.Conversation) == "" || p.MaxExchanges < 0 {
+		return nil, fmt.Errorf("renew requires conversation and nonnegative budget")
+	}
+	if p.ExpiresAt != nil && !p.ExpiresAt.After(time.Now()) {
+		return nil, fmt.Errorf("explicit expiry must be in the future")
+	}
 	tx, err := c.db.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -186,14 +200,15 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 
 	newVersion := current.GrantVersion + 1
 	next := store.Grant{
-		Conversation: p.Conversation,
-		GrantVersion: newVersion,
-		PeerAID:      current.PeerAID,
-		PeerBID:      current.PeerBID,
-		Direction:    current.Direction,
-		MaxExchanges: maxExchanges,
-		GrantedAt:    now,
-		ExpiresAt:    expiresAt,
+		CancelPendingReplies: p.CancelPendingReplies,
+		Conversation:         p.Conversation,
+		GrantVersion:         newVersion,
+		PeerAID:              current.PeerAID,
+		PeerBID:              current.PeerBID,
+		Direction:            current.Direction,
+		MaxExchanges:         maxExchanges,
+		GrantedAt:            now,
+		ExpiresAt:            expiresAt,
 	}
 	if err := store.InsertGrant(ctx, tx, next); err != nil {
 		return nil, err
@@ -238,4 +253,17 @@ func formatOptionalTime(t *time.Time) *string {
 	}
 	s := t.UTC().Format(time.RFC3339Nano)
 	return &s
+}
+
+func validateGrant(p GrantParams) error {
+	if strings.TrimSpace(p.Conversation) == "" || strings.TrimSpace(p.PeerAID) == "" || strings.TrimSpace(p.PeerBID) == "" || p.PeerAID == p.PeerBID || p.MaxExchanges <= 0 {
+		return fmt.Errorf("grant requires conversation, distinct peers and positive budget")
+	}
+	if p.Direction != store.Bidirectional && p.Direction != store.AToB && p.Direction != store.BToA {
+		return fmt.Errorf("invalid grant direction %q", p.Direction)
+	}
+	if p.ExpiresAt != nil && !p.ExpiresAt.After(time.Now()) {
+		return fmt.Errorf("explicit expiry must be in the future")
+	}
+	return nil
 }

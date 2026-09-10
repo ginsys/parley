@@ -84,11 +84,11 @@ func TestConcurrentBudgetExhaustion(t *testing.T) {
 	bridge := dispatch.New(db, transport)
 	ctx := context.Background()
 
-	e1, err := bridge.Send(ctx, "conv-budget", "a", "b", "first", nil)
+	e1, err := bridge.Send(ctx, "conv-budget", "claude-session-a", "codex-thread-b", "first", nil)
 	if err != nil {
 		t.Fatalf("send 1: %v", err)
 	}
-	e2, err := bridge.Send(ctx, "conv-budget", "a", "b", "second", nil)
+	e2, err := bridge.Send(ctx, "conv-budget", "claude-session-a", "codex-thread-b", "second", nil)
 	if err != nil {
 		t.Fatalf("send 2: %v", err)
 	}
@@ -143,11 +143,11 @@ func TestRevokeVsDispatch(t *testing.T) {
 	bridge := dispatch.New(db, transport)
 	ctx := context.Background()
 
-	dispatched, err := bridge.Send(ctx, "conv-revoke", "a", "b", "will be dispatching", nil)
+	dispatched, err := bridge.Send(ctx, "conv-revoke", "claude-session-a", "codex-thread-b", "will be dispatching", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	stillQueued, err := bridge.Send(ctx, "conv-revoke", "a", "b", "will be cancelled", nil)
+	stillQueued, err := bridge.Send(ctx, "conv-revoke", "claude-session-a", "codex-thread-b", "will be cancelled", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestRevokeVsDispatch(t *testing.T) {
 		t.Fatalf("want cancelled on disk, got %s", e.State)
 	}
 
-	if _, err := bridge.Send(ctx, "conv-revoke", "a", "b", "after revoke", nil); !errors.Is(err, store.ErrNoActiveGrant) {
+	if _, err := bridge.Send(ctx, "conv-revoke", "claude-session-a", "codex-thread-b", "after revoke", nil); !errors.Is(err, store.ErrNoActiveGrant) {
 		t.Fatalf("send after revoke: want ErrNoActiveGrant, got %v", err)
 	}
 }
@@ -198,7 +198,7 @@ func TestCrashAfterHandoffRecoversUncertain(t *testing.T) {
 	bridge := dispatch.New(db, transport)
 	ctx := context.Background()
 
-	e, err := bridge.Send(ctx, "conv-crash", "a", "b", "in flight when we died", nil)
+	e, err := bridge.Send(ctx, "conv-crash", "claude-session-a", "codex-thread-b", "in flight when we died", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestDispatchRecordsOutcomeDespiteContextCanceledDuringDeliver(t *testing.T)
 	})
 	bridge := dispatch.New(db, transport)
 
-	e, err := bridge.Send(context.Background(), "conv-cancel-during-deliver", "a", "b", "hi", nil)
+	e, err := bridge.Send(context.Background(), "conv-cancel-during-deliver", "claude-session-a", "codex-thread-b", "hi", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestStaleGrantVersionCancelledByRenewal(t *testing.T) {
 	bridge := dispatch.New(db, transport)
 	ctx := context.Background()
 
-	stale, err := bridge.Send(ctx, "conv-renew", "a", "b", "queued under v1", nil)
+	stale, err := bridge.Send(ctx, "conv-renew", "claude-session-a", "codex-thread-b", "queued under v1", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestRenewCarriesForwardQueuedReplyInsteadOfCancelling(t *testing.T) {
 	bridge := dispatch.New(db, transport)
 	ctx := context.Background()
 
-	reply := sendTrustedReply(t, db, "conv-reply-renew", "b", "a", "reply text", "original-envelope-id", 1)
+	reply := sendTrustedReply(t, db, "conv-reply-renew", "codex-thread-b", "claude-session-a", "reply text", "original-envelope-id", 1)
 	if reply.GrantVersion != 1 {
 		t.Fatalf("want grant_version 1, got %d", reply.GrantVersion)
 	}
@@ -448,14 +448,12 @@ func TestGrantExpiryRecheckedAtDispatch(t *testing.T) {
 	ctrl := controller.New(db)
 	ctx := context.Background()
 
-	past := time.Now().UTC().Add(-time.Hour)
 	if _, err := ctrl.Grant(ctx, controller.GrantParams{
 		Conversation: "conv-expiry-dispatch",
 		PeerAID:      "claude-session-a",
 		PeerBID:      "codex-thread-b",
 		Direction:    store.Bidirectional,
 		MaxExchanges: 10,
-		ExpiresAt:    &past,
 	}); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
@@ -463,11 +461,12 @@ func TestGrantExpiryRecheckedAtDispatch(t *testing.T) {
 	transport := newFakeTransport()
 	bridge := dispatch.New(db, transport)
 
-	e, err := bridge.Send(ctx, "conv-expiry-dispatch", "a", "b", "queued after expiry", nil)
+	e, err := bridge.Send(ctx, "conv-expiry-dispatch", "claude-session-a", "codex-thread-b", "queued before expiry", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
 
+	expireGrant(t, db, "conv-expiry-dispatch")
 	state, err := bridge.Dispatch(ctx, e.ID)
 	if !errors.Is(err, dispatch.ErrGrantExpired) {
 		t.Fatalf("want ErrGrantExpired, got %v", err)
@@ -494,7 +493,7 @@ func TestDispatchRequeuesAndRefundsNeverAttemptedDelivery(t *testing.T) {
 	bridge := dispatch.New(db, transport)
 	ctx := context.Background()
 
-	e, err := bridge.Send(ctx, "conv-no-attempt", "a", "b", "never attempted", nil)
+	e, err := bridge.Send(ctx, "conv-no-attempt", "claude-session-a", "codex-thread-b", "never attempted", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -546,7 +545,7 @@ func TestDispatchCancelsUnattemptedOrdinarySendWhenGrantRenewedMidFlight(t *test
 	})
 	bridge := dispatch.New(db, transport)
 
-	e, err := bridge.Send(ctx, "conv-no-attempt-renewed", "a", "b", "ordinary send", nil)
+	e, err := bridge.Send(ctx, "conv-no-attempt-renewed", "claude-session-a", "codex-thread-b", "ordinary send", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -655,12 +654,12 @@ func TestDispatchRescuesUnattemptedReplyOntoAlreadyExpiredSuccessorGrant(t *test
 	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
 		if !renewed {
 			renewed = true
-			past := time.Now().UTC().Add(-time.Hour)
 			if _, err := ctrl.Renew(context.Background(), controller.RenewParams{
-				Conversation: "conv-reply-rescue-expired", MaxExchanges: 5, ExpiresAt: &past,
+				Conversation: "conv-reply-rescue-expired", MaxExchanges: 5,
 			}); err != nil {
 				t.Fatalf("renew during deliver: %v", err)
 			}
+			expireGrant(t, db, "conv-reply-rescue-expired")
 			return dispatch.ErrNoAttempt
 		}
 		return nil
@@ -746,14 +745,12 @@ func TestGrantExpiryPreservesQueuedReplyForRenewal(t *testing.T) {
 	ctrl := controller.New(db)
 	ctx := context.Background()
 
-	past := time.Now().UTC().Add(-time.Hour)
 	if _, err := ctrl.Grant(ctx, controller.GrantParams{
 		Conversation: "conv-expiry-reply",
 		PeerAID:      "claude-session-a",
 		PeerBID:      "codex-thread-b",
 		Direction:    store.Bidirectional,
 		MaxExchanges: 10,
-		ExpiresAt:    &past,
 	}); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
@@ -762,8 +759,9 @@ func TestGrantExpiryPreservesQueuedReplyForRenewal(t *testing.T) {
 	transport := newFakeTransport()
 	bridge := dispatch.New(db, transport)
 
-	reply := sendTrustedReply(t, db, "conv-expiry-reply", "codex-thread-b", "claude-session-a", "reply after expiry", "original-envelope-id", 1)
+	reply := sendTrustedReply(t, db, "conv-expiry-reply", "codex-thread-b", "claude-session-a", "reply before expiry", "original-envelope-id", 1)
 
+	expireGrant(t, db, "conv-expiry-reply")
 	state, err := bridge.Dispatch(ctx, reply.ID)
 	if !errors.Is(err, dispatch.ErrGrantExpired) {
 		t.Fatalf("want ErrGrantExpired, got %v", err)
@@ -805,7 +803,7 @@ func TestDispatchFailsPermanentlyRejectedWithoutRequeueLoop(t *testing.T) {
 	})
 	bridge := dispatch.New(db, transport)
 
-	e, err := bridge.Send(ctx, "conv-permanent-reject", "a", "b", "too big", nil)
+	e, err := bridge.Send(ctx, "conv-permanent-reject", "claude-session-a", "codex-thread-b", "too big", nil)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -857,7 +855,7 @@ func TestRenewDoesNotCarryForwardFakeReplyWithUnackedOriginal(t *testing.T) {
 	bridge := dispatch.New(db, transport)
 
 	notActuallyAcked := "not-an-acked-envelope"
-	forged, err := bridge.Send(ctx, "conv-fake-reply", "a", "b", "pretending to be a reply", &notActuallyAcked)
+	forged, err := bridge.Send(ctx, "conv-fake-reply", "claude-session-a", "codex-thread-b", "pretending to be a reply", &notActuallyAcked)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -894,7 +892,7 @@ func TestRenewDoesNotCarryForwardOrdinarySendEvenNamingAGenuinelyAckedOriginal(t
 	bridge := dispatch.New(db, transport)
 
 	target := "genuinely-acked-envelope"
-	forged, err := bridge.Send(ctx, "conv-fake-reply-real-target", "a", "b", "pretending to be a reply", &target)
+	forged, err := bridge.Send(ctx, "conv-fake-reply-real-target", "claude-session-a", "codex-thread-b", "pretending to be a reply", &target)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -932,7 +930,7 @@ func TestDispatchDoesNotRescueOrdinarySendEvenNamingAGenuinelyAckedOriginal(t *t
 	bridge := dispatch.New(db, transport)
 
 	target := "genuinely-acked-envelope"
-	forged, err := bridge.Send(ctx, "conv-fake-rescue-real-target", "a", "b", "pretending to be a reply", &target)
+	forged, err := bridge.Send(ctx, "conv-fake-rescue-real-target", "claude-session-a", "codex-thread-b", "pretending to be a reply", &target)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}
@@ -943,5 +941,21 @@ func TestDispatchDoesNotRescueOrdinarySendEvenNamingAGenuinelyAckedOriginal(t *t
 	}
 	if state != store.Cancelled {
 		t.Fatalf("want an ordinary send cancelled rather than rescued, even though its InReplyTo names a genuinely acked envelope, got %s", state)
+	}
+}
+
+func expireGrant(t *testing.T, db *store.DB, conversation string) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "UPDATE grants SET expires_at=? WHERE conversation=? AND status='active'", time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), conversation); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }
