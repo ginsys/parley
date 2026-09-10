@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -105,37 +104,43 @@ func TestIndependentConnectionsAcquireImmediateLock(t *testing.T) {
 }
 
 func TestConcurrentMigrationAndRepeatedOpen(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "migrate.db")
-	seed, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := seed.Exec(strings.ReplaceAll(schema, "    is_trusted_reply INTEGER NOT NULL DEFAULT 0 CHECK (is_trusted_reply IN (0, 1)),\n", "")); err != nil {
-		t.Fatal(err)
-	}
-	seed.Close()
-	var wg sync.WaitGroup
-	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for name, path := range map[string]string{
+		"disk":          filepath.Join(t.TempDir(), "migrate.db"),
+		"shared memory": "file:concurrent-migration?mode=memory&cache=shared",
+	} {
+		t.Run(name, func(t *testing.T) {
+			seed, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := seed.Exec(historicalSchema(t)); err != nil {
+				t.Fatal(err)
+			}
+			defer seed.Close()
+			var wg sync.WaitGroup
+			for range 4 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					db, err := Open(context.Background(), path)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					db.Close()
+				}()
+			}
+			wg.Wait()
 			db, err := Open(context.Background(), path)
 			if err != nil {
-				t.Error(err)
-				return
+				t.Fatal(err)
 			}
-			db.Close()
-		}()
-	}
-	wg.Wait()
-	db, err := Open(context.Background(), path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	var version int
-	if err := db.sql.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 1 {
-		t.Fatalf("version=%d: %v", version, err)
+			defer db.Close()
+			var version int
+			if err := db.sql.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != len(migrations) {
+				t.Fatalf("version=%d: %v", version, err)
+			}
+		})
 	}
 }
 
@@ -197,7 +202,7 @@ func TestMigrationFailurePreservesSchemaVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer seed.Close()
-	if _, err := seed.Exec(strings.ReplaceAll(schema, "    is_trusted_reply INTEGER NOT NULL DEFAULT 0 CHECK (is_trusted_reply IN (0, 1)),\n", "")); err != nil {
+	if _, err := seed.Exec(historicalSchema(t)); err != nil {
 		t.Fatal(err)
 	}
 	// Missing index with conflicting history must fail its recreation atomically.

@@ -3,13 +3,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	_ "embed"
 	"errors"
 	"fmt"
-	"modernc.org/sqlite"
-	"reflect"
-	"slices"
-	"strings"
 	"time"
+
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Each numbered step and user_version update commits in the same immediate
@@ -41,100 +41,57 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	return tx.Commit()
 }
 
+// Frozen schema from a024019, before trusted reply provenance was introduced.
+// Together with schema.sql (8af08cb) and the original 0edf451 ALTER, this
+// describes every shipped version-zero representation. Preserve stored DDL,
+// including comments inside CREATE statements: adoption intentionally accepts
+// known catalogs, not arbitrary semantically equivalent SQL rewrites.
+//
+//go:embed legacy_schema.sql
+var legacySchema string
+
+const addTrustedReply = "ALTER TABLE envelopes ADD COLUMN is_trusted_reply INTEGER NOT NULL DEFAULT 0 CHECK (is_trusted_reply IN (0, 1))"
+
 func adoptLegacySchema(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+	actual, err := readSchemaCatalog(ctx, tx)
 	if err != nil {
 		return err
 	}
-	var tables []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			rows.Close()
-			return err
-		}
-		tables = append(tables, name)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return err
-	}
-	if len(tables) == 0 {
+	if len(actual) == 0 {
 		_, err := tx.ExecContext(ctx, schema)
 		return err
 	}
-	if !slices.Equal(tables, []string{"conversations", "envelopes", "grants"}) {
-		return fmt.Errorf("unrecognized unversioned tables: %v", tables)
-	}
-	// Compare structural metadata to the frozen version-one schema, allowing
-	// only the historically absent trusted-reply column. CHECK text is not
-	// compared because the supported pre-upgrade fixture predates those checks.
-	reference, err := sql.Open("sqlite", ":memory:")
-	if err != nil {
-		return err
-	}
-	defer reference.Close()
-	reference.SetMaxOpenConns(1)
-	if _, err := reference.ExecContext(ctx, schema); err != nil {
-		return err
-	}
-	trusted := false
-	for _, table := range tables {
-		actual, err := tableColumns(ctx, tx, table)
+	for _, variant := range []struct {
+		ddl               string
+		needsTrustedReply bool
+	}{
+		{schema, false},
+		{legacySchema, true},
+		{legacySchema + ";" + addTrustedReply, false},
+	} {
+		wanted, err := referenceCatalog(ctx, variant.ddl)
 		if err != nil {
 			return err
 		}
-		wanted, err := tableColumns(ctx, reference, table)
-		if err != nil {
-			return err
-		}
-		if table == "envelopes" {
-			_, trusted = actual["is_trusted_reply"]
-			if !trusted {
-				delete(wanted, "is_trusted_reply")
-			}
-		}
-		if !reflect.DeepEqual(actual, wanted) {
-			return fmt.Errorf("unrecognized unversioned columns in %s", table)
-		}
-		actualFK, err := tableForeignKeys(ctx, tx, table)
-		if err != nil {
-			return err
-		}
-		wantedFK, err := tableForeignKeys(ctx, reference, table)
-		if err != nil {
-			return err
-		}
-		if !reflect.DeepEqual(actualFK, wantedFK) {
-			return fmt.Errorf("unrecognized foreign keys in %s", table)
-		}
-	}
-	for _, name := range []string{"idx_grants_one_active", "idx_envelopes_conversation_state"} {
-		var actual, wanted string
-		err := tx.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", name).Scan(&actual)
-		if err == sql.ErrNoRows {
+		if !matchesLegacyCatalog(actual, wanted) {
 			continue
 		}
-		if err != nil {
-			return err
+		if variant.needsTrustedReply {
+			if _, err := tx.ExecContext(ctx, addTrustedReply); err != nil {
+				return err
+			}
 		}
-		if err := reference.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", name).Scan(&wanted); err != nil {
-			return err
-		}
-		if normalizeDDL(actual) != normalizeDDL(wanted) {
-			return fmt.Errorf("unrecognized index %s", name)
-		}
+		// Recreate the two known indexes if missing. Conflicting active grant
+		// history fails here and rolls back the column and version as well.
+		_, err = tx.ExecContext(ctx, schema)
+		return err
 	}
-	if !trusted {
-		if _, err := tx.ExecContext(ctx, "ALTER TABLE envelopes ADD COLUMN is_trusted_reply INTEGER NOT NULL DEFAULT 0 CHECK (is_trusted_reply IN (0,1))"); err != nil {
-			return err
-		}
-	}
-	// Install the known indexes after validating the legacy tables. This also
-	// rejects histories with multiple active grants without partially upgrading.
-	_, err = tx.ExecContext(ctx, schema)
-	return err
+	return fmt.Errorf("unrecognized unversioned schema")
+}
+
+type schemaObject struct {
+	kind, name, table string
+	ddl               sql.NullString
 }
 
 // sql.Tx and sql.DB both implement the inspection operations.
@@ -142,77 +99,68 @@ type schemaReader interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
-func tableColumns(ctx context.Context, db schemaReader, table string) (map[string]string, error) {
-	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+func readSchemaCatalog(ctx context.Context, db schemaReader) ([]schemaObject, error) {
+	// Filter by owning table, not object name: automatic indexes belonging to
+	// application tables are part of the contract even though their names start
+	// with sqlite_. SQLite-owned statistics tables are not application schema.
+	rows, err := db.QueryContext(ctx, "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE tbl_name NOT GLOB 'sqlite_*'")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	result := map[string]string{}
+	var objects []schemaObject
 	for rows.Next() {
-		var cid, nn, pk int
-		var name, kind string
-		var def sql.NullString
-		if err := rows.Scan(&cid, &name, &kind, &nn, &def, &pk); err != nil {
+		var object schemaObject
+		if err := rows.Scan(&object.kind, &object.name, &object.table, &object.ddl); err != nil {
 			return nil, err
 		}
-		result[name] = fmt.Sprintf("%s/%d/%d/%v", strings.ToUpper(kind), nn, pk, def)
+		objects = append(objects, object)
 	}
-	return result, rows.Err()
+	return objects, rows.Err()
 }
-func tableForeignKeys(ctx context.Context, db schemaReader, table string) ([]string, error) {
-	rows, err := db.QueryContext(ctx, "PRAGMA foreign_key_list("+table+")")
+
+func referenceCatalog(ctx context.Context, ddl string) ([]schemaObject, error) {
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	groups := map[int][]string{}
-	for rows.Next() {
-		var id, seq int
-		var target, from, to, onUpdate, onDelete, match string
-		if err := rows.Scan(&id, &seq, &target, &from, &to, &onUpdate, &onDelete, &match); err != nil {
-			return nil, err
-		}
-		groups[id] = append(groups[id], fmt.Sprintf("%d:%s:%s:%s:%s:%s:%s", seq, target, from, to, onUpdate, onDelete, match))
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, ddl); err != nil {
+		return nil, err
 	}
-	var result []string
-	for _, group := range groups {
-		slices.Sort(group)
-		result = append(result, strings.Join(group, ","))
-	}
-	slices.Sort(result)
-	return result, rows.Err()
+	return readSchemaCatalog(ctx, db)
 }
-func normalizeDDL(s string) string {
-	// Normalize syntax only. SQL string literals are case/space sensitive.
-	var out strings.Builder
-	quoted := false
-	for _, r := range strings.ReplaceAll(s, "IF NOT EXISTS", "") {
-		if r == '\'' {
-			quoted = !quoted
-			out.WriteRune(r)
-			continue
-		}
-		if quoted {
-			out.WriteRune(r)
-			continue
-		}
-		if r == ' ' || r == '\n' || r == '\r' || r == '\t' {
-			continue
-		}
-		out.WriteString(strings.ToLower(string(r)))
+
+func matchesLegacyCatalog(actual, wanted []schemaObject) bool {
+	remaining := make(map[schemaObject]bool, len(actual))
+	for _, object := range actual {
+		remaining[object] = true
 	}
-	return out.String()
+	for _, object := range wanted {
+		if remaining[object] {
+			delete(remaining, object)
+			continue
+		}
+		if object.kind == "index" && (object.name == "idx_grants_one_active" || object.name == "idx_envelopes_conversation_state") {
+			continue
+		}
+		return false
+	}
+	// A changed named index remains here, as do extra indexes, triggers/views,
+	// or tables. Table SQL covers CHECKs, UNIQUEs, collations, and table options.
+	return len(remaining) == 0
 }
 
 // SQLite can reject concurrent journal-mode initialization before its busy
-// handler waits. Retrying a failed Begin is safe: no migration SQL has run.
+// handler waits; shared-cache writers instead return LOCKED_SHAREDCACHE.
+// Retrying either failed Begin is safe: no migration SQL has run.
 func beginMigration(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		tx, err := db.BeginTx(ctx, nil)
 		var sqliteErr *sqlite.Error
-		if err == nil || !errors.As(err, &sqliteErr) || sqliteErr.Code()&255 != 5 || !time.Now().Before(deadline) {
+		if err == nil || !errors.As(err, &sqliteErr) || (sqliteErr.Code()&255 != sqlite3.SQLITE_BUSY && sqliteErr.Code() != sqlite3.SQLITE_LOCKED_SHAREDCACHE) || !time.Now().Before(deadline) {
 			return tx, err
 		}
 		timer := time.NewTimer(10 * time.Millisecond)
