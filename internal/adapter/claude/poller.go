@@ -74,11 +74,13 @@ func (p *Poller) Tick(ctx context.Context) ([]dispatch.Outcome, error) {
 			break
 		}
 		outcome, err := p.dispatchOne(ctx, genCtx, id.ID)
-		p.after = &id
 		outcomes = append(outcomes, outcome)
 		if err != nil {
 			return outcomes, err
 		}
+		// Keep the blocked position on errors such as budget exhaustion.
+		// Retryable transport outcomes return nil and still advance for fairness.
+		p.after = &id
 	}
 	return outcomes, nil
 }
