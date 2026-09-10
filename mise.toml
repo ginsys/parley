@@ -1,8 +1,10 @@
 [tools]
-# ci.yml installs from this list (jdx/mise-action); a bump here is the only edit needed.
+# CI reads versions here; new tools also need explicit job install_args in ci.yml.
 go = "1.27.1"
 actionlint = "1.7.12"
 shellcheck = "0.11.0"
+python = "3.14.7"
+ruff = "0.16.6"
 
 [tasks.lint]
 description = "actionlint on the workflows, shellcheck on the scripts"
@@ -11,6 +13,13 @@ description = "actionlint on the workflows, shellcheck on the scripts"
 run = """
 env -u SHELLCHECK_OPTS actionlint
 env -u SHELLCHECK_OPTS shellcheck scripts/ci/*.sh scripts/test/*.sh
+"""
+
+[tasks.python]
+description = "Ruff on all Python tooling and controlled wake-probe/CI-gate fixtures"
+run = """
+ruff check scripts
+python3 -m unittest discover -s scripts/probe -v
 """
 
 [tasks.test]
@@ -67,5 +76,5 @@ depends = ["upstream-sync"]
 run = "FIRST_PARTY_WORKFLOW_RE='^(go-kure|ginsys)/[^/]+/\\.github/workflows/[^@]+@main$' bash upstream/scripts/check-action-pins.sh ."
 
 [tasks.verify]
-description = "Everything ci.yml runs: lint, tests, docs, whitespace, commit subjects, go, action pins"
-depends = ["lint", "test", "docs", "whitespace", "commit-lint", "go", "action-pins"]
+description = "Everything ci.yml runs: lint, tests, docs, whitespace, commit subjects, go, action pins, Python"
+depends = ["lint", "test", "docs", "whitespace", "commit-lint", "go", "action-pins", "python"]

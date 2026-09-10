@@ -71,7 +71,7 @@ not closure evidence.
    or change branch protection.
 
 Every PR runs the `CI` workflow (documentation checks, `actionlint`, `go build`/`go vet`/`go
-test`/`gofmt`, conventional-commit subjects, action pins; aggregated as the `checks` context) and a
+test`/`gofmt`, conventional-commit subjects, action pins, Python lint and probe fixtures; aggregated as the `checks` context) and a
 Claude review (`PR Review`) whose findings are advisory (`PR_REVIEW_THREADS_MODE` is unset, so it
 posts one comment and creates no resolvable threads) but whose completion is a **required check**:
 the `main-protection` ruleset
@@ -96,6 +96,7 @@ git diff --cached --check
 With [mise](https://mise.jdx.dev/) installed and `origin/main` fetched, `mise run verify` runs
 everything the `CI` workflow runs: the documentation check, `actionlint` and `shellcheck`, the
 commit-lint fixture tests, the whole-tree whitespace check, `go build`/`go vet`/`go test`/`gofmt`,
+Ruff on all Python scripts and the controlled probe/CI-gate fixtures,
 the conventional-commit check on this branch's commits, and the action-pin check (which clones
 go-kure/.github into the gitignored `upstream/`).
 

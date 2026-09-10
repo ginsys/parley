@@ -58,6 +58,17 @@ jobs:
           install_args: actionlint shellcheck
       - run: mise run lint
 
+  python:
+    runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4
+        with:
+          install_args: python ruff
+      - run: python3 -m pip install --quiet 'PyYAML==6.0.3'
+      - run: mise run python
+
   test:
     # The commit-lint fixtures: every accepted and rejected subject shape, plus the range-walk
     # failure cases. `commit-lint` below checks only this PR's own subjects.
@@ -111,7 +122,7 @@ jobs:
     # Aggregator: fails on any failed or cancelled job. `commit-lint` is skipped by design outside
     # pull requests, so `skipped` counts as success only for that job.
     if: always()
-    needs: [docs, actionlint, test, go, commit-lint, action-pins]
+    needs: [docs, actionlint, test, go, commit-lint, action-pins, python]
     runs-on: ${{ (github.event_name == 'merge_group' || github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || 'autops-kube-ginsys' }}
     timeout-minutes: 2
     steps:
