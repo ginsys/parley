@@ -84,11 +84,12 @@ separate actions.
 
 ## Documentation checks
 
-With Python 3.9 or newer and PyYAML 6 installed in your Python environment, run from the repository
-root:
+With mise installed, run from the repository root. The docs and Python tasks share an isolated,
+gitignored `.venv`, created with the pinned interpreter and `requirements-dev.txt`; CI uses the
+same setup. A system Python or globally installed PyYAML is not a prerequisite:
 
 ```sh
-python3 scripts/verify-docs.py
+mise run docs
 git diff --check
 git diff --cached --check
 ```

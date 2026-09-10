@@ -15,11 +15,19 @@ env -u SHELLCHECK_OPTS actionlint
 env -u SHELLCHECK_OPTS shellcheck scripts/ci/*.sh scripts/test/*.sh
 """
 
+[tasks.python-deps]
+description = "Create an isolated Python environment and install pinned test/documentation dependencies"
+run = """
+python3 -m venv .venv
+.venv/bin/python -m pip install --disable-pip-version-check -r requirements-dev.txt
+"""
+
 [tasks.python]
+depends = ["python-deps"]
 description = "Ruff on all Python tooling and controlled wake-probe/CI-gate fixtures"
 run = """
 ruff check scripts
-python3 -m unittest discover -s scripts/probe -v
+.venv/bin/python -m unittest discover -s scripts/probe -v
 """
 
 [tasks.test]
@@ -27,8 +35,9 @@ description = "Fixture tests for scripts/ci/commit-lint.sh"
 run = "bash scripts/test/commit-lint-test.sh"
 
 [tasks.docs]
-description = "Documentation checks (needs Python 3.9+ with PyYAML 6)"
-run = "python3 scripts/verify-docs.py"
+description = "Documentation checks with pinned Python dependencies"
+depends = ["python-deps"]
+run = ".venv/bin/python scripts/verify-docs.py"
 
 [tasks.whitespace]
 description = "git diff --check over the whole tree at HEAD and over the working tree, as ci.yml's docs job does"

@@ -8,3 +8,4 @@ upstream/
 # Python tooling caches
 __pycache__/
 .ruff_cache/
+.venv/
