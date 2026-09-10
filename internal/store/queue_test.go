@@ -3,11 +3,41 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestSetStateDistinguishesMissingFromConflictingEnvelope(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	seedQueue(t, tx)
+	if err := SetState(ctx, tx, "missing", Queued, Cancelled, "2026-01-01T00:00:00Z"); !errors.Is(err, ErrEnvelopeNotFound) {
+		t.Fatalf("missing envelope: %v", err)
+	}
+	e := Envelope{ID: "existing", Conversation: "c", FromPeer: "a", ToPeer: "b", GrantVersion: 1, CreatedAt: "2026-01-01T00:00:00Z"}
+	if err := InsertQueued(ctx, tx, e); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetState(ctx, tx, e.ID, HandedOff, Acked, e.CreatedAt); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("wrong state: %v", err)
+	}
+	saved, err := GetByID(ctx, tx, e.ID)
+	if err != nil || saved.State != Queued {
+		t.Fatalf("mutated row: %+v %v", saved, err)
+	}
+}
 
 func seedQueue(t *testing.T, tx *sql.Tx) {
 	t.Helper()

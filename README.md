@@ -70,7 +70,11 @@ all flags; the human chooses conversation names, enrolled peer IDs, directions a
 Grant direction is `bidirectional`, `a_to_b` or `b_to_a`. A positive `-expires-in` duration sets
 expiry relative to now. Zero means no expiry for a new grant and preserves expiry for renewal;
 negative budgets and durations are invalid. Required names and IDs must be nonempty and peers
-must differ. Unknown commands, malformed flags and positional arguments fail before storage opens.
+must differ. Identifiers are preserved and compared exactly: `"x"` and `" x"` are different
+conversation names, just as `"a"` and `"a "` are different peer IDs. Whitespace-only identifiers are
+invalid. Administrator output quotes identifiers to make whitespace visible; use the exact name
+for later operations. Unknown commands, malformed flags and positional arguments fail before
+storage opens.
 
 Renewal cancels ordinary queued messages from the old version. It carries eligible trusted
 replies forward by default, because their originals have already been acknowledged. The human

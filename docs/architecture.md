@@ -38,7 +38,11 @@ semantics are separately tracked in [issue #6](https://github.com/ginsys/parley/
 A conversation has at most one active grant, enforced by a partial unique index. Versions
 increase across renewals and re-enrollment after revoke; history is retained. Peers must be
 nonempty and distinct, direction must be valid, the grant budget must be positive and an explicit
-expiry must be in the future. Renewal rejects negative budget/TTL inputs; zero budget or omitted
+expiry must be in the future. Names and peer IDs are opaque exact keys: leading/trailing
+whitespace is preserved, while whitespace-only values are rejected. There is no session identity
+canonicalization policy yet. Silently trimming existing keys could target a different conversation
+or make historical grants inaccessible; administrator output quotes keys to expose whitespace.
+Renewal rejects negative budget/TTL inputs; zero budget or omitted
 expiry preserves the current setting, while `exchanges_used` starts at zero on the successor.
 
 Acceptance validates the current peer pair, direction, status and expiry. Claiming delivery
@@ -77,7 +81,8 @@ Acceptance inserts a `queued` envelope without calling a host. Dispatch uses thr
 
 `handed_off` is host acceptance, not proof the recipient processed the message. Valid ingestion
 atomically moves the original from `handed_off` to `acked` and queues its trusted reply. Competing
-acknowledgements fail the expected-state transition. Settlement cannot overwrite a newer retry
+acknowledgements fail the expected-state transition. A missing envelope returns
+`ErrEnvelopeNotFound`; an existing envelope in the wrong state returns `ErrStateConflict`. Settlement cannot overwrite a newer retry
 or refund twice, even if the same grant remains active. If outcome storage fails, dispatch
 returns an error with an empty/unknown state and no uncommitted diagnostic values; it preserves
 whether this call attempted transport delivery. The row may still be `dispatching`.

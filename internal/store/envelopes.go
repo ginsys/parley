@@ -187,6 +187,14 @@ func SetState(ctx context.Context, tx *sql.Tx, id string, expected, state Envelo
 		return fmt.Errorf("set envelope state: rows affected: %w", err)
 	}
 	if n == 0 {
+		var exists int
+		err := tx.QueryRowContext(ctx, "SELECT 1 FROM envelopes WHERE id=?", id).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrEnvelopeNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("check envelope existence: %w", err)
+		}
 		return ErrStateConflict
 	}
 	return nil

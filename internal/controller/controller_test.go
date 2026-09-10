@@ -85,3 +85,40 @@ func TestReenrollmentPreservesHistoricalVersions(t *testing.T) {
 		t.Fatalf("history=%d: %v", count, err)
 	}
 }
+
+func TestConversationAndPeerIdentifiersRemainExact(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "exact.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctrl := New(db)
+	for _, name := range []string{"x", " x"} {
+		g, err := ctrl.Grant(ctx, GrantParams{Conversation: name, PeerAID: "a", PeerBID: "a ", Direction: store.Bidirectional, MaxExchanges: 2})
+		if err != nil || g.Conversation != name || g.PeerBID != "a " {
+			t.Fatalf("grant: %+v %v", g, err)
+		}
+	}
+	if _, err := ctrl.Renew(ctx, RenewParams{Conversation: " x", MaxExchanges: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctrl.Revoke(ctx, "x"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.CurrentGrant(ctx, tx, " x")
+	if err != nil || remaining.GrantVersion != 2 || remaining.MaxExchanges != 3 {
+		t.Fatalf("retargeted operation: %+v %v", remaining, err)
+	}
+	if remaining.Permits("a", "a", time.Now()) || !remaining.Permits("a", "a ", time.Now()) {
+		t.Fatal("peer identities were conflated")
+	}
+	tx.Rollback()
+	if _, err := ctrl.Revoke(ctx, " x"); err != nil {
+		t.Fatalf("exact historical name inaccessible: %v", err)
+	}
+}

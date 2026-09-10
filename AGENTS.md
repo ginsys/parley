@@ -149,3 +149,11 @@ for the exact conversation and recipient using a covering index; it returns expl
 and budget exhaustion without labelling an unattempted candidate as a host call. A cursor
 advances between serialized ticks and wraps at the tail, preventing retryable old rows from
 starving later queued messages. It is process-local and resets when the poller is recreated.
+
+## Exact identifiers
+
+Conversation names and peer IDs are opaque exact keys. Whitespace-only values are invalid;
+leading/trailing whitespace is preserved, and administrator output quotes identifiers so it is
+visible. Do not silently trim keys during grant/revoke/renew: existing spaced and unspaced names
+can coexist, and normalization could retarget an operation or strand a historical grant. Any
+future canonicalization requires an identity policy and migration design, not CLI-only cleanup.
