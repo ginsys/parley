@@ -2,14 +2,16 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from wake_probe import PtyProcess, Trial, aggregate
+from wake_probe import PtyProcess, Trial, aggregate, main, publish_record
 
 CHILD = '''
 import sys, termios
@@ -116,11 +118,102 @@ class PtyTests(unittest.TestCase):
         record = json.loads(output.read_text())
         self.assertIsNone(record['delivery_claim'])
         self.assertTrue(record['eof'])
+        self.assertEqual(record['exit_code'], 0)
+        self.assertIsNone(record['error'])
         self.assertIn(b'synthetic fixture', b''.join(bytes.fromhex(e['hex']) for e in record['events']))
         original = output.read_bytes()
         ran = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         self.assertNotEqual(ran.returncode, 0)
         self.assertEqual(output.read_bytes(), original)
+
+    def test_missing_command_and_nonzero_exit_are_failed_captures(self):
+        for command in ([str(Path(self.tmp.name, 'missing-host'))],
+                        [sys.executable, '-c', 'raise SystemExit(23)']):
+            with self.subTest(command=command):
+                output = Path(self.tmp.name, 'result-' + str(len(command)) + '.json')
+                args = ['wake_probe', '--output', str(output), '--seconds', '2', '--', *command]
+                with patch.object(sys, 'argv', args):
+                    result = main()
+                self.assertEqual(result, 1)
+                record = json.loads(output.read_text())
+                self.assertEqual(record['capture_status'], 'failed')
+                self.assertIn(record['exit_code'], (127, 23))
+                self.assertEqual(record['error'], 'child_exit_nonzero')
+
+    def test_interrupt_preserves_partial_events_and_reaps_child(self):
+        output = Path(self.tmp.name, 'interrupted.json')
+        original = PtyProcess.read
+        seen = []
+
+        def interrupted(child, timeout):
+            data = original(child, timeout)
+            if data:
+                seen.append(child.pid)
+                raise KeyboardInterrupt
+            return data
+
+        args = ['wake_probe', '--output', str(output), '--seconds', '30', '--',
+                sys.executable, '-u', '-c', "import time; print('before interrupt', flush=True); time.sleep(30)"]
+        with patch.object(sys, 'argv', args), patch.object(PtyProcess, 'read', interrupted):
+            try:
+                result = main()
+            except KeyboardInterrupt:
+                self.fail('interrupt escaped before partial evidence was saved')
+        self.assertEqual(result, 130)
+        record = json.loads(output.read_text())
+        self.assertEqual(record['capture_status'], 'interrupted')
+        self.assertTrue(record['events'])
+        self.assertTrue(record['cleanup_requested'])
+        self.assertFalse(Path(f'/proc/{seen[0]}').exists())
+
+    def test_failed_dump_leaves_no_empty_destination_or_temporary_file(self):
+        output = Path(self.tmp.name, 'failed.json')
+
+        def fail_dump(record, stream, **kwargs):
+            stream.write('{')
+            raise OSError('injected write failure')
+
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--',
+                sys.executable, '-c', 'pass']
+        with patch.object(sys, 'argv', args), patch('json.dump', fail_dump):
+            with self.assertRaises(OSError):
+                main()
+        self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
+
+    def test_publication_race_preserves_winner(self):
+        output = Path(self.tmp.name, 'winner.json')
+        output.write_text('existing evidence')
+        with self.assertRaises(FileExistsError):
+            publish_record(output, {'competing': True})
+        self.assertEqual(output.read_text(), 'existing evidence')
+        self.assertEqual(list(Path(self.tmp.name).iterdir()), [output])
+
+    def test_signal_exit_is_distinct_from_deadline_cleanup(self):
+        for code, duration, expected, status in (
+            ('import os, signal; os.kill(os.getpid(), signal.SIGTERM)', '2', -signal.SIGTERM, 'failed'),
+            ('import time; print("running", flush=True); time.sleep(30)', '0.2', -signal.SIGKILL, 'stopped'),
+        ):
+            with self.subTest(status=status):
+                output = Path(self.tmp.name, status + '.json')
+                args = ['wake_probe', '--output', str(output), '--seconds', duration, '--',
+                        sys.executable, '-u', '-c', code]
+                with patch.object(sys, 'argv', args):
+                    result = main()
+                record = json.loads(output.read_text())
+                self.assertEqual(record['exit_code'], expected)
+                self.assertEqual(record['capture_status'], status)
+                self.assertEqual(result, 1 if status == 'failed' else 0)
+
+    def test_constructor_failure_produces_complete_failure_record(self):
+        output = Path(self.tmp.name, 'startup.json')
+        with patch.object(sys, 'argv', ['wake_probe', '--output', str(output), '--', 'fixture']), \
+                patch('wake_probe.PtyProcess', side_effect=OSError('fixture startup failure')):
+            result = main()
+        self.assertEqual(result, 1)
+        record = json.loads(output.read_text())
+        self.assertEqual(record['capture_status'], 'failed')
+        self.assertEqual(record['events'], [])
+        self.assertIsNone(record['exit_code'])
 
     def test_limit_and_exit_are_bounded_and_child_is_reaped(self):
         child = self.spawn(code="print('x' * 100, flush=True)", max_bytes=16)

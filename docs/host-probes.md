@@ -38,7 +38,11 @@ output or an echoed marker cannot establish acceptance, a new turn or acknowledg
 process group, bounds captured input/output to 1 MiB, closes the PTY and kills/reaps its child on
 exit. Terminal bytes are hex-encoded with monotonic timestamps rather than rendered as terminal
 control sequences. The CLI creates a fresh HOME and working directory, passes only HOME/PATH/TERM,
-and never writes input. It refuses to overwrite an evidence file.
+and never writes input. Complete JSON is flushed to a temporary file beside the destination and
+published with an atomic no-replace hard link (then the temporary name is removed). This preserves
+another capture even if it creates the destination during recording. Failed serialization leaves
+no empty final file. A caught interruption preserves partial events and returns a nonzero status;
+an uncatchable SIGKILL or power loss before publication cannot preserve an in-memory transcript.
 
 For a synthetic recording, choose a new output filename:
 
@@ -46,7 +50,16 @@ For a synthetic recording, choose a new output filename:
 mise exec -- python3 scripts/probe/wake_probe.py --seconds 2 --output probe-example.json -- python3 -u -c 'print("synthetic fixture")'
 ```
 
-This command records output only; `delivery_claim` is null. Neither EOF nor a captured marker is
+This command records output only; `delivery_claim` is null. Every record includes raw `wait_status`,
+signed `exit_code` (negative means a signal), `cleanup_requested`, `stop_reason` and
+`capture_status`. A nonzero child exit, including 127 from a failed exec, fails the capture and CLI;
+127 can also be deliberately returned by a program, so it does not prove an exact startup stage.
+Natural signal termination is a failure. A child still running at the deadline is stopped by the
+harness and identified as such, not labelled a natural host failure. KeyboardInterrupt produces
+an `interrupted` record with partial events and CLI exit 130; other capture/startup errors produce
+failed records. Failed/interrupted recordings cannot supply negative wake findings. Even a
+`complete` passive recording is not host-readiness evidence, and early EOF does not complete an
+outcome observation window. Neither EOF nor a captured marker is
 promoted to host acceptance. The command runs under a fresh HOME with no copied host credentials.
 The Python `PtyProcess` API allows explicit writes only with a matching observer-supplied generation
 and observed idle-agent state. It records partial writes as ambiguous and refuses other states.
