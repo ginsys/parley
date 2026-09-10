@@ -87,16 +87,23 @@ type QueueSender interface {
 // ExecSender shells out to the codex CLI directly, per Probe A's verified
 // invocation: `codex queue --thread <id> --message <text>`, exit 0 is the
 // only observable success event.
-type ExecSender struct{}
+type ExecSender struct {
+	// command is an optional process factory for controlled adapter tests.
+	command func(context.Context, string, ...string) *exec.Cmd
+}
 
-func (ExecSender) QueueMessage(ctx context.Context, threadID, text string) error {
+func (s ExecSender) QueueMessage(ctx context.Context, threadID, text string) error {
 	if len(text) > maxMessageBytes {
 		return fmt.Errorf("%w: %d bytes > %d: %w", ErrMessageTooLarge, len(text), maxMessageBytes, ErrQueuePermanentlyRejected)
 	}
 	if strings.ContainsRune(text, 0) {
 		return fmt.Errorf("%w: %w", ErrMessageContainsNUL, ErrQueuePermanentlyRejected)
 	}
-	cmd := exec.CommandContext(ctx, "codex", "queue", "--thread", threadID, "--message", text)
+	makeCommand := s.command
+	if makeCommand == nil {
+		makeCommand = exec.CommandContext
+	}
+	cmd := makeCommand(ctx, "codex", "queue", "--thread", threadID, "--message", text)
 	return runAndClassify(ctx, cmd)
 }
 

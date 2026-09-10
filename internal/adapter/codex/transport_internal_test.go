@@ -3,7 +3,9 @@ package codex
 import (
 	"context"
 	"errors"
+	"io"
 	"os/exec"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -65,11 +67,25 @@ func TestRunAndClassifyExecStartFailureIsNeverAttempted(t *testing.T) {
 // ambiguous — the process may have partially run or already committed
 // something before being killed.
 func TestRunAndClassifyMidRunExpiryIsAmbiguous(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", "printf ready; exec sleep 30")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 5)
+		_, err := io.ReadFull(stdout, buf)
+		ready <- err
+		cancel()
+	}()
+	err = runAndClassify(ctx, cmd)
+	if readyErr := <-ready; readyErr != nil {
+		t.Fatalf("process startup: %v", readyErr)
+	}
 
-	cmd := exec.CommandContext(ctx, "sleep", "5")
-	err := runAndClassify(ctx, cmd)
 	if err == nil {
 		t.Fatalf("want an error, got nil")
 	}
@@ -95,9 +111,20 @@ func TestQueueMessageRejectsOversizedText(t *testing.T) {
 
 func TestQueueMessageAllowsTextAtLimit(t *testing.T) {
 	atLimit := strings.Repeat("x", maxMessageBytes)
-	err := ExecSender{}.QueueMessage(context.Background(), "thread-1", atLimit)
-	if errors.Is(err, ErrMessageTooLarge) {
-		t.Fatalf("want text exactly at the limit to pass the size check, got %v", err)
+	called := false
+	sender := ExecSender{command: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		called = true
+		want := []string{"queue", "--thread", "thread-1", "--message", atLimit}
+		if name != "codex" || !reflect.DeepEqual(args, want) {
+			t.Fatal("incorrect queue arguments")
+		}
+		return exec.CommandContext(ctx, "sh", "-c", "exit 0")
+	}}
+	if err := sender.QueueMessage(context.Background(), "thread-1", atLimit); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("command was not constructed")
 	}
 }
 
