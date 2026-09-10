@@ -47,8 +47,10 @@ class GateTests(unittest.TestCase):
             for name in deps:
                 text += f'\n[tasks.{name}]\nrun = "' + ('exit 41' if name == 'python' else 'true') + '"\n'
             Path(tmp, 'mise.toml').write_text(text)
+            empty = Path(tmp, 'empty.toml')
+            empty.write_text('')
             env = dict(os.environ, MISE_TRUSTED_CONFIG_PATHS=tmp,
-                       MISE_GLOBAL_CONFIG_FILE='/dev/null', MISE_SYSTEM_CONFIG_FILE='/dev/null',
+                       MISE_GLOBAL_CONFIG_FILE=str(empty), MISE_SYSTEM_CONFIG_FILE=str(empty),
                        MISE_TASK_RUN_AUTO_INSTALL='false')
             ran = subprocess.run(['mise', 'run', 'verify'], cwd=tmp, env=env,
                                  capture_output=True, text=True, timeout=30)
