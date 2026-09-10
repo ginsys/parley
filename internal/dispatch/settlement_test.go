@@ -14,9 +14,9 @@ import (
 	"github.com/ginsys/parley/internal/store"
 )
 
-type testTransport struct{}
+type testTransport struct{ err error }
 
-func (testTransport) Deliver(context.Context, store.Envelope) error { return nil }
+func (t testTransport) Deliver(context.Context, store.Envelope) error { return t.err }
 
 func setupSettlement(t *testing.T) (*store.DB, *Bridge, *store.Envelope, string) {
 	t.Helper()
@@ -126,8 +126,12 @@ func TestRefundFailureRollsBackSettlement(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.settle(ctx, claimed, ErrNoAttempt); err == nil {
+	outcome, err := b.settle(ctx, claimed, ErrNoAttempt)
+	if err == nil {
 		t.Fatal("refund unexpectedly succeeded")
+	}
+	if outcome.State != "" || outcome.ErrorCode != "" || outcome.ErrorDetail != "" {
+		t.Fatalf("reported uncommitted outcome: %+v", outcome)
 	}
 	tx, err = db.Begin(ctx)
 	if err != nil {
@@ -204,4 +208,33 @@ func TestCrashHandoffHelper(t *testing.T) {
 	}
 	// Exit after host return, before any outcome transaction or deferred cleanup.
 	os.Exit(23)
+}
+
+func TestDispatchOutcomeDoesNotReportRolledBackSettlement(t *testing.T) {
+	db, b, e, _ := setupSettlement(t)
+	ctx := context.Background()
+	b.transport = testTransport{err: ErrNoAttempt}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`CREATE TRIGGER reject_refund BEFORE UPDATE OF exchanges_used ON grants WHEN NEW.exchanges_used<OLD.exchanges_used BEGIN SELECT RAISE(ABORT,'synthetic refund failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := b.DispatchOutcome(ctx, e.ID)
+	if err == nil || outcome.ID != e.ID || outcome.State != "" || outcome.ErrorCode != "" || outcome.ErrorDetail != "" || outcome.Attempted {
+		t.Fatalf("rolled-back outcome: %+v %v", outcome, err)
+	}
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	saved, err := store.GetByID(ctx, tx, e.ID)
+	if err != nil || saved.State != store.Dispatching {
+		t.Fatalf("stored outcome: %+v %v", saved, err)
+	}
 }

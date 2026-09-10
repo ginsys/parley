@@ -192,11 +192,21 @@ func (b *Bridge) dispatch(ctx context.Context, envelopeID string, outcome *Outco
 	return settled.State, err
 }
 
-func (b *Bridge) settle(ctx context.Context, claimed *store.Envelope, deliverErr error) (Outcome, error) {
+func (b *Bridge) settle(ctx context.Context, claimed *store.Envelope, deliverErr error) (outcome Outcome, err error) {
+	// A failed transaction cannot report its intended state as durable evidence.
+	// Preserve attempt information, but leave the stored outcome unknown on error.
+	defer func() {
+		if err != nil {
+			outcome.State = ""
+			outcome.ErrorCode = ""
+			outcome.ErrorDetail = ""
+		}
+	}()
+
 	ambiguous := errors.Is(deliverErr, ErrAmbiguous)
 	noAttempt := !ambiguous && errors.Is(deliverErr, ErrNoAttempt)
 	permanent := !ambiguous && errors.Is(deliverErr, ErrPermanentlyRejected)
-	outcome := Outcome{ID: claimed.ID, State: store.HandedOff, Attempted: !noAttempt && !permanent}
+	outcome = Outcome{ID: claimed.ID, State: store.HandedOff, Attempted: !noAttempt && !permanent}
 	switch {
 	case deliverErr == nil:
 	case errors.Is(deliverErr, ErrAmbiguous):
