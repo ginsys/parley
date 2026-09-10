@@ -6,12 +6,16 @@ The controlled fixtures launch only Python children, never installed Claude, Cod
 
 ## Reproduce controlled fixtures
 
-Install the Python and Ruff versions pinned in `mise.toml`, plus PyYAML 6, then run:
+With mise installed, run:
 
 ```sh
 mise run python
 mise run verify
 ```
+
+`mise run python` and `mise run docs` first create the gitignored `.venv` using the pinned
+Python and install `requirements-dev.txt` (`PyYAML==6.0.3`). CI uses the same setup task; no
+system-interpreter PyYAML installation is required.
 
 `mise run python` lints all Python under `scripts/` and runs the PTY, classification and aggregate
 CI fixtures. The CI Python job installs both pinned tools explicitly. Python is a dependency of

@@ -1,0 +1,2 @@
+# Shared by mise documentation and probe verification, locally and in CI.
+PyYAML==6.0.3
