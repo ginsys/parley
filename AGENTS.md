@@ -94,5 +94,13 @@ commit cleanup. Outcome recording after a host attempt keeps its independent con
 cancellation does not erase delivery evidence. Connection pragmas are supplied through the DSN.
 
 Schema upgrades use ordered `PRAGMA user_version` steps in an immediate transaction. Version-zero
-adoption alone recognizes the two historical column layouts; later steps use versions, not column
-sniffing. Unknown layouts or future versions fail without partial schema changes.
+adoption compares the complete application catalog against the shipped schemas: initial `a024019`,
+fresh trusted-reply `8af08cb`, and the initial schema upgraded by `0edf451`'s ALTER. The frozen SQL
+includes CHECK/UNIQUE constraints, collations and automatic indexes; extra objects are rejected.
+Only the two known explicit indexes may be absent, and their recreation commits atomically with
+adoption. Even equivalent rewritten DDL is rejected: exact historical matching avoids maintaining
+a SQL equivalence parser or silently accepting changed semantics. Preserve the embedded historical
+DDL, including comments inside CREATE statements. Later steps use versions, not column sniffing.
+Unknown layouts or future versions fail without partial schema changes. Before any migration SQL
+runs, BEGIN retries busy and shared-cache writer contention within a five-second retry window,
+respecting context cancellation; migration statements themselves are never replayed.

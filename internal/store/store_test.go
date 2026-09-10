@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -17,51 +18,20 @@ import (
 // exists — so a database created before is_trusted_reply was added to the
 // envelopes table would never gain the column, and every subsequent
 // InsertQueued/ListQueued/GetByID call against it would fail with
-// "no such column: is_trusted_reply". This constructs exactly that
-// pre-upgrade shape by hand (the envelopes table as it existed before this
-// column, plus the conversations/grants tables its foreign keys need), then
-// verifies Open's migration step adds the column to the existing table
-// rather than leaving it untouched.
+// "no such column: is_trusted_reply". Seed the actual initial schema from
+// a024019, including its CHECK constraints, rather than a partial reconstruction.
 func TestOpenMigratesPreExistingDatabaseMissingTrustedReplyColumn(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "pre-upgrade.sqlite")
 	seedDB, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatalf("open seed db: %v", err)
 	}
+	legacy, err := os.ReadFile("legacy_schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, stmt := range []string{
-		`CREATE TABLE conversations (
-			id         TEXT PRIMARY KEY,
-			name       TEXT NOT NULL UNIQUE,
-			created_at TEXT NOT NULL
-		)`,
-		`CREATE TABLE grants (
-			conversation   TEXT    NOT NULL REFERENCES conversations(id),
-			grant_version  INTEGER NOT NULL,
-			peer_a_id      TEXT    NOT NULL,
-			peer_b_id      TEXT    NOT NULL,
-			direction      TEXT    NOT NULL,
-			max_exchanges  INTEGER NOT NULL,
-			exchanges_used INTEGER NOT NULL DEFAULT 0,
-			granted_at     TEXT    NOT NULL,
-			expires_at     TEXT,
-			status         TEXT    NOT NULL,
-			revoked_at     TEXT,
-			PRIMARY KEY (conversation, grant_version)
-		)`,
-		// The envelopes table exactly as it existed before is_trusted_reply.
-		`CREATE TABLE envelopes (
-			id            TEXT    PRIMARY KEY,
-			conversation  TEXT    NOT NULL REFERENCES conversations(id),
-			from_peer     TEXT    NOT NULL,
-			to_peer       TEXT    NOT NULL,
-			text          TEXT    NOT NULL,
-			grant_version INTEGER NOT NULL,
-			in_reply_to   TEXT,
-			state         TEXT    NOT NULL,
-			created_at    TEXT    NOT NULL,
-			updated_at    TEXT    NOT NULL,
-			FOREIGN KEY (conversation, grant_version) REFERENCES grants(conversation, grant_version)
-		)`,
+		string(legacy),
 		`INSERT INTO conversations (id, name, created_at) VALUES ('conv-1', 'conv-1', '2026-01-01T00:00:00Z')`,
 		`INSERT INTO grants (conversation, grant_version, peer_a_id, peer_b_id, direction, max_exchanges, granted_at, status)
 			VALUES ('conv-1', 1, 'a', 'b', 'bidirectional', 10, '2026-01-01T00:00:00Z', 'active')`,
