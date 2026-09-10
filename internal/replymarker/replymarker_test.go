@@ -700,3 +700,62 @@ func TestValidateRejectsReplyFromNonAddressee(t *testing.T) {
 		t.Fatalf("want ErrWrongReplier, got %v", err)
 	}
 }
+
+// Regression for finding 3974355741 on PR #3's third review round:
+// stripCodeSpans used to delete a matched code span's delimiters and
+// content outright, concatenating the literal text immediately before and
+// after it. Those two fragments were never adjacent in the source — here,
+// literal "<!" then an inline code span "`x`" then literal "--" — so
+// closing the gap between them could synthesize a comment delimiter
+// ("<!--") that was never actually present, hiding a following valid
+// marker as if it were inside an HTML comment.
+func TestExtractFindsMarkerAfterCodeSpanSplitCommentLookalike(t *testing.T) {
+	turn := "<!`x`--\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want the marker to be found (no real HTML comment was opened), got %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text hi, got %q", m.Text)
+	}
+}
+
+// Regression for finding 3974355748 on PR #3's third review round:
+// CommonMark's type 7 (a generic complete tag alone on a line) cannot
+// interrupt an open paragraph — only types 1-6 and fenced code blocks can.
+// A custom tag immediately following ordinary paragraph text, with no blank
+// line between them, must stay live paragraph text; a following reply fence
+// still interrupts the paragraph and must be found, not hidden as if the
+// custom tag had opened a blank-line-terminated raw HTML block.
+func TestExtractFindsMarkerAfterCustomTagCannotInterruptParagraph(t *testing.T) {
+	turn := "some ordinary paragraph text\n<custom>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want the marker to be found (type 7 cannot interrupt the open paragraph), got %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text hi, got %q", m.Text)
+	}
+}
+
+// Regression for finding 3974355752 on PR #3's third review round: a
+// self-contained type-1 block (script/pre/style/textarea opened and closed
+// on the same line) must be recognized as that specific raw HTML block type
+// even when its content contains a literal comment-opener-like substring
+// ("<!--"). The previous ordering checked for an HTML comment first, so a
+// line like `<script>const s = "<!--";</script>` was misread as opening an
+// unterminated comment, hiding every following line — including a valid
+// reply fence — until an unrelated "-->" happened to appear.
+func TestExtractFindsMarkerAfterSelfContainedScriptBlockContainingCommentLookalike(t *testing.T) {
+	turn := `<script>const s = "<!--";</script>` + "\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want the marker to be found (the script block closes on its own line), got %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text hi, got %q", m.Text)
+	}
+}
