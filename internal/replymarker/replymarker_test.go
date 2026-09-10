@@ -759,3 +759,79 @@ func TestExtractFindsMarkerAfterSelfContainedScriptBlockContainingCommentLookali
 		t.Fatalf("want text hi, got %q", m.Text)
 	}
 }
+
+// Regression for a finding on PR #3's fourth review round: <source> is part
+// of CommonMark's fixed type-6 block-level tag list, missing from
+// blockLevelTags. A <source> block hides its content (including a following
+// marker) until the next blank line, same as any other type-6 tag.
+func TestExtractIgnoresMarkerInsideSourceBlock(t *testing.T) {
+	turn := "<source>\nhidden\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker nested inside a <source> block, got %v", err)
+	}
+}
+
+func TestExtractFindsMarkerAfterBlankLineEndsSourceBlock(t *testing.T) {
+	turn := "<source>\nhidden\n\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after the blank line closing the <source> block, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
+// Regression for a finding on PR #3's fourth review round: scanForMarker's
+// paragraphOpen fallback previously marked every unrecognized nonblank line
+// as opening a paragraph, including headings, thematic breaks and indented
+// code — none of which are CommonMark paragraphs. That wrongly gated a
+// following type-7 tag as "cannot interrupt a paragraph" (skipping the
+// raw-HTML-block check), leaving it as ordinary text and exposing a marker
+// that should instead have stayed hidden inside the type-7 block until a
+// blank line, exactly as it would with nothing before the tag at all.
+func TestExtractIgnoresMarkerInsideCustomTagAfterHeading(t *testing.T) {
+	turn := "# heading\n<custom>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker inside a type-7 block opened right after a heading (not a paragraph), got %v", err)
+	}
+}
+
+func TestExtractIgnoresMarkerInsideCustomTagAfterThematicBreak(t *testing.T) {
+	turn := "---\n<custom>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	if _, err := replymarker.Extract(turn); !errors.Is(err, replymarker.ErrNoMarker) {
+		t.Fatalf("want ErrNoMarker for a marker inside a type-7 block opened right after a thematic break (not a paragraph), got %v", err)
+	}
+}
+
+func TestExtractFindsMarkerAfterBlankLineEndsCustomTagAfterHeading(t *testing.T) {
+	turn := "# heading\n<custom>\nhidden\n\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want a live marker after the blank line closing the custom-tag block, got err %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text %q, got %q", "hi", m.Text)
+	}
+}
+
+// A type-7 tag immediately after genuine paragraph text is the unchanged
+// case (TestExtractFindsMarkerAfterCustomTagCannotInterruptParagraph above):
+// it still cannot interrupt the paragraph, unlike the heading/thematic-break
+// cases just added.
+func TestExtractFindsMarkerAfterCustomTagCannotInterruptIndentedCodeContinuation(t *testing.T) {
+	turn := "some paragraph text\n    still part of the paragraph (lazy continuation)\n<custom>\n```BRIDGE-REPLY\n" +
+		"{\"in_reply_to\": \"env-1\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
+	m, err := replymarker.Extract(turn)
+	if err != nil {
+		t.Fatalf("want the marker to be found (the indented line is a lazy paragraph continuation, still an open paragraph), got %v", err)
+	}
+	if m.Text != "hi" {
+		t.Fatalf("want text hi, got %q", m.Text)
+	}
+}

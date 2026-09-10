@@ -38,6 +38,29 @@ func TestRunAndClassifyPreStartCancellationIsNeverAttempted(t *testing.T) {
 	}
 }
 
+// Regression for a finding on PR #3's fourth review round: exec failing to
+// start the process at all (binary not found) with a live, uncanceled
+// context must still classify as never-attempted, not fall through to a
+// plain terminal failure — cmd.Process staying nil is what proves nothing
+// was attempted, independent of ctx.Err().
+func TestRunAndClassifyExecStartFailureIsNeverAttempted(t *testing.T) {
+	ctx := context.Background()
+	cmd := exec.CommandContext(ctx, "/nonexistent-parley-test-binary")
+	err := runAndClassify(ctx, cmd)
+	if err == nil {
+		t.Fatalf("want an error, got nil")
+	}
+	if errors.Is(err, ErrQueueAmbiguous) {
+		t.Fatalf("want never-attempted for an exec start failure, got ambiguous: %v", err)
+	}
+	if !errors.Is(err, ErrQueueNotAttempted) {
+		t.Fatalf("want ErrQueueNotAttempted for an exec start failure, got %v", err)
+	}
+	if cmd.Process != nil {
+		t.Fatalf("test premise violated: process must not have started")
+	}
+}
+
 // A context that expires only after the process has started is genuinely
 // ambiguous — the process may have partially run or already committed
 // something before being killed.

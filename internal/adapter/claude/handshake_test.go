@@ -111,7 +111,10 @@ func TestDelayedReadinessKeepsQueued(t *testing.T) {
 	}
 
 	probe := &probeRecorder{}
-	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	hs, err := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start handshake: %v", err)
 	}
@@ -171,7 +174,10 @@ func TestHandshakeTimeoutRetriesOnlyHandshake(t *testing.T) {
 	}
 
 	probe := &probeRecorder{}
-	hs := adapterclaude.NewHandshake(probe.send, 20*time.Millisecond)
+	hs, err := adapterclaude.NewHandshake(probe.send, 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start handshake: %v", err)
 	}
@@ -214,7 +220,10 @@ func TestHandshakeTimeoutRetriesOnlyHandshake(t *testing.T) {
 // before dispatching anything on the new connection.
 func TestReconnectResetsReadiness(t *testing.T) {
 	probe := &probeRecorder{}
-	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	hs, err := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -261,7 +270,10 @@ func TestReconnectResetsReadiness(t *testing.T) {
 // immediately rather than keep dispatching into a dead transport.
 func TestStopClearsReadiness(t *testing.T) {
 	probe := &probeRecorder{}
-	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	hs, err := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -302,7 +314,10 @@ func TestPollerStopsMidBatchWhenReadinessRevoked(t *testing.T) {
 	}
 
 	probe := &probeRecorder{}
-	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	hs, err := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -352,7 +367,10 @@ func TestPollerStopsMidBatchWhenGenerationChangesDespiteReady(t *testing.T) {
 	}
 
 	probe := &probeRecorder{}
-	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	hs, err := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -426,7 +444,10 @@ func TestPollerStopsBatchOnBudgetExhaustion(t *testing.T) {
 	}
 
 	probe := &probeRecorder{}
-	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	hs, err := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -493,7 +514,10 @@ func TestPollerCancelsInFlightDispatchWhenGenerationInvalidatedMidDelivery(t *te
 	}
 
 	probe := &probeRecorder{}
-	hs := adapterclaude.NewHandshake(probe.send, time.Hour)
+	hs, err := adapterclaude.NewHandshake(probe.send, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -550,11 +574,14 @@ func TestPollerCancelsInFlightDispatchWhenGenerationInvalidatedMidDelivery(t *te
 func TestSendProbeRunsOutsideLock(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	hs := adapterclaude.NewHandshake(func(context.Context, string) error {
+	hs, err := adapterclaude.NewHandshake(func(context.Context, string) error {
 		close(started)
 		<-release
 		return nil
 	}, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 
 	done := make(chan error, 1)
 	go func() { done <- hs.Start() }()
@@ -584,7 +611,10 @@ func TestSendProbeRunsOutsideLock(t *testing.T) {
 
 func TestHandshakeStartPropagatesProbeError(t *testing.T) {
 	boom := errors.New("boom")
-	hs := adapterclaude.NewHandshake(func(context.Context, string) error { return boom }, time.Hour)
+	hs, err := adapterclaude.NewHandshake(func(context.Context, string) error { return boom }, time.Hour)
+	if err != nil {
+		t.Fatalf("new handshake: %v", err)
+	}
 	if err := hs.Start(); !errors.Is(err, boom) {
 		t.Fatalf("want probe error propagated, got %v", err)
 	}

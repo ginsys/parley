@@ -70,10 +70,22 @@ func (g Grant) Expired(now time.Time) bool {
 // resolving a Grant some other way must not have to separately remember to
 // check RevokedAt or ExpiresAt itself.
 func (g Grant) Permits(from, to string, now time.Time) bool {
-	if g.RevokedAt != nil {
+	if g.Expired(now) {
 		return false
 	}
-	if g.Expired(now) {
+	return g.PermitsDirection(from, to)
+}
+
+// PermitsDirection reports whether this grant's enrolled pair and Direction
+// allow a message from "from" to "to", the same identity/direction check
+// Permits makes, but deliberately without Permits's expiry check. A caller
+// rescuing a trusted reply onto a successor grant (dispatch.
+// resolveRequeueVersion) needs exactly this: an expired-but-otherwise-
+// permitted grant is still a valid requeue target — a later claim-time
+// expiry check governs whether it can actually dispatch — while a grant that
+// never permitted this direction/pair at all is not, regardless of expiry.
+func (g Grant) PermitsDirection(from, to string) bool {
+	if g.RevokedAt != nil {
 		return false
 	}
 	switch {
