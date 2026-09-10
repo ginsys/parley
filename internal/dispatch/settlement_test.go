@@ -109,6 +109,41 @@ func TestDiagnosticsPersistWithoutTransportSecrets(t *testing.T) {
 	}
 }
 
+func TestRefundFailureRollsBackSettlement(t *testing.T) {
+	db, b, e, _ := setupSettlement(t)
+	ctx := context.Background()
+	claimed, ok, err := b.claim(ctx, e.ID)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v", err)
+	}
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`CREATE TRIGGER reject_refund BEFORE UPDATE OF exchanges_used ON grants WHEN NEW.exchanges_used<OLD.exchanges_used BEGIN SELECT RAISE(ABORT,'synthetic refund failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.settle(ctx, claimed, ErrNoAttempt); err == nil {
+		t.Fatal("refund unexpectedly succeeded")
+	}
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	saved, err := store.GetByID(ctx, tx, e.ID)
+	if err != nil || saved.State != store.Dispatching || saved.DispatchAttempt != claimed.DispatchAttempt || saved.ErrorCode != "" {
+		t.Fatalf("partial settlement: %+v %v", saved, err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, "c")
+	if err != nil || g.ExchangesUsed != 1 {
+		t.Fatalf("partial refund: %+v %v", g, err)
+	}
+}
+
 func TestCrashAfterHandoffRecoversUncertainWithoutReplay(t *testing.T) {
 	db, _, e, path := setupSettlement(t)
 	executable, err := os.Executable()

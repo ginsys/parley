@@ -14,7 +14,7 @@ import (
 
 // Each numbered step and user_version update commits in the same immediate
 // transaction. Only version-zero adoption examines historical column layouts.
-var migrations = []func(context.Context, *sql.Tx) error{adoptLegacySchema, addRenewalPolicy, addDeliveryOutcomes}
+var migrations = []func(context.Context, *sql.Tx) error{adoptLegacySchema, addRenewalPolicy, addDeliveryOutcomes, addQueueOrdering}
 
 func migrate(ctx context.Context, db *sql.DB) error {
 	tx, err := beginMigration(ctx, db)

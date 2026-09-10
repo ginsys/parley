@@ -150,7 +150,7 @@ func TestDelayedReadinessKeepsQueued(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tick after ack: %v", err)
 	}
-	if len(ids) != 1 || ids[0] != e.ID {
+	if len(ids) != 1 || ids[0].ID != e.ID {
 		t.Fatalf("want envelope %s dispatched, got %v", e.ID, ids)
 	}
 	assertState(t, db, e.ID, store.HandedOff)
@@ -338,7 +338,7 @@ func TestPollerStopsMidBatchWhenReadinessRevoked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tick: %v", err)
 	}
-	if len(attempted) != 1 || attempted[0] != e1.ID {
+	if len(attempted) != 1 || attempted[0].ID != e1.ID {
 		t.Fatalf("want only %s attempted before readiness was revoked, got %v", e1.ID, attempted)
 	}
 	assertState(t, db, e1.ID, store.HandedOff)
@@ -400,7 +400,7 @@ func TestPollerStopsMidBatchWhenGenerationChangesDespiteReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tick: %v", err)
 	}
-	if len(attempted) != 1 || attempted[0] != e1.ID {
+	if len(attempted) != 1 || attempted[0].ID != e1.ID {
 		t.Fatalf("want only %s attempted before the generation changed, got %v", e1.ID, attempted)
 	}
 	if !hs.Ready() {
@@ -459,17 +459,13 @@ func TestPollerStopsBatchOnBudgetExhaustion(t *testing.T) {
 	b := dispatch.New(db, transport)
 	poller := adapterclaude.NewPoller(db, b, hs, conversation, "claude-session-a")
 
-	// e1 consumes the only budget slot; e2 discovers the exhaustion (a
-	// genuine attempt that fails, so it's correctly counted as attempted);
-	// e3 must never be touched at all — that's what stopping the batch
-	// protects, not re-litigating the envelope that already found the
-	// exhausted budget.
+	// Exhaustion is a candidate outcome, never a host attempt.
 	attempted, err := poller.Tick(ctx)
-	if err != nil {
+	if !errors.Is(err, dispatch.ErrBudgetExhausted) {
 		t.Fatalf("tick: %v", err)
 	}
-	if len(attempted) != 2 || attempted[0] != e1.ID || attempted[1] != e2.ID {
-		t.Fatalf("want e1 and e2 attempted and the batch to stop before e3, got %v", attempted)
+	if len(attempted) != 2 || attempted[0].ID != e1.ID || !attempted[0].Attempted || attempted[1].ID != e2.ID || attempted[1].Attempted || attempted[1].State != store.Queued {
+		t.Fatalf("outcomes=%+v", attempted)
 	}
 	assertState(t, db, e1.ID, store.HandedOff)
 	assertState(t, db, e2.ID, store.Queued)

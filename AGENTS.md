@@ -141,3 +141,11 @@ in the same transaction. This prevents duplicate or stale results from refunding
 Abnormal termination after process startup and interrupted dispatch recovery remain `uncertain`;
 there is no automatic retry. Diagnostics use fixed codes and summaries, never transport error
 strings or message bodies. Tests use controlled child processes for crash-after-handoff coverage.
+
+## Queue ordering
+
+Schema version 4 preserves textual envelope timestamps and backfills numeric nanoseconds inside
+one immediate migration transaction. Invalid or unrepresentable timestamps abort the migration.
+Delivery order is numeric creation time then envelope ID. Polling selects at most 100 queued IDs
+for the exact conversation and recipient using a covering index; it returns explicit outcomes
+and budget exhaustion without labelling an unattempted candidate as a host call.

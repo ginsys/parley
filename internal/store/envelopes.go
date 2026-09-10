@@ -10,16 +10,43 @@ import (
 var ErrEnvelopeNotFound = errors.New("envelope not found")
 var ErrStateConflict = errors.New("envelope is not in the expected state")
 
+const MaxQueueBatch = 100
+
+// ListQueuedIDs bounds work and avoids reading bodies for other recipients.
+func ListQueuedIDs(ctx context.Context, tx *sql.Tx, conversation, toPeer string, limit int) ([]string, error) {
+	if limit < 1 || limit > MaxQueueBatch {
+		return nil, fmt.Errorf("queue limit must be between 1 and %d", MaxQueueBatch)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM envelopes WHERE conversation=? AND state='queued' AND to_peer=? ORDER BY created_at_ns ASC, id ASC LIMIT ?`, conversation, toPeer, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // InsertQueued writes a new envelope in the queued state. GrantVersion must
 // already be stamped by the caller from CurrentGrant at accept time.
 // TrustedReply must only ever be true when the caller is codex.IngestTurn.
 func InsertQueued(ctx context.Context, tx *sql.Tx, e Envelope) error {
-	_, err := tx.ExecContext(ctx, `
+	ns, err := timestampNanos(e.CreatedAt)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO envelopes (id, conversation, from_peer, to_peer, text, grant_version,
-		                        in_reply_to, is_trusted_reply, state, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+		                        in_reply_to, is_trusted_reply, state, created_at, updated_at, created_at_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
 		e.ID, e.Conversation, e.FromPeer, e.ToPeer, e.Text, e.GrantVersion,
-		e.InReplyTo, e.TrustedReply, e.CreatedAt, e.CreatedAt)
+		e.InReplyTo, e.TrustedReply, e.CreatedAt, e.CreatedAt, ns)
 	if err != nil {
 		return fmt.Errorf("insert queued envelope: %w", err)
 	}
@@ -34,7 +61,7 @@ func ListQueued(ctx context.Context, tx *sql.Tx, conversation string) ([]Envelop
 		       is_trusted_reply, state, created_at, updated_at, dispatch_attempt, error_code, error_detail
 		FROM envelopes
 		WHERE conversation = ? AND state = 'queued'
-		ORDER BY created_at ASC`, conversation)
+		ORDER BY created_at_ns ASC, id ASC`, conversation)
 	if err != nil {
 		return nil, fmt.Errorf("list queued: %w", err)
 	}
