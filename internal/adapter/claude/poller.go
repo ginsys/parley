@@ -2,7 +2,6 @@ package claude
 
 import (
 	"context"
-	"errors"
 
 	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
@@ -48,9 +47,9 @@ func NewPoller(db *store.DB, bridge *dispatch.Bridge, handshake *Handshake, conv
 //
 // On the grant's budget running out, the whole batch stops rather than
 // continuing through the remaining candidates, each of which would hit the
-// same exhausted budget. Returns the envelope ids actually dispatched, for
-// tests.
-func (p *Poller) Tick(ctx context.Context) ([]string, error) {
+// same exhausted budget. Returns explicit outcomes, including the unattempted exhausted candidate,
+// and ErrBudgetExhausted. Each tick considers at most store.MaxQueueBatch rows.
+func (p *Poller) Tick(ctx context.Context) ([]dispatch.Outcome, error) {
 	if !p.handshake.Ready() {
 		return nil, nil
 	}
@@ -60,35 +59,32 @@ func (p *Poller) Tick(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var attempted []string
+	var outcomes []dispatch.Outcome
 	for _, id := range candidates {
 		genCtx, ok := p.handshake.GenerationContext(gen)
 		if !ok {
 			break
 		}
-		attempted = append(attempted, id)
-		if err := p.dispatchOne(ctx, genCtx, id); err != nil {
-			if errors.Is(err, dispatch.ErrBudgetExhausted) {
-				break
-			}
-			return attempted, err
+		outcome, err := p.dispatchOne(ctx, genCtx, id)
+		outcomes = append(outcomes, outcome)
+		if err != nil {
+			return outcomes, err
 		}
 	}
-	return attempted, nil
+	return outcomes, nil
 }
 
 // dispatchOne runs one Dispatch call bound to both the caller's ctx and
 // genCtx: canceled the instant either one is, via context.AfterFunc rather
 // than a manual select-based goroutine, which is the standard library's
 // leak-free way to propagate cancellation from a second context.
-func (p *Poller) dispatchOne(ctx, genCtx context.Context, id string) error {
+func (p *Poller) dispatchOne(ctx, genCtx context.Context, id string) (dispatch.Outcome, error) {
 	dispatchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(genCtx, cancel)
 	defer stop()
 
-	_, err := p.bridge.Dispatch(dispatchCtx, id)
-	return err
+	return p.bridge.DispatchOutcome(dispatchCtx, id)
 }
 
 func (p *Poller) queuedForMe(ctx context.Context) ([]string, error) {
@@ -97,15 +93,5 @@ func (p *Poller) queuedForMe(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
-	envs, err := store.ListQueued(ctx, tx, p.conversation)
-	if err != nil {
-		return nil, err
-	}
-	var ids []string
-	for _, e := range envs {
-		if e.ToPeer == p.toPeer {
-			ids = append(ids, e.ID)
-		}
-	}
-	return ids, nil
+	return store.ListQueuedIDs(ctx, tx, p.conversation, p.toPeer, store.MaxQueueBatch)
 }
