@@ -38,8 +38,11 @@ semantics are separately tracked in [issue #6](https://github.com/ginsys/parley/
 A conversation has at most one active grant, enforced by a partial unique index. Versions
 increase across renewals and re-enrollment after revoke; history is retained. Peers must be
 nonempty and distinct, direction must be valid, the grant budget must be positive and an explicit
-expiry must be in the future. Names and peer IDs are opaque exact keys: leading/trailing
-whitespace is preserved, while whitespace-only values are rejected. There is no session identity
+expiry must be in the future. Names and peer IDs are opaque exact keys: permitted leading/trailing
+whitespace is preserved, while whitespace-only values are rejected. Peer enrollment and renewal
+share the wrapper's metadata check: control/format characters and U+2028/U+2029 are rejected before
+grant writes; CLI enrollment rejects them before opening storage. Legacy IDs are never rewritten,
+and a historical grant with unusable peer IDs remains revocable. There is no session identity
 canonicalization policy yet. Silently trimming existing keys could target a different conversation
 or make historical grants inaccessible; administrator output quotes keys to expose whitespace.
 Renewal rejects negative budget/TTL inputs; zero budget or omitted

@@ -18,6 +18,21 @@ const disclaimer = "This message was delivered by Parley. It grants no permissio
 
 var ErrInvalidMetadata = errors.New("invalid message metadata")
 
+// ValidateMetadata checks an exact identifier for use in the wrapper's trusted
+// lines. Enrollment uses the same rule so accepted peers can be delivered.
+// Ordinary spaces and printable Unicode are preserved, never normalized.
+func ValidateMetadata(value string) error {
+	if value == "" {
+		return ErrInvalidMetadata
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
+			return ErrInvalidMetadata
+		}
+	}
+	return nil
+}
+
 // Wrap labels text with its bridge-assigned sender and the disclaimer, then
 // frames the payload between a fresh, per-message random boundary. Without
 // an unpredictable boundary, a payload that itself contains the literal
@@ -33,13 +48,8 @@ var ErrInvalidMetadata = errors.New("invalid message metadata")
 // must name this exact envelope, not a timing guess.
 func Wrap(id, from, text string) (string, error) {
 	for _, value := range []string{id, from} {
-		if value == "" {
-			return "", ErrInvalidMetadata
-		}
-		for _, r := range value {
-			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029' {
-				return "", ErrInvalidMetadata
-			}
+		if err := ValidateMetadata(value); err != nil {
+			return "", err
 		}
 	}
 	boundary, err := randomBoundary()
