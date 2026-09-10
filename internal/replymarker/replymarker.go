@@ -13,6 +13,7 @@ package replymarker
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -572,7 +573,7 @@ func decodeMarker(raw []byte) (*Marker, error) {
 // outcome, so it returns ErrDeliveryPending rather than ErrStaleReply — a
 // transient condition the caller should retry, not a permanent rejection.
 // Returns the envelope the reply resolves against.
-func Validate(ctx context.Context, tx *store.Tx, conversation, replyingPeer, expectedTo string, m *Marker) (*store.Envelope, error) {
+func Validate(ctx context.Context, tx *sql.Tx, conversation, replyingPeer, expectedTo string, m *Marker) (*store.Envelope, error) {
 	if m.To != expectedTo {
 		return nil, fmt.Errorf("%w: marker to=%q, expected %q", ErrWrongRecipient, m.To, expectedTo)
 	}

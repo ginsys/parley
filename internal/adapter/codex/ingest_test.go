@@ -66,7 +66,7 @@ func queueOne(t *testing.T, db *store.DB) (conversation, id string) {
 	if err := store.SetState(ctx, tx, e.ID, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
 		t.Fatalf("set handed off: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	return conversation, e.ID
@@ -97,7 +97,7 @@ func TestIngestTurnAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 	original, err := store.GetByID(ctx, tx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -121,7 +121,7 @@ func TestIngestTurnNoMarkerIsOrdinaryConversation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 	original, err := store.GetByID(ctx, tx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -216,7 +216,7 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 	if err := store.SetState(ctx, tx, e.ID, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
 		t.Fatalf("set handed off: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -230,7 +230,7 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx2.Rollback(ctx)
+	defer tx2.Rollback()
 	original, err := store.GetByID(ctx, tx2, e.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -286,7 +286,7 @@ func TestIngestTurnReplyRespectsExchangeBudgetAtDispatch(t *testing.T) {
 	if err := store.InsertQueued(ctx, tx, original); err != nil {
 		t.Fatalf("insert queued: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 

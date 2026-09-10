@@ -93,7 +93,7 @@ func TestOpenMigratesPreExistingDatabaseMissingTrustedReplyColumn(t *testing.T) 
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("InsertQueued after migration: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -101,7 +101,7 @@ func TestOpenMigratesPreExistingDatabaseMissingTrustedReplyColumn(t *testing.T) 
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx2.Rollback(ctx)
+	defer tx2.Rollback()
 	got, err := store.GetByID(ctx, tx2, "env-1")
 	if err != nil {
 		t.Fatalf("GetByID after migration: %v", err)

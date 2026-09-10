@@ -12,8 +12,8 @@ var ErrEnvelopeNotFound = errors.New("envelope not found")
 // InsertQueued writes a new envelope in the queued state. GrantVersion must
 // already be stamped by the caller from CurrentGrant at accept time.
 // TrustedReply must only ever be true when the caller is codex.IngestTurn.
-func InsertQueued(ctx context.Context, tx *Tx, e Envelope) error {
-	_, err := tx.Exec(ctx, `
+func InsertQueued(ctx context.Context, tx *sql.Tx, e Envelope) error {
+	_, err := tx.ExecContext(ctx, `
 		INSERT INTO envelopes (id, conversation, from_peer, to_peer, text, grant_version,
 		                        in_reply_to, is_trusted_reply, state, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)`,
@@ -27,8 +27,8 @@ func InsertQueued(ctx context.Context, tx *Tx, e Envelope) error {
 
 // ListQueued returns queued envelopes for a conversation, oldest first —
 // the order the single-process dispatcher claims them in.
-func ListQueued(ctx context.Context, tx *Tx, conversation string) ([]Envelope, error) {
-	rows, err := tx.Query(ctx, `
+func ListQueued(ctx context.Context, tx *sql.Tx, conversation string) ([]Envelope, error) {
+	rows, err := tx.QueryContext(ctx, `
 		SELECT id, conversation, from_peer, to_peer, text, grant_version, in_reply_to,
 		       is_trusted_reply, state, created_at, updated_at
 		FROM envelopes
@@ -43,7 +43,7 @@ func ListQueued(ctx context.Context, tx *Tx, conversation string) ([]Envelope, e
 
 // CancelQueued transitions every queued row for a conversation to cancelled,
 // regardless of grant_version. Used by revoke.
-func CancelQueued(ctx context.Context, tx *Tx, conversation, updatedAt string) (int64, error) {
+func CancelQueued(ctx context.Context, tx *sql.Tx, conversation, updatedAt string) (int64, error) {
 	return cancelQueuedWhere(ctx, tx, `conversation = ? AND state = 'queued'`, updatedAt, conversation)
 }
 
@@ -51,7 +51,7 @@ func CancelQueued(ctx context.Context, tx *Tx, conversation, updatedAt string) (
 // (soon-to-be-superseded) grant_version to cancelled. Used by renewal: a
 // message accepted under the old grant never silently carries forward under
 // the new one.
-func CancelQueuedUnderVersion(ctx context.Context, tx *Tx, conversation string, version int64, updatedAt string) (int64, error) {
+func CancelQueuedUnderVersion(ctx context.Context, tx *sql.Tx, conversation string, version int64, updatedAt string) (int64, error) {
 	return cancelQueuedWhere(ctx, tx,
 		`conversation = ? AND grant_version = ? AND state = 'queued'`, updatedAt, conversation, version)
 }
@@ -78,8 +78,8 @@ func CancelQueuedUnderVersion(ctx context.Context, tx *Tx, conversation string, 
 // is actually replying to — could otherwise claim reply status and get
 // silently carried across a renewal instead of cancelled like every other
 // old-grant message.
-func CarryForwardQueuedReplies(ctx context.Context, tx *Tx, conversation string, oldVersion, newVersion int64, updatedAt string) (int64, error) {
-	res, err := tx.Exec(ctx, `
+func CarryForwardQueuedReplies(ctx context.Context, tx *sql.Tx, conversation string, oldVersion, newVersion int64, updatedAt string) (int64, error) {
+	res, err := tx.ExecContext(ctx, `
 		UPDATE envelopes SET grant_version = ?, updated_at = ?
 		WHERE conversation = ? AND grant_version = ? AND state = 'queued' AND is_trusted_reply = 1`,
 		newVersion, updatedAt, conversation, oldVersion)
@@ -89,9 +89,9 @@ func CarryForwardQueuedReplies(ctx context.Context, tx *Tx, conversation string,
 	return res.RowsAffected()
 }
 
-func cancelQueuedWhere(ctx context.Context, tx *Tx, where, updatedAt string, args ...any) (int64, error) {
+func cancelQueuedWhere(ctx context.Context, tx *sql.Tx, where, updatedAt string, args ...any) (int64, error) {
 	execArgs := append([]any{updatedAt}, args...)
-	res, err := tx.Exec(ctx, `UPDATE envelopes SET state = 'cancelled', updated_at = ? WHERE `+where, execArgs...)
+	res, err := tx.ExecContext(ctx, `UPDATE envelopes SET state = 'cancelled', updated_at = ? WHERE `+where, execArgs...)
 	if err != nil {
 		return 0, fmt.Errorf("cancel queued: %w", err)
 	}
@@ -102,8 +102,8 @@ func cancelQueuedWhere(ctx context.Context, tx *Tx, where, updatedAt string, arg
 // false (no error) if the row is no longer queued — already cancelled by a
 // concurrent revoke/renewal that committed first, which is not a bug, it's
 // the serialization this design relies on.
-func TransitionToDispatching(ctx context.Context, tx *Tx, id, updatedAt string) (bool, error) {
-	res, err := tx.Exec(ctx, `
+func TransitionToDispatching(ctx context.Context, tx *sql.Tx, id, updatedAt string) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
 		UPDATE envelopes SET state = 'dispatching', updated_at = ?
 		WHERE id = ? AND state = 'queued'`, updatedAt, id)
 	if err != nil {
@@ -135,8 +135,8 @@ func TransitionToDispatching(ctx context.Context, tx *Tx, id, updatedAt string) 
 // change (there shouldn't be one, since nothing else touches a 'dispatching'
 // row) is surfaced as false rather than silently overwriting whatever it
 // became.
-func RequeueUnattempted(ctx context.Context, tx *Tx, id string, grantVersion int64, updatedAt string) (bool, error) {
-	res, err := tx.Exec(ctx, `
+func RequeueUnattempted(ctx context.Context, tx *sql.Tx, id string, grantVersion int64, updatedAt string) (bool, error) {
+	res, err := tx.ExecContext(ctx, `
 		UPDATE envelopes SET state = 'queued', grant_version = ?, updated_at = ?
 		WHERE id = ? AND state = 'dispatching'`, grantVersion, updatedAt, id)
 	if err != nil {
@@ -152,8 +152,8 @@ func RequeueUnattempted(ctx context.Context, tx *Tx, id string, grantVersion int
 // SetState sets an envelope's terminal (or acked) state outside the
 // dispatching transaction — after the host call returns, success, failure,
 // or ambiguous.
-func SetState(ctx context.Context, tx *Tx, id string, state EnvelopeState, updatedAt string) error {
-	res, err := tx.Exec(ctx, `UPDATE envelopes SET state = ?, updated_at = ? WHERE id = ?`,
+func SetState(ctx context.Context, tx *sql.Tx, id string, state EnvelopeState, updatedAt string) error {
+	res, err := tx.ExecContext(ctx, `UPDATE envelopes SET state = ?, updated_at = ? WHERE id = ?`,
 		string(state), updatedAt, id)
 	if err != nil {
 		return fmt.Errorf("set envelope state: %w", err)
@@ -169,8 +169,8 @@ func SetState(ctx context.Context, tx *Tx, id string, state EnvelopeState, updat
 }
 
 // GetByID fetches one envelope by id within the caller's transaction.
-func GetByID(ctx context.Context, tx *Tx, id string) (*Envelope, error) {
-	row := tx.QueryRow(ctx, `
+func GetByID(ctx context.Context, tx *sql.Tx, id string) (*Envelope, error) {
+	row := tx.QueryRowContext(ctx, `
 		SELECT id, conversation, from_peer, to_peer, text, grant_version, in_reply_to,
 		       is_trusted_reply, state, created_at, updated_at
 		FROM envelopes WHERE id = ?`, id)

@@ -173,10 +173,10 @@ func TestRevokeVsDispatch(t *testing.T) {
 	}
 	e, err := store.GetByID(ctx, tx, stillQueued.ID)
 	if err != nil {
-		tx.Rollback(ctx)
+		tx.Rollback()
 		t.Fatalf("get: %v", err)
 	}
-	tx.Rollback(ctx)
+	tx.Rollback()
 	if e.State != store.Cancelled {
 		t.Fatalf("want cancelled on disk, got %s", e.State)
 	}
@@ -214,7 +214,7 @@ func TestCrashAfterHandoffRecoversUncertain(t *testing.T) {
 	if err := store.SetState(ctx, tx, e.ID, store.Dispatching, "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("set dispatching: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -230,7 +230,7 @@ func TestCrashAfterHandoffRecoversUncertain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx2.Rollback(ctx)
+	defer tx2.Rollback()
 	got, err := store.GetByID(ctx, tx2, e.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -279,7 +279,7 @@ func TestDispatchRecordsOutcomeDespiteContextCanceledDuringDeliver(t *testing.T)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(context.Background())
+	defer tx.Rollback()
 	got, err := store.GetByID(context.Background(), tx, e.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -346,7 +346,7 @@ func ackEnvelope(t *testing.T, db *store.DB, conversation, id string, grantVersi
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	e := store.Envelope{
 		ID: id, Conversation: conversation, FromPeer: "claude-session-a", ToPeer: "codex-thread-b",
@@ -359,7 +359,7 @@ func ackEnvelope(t *testing.T, db *store.DB, conversation, id string, grantVersi
 	if err := store.SetState(ctx, tx, id, store.Acked, now); err != nil {
 		t.Fatalf("ack original: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 }
@@ -381,7 +381,7 @@ func sendTrustedReply(t *testing.T, db *store.DB, conversation, from, to, text, 
 	committed := false
 	defer func() {
 		if !committed {
-			tx.Rollback(ctx)
+			tx.Rollback()
 		}
 	}()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -393,7 +393,7 @@ func sendTrustedReply(t *testing.T, db *store.DB, conversation, from, to, text, 
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("insert trusted reply: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	committed = true
@@ -563,9 +563,9 @@ func TestDispatchCancelsUnattemptedOrdinarySendWhenGrantRenewedMidFlight(t *test
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 	var used int64
-	if err := tx.QueryRow(ctx,
+	if err := tx.QueryRowContext(ctx,
 		`SELECT exchanges_used FROM grants WHERE conversation = ? AND grant_version = ?`,
 		"conv-no-attempt-renewed", int64(1)).Scan(&used); err != nil {
 		t.Fatalf("query old grant: %v", err)
@@ -617,7 +617,7 @@ func TestDispatchRescuesUnattemptedReplyOntoRenewedGrantVersion(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	got, err := store.GetByID(ctx, tx, reply.ID)
-	tx.Rollback(ctx)
+	tx.Rollback()
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -682,7 +682,7 @@ func TestDispatchRescuesUnattemptedReplyOntoAlreadyExpiredSuccessorGrant(t *test
 		t.Fatalf("begin: %v", err)
 	}
 	got, err := store.GetByID(ctx, tx, reply.ID)
-	tx.Rollback(ctx)
+	tx.Rollback()
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -823,7 +823,7 @@ func TestDispatchFailsPermanentlyRejectedWithoutRequeueLoop(t *testing.T) {
 		t.Fatalf("begin: %v", err)
 	}
 	g, err := store.CurrentGrant(ctx, tx, "conv-permanent-reject")
-	tx.Rollback(ctx)
+	tx.Rollback()
 	if err != nil {
 		t.Fatalf("current grant: %v", err)
 	}

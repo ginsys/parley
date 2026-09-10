@@ -85,3 +85,14 @@ Ordinary tests use synthetic databases and controlled subprocesses. Process crea
 sender is injectable so size-boundary tests cannot launch an installed host CLI or pass merely
 because a real thread is missing. Cancellation tests synchronize with child startup rather than
 assuming a timeout is longer than process creation. Live compatibility needs separate evidence.
+
+## Transactions and schema upgrades
+
+The store uses `database/sql.Tx` with the SQLite driver's `_txlock=immediate`: the write lock is
+acquired before authorization reads, and the standard library/driver own cancellation and failed
+commit cleanup. Outcome recording after a host attempt keeps its independent context so caller
+cancellation does not erase delivery evidence. Connection pragmas are supplied through the DSN.
+
+Schema upgrades use ordered `PRAGMA user_version` steps in an immediate transaction. Version-zero
+adoption alone recognizes the two historical column layouts; later steps use versions, not column
+sniffing. Unknown layouts or future versions fail without partial schema changes.

@@ -627,7 +627,7 @@ func assertState(t *testing.T, db *store.DB, id string, want store.EnvelopeState
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 	e, err := store.GetByID(ctx, tx, id)
 	if err != nil {
 		t.Fatalf("get %s: %v", id, err)

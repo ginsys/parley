@@ -65,7 +65,7 @@ func queueOne(t *testing.T, db *store.DB) (conversation string, id string) {
 	if err := store.SetState(ctx, tx, e.ID, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
 		t.Fatalf("set handed off: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	return conversation, e.ID
@@ -467,7 +467,7 @@ func TestValidateWrongRecipient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
 	m := &replymarker.Marker{InReplyTo: id, To: "some-other-peer", Text: "hi"}
 	_, err = replymarker.Validate(ctx, tx, conversation, "codex-thread-b", "claude-session-a", m)
@@ -518,7 +518,7 @@ func TestValidateRejectsQueuedEnvelope(t *testing.T) {
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("insert queued: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -526,7 +526,7 @@ func TestValidateRejectsQueuedEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx2.Rollback(ctx)
+	defer tx2.Rollback()
 	m := &replymarker.Marker{InReplyTo: e.ID, To: "claude-session-a", Text: "hi"}
 	if _, err := replymarker.Validate(ctx, tx2, conversation, "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
 		t.Fatalf("want ErrStaleReply for a still-queued (never handed off) envelope, got %v", err)
@@ -580,7 +580,7 @@ func TestValidateDispatchingIsPendingNotStale(t *testing.T) {
 	if err := store.SetState(ctx, tx, e.ID, store.Dispatching, "2026-01-01T00:00:01Z"); err != nil {
 		t.Fatalf("set dispatching: %v", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -588,7 +588,7 @@ func TestValidateDispatchingIsPendingNotStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx2.Rollback(ctx)
+	defer tx2.Rollback()
 	m := &replymarker.Marker{InReplyTo: e.ID, To: "claude-session-a", Text: "hi"}
 	_, err = replymarker.Validate(ctx, tx2, conversation, "codex-thread-b", "claude-session-a", m)
 	if !errors.Is(err, replymarker.ErrDeliveryPending) {
@@ -612,7 +612,7 @@ func TestValidateStaleReply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		defer tx.Rollback(ctx)
+		defer tx.Rollback()
 		m := &replymarker.Marker{InReplyTo: "does-not-exist", To: "claude-session-a", Text: "hi"}
 		if _, err := replymarker.Validate(ctx, tx, conversation, "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
 			t.Fatalf("want ErrStaleReply, got %v", err)
@@ -624,7 +624,7 @@ func TestValidateStaleReply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		defer tx.Rollback(ctx)
+		defer tx.Rollback()
 		m := &replymarker.Marker{InReplyTo: id, To: "claude-session-a", Text: "hi"}
 		if _, err := replymarker.Validate(ctx, tx, "a-different-conversation", "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
 			t.Fatalf("want ErrStaleReply, got %v", err)
@@ -637,10 +637,10 @@ func TestValidateStaleReply(t *testing.T) {
 			t.Fatalf("begin: %v", err)
 		}
 		if err := store.SetState(ctx, tx, id, store.Acked, "2026-01-01T00:01:00Z"); err != nil {
-			tx.Rollback(ctx)
+			tx.Rollback()
 			t.Fatalf("set acked: %v", err)
 		}
-		if err := tx.Commit(ctx); err != nil {
+		if err := tx.Commit(); err != nil {
 			t.Fatalf("commit: %v", err)
 		}
 
@@ -648,7 +648,7 @@ func TestValidateStaleReply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
-		defer tx2.Rollback(ctx)
+		defer tx2.Rollback()
 		m := &replymarker.Marker{InReplyTo: id, To: "claude-session-a", Text: "hi"}
 		if _, err := replymarker.Validate(ctx, tx2, conversation, "codex-thread-b", "claude-session-a", m); !errors.Is(err, replymarker.ErrStaleReply) {
 			t.Fatalf("want ErrStaleReply, got %v", err)
@@ -664,7 +664,7 @@ func TestValidateAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
 	m := &replymarker.Marker{InReplyTo: id, To: "claude-session-a", Text: "hi"}
 	e, err := replymarker.Validate(ctx, tx, conversation, "codex-thread-b", "claude-session-a", m)
@@ -689,7 +689,7 @@ func TestValidateRejectsReplyFromNonAddressee(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 
 	// queueOne's envelope was sent from claude-session-a to codex-thread-b.
 	// claude-session-a (the sender, not the addressee) must not be able to
