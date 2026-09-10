@@ -71,7 +71,7 @@ func TestSettlementCannotRefundOrOverwriteANewerAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	outcome, err := b.settle(ctx, second, ErrNoAttempt)
-	if err != nil || outcome.State != store.HandedOff {
+	if err != nil || outcome.State != store.HandedOff || outcome.Attempted {
 		t.Fatalf("terminal overwritten: %+v %v", outcome, err)
 	}
 	tx, err = db.Begin(ctx)
@@ -82,6 +82,16 @@ func TestSettlementCannotRefundOrOverwriteANewerAttempt(t *testing.T) {
 	g, err = store.CurrentGrant(ctx, tx, "c")
 	if err != nil || g.ExchangesUsed != 1 {
 		t.Fatalf("double refund: %+v %v", g, err)
+	}
+}
+
+func TestRepeatedDispatchReportsOnlyThisCallsAttempt(t *testing.T) {
+	_, b, e, _ := setupSettlement(t)
+	for _, attempted := range []bool{true, false} {
+		outcome, err := b.DispatchOutcome(context.Background(), e.ID)
+		if err != nil || outcome.State != store.HandedOff || outcome.Attempted != attempted {
+			t.Fatalf("want this call attempted=%t, got %+v: %v", attempted, outcome, err)
+		}
 	}
 }
 
