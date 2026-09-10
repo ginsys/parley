@@ -23,6 +23,10 @@ session**, and never let an agent construct or approve the grant/revoke/renew ar
 human's behalf. This is a cooperative-policy boundary, not a proven impersonation-proof one: see
 [the architecture limitations](docs/architecture.md#authority-boundary) before treating it as stronger than that.
 
+The [accepted runtime direction](docs/architecture.md#accepted-runtime-direction) records the
+owner-approved move to server-owned storage and authenticated human administration, with dedicated
+production accounts. It is a target contract, not an implemented exception to the restrictions above.
+
 ## Start from the work item
 
 - Read the issue, its native GitHub dependencies, and existing code before changing anything. This
