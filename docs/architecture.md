@@ -89,7 +89,11 @@ The `directed` policy never adds edges implicitly when a member joins.
 
 **The first runtime and two-peer inbox retain the current positional grant storage.** A
 members-shaped API translates the supported two-member policies to that representation and rejects
-unsupported requests explicitly. The members/policies/edges tables and historical backfill appear
+unsupported requests explicitly. Initially accept exactly two `member` roles with `open` or a
+single-edge `directed` policy. Reject `lead_only`, empty/two-edge `directed` and larger groups:
+pair storage cannot retain their role/policy intent, even if today's allowed edges coincide with
+`bidirectional`. Never collapse them into `open` or add hidden policy storage. The
+members/policies/edges tables and historical backfill appear
 only in the later room migration, after the inbox. The membership specification defines both
 stages; runtime ownership and administration do not require a members table. The room migration
 uses numbered atomic `user_version` steps, preserves every historical conversation/version key and
