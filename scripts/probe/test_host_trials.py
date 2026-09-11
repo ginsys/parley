@@ -434,6 +434,19 @@ class ClaudeDriverTests(unittest.TestCase):
         self.assertEqual(driver.observe('abcd1234', marker=MARKER, submitted_at=0.0),
                           Observation(outcomes={}, observable=False))
 
+    def test_observe_is_unobservable_when_claude_logs_times_out(self):
+        # A stalled claude logs raised TimeoutExpired uncaught, aborting the whole trial instead
+        # of returning the same unobservable result a nonzero exit already produces.
+        registry = SessionRegistry()
+        registry.mint('abcd1234')
+
+        def fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 15))
+
+        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
+        self.assertEqual(driver.observe('abcd1234', marker=MARKER, submitted_at=0.0),
+                          Observation(outcomes={}, observable=False))
+
     def test_observe_of_an_untimestamped_transcript_is_unobservable(self):
         # `claude logs` prints no per-line timestamp, so a reachable transcript still cannot be
         # ordered against submission: the create() prompt's own turn would otherwise be read as

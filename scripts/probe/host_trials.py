@@ -396,10 +396,15 @@ class ClaudeDriver:
         recognized `User:`/`Assistant:` block is an unrecognized transcript shape, not "read
         cleanly, nothing there yet" — those two must not collapse into the same empty,
         `observable=True` result, or a format this runner cannot parse reads as a host that
-        stayed silent.
+        stayed silent. A stalled `claude logs` is the same unavailable channel too: `run_trial`'s
+        polling loop does not catch exceptions from `observe`, so an uncaught timeout here would
+        abort the whole trial and lose every poll's evidence gathered so far, not just this read.
         """
         self.registry.require_owned(session_id)
-        result = self.run(['claude', 'logs', session_id], capture_output=True, text=True, timeout=15)
+        try:
+            result = self.run(['claude', 'logs', session_id], capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            return Observation(observable=False)
         if result.returncode != 0:
             return Observation(observable=False)
         events = parse_claude_transcript(result.stdout)
