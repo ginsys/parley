@@ -60,9 +60,9 @@ and validation remain server-independent. Migration documentation must cover hum
 stopped-service consistent backup/relocation, WAL/SHM and ownership, and must not silently create a
 replacement database at a new location.
 
-Unix-first NDJSON JSON-RPC remains a proposal, and session authentication still needs an owner
-decision. Protocol v1 must use the accepted membership model below even for a two-member-only
-implementation. Unsupported larger topologies must fail explicitly. Future TCP
+Unix-first NDJSON JSON-RPC remains a proposal. Session authentication follows the
+[accepted identity decision](#accepted-peer-identity). Protocol v1 must use the accepted membership
+model below even for a two-member-only implementation. Unsupported larger topologies must fail explicitly. Future TCP
 transport should preserve application semantics; its implementation is outside the first milestone.
 The product sequence is two-peer runtime, durable inbox, then shared rooms. GitHub owns scopes,
 acceptance and native dependencies; this section records architectural direction only.
@@ -71,7 +71,7 @@ acceptance and native dependencies; this section records architectural direction
 
 The owner approved the actual-pair admission direction in
 [decision #21](https://github.com/ginsys/parley/issues/21) on 2026-09-11. This is a target workflow,
-not an implemented API or a completed authentication design.
+not an implemented API. The full identity decision is recorded below.
 
 Two-peer support limits participants per conversation, not the number of conversations. Several
 conversations may independently be waiting for a counterpart. Resuming a known host session does
@@ -108,18 +108,33 @@ later eligible agent was considered but not selected for this initial workflow: 
 separate bounded admission authorization with eligibility, expiry and limits. Discoverability or
 possession of a connection credential must not accidentally provide that authority.
 
-Identity credentials, discovery eligibility, pending-request ownership/timeouts and exact
-reconnect/replacement rules still require contracts. This ruling does not select wire methods,
+The accepted identity model below settles credentials, discovery and reconnect policy; detailed
+operation schemas and pending-request deadlines belong to the connection specification. This ruling does not select wire methods,
 change the protected-controller restrictions, approve host execution, or prove production account
 isolation. Retained conversation context is a separate feature; context delivery cannot itself
 authorize admission. Implementation must exercise multiple waiting conversations, unauthorized
 discovery/join, competing candidates, stale approval, duplicate requests, restart and offline
 members with synthetic identities and controlled transports.
 
-The [identity and admission proposal](identity-proposal.md) provides a complete candidate for
-registration, per-binding credentials, discovery, reconnect, revocation and their verification
-cases. Those choices remain proposed for owner review; only the actual-pair admission direction
-above is approved.
+## Accepted peer identity
+
+On 2026-09-11 the owner accepted the full [identity decision](identity-proposal.md), after PR #43
+landed and its review findings were resolved. A human registers an existing native host session;
+one immutable binding and private per-binding bearer credential identify its peer across multiple
+conversations. Local connector UID and server identity checks complement credential possession.
+Same-account theft and compromised adapters remain explicit limitations.
+
+Discovery uses explicit advertisement to registered peers or named invitations. A resumed native
+session keeps its peer, while a new native session requires a new binding and admission. Exclusive
+connection generations and authenticated generation lookup handle reconnect and lost responses;
+neither reconnect nor rotation renews a grant. Revocation holds outstanding authored work across
+credential versions until human disposition, including after re-enrollment or late settlement.
+Restoration blocks ordinary operation until replay, delivery, authorization and accounting state
+are reconciled; a new credential or process epoch alone is insufficient.
+
+The decision records rationale, alternatives and required rejection/recovery cases. The
+[connection specification](specifications/connections.md) proposes its data, operation, migration
+and fixture details. These are target contracts; identity binding is not yet implemented.
 
 ## Accepted membership model
 

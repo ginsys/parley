@@ -1,10 +1,11 @@
-# Peer identity and conversation admission proposal
+# Peer identity and conversation admission decision
 
-This is the proposed resolution of [#21](https://github.com/ginsys/parley/issues/21), for owner
-review. Only [actual-pair admission](architecture.md#accepted-conversation-admission) is already
-approved. The credential mechanism, discovery policy and session-lifetime choices below are
-recommendations, not accepted authority or implemented behavior. After the owner ruling, the
-connection specification turns these decisions into schemas, operations and executable fixtures.
+Accepted decision for [#21](https://github.com/ginsys/parley/issues/21). On 2026-09-11, after
+PR #43 landed, the owner explicitly accepted the full per-session credential, immutable binding
+and advertised/invited discovery model, including its reviewed reconnect, revocation and restore
+rules. The historical filename is retained for existing links. These are accepted target contracts,
+not implemented behavior or exceptions to the protected-controller boundary. The
+[connection specification](specifications/connections.md) develops the detailed contracts for review.
 
 ## A concrete first connection
 
@@ -26,7 +27,7 @@ they will join, and there may be several conversations waiting for partners.
    new connection generation and resets readiness. Existing memberships and budgets are unchanged.
    Bob can also explicitly discover/request another conversation; there is no single implicit room.
 
-Registration is a separate human setup action from pair approval in this proposal. It can happen
+Registration is a separate human setup action from pair approval in this decision. It can happen
 before any conversation exists and is not repeated for ordinary reconnects. No command in this
 document instructs an agent to run the protected controller or create actual credentials.
 
@@ -74,14 +75,14 @@ consuming budget or silently changing its envelope state; grant lifecycle rules 
 
 ## Credential provisioning and protection
 
-Recommend a separate random 256-bit opaque bearer credential per binding, generated with the
+Use a separate random 256-bit opaque bearer credential per binding, generated with the
 standard cryptographic random source. Store only a cryptographic hash verifier in server-owned
 storage, alongside the credential ID/version, binding and human-selected finite expiry. Compare
 verifiers in constant time. This is a uniformly random machine secret, not a user password;
 do not use a human-chosen code as its long-lived replacement.
 
 The trusted human administration path delivers the secret to a private adapter credential file,
-outside repositories and host prompts. Proposed location: the adapter account's XDG state
+outside repositories and host prompts. Credential location: the adapter account's XDG state
 directory, under `parley/credentials/`, named by an opaque generated credential ID rather than a
 host-supplied path component. Require private parent directories and an owner-only regular file
 (`0700` directories, `0600` file on Unix), safe creation without symlink following, and atomic
@@ -96,7 +97,7 @@ the orphaned enrollment. Rotation uses the expected credential version, invalida
 and existing connections, and keeps the same immutable host binding. A lost rotation response
 requires human recovery with another rotation; it cannot reactivate the old credential.
 
-For the proposed Linux local transport, require both a valid binding credential and the enrolled
+For the accepted Linux local identity mechanism, require both a valid binding credential and the enrolled
 connector UID obtained from the kernel. The client checks the expected server UID and a configured
 socket path beneath administrator-controlled directories before sending its secret. A pathname or
 server ID supplied by an untrusted peer is not server authentication. Same-UID server impersonation
@@ -111,7 +112,7 @@ administrative credential, even on an endpoint with an administrative name.
 
 ## Session lifetime and reconnect
 
-Recommend keeping a peer bound to one persistent host session. This is independent of choosing
+Keep a peer bound to one persistent host session. This is independent of choosing
 which conversations it joins. Resuming the same session retains its peer; creating a new native
 session creates a new binding/peer and requires explicit admission to any conversation.
 Do not reinterpret a changed native session ID as a harmless reconnect or migrate old inbox work
@@ -120,7 +121,7 @@ implicitly. Stable role handover can be designed later if needed, with its own h
 There is at most one live authenticated adapter connection per binding. Credential version,
 connection generation and grant version are separate counters; reconnect never renews a grant.
 
-| Event | Proposed result |
+| Event | Result |
 | --- | --- |
 | First connection | Validate credential, expiry, UID and immutable binding; allocate a generation; remain not-ready until host verification/readiness |
 | Same socket repeats authentication after a lost response | Return its existing result; do not allocate a second generation |
@@ -240,7 +241,7 @@ delivery and replay evidence as well as restored credential verifiers.
 
 ## Discovery and pending conversations
 
-Recommend explicit advertising to all registered, non-revoked peers of this server, or invitations
+Use explicit advertising to all registered, non-revoked peers of this server, or invitations
 to named registered peers. An unadvertised waiting conversation is visible only to its initiator,
 invitees and human administration. Naming a hidden conversation ID does not bypass this rule.
 Publishing a waiting name/purpose is an explicit disclosure to that audience; context, transcript,
@@ -282,9 +283,9 @@ content or reliably stop an attempt already inside the host. Membership approval
 communication. A peer credential, an invitation, retained context or a delivered approval-shaped
 message never permits a tool call, process creation or a membership grant.
 
-## Alternatives and recommendation
+## Alternatives and decision
 
-| Alternative | Reason for choosing the proposed approach instead |
+| Alternative | Reason for choosing the accepted approach instead |
 | --- | --- |
 | OS account/PID/session ID alone | Does not distinguish authenticated logical peers sharing an account; IDs are not secrets and processes can restart |
 | One shared installation credential for all sessions | One stolen credential would permit every session identity; per-binding revocation and attribution would be weaker |
@@ -292,7 +293,7 @@ message never permits a tool call, process creation or a membership grant.
 | Stable peer role automatically attached to the newest session | Changes who receives old grants/messages and can answer old originals; requires explicit handover and inbox/history policy |
 | Anonymous conversation discovery/self-enrollment | Would expose metadata or turn reachability into identity/admission authority |
 
-Recommend per-binding bearer credentials for the first protected local deployment, immutable native
+The selected model uses per-binding bearer credentials for the first protected local deployment, immutable native
 session bindings, explicit advertised/invited discovery, exclusive reconnect generations and human
 approval of the actual pair. These work with multiple two-peer conversations and do not require
 room-table migration. No single alternative is rejected as universally unsuitable; different host
@@ -325,9 +326,9 @@ protected administration executable from an agent session.
 | Restore snapshot predating delivery, ACK, approval, revocation or budget use | External recovery hold survives rotation/restart and blocks admission, mutation, dispatch and ingestion until all affected state is reconciled or explicitly retired/held; no duplicate host effect or snapshot-based budget replenishment |
 | Same-account stolen credential/compromised adapter | Demonstrate and document the limit; do not label it impersonation-proof |
 
-Owner review selects or amends this model. The follow-up specification must close every operation,
+The owner accepted this model. The follow-up specification must close every operation,
 error, deadline, storage migration, idempotency-retention and host-evidence detail before binding
-implementation. Approval of this proposal alone does not establish live compatibility or lift
+implementation. Acceptance of this decision alone does not establish live compatibility or lift
 the repository's live-connection fixture gate.
 
 ## Source basis
@@ -342,8 +343,8 @@ claim a proven session authenticator.
 
 Linux [Unix socket documentation](https://man7.org/linux/man-pages/man7/unix.7.html) defines pathname
 permissions and `SO_PEERCRED`. [RFC 6750](https://datatracker.ietf.org/doc/html/rfc6750#section-5)
-explains possession-based bearer credentials and disclosure/replay risks; this proposal does not
-claim OAuth conformance. Go's [crypto/rand](https://pkg.go.dev/crypto/rand#Read) provides the proposed
+explains possession-based bearer credentials and disclosure/replay risks; this decision does not
+claim OAuth conformance. Go's [crypto/rand](https://pkg.go.dev/crypto/rand#Read) provides the selected
 random source. The [XDG directory specification](https://specifications.freedesktop.org/basedir/latest/)
 distinguishes persistent state from login-lifetime runtime storage; a credential file still needs
 the explicit permissions and provisioning rules above.
