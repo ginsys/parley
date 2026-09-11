@@ -38,7 +38,10 @@ output or an echoed marker cannot establish acceptance, a new turn or acknowledg
 process group, bounds captured input/output to 1 MiB, closes the PTY and kills/reaps its child on
 exit. Terminal bytes are hex-encoded with monotonic timestamps rather than rendered as terminal
 control sequences. The CLI creates a fresh HOME and working directory, passes only HOME/PATH/TERM,
-and never writes input. Complete JSON is flushed to a temporary file beside the destination and
+and never writes input. Before exec, the child closes all non-stdio descriptors, including handles
+made inheritable by its launcher. This Linux harness requires `/proc/self/fd` to enumerate the
+actual descriptor range; enumeration failure aborts startup instead of launching with unknown
+handles. The parent's descriptors remain unchanged. Complete JSON is flushed to a temporary file beside the destination and
 published with an atomic no-replace hard link (then the temporary name is removed). The containing
 directory is fsynced before success is reported, persisting the new link and removal as well as
 the file contents. Directory-sync failures fail loudly; a visible file after such a failure does

@@ -1,5 +1,6 @@
 """Controlled subprocesses only: no installed host CLI is launched by these tests."""
 
+import fcntl
 import json
 import os
 import signal
@@ -91,6 +92,39 @@ class PtyTests(unittest.TestCase):
             data += child.read(.1)
         self.assertIn(marker, data)
         return data
+
+    def test_exec_closes_inherited_non_stdio_descriptors(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        # Allocate a free high descriptor so interpreter startup cannot reuse its
+        # number and make the assertion accidentally inspect an unrelated file.
+        inherited = fcntl.fcntl(read_fd, fcntl.F_DUPFD, 200)
+        self.addCleanup(os.close, inherited)
+        os.set_inheritable(inherited, True)
+        code = f"""
+import errno, os
+try:
+    os.fstat({inherited})
+except OSError as error:
+    assert error.errno == errno.EBADF
+    print('DESCRIPTOR_CLOSED', flush=True)
+else:
+    print('DESCRIPTOR_LEAKED', flush=True)
+"""
+        child = self.spawn(code)
+        self.until(child, b'DESCRIPTOR_CLOSED')
+        # Child isolation must not close or otherwise consume the parent handle.
+        os.write(write_fd, b'parent fixture')
+        self.assertEqual(os.read(inherited, 100), b'parent fixture')
+
+    def test_descriptor_enumeration_failure_aborts_exec(self):
+        with patch('wake_probe.os.listdir', side_effect=OSError('proc unavailable')):
+            child = self.spawn("print('must not execute', flush=True)")
+        self.assertTrue(child.wait_for_exit(time.monotonic() + 5))
+        child.close()
+        self.assertEqual(child.exit_code, 127)
+        self.assertFalse(child.cleanup_requested)
 
     def test_replaced_pane_and_approval_prompt_reject_before_writing(self):
         for state in ('shell', 'pager', 'editor', 'approval', 'busy', 'unknown'):
