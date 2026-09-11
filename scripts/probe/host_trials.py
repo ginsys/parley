@@ -34,7 +34,9 @@ export from at investigation time) and is deliberately left unimplemented rather
 """
 
 import datetime
+import glob
 import json
+import os
 import re
 import subprocess
 import time
@@ -49,6 +51,11 @@ LAST_WINDOW = max(WINDOWS.values())  # 120s: the longest outcome window an obser
 # Mirrors the state values `wake_probe.Trial.result` accepts; validated at submission time so a
 # typo fails before a host is driven rather than at classification.
 TRIAL_STATES = frozenset({'idle', 'busy', 'approval', 'disconnected', 'restarted'})
+# A busy trial's dependent windows start at the turn already running, so `wake_probe.py:59-66`
+# refuses to classify `turn_start`/`ack` until either that turn ended or 900s passed. Observation
+# must last that long or the cell is unclassifiable; the constant is wake_probe's, restated here
+# because it is inline there.
+BUSY_CAP = 900
 
 
 class ForeignSessionError(ValueError):
@@ -56,7 +63,28 @@ class ForeignSessionError(ValueError):
 
 
 class SubmissionUnsupported(NotImplementedError):
-    """Raised when a host has no captured mechanism for submitting to an existing session."""
+    """Raised when the *host* lacks the submission mechanism — evidence about the host.
+
+    Claude's absent `--channels` is the model case: missing from the help text and the plugin
+    cache, so its absence is a property of the product. Classifies the cell `unsupported`.
+    """
+
+
+class SubmissionUncaptured(NotImplementedError):
+    """Raised when *this runner* has captured no submission path — evidence about us.
+
+    The host may well support submission by a mechanism nobody here has exercised yet, so the
+    trial establishes nothing in either direction and classifies `unobservable`, never
+    `unsupported`. Keeping the two apart stops a gap in our tooling being published as a
+    host-capability result (docs/host-probes.md, Matrix runner).
+    """
+
+
+class SessionCreationUncaptured(NotImplementedError):
+    """Raised when this runner has captured no session-creation path for a host.
+
+    Like `SubmissionUncaptured`, a statement about this runner's evidence, not about the host.
+    """
 
 
 @dataclass
@@ -101,7 +129,10 @@ class Event:
     `detect_outcomes` for why that has to fail closed.
     """
 
-    role: str  # 'user' or 'assistant'; 'developer'/system entries are filtered before this point
+    # 'user' or 'assistant' for a message; 'turn_start'/'turn_end' for a host's own turn-boundary
+    # signal (Codex `event_msg` task_started/task_complete/turn_aborted), which carries no text.
+    # 'developer'/system entries are filtered before this point.
+    role: str
     text: str
     time: float | None = None
 
@@ -114,13 +145,18 @@ class Observation:
     or it carried entries that cannot be placed relative to submission. Classification must map
     that to `unobservable`, never to `not_observed`: a dead or undatable channel is not negative
     evidence (docs/host-probes.md, Trial protocol).
+
+    `turn_end` is the completion instant of the turn that was already running at submission,
+    when the host emits such a signal, and None when it emits none or none arrived yet. A busy
+    trial's dependent windows start there (docs/host-probes.md, Trial protocol).
     """
 
     outcomes: dict = field(default_factory=dict)
     observable: bool = True
+    turn_end: float | None = None
 
 
-def detect_outcomes(events, marker, *, submitted_at):
+def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
     """Classify normalized `events` into an `Observation` over visible/turn_start/ack.
 
     `submitted_at` is an epoch-seconds float on the same clock as each `Event.time`, marking
@@ -134,14 +170,30 @@ def detect_outcomes(events, marker, *, submitted_at):
     whole read is reported unobservable. Promoting undated entries into the current window
     manufactures outcomes out of pre-submission history: an old untimestamped rollout record, or
     the assistant turn a session-creation prompt produced before this trial's marker existed.
+
+    `turn_stream` says the host emits its own turn-boundary events (`turn_start`/`turn_end`
+    pseudo-roles). Then the first such `turn_start` is the turn-start outcome rather than the
+    first assistant message, and the first `turn_end` is reported separately as the completion
+    of whatever turn was already running. Without that stream the caller cannot tell a host that
+    stayed silent from one that was still finishing an earlier turn.
     """
     outcomes = {}
     undated = False
+    turn_end = None
+    started = None
     for event in events:
         if event.time is None:
             undated = True
             continue
         if event.time < submitted_at:
+            continue
+        if event.role == 'turn_start':
+            if started is None:
+                started = event.time
+            continue
+        if event.role == 'turn_end':
+            if turn_end is None:
+                turn_end = event.time
             continue
         if event.role == 'user':
             if marker in event.text:
@@ -152,7 +204,11 @@ def detect_outcomes(events, marker, *, submitted_at):
         outcomes.setdefault('turn_start', event.time)
         if marker in event.text:
             outcomes.setdefault('ack', event.time)
-    return Observation(outcomes=outcomes, observable=not undated)
+    if turn_stream:
+        outcomes.pop('turn_start', None)
+        if started is not None:
+            outcomes['turn_start'] = started
+    return Observation(outcomes=outcomes, observable=not undated, turn_end=turn_end)
 
 
 # --- Claude: `claude agents --json [--all] [--cwd ...]` and `claude logs <id>` -----------------
@@ -230,16 +286,25 @@ class ClaudeDriver:
         (docs/host-probe-preflight.md, 2026-09-11). This previously returned True after merely
         listing the session, which recorded an `accepted` outcome for a marker the host never
         received. Guessing an unconfirmed submission flag would violate AGENTS.md's evidence
-        rule (the same reason `OpenCodeDriver` refuses), so this raises and `run_trial`
-        classifies the cell `unsupported`. The listing check runs first, so an absent or
-        foreign session still fails as such rather than as an unsupported mechanism.
+        rule (the same reason `OpenCodeDriver` refuses), so this raises `SubmissionUncaptured`
+        — a statement about this runner, not about Claude — and `run_trial` classifies the cell
+        `unobservable`. The listing check runs first, so an absent or foreign session still
+        fails as such rather than as a missing mechanism.
+
+        `--all` is required: without it the listing carries only `kind: "interactive"` entries
+        (docs/host-probe-preflight.md, 2026-09-11), so `background_sessions()` would return
+        nothing and every owned session would fail the membership check below. A nonzero
+        listing is reported as such rather than reaching `json.loads` as a decode error.
         """
         self.registry.require_owned(session_id)
-        result = self.run(['claude', 'agents', '--json', '--cwd', self.cwd], capture_output=True, text=True, timeout=15)
+        result = self.run(['claude', 'agents', '--json', '--all', '--cwd', self.cwd],
+                          capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            raise RuntimeError(f'claude agents exited {result.returncode}: {result.stderr}')
         owned = {entry['id'] for entry in background_sessions(result.stdout)}
         if session_id not in owned:
             raise ValueError(f'session not listed under {self.cwd}: {session_id}')
-        raise SubmissionUnsupported(
+        raise SubmissionUncaptured(
             'claude has no captured message-submission path to an existing --bg session; '
             'creation carries the only delivered prompt')
 
@@ -272,14 +337,22 @@ class ClaudeDriver:
 # --- Codex: `codex queue --thread <id> --message <text>` and the rollout JSONL -----------------
 
 def record_time(record):
-    """Epoch seconds from a rollout record's ISO-8601 `timestamp`, or None if unusable."""
+    """Epoch seconds from a rollout record's ISO-8601 `timestamp`, or None if unusable.
+
+    A timezone-naive stamp is unusable, not merely awkward: `datetime.timestamp()` would read
+    it as *local* time and return an epoch offset by the host's UTC offset, which then compares
+    against `submitted_at` as a silently wrong instant. Every captured rollout record carries a
+    trailing `Z` (docs/host-probe-preflight.md, 2026-09-11), so a naive one is an unknown
+    producer and fails closed like any other undatable record.
+    """
     stamp = record.get('timestamp')
     if not isinstance(stamp, str):
         return None
     try:
-        return datetime.datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp()
+        when = datetime.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
     except ValueError:
         return None
+    return None if when.tzinfo is None else when.timestamp()
 
 
 def rollout_started_at(lines):
@@ -307,13 +380,21 @@ def rollout_started_at(lines):
     return min(stamps) if stamps else None
 
 
+# Codex's own turn-boundary signals, captured in a real rollout (docs/host-probe-preflight.md,
+# 2026-09-11). They carry no text and are emitted by the host, not by a speaker, so they become
+# pseudo-role Events: the only evidence that separates a *new* turn from the one already running.
+TURN_BOUNDARY_ROLES = {'task_started': 'turn_start',
+                       'task_complete': 'turn_end',
+                       'turn_aborted': 'turn_end'}
+
+
 def codex_rollout_events(lines):
-    """Extract message Events from rollout JSONL lines; returns `(events, unusable)`.
+    """Extract message and turn-boundary Events from rollout JSONL; returns `(events, unusable)`.
 
     Skips `developer`-role entries (fixed instructions, not conversation turns) and any record
-    missing the expected shape; a rollout file accumulates non-message record types this runner
-    has no use for (event_msg, token_usage_record, world_state, turn_context, ...). Those are
-    skipped silently: a record this runner has no use for is not evidence it failed to read.
+    missing the expected shape; a rollout file accumulates record types this runner has no use
+    for (token_usage_record, world_state, turn_context, ...). Those are skipped silently: a
+    record this runner has no use for is not evidence it failed to read.
 
     `unusable` counts content that *should* have been readable and was not — a line that is not
     valid JSON (a corrupt or half-written rollout), or a message record whose `timestamp` is
@@ -333,7 +414,17 @@ def codex_rollout_events(lines):
             unusable += 1
             continue
         payload = record.get('payload')
-        if not isinstance(payload, dict) or payload.get('type') != 'message':
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get('type')
+        if kind in TURN_BOUNDARY_ROLES:
+            when = record_time(record)
+            if when is None:
+                unusable += 1
+                continue
+            events.append(Event(role=TURN_BOUNDARY_ROLES[kind], text='', time=when))
+            continue
+        if kind != 'message':
             continue
         role = payload.get('role')
         if role not in ('user', 'assistant'):
@@ -351,7 +442,8 @@ class CodexDriver:
     """Drives Codex CLI sessions via `codex queue`. Requires an existing thread id — creating one
     needs an interactive/exec session first; `create()` documents this as the caller's job."""
 
-    def __init__(self, registry, *, run=subprocess.run, rollout_path_for, started_at):
+    def __init__(self, registry, *, run=subprocess.run, rollout_path_for, started_at,
+                 sessions_root=None):
         self.registry = registry
         self.run = run
         # Injectable lookup from thread id to its rollout file path, so tests never touch
@@ -359,6 +451,40 @@ class CodexDriver:
         self.rollout_path_for = rollout_path_for
         # Epoch seconds this run began: the provenance boundary register_existing enforces.
         self.started_at = started_at
+        # Directory holding every rollout this host writes ($CODEX_HOME/sessions). Adoption
+        # needs it to see rival threads; without it there is nothing to compare against.
+        self.sessions_root = sessions_root
+
+    def create(self, prompt):
+        """Refuse: no non-interactive codex thread-creation path has been captured.
+
+        `codex exec` plausibly creates one, but nothing here has captured what it prints, and
+        minting an id from a guessed output shape is the evidence failure `OpenCodeDriver`
+        refuses for the same reason. Drive this host with `run_trial(existing_session=...)`,
+        which adopts a caller-created thread through the provenance check below.
+        """
+        raise SessionCreationUncaptured(
+            'no captured codex thread-creation path; pass existing_session= to run_trial')
+
+    def _unruled_out_threads(self, adopted):
+        """Rollouts under the sessions root that could equally be this run's thread.
+
+        Fail closed in both directions: a neighbour that started after this run did, and a
+        neighbour that cannot be read or dated at all, are both ambiguity rather than absence.
+        """
+        adopted = os.path.realpath(adopted)
+        rivals = []
+        for other in glob.glob(os.path.join(self.sessions_root, '**', '*.jsonl'), recursive=True):
+            if os.path.realpath(other) == adopted:
+                continue
+            try:
+                with open(other, encoding='utf-8') as handle:
+                    started = rollout_started_at(handle)
+            except (OSError, UnicodeDecodeError):
+                started = None
+            if started is None or started >= self.started_at:
+                rivals.append(other)
+        return rivals
 
     def register_existing(self, thread_id):
         """Adopt a thread created during *this run*; refuse anything that predates it.
@@ -369,9 +495,12 @@ class CodexDriver:
         (confirmed shape, docs/host-probe-preflight.md 2026-09-11) — the earliest record must
         be at or after `started_at`, so a pre-existing thread cannot be adopted by accident.
 
-        This orders a thread against the run; it does not authenticate it, and creating the
-        thread remains the caller's job (class docstring). A thread whose rollout is missing or
-        carries no usable timestamp is refused rather than adopted on trust.
+        "Started after this run did" is still not "created by this run": a human opening their
+        own thread meanwhile satisfies it just as well. So adoption also requires that no other
+        rollout under `sessions_root` could be that thread — one candidate, or refuse. This
+        orders and isolates a thread; it does not authenticate it, and creating it remains the
+        caller's job (class docstring). A thread whose rollout is missing or carries no usable
+        timestamp is refused rather than adopted on trust.
         """
         path = self.rollout_path_for(thread_id)
         if path is None:
@@ -379,12 +508,19 @@ class CodexDriver:
         try:
             with open(path, encoding='utf-8') as handle:
                 started = rollout_started_at(handle)
-        except OSError as error:  # an unreadable rollout proves nothing; refuse, never adopt
+        except (OSError, UnicodeDecodeError) as error:  # unreadable proves nothing; never adopt
             raise ForeignSessionError(f'cannot read rollout for thread {thread_id}: {error}') from error
         if started is None:
             raise ForeignSessionError(f'rollout carries no usable timestamp for thread: {thread_id}')
         if started < self.started_at:
             raise ForeignSessionError(f'thread predates this run and was not created by it: {thread_id}')
+        if self.sessions_root is None:
+            raise ForeignSessionError('sessions_root is required to rule out concurrent threads')
+        rivals = self._unruled_out_threads(path)
+        if rivals:
+            raise ForeignSessionError(
+                f'{len(rivals)} concurrent thread(s) under {self.sessions_root} cannot be told '
+                f'apart from this run\'s; refusing to adopt {thread_id}')
         return self.registry.mint(thread_id)
 
     def submit(self, thread_id, message):
@@ -402,13 +538,18 @@ class CodexDriver:
         try:
             with open(path, encoding='utf-8') as handle:
                 events, unusable = codex_rollout_events(handle)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             # Same rule as a failed `claude logs`: an unreadable channel is unobservable, not
-            # an absence of outcomes. A rollout is created lazily, so an early poll can precede it.
+            # an absence of outcomes. A rollout is created lazily, so an early poll can precede
+            # it, and a partially written multi-byte character decodes no better than a missing
+            # file — both are the channel being unreadable, not the host being silent.
             return Observation(observable=False)
-        observation = detect_outcomes(events, marker, submitted_at=submitted_at)
+        # turn_stream: this host reports its own turn boundaries, so a message emitted by the
+        # turn that was already running cannot be miscounted as the start of a new one.
+        observation = detect_outcomes(events, marker, submitted_at=submitted_at, turn_stream=True)
         if unusable:
-            return Observation(outcomes=observation.outcomes, observable=False)
+            return Observation(outcomes=observation.outcomes, observable=False,
+                               turn_end=observation.turn_end)
         return observation
 
     def teardown(self, thread_id):
@@ -447,11 +588,21 @@ class TrialRun:
     state: str
     supported: dict
     observable: dict
+    # The turn already running at submission, and whether its end could be observed at all.
+    # `Trial` needs both to classify a busy cell; omitting them defaulted every busy trial to
+    # "no turn was running", which is the one thing a busy trial is defined not to be.
+    turn_end: float | None = None
+    turn_end_observable: bool = True
 
 
 def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
+              existing_session=None,
               poll_interval=5.0, clock=time.time, monotonic=time.monotonic, sleep=time.sleep):
     """Create, submit and observe one trial through its windows; returns a `TrialRun`.
+
+    `existing_session` adopts a session the caller already created (`driver.register_existing`)
+    instead of calling `driver.create`. A host with no captured creation path — Codex today —
+    can be driven no other way, and unconditional creation left it undriveable.
 
     `settle` is what establishes the requested `state` (busy/approval/disconnected/restarted)
     before submission — this function cannot create those conditions itself, and the default
@@ -467,6 +618,12 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     deadlines use `monotonic` (injected, `time.monotonic` by default) because a local elapsed
     interval must not move when NTP steps the clock.
 
+    A `busy` trial polls to `BUSY_CAP` instead, shortened to the dependent windows once the
+    running turn's end is observed, because `Trial.result` refuses to classify `turn_start`/
+    `ack` before then. If that end never appears, those two outcomes are reported unobservable:
+    the runner cannot tell "the host ignored us" from "the earlier turn was still going", and
+    only a host that emits turn boundaries (`turn_stream` in `detect_outcomes`) can.
+
     Deliberate, bounded deviation from `Trial`'s "same monotonic clock" docstring: every
     timestamp that is *compared* — `submitted_at`, `accepted_at`, each `Event.time` — comes from
     `clock` (`time.time` by default), because a real host's transcript carries only
@@ -478,16 +635,19 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
 
     `accepted_at` is taken *after* `submit` returns, not before: submission can block up to the
     subprocess timeout, and stamping acceptance at `submitted_at` backdated a slow
-    acknowledgement into its 10s window. A host with no captured submission mechanism raises
-    `SubmissionUnsupported`, which is recorded as `unsupported` for every outcome — nothing was
-    delivered, so no transcript signal could belong to this trial.
+    acknowledgement into its 10s window. A host whose *product* lacks the mechanism raises
+    `SubmissionUnsupported` and every outcome is `unsupported` — nothing was delivered, so no
+    transcript signal could belong to this trial. A host where only *this runner* has captured
+    no path raises `SubmissionUncaptured` and every outcome is `unobservable` instead: the same
+    empty result, but recorded against us rather than published as a host capability.
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
-    session_id = driver.create(prompt)
+    session_id = (driver.register_existing(existing_session) if existing_session is not None
+                  else driver.create(prompt))
     settle()
     submitted_at = clock()
-    deadline = monotonic() + LAST_WINDOW
+    deadline = monotonic() + (BUSY_CAP if state == 'busy' else LAST_WINDOW)
     try:
         accepted = driver.submit(session_id, marker)
     except SubmissionUnsupported:
@@ -495,8 +655,15 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
                         outcomes={}, state=state,
                         supported={name: False for name in OUTCOME_NAMES},
                         observable={name: True for name in OUTCOME_NAMES})
+    except SubmissionUncaptured:
+        return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
+                        outcomes={}, state=state,
+                        supported={name: True for name in OUTCOME_NAMES},
+                        observable={name: False for name in OUTCOME_NAMES},
+                        turn_end_observable=False)
     accepted_at = clock() if accepted else None
     outcomes = {}
+    turn_end = None
     channel_readable = False
     while True:
         observation = driver.observe(session_id, marker=marker, submitted_at=submitted_at)
@@ -508,6 +675,12 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         channel_readable = observation.observable
         for name, when in observation.outcomes.items():
             outcomes.setdefault(name, when)
+        if turn_end is None and observation.turn_end is not None:
+            turn_end = observation.turn_end
+            # The dependent windows run from the turn's end, so stop waiting when they close
+            # rather than sitting out the rest of the cap.
+            deadline = min(deadline,
+                           monotonic() + max(0.0, LAST_WINDOW - (clock() - turn_end)))
         remaining = deadline - monotonic()
         if remaining <= 0 or all(name in outcomes for name in TRANSCRIPT_OUTCOMES):
             break
@@ -519,9 +692,17 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     observable = {'accepted': True}
     for name in TRANSCRIPT_OUTCOMES:
         observable[name] = True if name in outcomes else channel_readable
+    if state == 'busy' and turn_end is None:
+        # No turn-boundary evidence: the windows for these two never started, so an *absence*
+        # measures nothing. Fail closed rather than let it read as the host staying silent.
+        # An event that was positively seen keeps its own evidence (`wake_probe.py:57-61`).
+        for name in ('turn_start', 'ack'):
+            if name not in outcomes:
+                observable[name] = False
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
                     outcomes=outcomes, state=state,
-                    supported={name: True for name in OUTCOME_NAMES}, observable=observable)
+                    supported={name: True for name in OUTCOME_NAMES}, observable=observable,
+                    turn_end=turn_end, turn_end_observable=turn_end is not None or channel_readable)
 
 
 def classify_trial(trial, now, *, supported=None, observable=None):

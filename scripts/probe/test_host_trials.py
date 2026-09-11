@@ -14,7 +14,9 @@ from host_trials import (
     ForeignSessionError,
     Observation,
     OpenCodeDriver,
+    SessionCreationUncaptured,
     SessionRegistry,
+    SubmissionUncaptured,
     SubmissionUnsupported,
     background_sessions,
     classify_trial,
@@ -173,6 +175,30 @@ class CodexParsingTests(unittest.TestCase):
         self.assertEqual(codex_rollout_events(lines), ([], 1))
         self.assertEqual(codex_rollout_events([json.dumps({'payload': {'type': 'world_state'}})]), ([], 0))
 
+    def test_turn_boundary_records_become_pseudo_role_events(self):
+        # Captured shapes (docs/host-probe-preflight.md): these are the only evidence that a
+        # post-submission assistant message belongs to a *new* turn rather than the running one.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:01.000Z',
+                             'type': 'event_msg', 'payload': {'type': kind}})
+                 for kind in ('task_started', 'task_complete', 'turn_aborted')]
+        events, unusable = codex_rollout_events(lines)
+        self.assertEqual([e.role for e in events], ['turn_start', 'turn_end', 'turn_end'])
+        self.assertEqual(unusable, 0)
+
+    def test_turn_stream_prefers_the_hosts_own_boundary_over_the_first_assistant_message(self):
+        # The busy case: an assistant message from the turn already running must not be read
+        # as this trial's turn starting.
+        events = [Event(role='assistant', text='still finishing', time=5.0),
+                  Event(role='turn_end', text='', time=7.0),
+                  Event(role='turn_start', text='', time=8.0),
+                  Event(role='assistant', text=f'ack {MARKER}', time=9.0)]
+        observation = detect_outcomes(events, MARKER, submitted_at=0.0, turn_stream=True)
+        self.assertEqual(observation.outcomes['turn_start'], 8.0)
+        self.assertEqual(observation.turn_end, 7.0)
+        self.assertEqual(observation.outcomes['ack'], 9.0)
+        without = detect_outcomes(events, MARKER, submitted_at=0.0)
+        self.assertEqual(without.outcomes['turn_start'], 5.0)  # the old behaviour, for contrast
+
     def test_message_records_without_a_usable_timestamp_are_dropped_and_counted(self):
         lines = [
             json.dumps({'payload': {'type': 'message', 'role': 'assistant',
@@ -231,16 +257,35 @@ class ClaudeDriverTests(unittest.TestCase):
         with self.assertRaises(ForeignSessionError):
             driver.submit('not-mine', 'msg')
 
-    def test_submit_confirms_listing_then_refuses_to_claim_an_unsupported_delivery(self):
+    def test_submit_confirms_listing_then_refuses_to_claim_an_uncaptured_delivery(self):
         # A listed session no longer yields a bare True: nothing captured at this version
         # delivers a further message to a running --bg session, so reporting acceptance would
-        # record an `accepted` outcome for a marker the host never received.
+        # record an `accepted` outcome for a marker the host never received. The refusal is
+        # `Uncaptured`, not `Unsupported` — we have not exercised a path, which is not the
+        # same claim as Claude not having one.
         registry = SessionRegistry()
         registry.mint('abcd1234')
         present = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(
             0, stdout=json.dumps([{'id': 'abcd1234', 'kind': 'background', 'state': 'idle'}])), cwd='/scratch')
-        with self.assertRaises(SubmissionUnsupported):
+        with self.assertRaises(SubmissionUncaptured):
             present.submit('abcd1234', 'msg')
+        self.assertNotIsInstance(SubmissionUncaptured(''), SubmissionUnsupported)
+
+    def test_submit_lists_background_sessions_and_reports_a_failed_listing(self):
+        # Without --all the listing carries interactive entries only, so every owned session
+        # would fail the membership check; a nonzero exit is reported, not parsed as JSON.
+        registry = SessionRegistry()
+        registry.mint('abcd1234')
+        seen = []
+
+        def fake_run(argv, **kwargs):
+            seen.append(argv)
+            return FakeResult(1, stderr='daemon unreachable')
+
+        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
+        with self.assertRaises(RuntimeError):
+            driver.submit('abcd1234', 'msg')
+        self.assertIn('--all', seen[0])
 
     def test_submit_rejects_a_session_absent_from_the_listing_before_anything_else(self):
         registry = SessionRegistry()
@@ -292,12 +337,17 @@ class ClaudeDriverTests(unittest.TestCase):
 class CodexDriverTests(unittest.TestCase):
     RUN_STARTED = datetime.datetime(2026, 9, 11, 12, 0, 0, tzinfo=datetime.UTC).timestamp()
 
-    def rollout(self, *records):
-        """A throwaway rollout file; returns its path and removes it when the test ends."""
-        with tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False) as handle:
-            handle.writelines(json.dumps(record) + '\n' for record in records)
-            path = handle.name
-        self.addCleanup(os.unlink, path)
+    def setUp(self):
+        # One sessions root per test, so adoption sees exactly the rollouts the test wrote.
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        self.sessions_root = root.name
+
+    def rollout(self, *records, lines=None):
+        """A throwaway rollout under this test's sessions root; returns its path."""
+        path = os.path.join(self.sessions_root, f'rollout-{len(os.listdir(self.sessions_root))}.jsonl')
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.writelines(lines or [json.dumps(record) + '\n' for record in records])
         return path
 
     @staticmethod
@@ -307,7 +357,33 @@ class CodexDriverTests(unittest.TestCase):
 
     def driver(self, registry, path, *, run=None):
         return CodexDriver(registry, run=run or (lambda *a, **k: FakeResult(0)),
-                           rollout_path_for=lambda _id: path, started_at=self.RUN_STARTED)
+                           rollout_path_for=lambda _id: path, started_at=self.RUN_STARTED,
+                           sessions_root=self.sessions_root)
+
+    def test_create_refuses_because_no_thread_creation_path_is_captured(self):
+        # Guessing what `codex exec` prints would be the evidence failure OpenCodeDriver
+        # refuses for; run_trial(existing_session=...) is the supported way in.
+        with self.assertRaises(SessionCreationUncaptured):
+            self.driver(SessionRegistry(), None).create('hi')
+
+    def test_adoption_ignores_an_older_neighbour_but_refuses_a_concurrent_one(self):
+        # "Started after this run did" is equally true of a thread the human opened meanwhile,
+        # so a second fresh rollout under the sessions root makes the adopted one ambiguous.
+        registry = SessionRegistry()
+        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
+        self.rollout({'timestamp': '2026-09-10T09:00:00.000Z', 'type': 'session_meta'})
+        self.driver(registry, mine).register_existing('thread-1')
+        self.rollout({'timestamp': '2026-09-11T12:00:31.000Z', 'type': 'session_meta'})
+        with self.assertRaises(ForeignSessionError):
+            self.driver(SessionRegistry(), mine).register_existing('thread-1')
+
+    def test_a_neighbour_that_cannot_be_dated_is_ambiguity_not_absence(self):
+        registry = SessionRegistry()
+        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
+        self.rollout(lines=['not json\n'])
+        with self.assertRaises(ForeignSessionError):
+            self.driver(registry, mine).register_existing('thread-1')
+        self.assertEqual(registry.created, set())
 
     def test_register_existing_mints_a_thread_created_after_the_run_started_then_submits(self):
         registry = SessionRegistry()
@@ -368,9 +444,16 @@ class CodexDriverTests(unittest.TestCase):
     def test_observe_reads_the_rollout_file(self):
         registry = SessionRegistry()
         registry.mint('thread-1')
-        path = self.rollout(self.message('2026-09-11T00:00:01.000Z', 'assistant', f'ack {MARKER}'))
+        path = self.rollout(
+            {'timestamp': '2026-09-11T00:00:00.500Z', 'type': 'event_msg',
+             'payload': {'type': 'task_started'}},
+            self.message('2026-09-11T00:00:01.000Z', 'assistant', f'ack {MARKER}'),
+            {'timestamp': '2026-09-11T00:00:02.000Z', 'type': 'event_msg',
+             'payload': {'type': 'task_complete'}})
         observation = self.driver(registry, path).observe('thread-1', marker=MARKER, submitted_at=0.0)
+        # turn_start comes from the host's own boundary event, not from the message.
         self.assertEqual(set(observation.outcomes), {'turn_start', 'ack'})
+        self.assertIsNotNone(observation.turn_end)
         self.assertTrue(observation.observable)
 
     def test_observe_is_unobservable_when_the_rollout_holds_unparseable_content(self):
@@ -441,6 +524,10 @@ class FakeDriver:
         self.order.append('create')
         return 'sid'
 
+    def register_existing(self, session_id):
+        self.order.append('register_existing')
+        return session_id
+
     def submit(self, session_id, marker):
         assert session_id == 'sid'
         self.order.append('submit')
@@ -495,6 +582,12 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(driver.order.count('observe'), 3)
         self.assertEqual(set(run.outcomes), {'accepted', 'visible', 'turn_start', 'ack'})
         self.assertTrue(all(run.observable.values()))
+        # Merging the polls is only half of it: the merged timestamps must also classify as
+        # arrived-in-window, which is the failure a single snapshot produced.
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
+        classified = classify_trial(trial, run.submitted_at + 200, observable=run.observable)
+        self.assertEqual(classified['ack'], 'observed')
+        self.assertEqual(classified['turn_start'], 'observed')
 
     def test_polling_stops_at_the_longest_window_and_reports_what_is_missing(self):
         clock = FakeClock()
@@ -544,6 +637,54 @@ class RunTrialTests(unittest.TestCase):
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
         classified = classify_trial(trial, run.submitted_at + 1000, supported=run.supported)
         self.assertTrue(all(value == 'unsupported' for value in classified.values()))
+
+    def test_uncaptured_submission_is_unobservable_not_a_claim_about_the_host(self):
+        clock = FakeClock()
+        driver = FakeDriver(submit_error=SubmissionUncaptured('nothing captured here'), clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertTrue(all(run.supported.values()))  # no claim that the host lacks the path
+        self.assertFalse(any(run.observable.values()))
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
+                      turn_end_observable=run.turn_end_observable)
+        classified = classify_trial(trial, run.submitted_at + 1000,
+                                    supported=run.supported, observable=run.observable)
+        self.assertTrue(all(value == 'unobservable' for value in classified.values()))
+
+    def test_an_existing_session_is_adopted_instead_of_created(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock)
+        run = self.run_one(driver, clock, existing_session='sid')
+        self.assertEqual(driver.order[:2], ['register_existing', 'submit'])
+        self.assertNotIn('create', driver.order)
+        self.assertEqual(run.session_id, 'sid')
+
+    def test_a_busy_trial_without_a_turn_end_leaves_its_dependent_outcomes_unobservable(self):
+        # The host never said the running turn finished, so the turn_start/ack windows never
+        # started: their absence measures nothing and must not read as host silence.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'visible': 1000.0})], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0)
+        self.assertGreaterEqual(clock.elapsed, 900)  # BUSY_CAP, not the 120s idle window
+        self.assertIsNone(run.turn_end)
+        self.assertTrue(run.observable['visible'])
+        self.assertFalse(run.observable['ack'])
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
+                      turn_end=run.turn_end, turn_end_observable=run.turn_end_observable)
+        classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
+        self.assertEqual(classified['turn_start'], 'unobservable')
+
+    def test_an_observed_turn_end_shortens_the_busy_wait_and_reaches_classification(self):
+        clock = FakeClock()
+        seen = Observation(outcomes={'visible': 1000.0, 'turn_start': 1040.0, 'ack': 1041.0},
+                           turn_end=1030.0)
+        driver = FakeDriver(observations=[seen], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0)
+        self.assertEqual(run.turn_end, 1030.0)
+        self.assertLess(clock.elapsed, 900)  # the dependent windows closed before the cap
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
+                      turn_end=run.turn_end, turn_end_observable=run.turn_end_observable)
+        classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
+        self.assertEqual(classified['ack'], 'observed')
 
     def test_requested_state_is_validated_and_carried_into_the_result(self):
         clock = FakeClock()

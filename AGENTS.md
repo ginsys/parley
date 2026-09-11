@@ -115,6 +115,15 @@ sender is injectable so size-boundary tests cannot launch an installed host CLI 
 because a real thread is missing. Cancellation tests synchronize with child startup rather than
 assuming a timeout is longer than process creation. Live compatibility needs separate evidence.
 
+Host-probe matrix trials are not ordinary tests and carry an owner decision of 2026-09-11: they
+run against an installed host CLI under the operator's **real HOME**
+(`scripts/probe/wake_probe.py --home inherit`), because a disposable HOME holds no host
+credentials and would measure an unauthenticated session rather than a wake. Isolation is at the
+*session* level — a throwaway host session torn down after the trial — never at the HOME level,
+so every matrix cell is produced with real credentials and configuration and must be sanitized
+before it is published. The PTY fixtures keep `--home disposable`, and no ordinary test may
+launch an installed host CLI. See [host probes](docs/host-probes.md#matrix-runner).
+
 ## Transactions and schema upgrades
 
 The store uses `database/sql.Tx` with the SQLite driver's `_txlock=immediate`: the write lock is

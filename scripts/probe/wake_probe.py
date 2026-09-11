@@ -304,7 +304,7 @@ def main():
     # so two captures of the same command in different directories are otherwise
     # indistinguishable and cannot satisfy the reproduction requirement in docs/host-probes.md.
     record = {'utc': datetime.datetime.now(datetime.UTC).isoformat(), 'home_mode': args.home,
-              'cwd': None,
+              'cwd': None, 'generation': args.home,
               'command': command, 'duration': args.seconds, 'started': time.monotonic(),
               'kind': 'passive_capture', 'delivery_claim': None, 'events': [],
               'terminal_size': {'rows': PTY_SIZE[0], 'columns': PTY_SIZE[1]},
@@ -333,7 +333,10 @@ def main():
             # chdir actually reaches. The child keeps the caller's own string either way — the
             # record describes where it ran, it does not redirect it.
             record['cwd'] = os.path.realpath(child_cwd)
-            child = PtyProcess(command, cwd=child_cwd, env=env, generation='disposable')
+            # The generation names the session this transcript belongs to and is what `send`
+            # checks for staleness; hardcoding 'disposable' labelled an inherit-mode capture
+            # as the credential-free one and let a stale disposable-era token pass.
+            child = PtyProcess(command, cwd=child_cwd, env=env, generation=args.home)
             if interrupted[0]:
                 raise KeyboardInterrupt
             deadline = record['started'] + args.seconds

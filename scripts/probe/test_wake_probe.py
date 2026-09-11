@@ -248,6 +248,9 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
             self.assertEqual(main(), 0)
         record = json.loads(output.read_text())
         self.assertEqual(record['home_mode'], 'inherit')
+        # The generation names the session `send` checks against; an inherit-mode capture
+        # labelled 'disposable' would let a token from the other mode pass as current.
+        self.assertEqual(record['generation'], 'inherit')
         self.assertIsNone(record['home_cleanup_error'])
         printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
         self.assertIn(os.environ['HOME'].encode(), printed)
@@ -268,6 +271,7 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
             self.assertEqual(main(), 0)
         record = json.loads(output.read_text())
         self.assertEqual(record['home_mode'], 'disposable')
+        self.assertEqual(record['generation'], 'disposable')
         self.assertIsNotNone(record['cwd'])  # the throwaway HOME, recorded not implied
 
     def test_explicit_cwd_is_recorded_as_the_resolved_effective_directory(self):
