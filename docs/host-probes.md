@@ -70,8 +70,9 @@ signed `exit_code` (negative means a signal), `cleanup_requested`, `stop_reason`
 Natural signal termination is a failure. A child still running at the deadline is stopped by the
 harness and identified as such, not labelled a natural host failure. KeyboardInterrupt produces
 an `interrupted` record with partial events and CLI exit 130; other capture/startup errors produce
-failed records. A deadline always produces `stopped`, even when the direct child exited zero but
-a descendant kept the PTY open. `cleanup_requested` describes intervention on the direct child,
+failed records. A deadline cannot produce `complete`: an otherwise successful capture is
+`stopped`, even when the direct child exited zero but a descendant kept the PTY open. Independent
+capture/child failures still take precedence. `cleanup_requested` describes intervention on the direct child,
 not whether every descendant exited naturally. `complete` requires observed PTY EOF and natural
 direct-child exit zero, without a capture/cleanup error; it does not certify descendant outcomes.
 CLI zero means the record was published successfully (including an intentionally stopped capture),
