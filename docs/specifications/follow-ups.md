@@ -231,10 +231,24 @@ revisions. Server restart invalidates cursors; authoritative records persist. Bo
 five seconds and close its read transaction before writing a response; use the server's separate
 reader pool.
 
-`follow_up.get` returns one authorized record; `include_original` defaults false. Setting it true
-returns the original content once within the existing message size limit, clearly wrapped as
-untrusted data. Retrieval is read-only: it is not receipt acknowledgement, task acceptance or a
-request to execute anything. Recipient retrieval of the body requires existing `handed_off`, `acked`
+`follow_up.get` returns one authorized record; `include_original` defaults false and omits the
+`original` field. When true, check current visibility and delivery eligibility before returning one
+of two disjoint results: `original: {status: "available", text: ...}` contains the original within
+the existing message size limit, clearly wrapped as untrusted data; `original: {status: "retired"}`
+contains no text and means human payload retirement removed it while retaining the follow-up and
+envelope identity. Retired content is a successful metadata response, not missing work, an empty
+message, an authorization failure or a reason to retry delivery. The retirement marker persists
+with original identity across restart/restore; do not infer retirement from empty or missing text.
+Missing payload without a retirement marker is a storage/recovery error (`recovery_required`),
+not successful retirement. Retrieval never reconstructs retired content from receipts or backups.
+
+Read availability and payload in the same snapshot, reporting that snapshot's server time. Retirement
+committed before the snapshot yields retired; a later retirement cannot recall already read or
+transmitting data. Ordinary authorization checks still apply before response output, and inaccessible
+callers learn neither availability nor retirement. Payload retirement never changes item disposition.
+
+Retrieval is read-only: it is not receipt acknowledgement, task acceptance or a request to execute
+anything. Recipient retrieval of either original variant requires existing `handed_off`, `acked`
 or `uncertain` evidence from a charged host attempt; queued, dispatching, failed or cancelled
 originals cannot be read this way to bypass delivery accounting/readiness. Original senders already
 know their own content but gain no additional recipient metadata through that exception. Retrieval
@@ -319,6 +333,7 @@ calls; run the repository's full `mise run verify` for each implementation incre
 | F14 | Failed/cancelled/uncertain original; migration and restore of old data | No invented completion, receipt or retry, and no pre-handoff body retrieval bypass; blocked work remains evidence; historic envelopes not auto-classified; restore reconciles receipts and holds. |
 | F15 | Reconnect/rotation/restart, cross-conversation alternating defer/reopen with fresh IDs, duplicate/stale requests and all mutation methods; missing/stale checkpoint revision | Shared binding slot and each bucket hold, including the combined 30/minute mutation rate and cold-start refill; rejected requests append nothing; unchanged revision suppresses reminders; null revision yields one bounded notice. |
 | F16 | Capacity exhausted during offer/resolve/event/receipt creation, unchanged checkpoint, due batch and existing-receipt replay; injected storage-full failure and unknown commit outcome | Definite failed transaction rolls back all its rows with capacity_exceeded; no stale page on failed deadline advancement; prior committed batch remains; no replay-state eviction; authorized existing receipt remains replayable without allocation; unknown outcome uses the original ID. |
+| F17 | Get with original omitted/available/retired; retirement before/after snapshot, restart/restore, empty text, missing unmarked payload and unauthorized caller | Disjoint omitted/available/retired results preserve item identity and disposition; marker survives; empty content is not inferred retirement; unmarked loss requires recovery; unauthorized reads expose no availability; no reconstruction or retry. |
 
 Owner review must assess the two-peer walkthrough, explicit actionability, transfer acceptance,
 post-revoke visibility and checkpoint-only blocker policy. This does not solve live wake delivery,
