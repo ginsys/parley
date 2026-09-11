@@ -234,8 +234,22 @@ def background_sessions(raw):
 
     Interactive sessions report `status`, not `state`, and are never this module's concern:
     only sessions this runner itself starts with `claude --bg` are eligible for any operation.
+
+    A daemon-restarting or otherwise degraded CLI can print valid JSON that is not the expected
+    list-of-objects shape -- an error object, `null`, or a bare scalar -- and `claude agents`
+    still exits 0 when it does. Raising a clear RuntimeError here, rather than letting a
+    non-list top level or a non-dict entry escape as an uncaught TypeError/AttributeError from
+    the caller's own iteration, keeps this failure in the same reportable class as a nonzero
+    exit instead of crashing the trial with an unrelated-looking exception.
     """
-    return [entry for entry in json.loads(raw) if entry.get('kind') == 'background']
+    try:
+        entries = json.loads(raw)
+    except ValueError as error:
+        raise RuntimeError(f'claude agents --json produced unparseable output: {error}') from error
+    if not isinstance(entries, list):
+        raise RuntimeError(
+            f'claude agents --json produced a non-list top level ({type(entries).__name__}): {raw!r}')
+    return [entry for entry in entries if isinstance(entry, dict) and entry.get('kind') == 'background']
 
 
 def parse_claude_transcript(raw, *, marker):
@@ -285,7 +299,12 @@ class ClaudeDriver:
                           capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             raise RuntimeError(f'claude agents exited {result.returncode}: {result.stderr}')
-        return {entry['id'] for entry in background_sessions(result.stdout)}
+        ids = set()
+        for entry in background_sessions(result.stdout):
+            if 'id' not in entry:
+                raise RuntimeError(f'claude agents --json listed a background session with no id: {entry!r}')
+            ids.add(entry['id'])
+        return ids
 
     def create(self, prompt):
         """Start a background session and identify it from a listing diff, never from stdout.
