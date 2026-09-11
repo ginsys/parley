@@ -12,9 +12,12 @@ import pty
 import selectors
 import signal
 import tempfile
+import termios
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+
+PTY_SIZE = (24, 80)  # rows, columns; reproducible across launch environments
 
 WINDOWS = {'accepted': 10, 'visible': 30, 'turn_start': 60, 'ack': 120}
 RESULTS = {'observed', 'not_observed', 'unobservable', 'unsupported', 'inconclusive'}
@@ -99,19 +102,26 @@ class PtyProcess:
         self.cleanup_requested = False
         self.selector = selectors.DefaultSelector()
         try:
-            pid, fd = pty.fork()
-            if pid == 0:
-                try:
-                    # A wrapper may pass authenticated sockets or other inheritable
-                    # handles. Inspect actual FDs, including those above a lowered
-                    # soft limit, and retain only the new PTY's standard streams.
-                    highest_fd = max(map(int, os.listdir('/proc/self/fd')), default=2)
-                    os.closerange(3, highest_fd + 1)
-                    os.chdir(cwd)
-                    os.execvpe(argv[0], argv, env)
-                except BaseException:
-                    os._exit(127)
-            self.pid, self.fd = pid, fd
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+            try:
+                pid, fd = pty.fork()
+                if pid == 0:
+                    try:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                        # A wrapper may pass authenticated sockets or other inheritable
+                        # handles. Include descriptors above a lowered soft limit.
+                        highest_fd = max(map(int, os.listdir('/proc/self/fd')), default=2)
+                        os.closerange(3, highest_fd + 1)
+                        termios.tcsetwinsize(0, PTY_SIZE)
+                        os.chdir(cwd)
+                        os.execvpe(argv[0], argv, env)
+                    except BaseException:
+                        os._exit(127)
+                self.pid, self.fd = pid, fd
+            finally:
+                # A pending Ctrl-C can raise here, only after the parent owns both
+                # handles and its exception path can kill/reap/close the child.
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             os.set_blocking(fd, False)
             os.set_inheritable(fd, False)
             self.selector.register(fd, selectors.EVENT_READ)
@@ -163,6 +173,7 @@ class PtyProcess:
             if os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
                 return True
             time.sleep(min(.01, max(0, deadline - time.monotonic())))
+        # A later status has no exit timestamp proving completion within the window.
         return False
 
     def close(self):
@@ -267,6 +278,7 @@ def main():
     record = {'utc': datetime.datetime.now(datetime.UTC).isoformat(),
               'command': command, 'duration': args.seconds, 'started': time.monotonic(),
               'kind': 'passive_capture', 'delivery_claim': None, 'events': [],
+              'terminal_size': {'rows': PTY_SIZE[0], 'columns': PTY_SIZE[1]},
               'eof': False, 'error': None, 'cleanup_error': None, 'wait_status': None, 'exit_code': None,
               'cleanup_requested': False, 'capture_status': 'failed', 'stop_reason': 'startup'}
     result = 0

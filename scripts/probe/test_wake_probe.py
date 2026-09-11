@@ -3,6 +3,7 @@
 import fcntl
 import json
 import os
+import pty
 import signal
 import stat
 import subprocess
@@ -125,6 +126,67 @@ else:
         child.close()
         self.assertEqual(child.exit_code, 127)
         self.assertFalse(child.cleanup_requested)
+
+    def test_sigint_during_fork_records_ownership_before_unmasking(self):
+        output = Path(self.tmp.name, 'fork-interrupt.json')
+        original_fork = pty.fork
+        handles = []
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def interrupted_fork():
+            pid, fd = original_fork()
+            if pid:
+                handles.append((pid, fd))
+                os.kill(os.getpid(), signal.SIGINT)
+            return pid, fd
+
+        args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
+                sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(30)']
+        try:
+            with patch.object(sys, 'argv', args), patch('wake_probe.pty.fork', interrupted_fork):
+                self.assertEqual(main(), 130)
+            self.assertEqual(json.loads(output.read_text())['capture_status'], 'interrupted')
+            self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), original_mask)
+            self.assertEqual(len(handles), 1)
+            pid, fd = handles[0]
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+        finally:
+            # The red test must also clean up the child/FD leaked by the old
+            # constructor. Only kill a still-owned unreaped child, never a reused PID.
+            for pid, fd in handles:
+                try:
+                    ended, _ = os.waitpid(pid, os.WNOHANG)
+                    if not ended:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_exec_has_recorded_terminal_size_and_restored_signal_mask(self):
+        output = Path(self.tmp.name, 'terminal.json')
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        code = f"""
+import os, signal
+size = os.get_terminal_size(0)
+assert set(signal.pthread_sigmask(signal.SIG_BLOCK, set())) == {set(map(int, original_mask))!r}
+print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
+"""
+        args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
+                sys.executable, '-u', '-c', code]
+        with patch.object(sys, 'argv', args):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        transcript = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
+        self.assertIn(b'SIZE 80 24', transcript)
+        self.assertEqual(record['terminal_size'], {'columns': 80, 'rows': 24})
+        self.assertEqual(record['capture_status'], 'complete')
 
     def test_replaced_pane_and_approval_prompt_reject_before_writing(self):
         for state in ('shell', 'pager', 'editor', 'approval', 'busy', 'unknown'):
@@ -432,6 +494,22 @@ os._exit({expected if expected >= 0 else 0})
                                  'capture' if outcome == 'interrupt' else 'eof')
                 self.assertIn(b'before eof', b''.join(bytes.fromhex(e['hex']) for e in record['events']))
                 self.assertFalse(Path(f'/proc/{waited[0]}').exists())
+
+    def test_exit_first_observable_after_deadline_is_not_completion(self):
+        child = object.__new__(PtyProcess)
+        child.pid = 123  # virtual child: all process observation is mocked
+        now = 0
+        exited = object()
+
+        def sleep(_):
+            nonlocal now
+            now = 2  # scheduling resumes after the deadline; exit time is unknown
+
+        with patch('wake_probe.time.monotonic', side_effect=lambda: now), \
+                patch('wake_probe.time.sleep', sleep), patch('os.waitid', side_effect=[None, exited]):
+            self.assertFalse(child.wait_for_exit(1))
+            # An exit available now must not retroactively certify the window.
+            self.assertIs(os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT), exited)
 
     def test_deadline_with_exited_leader_and_live_descendant_is_stopped(self):
         output = Path(self.tmp.name, 'descendant.json')
