@@ -13,15 +13,19 @@ separate outcomes for every trial.
 | `codex queue --help` | Exit 0; advertises queuing a message for an existing session using thread and message arguments |
 | `claude --help` | Exit 0; MCP config options advertised; Channels absent from this help output, which does not establish lack of support |
 | `opencode auth --help` | Exit 0; provider-list command advertised |
-| `opencode --pure auth list` | Exit 1 in the restricted environment; provider availability unresolved, no credential values retained |
+| `opencode --pure auth list` (17:20 UTC, restricted environment) | Exit 1 while opening its normal log file; provider listing not obtained, no credential values retained |
+| `opencode --pure auth list` (17:27 UTC, retry with normal log access) | Exit 0; two stored credential entries reported; no credential values retained or provider request made |
 | Expected Codex IPC path existence | No socket found at the configured/default Codex HOME's `ipc/ipc.sock`; no connection attempted |
 | `command -v herdr` | Not found; harness does not depend on herdr |
 
 Commands had a ten-second timeout, except provider listing with fifteen seconds. None timed out.
-The provider/socket observations were recorded at 17:20 UTC. No message was queued, no ordinary
+The initial provider/socket observations were recorded at 17:20 UTC; the provider retry is listed
+separately above and was also recorded in [issue #18](https://github.com/ginsys/parley/issues/18).
+The retry resolves the listing failure, but credential presence does not prove usable provider
+authentication in a disposable session. No message was queued, no ordinary
 session was contacted and no provider request was made. Presence of a command is not evidence
 that it wakes a session, and absence of an IPC path in this environment is not product-wide
-unsupported status. OpenCode remains the intended third host; resolve its provider preflight or
+unsupported status. OpenCode remains the intended third host; verify disposable-session authentication or
 record an explicit owner scope amendment before treating the investigation as complete.
 
 The controlled harness fixtures are independently reproducible with `mise run python`; their
