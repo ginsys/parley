@@ -217,6 +217,16 @@ class CodexParsingTests(unittest.TestCase):
         expected = datetime.datetime(2026, 9, 11, 0, 0, 1, tzinfo=datetime.UTC).timestamp()
         self.assertEqual(rollout_started_at(lines), expected)
 
+    def test_rollout_started_at_fails_closed_on_an_undated_record_of_any_type(self):
+        # A record whose own timestamp is missing or unusable must not be silently skipped from
+        # the earliest-of computation: skipping it could hide that this exact record was the
+        # earliest one in the file, letting a thread that predates this run pass provenance.
+        lines = [
+            json.dumps({'timestamp': '2026-09-11T00:00:05.000Z', 'payload': {'type': 'message'}}),
+            json.dumps({'type': 'world_state'}),  # no timestamp key at all
+        ]
+        self.assertIsNone(rollout_started_at(lines))
+
     def test_rollout_started_at_fails_closed_on_an_unparseable_line(self):
         # The unreadable line could be the earliest record, so a minimum taken over whatever
         # survived would let a thread older than this run pass the provenance check.

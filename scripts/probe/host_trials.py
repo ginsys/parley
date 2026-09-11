@@ -361,9 +361,12 @@ def rollout_started_at(lines):
     Provenance, not transcript: every record type counts here (`session_meta` included), because
     the question is when the thread itself came into existence, not when it was spoken in.
 
-    An unparseable line makes the whole answer None rather than being skipped: skipping it means
-    the earliest record might be the one that failed to parse, so a thread that predates the run
-    could pass the provenance check on the minimum of whatever happened to survive.
+    An unparseable line, or a record whose own timestamp is missing or unusable, makes the whole
+    answer None rather than being skipped: skipping it means the earliest record might be the
+    one that failed, so a thread that predates the run could pass the provenance check on the
+    minimum of whatever happened to survive. Every captured rollout record carries a top-level
+    `timestamp` (`record_time`'s docstring), so a record without one is exactly as untrustworthy
+    as a line that failed to parse at all — not a legitimate timestamp-free record type.
     """
     stamps = []
     for line in lines:
@@ -375,8 +378,9 @@ def rollout_started_at(lines):
         except ValueError:
             return None
         when = record_time(record)
-        if when is not None:
-            stamps.append(when)
+        if when is None:
+            return None
+        stamps.append(when)
     return min(stamps) if stamps else None
 
 
