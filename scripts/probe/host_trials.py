@@ -619,11 +619,16 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     deadlines use `monotonic` (injected, `time.monotonic` by default) because a local elapsed
     interval must not move when NTP steps the clock.
 
-    A `busy` trial polls to `BUSY_CAP` instead, shortened to the dependent windows once the
-    running turn's end is observed, because `Trial.result` refuses to classify `turn_start`/
-    `ack` before then. If that end never appears, those two outcomes are reported unobservable:
-    the runner cannot tell "the host ignored us" from "the earlier turn was still going", and
-    only a host that emits turn boundaries (`turn_stream` in `detect_outcomes`) can.
+    A `busy` trial polls to `BUSY_CAP` instead, adjusted — shortened *or extended* — to the
+    dependent windows once the running turn's end is observed, because `Trial.result` refuses to
+    classify `turn_start`/`ack` before then and gives them a full `LAST_WINDOW` from that end
+    even when it lands past `BUSY_CAP` itself. A turn ending at, say, 890s still owes its
+    dependent outcomes the window out to 1010s; only a turn ending *after* `BUSY_CAP` gets no
+    such extension, because `Trial.result` classifies that case `inconclusive` regardless of how
+    much longer polling would wait. If the turn's end never appears at all, those two outcomes
+    are reported unobservable: the runner cannot tell "the host ignored us" from "the earlier
+    turn was still going", and only a host that emits turn boundaries (`turn_stream` in
+    `detect_outcomes`) can.
 
     Deliberate, bounded deviation from `Trial`'s "same monotonic clock" docstring: every
     timestamp that is *compared* — `submitted_at`, `accepted_at`, each `Event.time` — comes from
@@ -678,10 +683,15 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
             outcomes.setdefault(name, when)
         if turn_end is None and observation.turn_end is not None:
             turn_end = observation.turn_end
-            # The dependent windows run from the turn's end, so stop waiting when they close
-            # rather than sitting out the rest of the cap.
-            deadline = min(deadline,
-                           monotonic() + max(0.0, LAST_WINDOW - (clock() - turn_end)))
+            # The dependent windows run from the turn's end: adjust the deadline to match,
+            # shortening it when they close early rather than sitting out the rest of the cap,
+            # but also extending it when the end lands close to the cap — `min()` against the
+            # cap-based deadline could only ever shorten, silently truncating a turn that ended
+            # at e.g. 890s to the 900s cap instead of the 1010s its own window earns it. A turn
+            # ending *past* the cap gets no such extension: `Trial.result` classifies that
+            # `inconclusive` no matter how much longer polling would wait.
+            if state != 'busy' or turn_end - submitted_at <= BUSY_CAP:
+                deadline = monotonic() + max(0.0, LAST_WINDOW - (clock() - turn_end))
         remaining = deadline - monotonic()
         if remaining <= 0 or all(name in outcomes for name in TRANSCRIPT_OUTCOMES):
             break
