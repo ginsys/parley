@@ -27,7 +27,7 @@ retained context, inbox dispositions, multi-party membership or execution author
 ## Logical records and validation
 
 All records belong to the server-owned database except private credential files, live sockets and
-the restore startup gate. The following are proposed logical storage contracts, not migration SQL.
+external recovery/clock markers. The following are logical storage contracts, not migration SQL.
 
 | Record | Required fields and constraints |
 | --- | --- |
@@ -37,7 +37,9 @@ the restore startup gate. The following are proposed logical storage contracts, 
 | Connection | Binding and credential version, epoch/generation, kernel connector UID, socket identity, liveness deadline, `authenticating`, `not_ready`, `ready` or `closed`; socket/readiness are process-local |
 | Pending conversation | Unique `pending_id`, exact `conversation`, creator binding/credential provenance, purpose, visibility, immutable invitee set, finite deadline, positive `request_version`, `waiting`, `approved`, `cancelled` or `expired` |
 | Join request | Unique `join_id`, pending ID, candidate binding/credential provenance, finite deadline, positive `request_version`, `pending`, `approved`, `rejected`, `cancelled` or `expired` |
-| Accepted-work provenance | Unique work kind/ID, accepting binding and credential version; immutable across grant renewal, carry and credential rotation |
+| Accepted-work provenance | Unique work kind/ID; tagged `authenticated` with accepting binding/credential version, or `legacy` with migration incident and original exact envelope identifiers but no binding/credential fields; immutable across renewal/carry/rotation |
+| Migration quarantine | Migration incident ID and adopted schema version; per-work ID, positive `quarantine_version`, `held`, `released` or `cancelled`, and append-only human disposition; no binding or credential FK |
+| Clock incident | Unique incident ID, positive `clock_version`, `held` or `reconciled`, last trusted/observed times, detection evidence and audited human disposition; independent external marker survives restart |
 | Security hold | Work kind/ID and revocation incident ID, binding, creation time, positive `hold_version`, `held`, `released` or `cancelled`; append-only human disposition evidence; several incidents may hold one item |
 | Operation result | Unique `(principal_id, operation_id)`, operation kind, canonical request digest, committed result or terminal error; no credentials or message bodies in result metadata |
 | Ingestion evidence | Unique `(binding_id, native_event_id)`, source revision/digest and result; durable source cursor, unresolved event references and any recovery barrier |
@@ -57,12 +59,12 @@ Existing longer or incompatible identifiers require read-only inventory and expl
 the upgrade must not strand human revocation or silently omit historical records.
 
 Persist timestamps as UTC instants with numeric nanosecond ordering and an explicit representable
-range. Compare expiry using server time (`now >= deadline` is expired), never client time. Deadline addition overflow rejects the operation. Liveness timers use a monotonic clock; restart
-resets them. Reliable server wall time is an operational precondition. A detected backward step
-blocks new authorization pending human clock reconciliation; do not claim to detect every clock
-rollback across a crash or database restore. Persist observed terminal request/credential expiry
-in the writer so those records cannot revive when time changes. Clock recovery never extends
-existing deadlines; broader restore recovery is specified below.
+range. Compare expiry using server time (`now >= deadline` is expired), never client time. Deadline
+addition overflow rejects the operation. Liveness timers use a monotonic clock; restart resets them.
+Reliable server wall time is an operational precondition. Persist observed terminal request/credential
+expiry so it cannot revive; clock recovery never extends a deadline. A detected backward step uses
+the [durable clock-recovery lifecycle](#clock-rollback-recovery), not only a process-local flag.
+This does not claim detection of every previously unobserved rollback across a crash or restore.
 
 ## Registration, credentials and host provenance
 
@@ -113,6 +115,8 @@ operation IDs. No agent-facing request may call them through an alias.
 | `hold.disposition` | Work kind/ID, incident ID, expected hold version, cancel/release, reason | Incremented hold version and audited disposition |
 | `ingestion.resume` | Binding ID, expected binding/barrier version, verified source interval and disposition, reviewed resume cursor/held event set | Audited barrier resolution; accepted events/ACKs are never invented |
 | `recovery.complete` | External incident ID, expected durable recovery-record version, reviewed reconciliation/disposition references | Audited two-phase completion described below |
+| `legacy.disposition` | Migration incident ID, work ID, expected quarantine version, cancel/release and reviewed disposition reference | Audited legacy disposition without inventing authentication provenance |
+| `clock.reconcile` | Clock incident ID, expected clock version and reviewed time-evidence reference | Audited reconciliation of that clock incident only; no deadline/grant renewal |
 
 All mutable incident/barrier/recovery records have positive versions and increment them on each
 transition. Repeating an operation ID returns its committed metadata; it never reprovisions a secret.
@@ -230,13 +234,13 @@ separate human membership-change path, not this initial-admission shortcut.
 
 An enabled binding has enabled enrollment and a current unexpired credential; it need not have a
 live socket. Before message acceptance, check the authenticated sender's exact current token and
-verified host binding, enabled recipient, membership edge/expiry and recovery barriers in the same
+verified host binding, enabled recipient, membership edge/expiry and every applicable quarantine/recovery barrier in the same
 writer transaction that inserts the message, provenance and operation result. Sender IDs and
 trusted-reply flags supplied by callers are rejected. Fresh sends name one conversation and one
 recipient. Identity success alone never supplies membership or permits broadcast.
 
 Reply ingestion validates native source evidence/event identity, current connection, original
-provenance and membership, then commits original ACK, reply/provenance, cursor/result evidence
+provenance and membership, checks any quarantine on the original, then commits original ACK, reply/provenance, cursor/result evidence
 atomically. The reply carries the actual accepting credential version, even across later grant
 carry. Different content for an already-recorded native event is `event_conflict`, not a second
 reply. Ordinary no-marker and terminal malformed events can advance a cursor only with durable
@@ -245,7 +249,7 @@ binding, cannot be skipped. Persist a pending event reference and retry after th
 changes; do not hold the writer while waiting. Cursor advancement must not jump over unresolved
 source events. Reconnect never invents new native event IDs for previously observed turns.
 
-Check both required bindings, hold absence, exact grant/version/edge/expiry/budget and recipient
+Check both required bindings, security/quarantine/clock-hold absence, exact grant/version/edge/expiry/budget and recipient
 readiness immediately before a dispatch claim in the writer transaction. The original sender may
 be offline after acceptance. An unavailable binding or held work defers without consuming budget
 or changing delivery state; independent grant lifecycle still applies. Bind the claim to the exact
@@ -335,10 +339,30 @@ state values, grants, attempt tokens and numeric ordering remain authoritative.
 
 Migrate under the accepted exclusive server lock and one immediate writer transaction before
 readers/listeners. Rollback failed validation completely; rerunning a completed migration is a
-no-op. Existing peer names do not establish bindings. Mark existing work as legacy/unprovenanced;
-never infer credential provenance from the grant or current enrollment. Hold it pending human
-review/retirement before enabling affected legacy access. Human-reviewed release retains explicit
-legacy provenance and cannot manufacture trusted replies, ACKs or successful host attempts.
+no-op. Existing peer names do not establish bindings. Every adopted envelope receives immutable
+`legacy` provenance with a migration incident ID, original exact envelope/from/to/conversation IDs
+and its grant version at adoption. Its binding and credential fields must be absent; CHECK rules
+make the authenticated and legacy variants exclusive. A legacy incident records migration/schema
+identity, not a fictional revocation. No client or ordinary acceptance path may select `legacy`;
+only the numbered migration creates it. Fresh work requires authenticated provenance and real FKs.
+
+Create independent quarantine rows for outstanding legacy envelopes (`queued`, `dispatching`,
+`handed_off`, `uncertain`) in the same migration transaction. Historical terminal rows retain the
+legacy tag without becoming actionable. Migration creates no binding or credential just to satisfy
+a FK. Legacy rows preserve all original states, ACKs, trusted-reply flags and attempt evidence;
+interrupted dispatch still becomes uncertain through ordinary recovery. Quarantine is checked
+before dispatch or consuming a legacy original during reply ingestion, and survives renewal/carry.
+
+Human `legacy.disposition` matches the incident/work/quarantine version and reviewed evidence.
+Release is permitted for queued work or a handed-off original only after review; it leaves the
+legacy tag unchanged and every current membership, enabled-binding and provenance rule still
+applies. It cannot release dispatching/uncertain work into an automatic retry, synthesize trusted
+reply evidence, reset an ACK or revive terminal state. Cancel permanently prevents further use;
+only never-attempted queued work may become cancelled in the envelope state machine, while other
+states retain their delivery evidence. A late never-attempted settlement cannot bypass a cancelled
+quarantine. A later credential revocation also holds outstanding legacy work whose exact historical
+sender key belongs to that binding; this security hold is independent of migration quarantine.
+Releasing one cannot clear the other. Dispositions increment the quarantine version and retain audit.
 
 Ordinary restart creates a new epoch, drops all live slots/readiness, preserves durable generations,
 operation/event evidence and holds, and applies existing interrupted-dispatch recovery. It does not
@@ -366,6 +390,40 @@ mismatched record refuses release. Unresolved namespaces stay disabled after the
 Operators must re-establish the external marker before every subsequent restore, even of a snapshot
 containing a prior completion record. No agent operation can complete recovery or delete tombstones.
 
+## Clock rollback recovery
+
+On detecting backward wall time, stop ordinary authorization/dispatch/ingestion immediately and
+create an independent clock-incident marker in trusted recovery storage outside SQLite. Atomically
+publish and durably sync the marker before considering the hold established; record the matching
+clock incident in the writer. Marker and record contain server/incident identity, last trusted
+instant and newly observed time, with no secrets. If SQLite recording fails, the marker still
+blocks restart. If the external marker cannot be persisted, fail-stop and require the trusted
+service supervisor/operator to prevent unattended restart until recovery; no durable-hold guarantee
+is claimed when every persistence path fails. This failure must never be reported as recovered.
+
+Startup checks both markers and durable clock incidents before ordinary listeners/workers. Either
+held form keeps service in recovery-only mode; a marker without a DB record is reconstructed as
+held, never ignored. Retain a durable last-trusted-time checkpoint at writer authorization and
+reconciliation so startup can also reject a clock earlier than that checkpoint. New epochs,
+credential rotation and ordinary restart cannot clear a detected incident. Several clock or restore
+incidents can coexist; their IDs/markers cannot overwrite one another. Restricted human inspection,
+operation-result lookup and explicit recovery actions remain available under trusted-admin identity.
+
+`clock.reconcile` requires exact incident/version and a trusted human-reviewed time-evidence record
+bound to that incident. Validate the configured time source and that current time is not earlier
+than the recorded last-trusted floor. Two samples separated by at least one monotonic second must
+be nondecreasing; take them without holding a DB transaction and recheck the floor/version in the
+writer. The source's correctness remains an operator responsibility, not cryptographic proof from
+a timestamp. If a bad historical clock established an unusable future floor, ordinary reconciliation
+cannot lower it: use broader reviewed recovery/retirement of affected authority instead.
+
+Commit reconciled status, incremented version, trusted-time checkpoint, operation receipt and audit,
+then remove only the matching external marker. A crash before removal stays held. An authenticated
+retry of the same operation may finish that marker removal after checking its exact committed
+incident/version; it cannot repeat the mutation or remove a newer/different hold. Resume ordinary
+service only after every clock/restore marker and durable global hold is resolved. Persisted expiry,
+item quarantine, credential revocation and grant deadlines remain unchanged; no budget is reset.
+
 ## Required controlled fixtures
 
 These are executable-test requirements for later implementation, not tests claimed to exist.
@@ -388,10 +446,11 @@ injectable time. Never use real credentials or invoke the protected executable f
 | C12 Late settlement | Revoke during claim/handoff; never-attempted result arrives after recovery | Exact refund once, no retarget, hold/provenance survives carry, original ACK preserved |
 | C13 Revoked source interval | Unaccepted host event from compromised interval, then fresh credential ingestion | Barrier holds event until audited disposition; no credential laundering |
 | C14 Replay retention | Duplicate/conflicting operations after reconnect/restart/credential rotation; payload purge | One effect; tombstones reject replay; current authorization required for results |
-| C15 Migration | Known legacy DB, incompatible IDs, injected migration failure; rerun | Atomic schema upgrade, no synthesized provenance, reviewed legacy access, no room tables |
+| C15 Migration | Nonempty known legacy DB with no bindings/credentials; incompatible IDs; failure/rerun; release/cancel/carry | Legacy-tag and quarantine constraints satisfied without invented identities; reviewed disposition preserves provenance and delivery evidence; no room tables |
 | C16 Restore | Snapshot before delivery/ACK/approval/revoke/budget use; rotate/restart and lose recovery response | External hold persists; no replay/replenishment; unknown namespaces retired/held; audited release only |
 | C17 Limits and time | Boundary TTL/size/counter, expiry at equality, clock rollback, storage exhaustion | Explicit rejection; detected clock rollback blocks authorization; persisted terminal expiry and replay evidence survive restart |
 | C18 Isolation limits | Same-UID stolen credential and compromised verifier; cross-UID secret possession | Demonstrate accepted same-account limit; wrong UID rejected without claiming production validation |
+| C19 Clock hold | Detect rollback, crash/restart, fail SQLite recording, reconcile stale/correct versions, lose post-commit response | Marker and durable hold survive restart; stale release cannot clear newer holds; exact audited recovery and unchanged deadlines/budgets; total persistence failure requires operator-held shutdown |
 
 Acceptance of this specification requires review of these records and transitions against the
 identity and membership decisions. Runtime implementation must supply passing applicable fixtures;

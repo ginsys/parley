@@ -107,6 +107,7 @@ there is no generic action executor. Read operations omit operation IDs and are 
 | `admission.approve`, `admission.reject`, `admission.cancel` | Exact IDs, expected versions and membership/limits from connections.md, plus operation ID | Request/grant receipt under its atomic admission contract |
 | `binding.register`, `binding.rotate`, `binding.reenroll`, `binding.revoke`, `binding.retire` | Exact connection-contract fields plus operation ID | Binding/credential metadata and incident references; never a secret |
 | `connection.disconnect`, `hold.disposition`, `ingestion.resume`, `recovery.complete` | Exact versioned fields from connections.md plus operation ID | Audited target-specific receipt; no generic execution |
+| `legacy.disposition`, `clock.reconcile` | Exact incident/version fields below plus operation ID | Audited quarantine/clock recovery without invented credentials or renewed deadlines |
 | `provisioning.status` | Own committed `operation_id` | Recorded publication evidence/status; no secret or arbitrary file read |
 
 Membership command fields are `operation_id`, exact `conversation` and
@@ -138,6 +139,8 @@ contract's UUID/exact-key rules; unknown or extraneous fields fail rather than b
 | `hold.disposition` | `work` tagged as `pending`, `join` or `envelope` with `id`; `incident_id`, `expected_hold_version`, `action` (`cancel` or `release`), `reason` |
 | `ingestion.resume` | `binding_id`, `expected_binding_version`, `expected_barrier_version`, `disposition_ref` |
 | `recovery.complete` | `incident_id`, `expected_recovery_version`, `disposition_ref` |
+| `legacy.disposition` | `migration_incident_id`, `work_id`, `expected_quarantine_version`, `action` (`cancel` or `release`), `disposition_ref` |
+| `clock.reconcile` | `incident_id`, `expected_clock_version`, `time_evidence_ref` |
 
 Each expected-binding tuple contains `binding_id`, `expected_binding_version` and
 `expected_credential_version`; array order has no authorization meaning. A `reason` is an object
@@ -148,7 +151,8 @@ reason text never supplies authority or overrides a hold.
 References are immutable UUIDs for trusted, versioned evidence/configuration records, not paths
 or proof by possession. Provisioning targets come from human-owned setup configuration and bind
 an allowed destination/account. Host evidence resolves through the verified host integration.
-A disposition reference resolves an already human-reviewed manifest bound to exact incident,
+A time-evidence reference resolves a reviewed clock-source/floor record for the exact clock
+incident. A disposition reference resolves an already human-reviewed manifest bound to exact incident,
 principal/binding and expected versions, including the reviewed source interval/cursor/held events
 or restore reconciliation from connections.md. A missing, stale, mismatched or unverified reference
 fails closed. The initial trusted manifest-preparation procedure is a stopped-service human step:
@@ -161,7 +165,8 @@ completion must reference audited reconciliation and every remaining disabled na
 size limits never authorize partial recovery, truncation or blanket release. Matching a manifest does
 not dispense with the operation's current writer-transaction checks or audited disposition.
 
-Pending kinds are `admission`, `hold`, `ingestion_barrier`, `recovery` and `uncertain_delivery`.
+Pending kinds are `admission`, `hold`, `legacy_quarantine`, `clock_hold`, `ingestion_barrier`,
+`recovery` and `uncertain_delivery`.
 Action names are an allowlisted enumeration derived from current state. Uncertain-delivery items
 are observational here: no new retry/ACK/inbox-disposition operation is authorized. The client must
 construct only a named schema-bound operation after human selection, never execute an operation
@@ -263,7 +268,7 @@ The same operation ID with different content or method returns `operation_confli
 
 For a new valid command, acquire the coordinator gate and one immediate writer transaction.
 Recheck current admin capability, recovery mode, all relevant membership/binding/credential/item
-versions, expiry and holds. No read-pool snapshot authorizes a write. Write the mutation, permanent
+versions, expiry and every security, migration-quarantine and global recovery/clock hold. No read-pool snapshot authorizes a write. Write the mutation, permanent
 operation receipt and audit row in that transaction, reserving its next view revision. On commit,
 publish the corresponding revision/hint before releasing the gate; response I/O follows release.
 A failed commit publishes no successful receipt or revision. A crash after commit but before
@@ -382,7 +387,7 @@ Do not support shared network-filesystem or simultaneous restored-copy operation
 
 After locking: open writer, validate/adopt/upgrade known schema atomically, establish recovery mode,
 apply interrupted-dispatch recovery as permitted by that mode, then open readers and finally
-publish listeners. Ordinary requests cannot run during initialization. With an external restore
+publish listeners. Ordinary requests cannot run during initialization. With an external restore or clock
 hold, only the explicitly limited human recovery inspection/disposition surface becomes available;
 agent admission/dispatch/ingestion remain blocked. Define cleanup in reverse order on every failure.
 Preserve frozen adoption SQL and choose ordered migration versions when implementation lands.
@@ -409,7 +414,8 @@ configuration; verify the intended installation ID and file inventory before reo
 
 Any restore, including a rollback during relocation, establishes the connection contract's
 external recovery marker before startup. Reconcile grants/budgets/envelopes/attempts, bindings,
-credential/revocation/provenance/holds, source cursors/deduplication, command results/tombstones and
+credential/revocation/provenance/holds, legacy quarantine, clock incidents/markers, source
+cursors/deduplication, command results/tombstones and
 audit history against surviving evidence. A new epoch invalidates views but cannot restore lost
 external effects or authorize replay. Retain disabled namespaces/held or uncertain work when
 evidence is incomplete; complete recovery only by the audited human procedure. A second restored
@@ -442,6 +448,7 @@ controlled subprocesses. No host CLI, real credentials or protected-controller i
 | P16 Paths/configuration | Reject missing/untrusted/URI/memory DB and invalid endpoint; explicit initialization only; help/validation need no server; no PARLEY_DB client fallback |
 | P17 Backup/restore | WAL-dependent snapshot, stale copied installation, lost audit/results and response loss during recovery stay held until human disposition; no replay or budget replenishment |
 | P18 Membership projection | Two-peer members/policy round-trip exactly, unsupported room shape rejects, oversized legacy data fails explicitly and no generic uncertain-delivery action appears |
+| P19 Legacy/clock recovery | Nonempty legacy provenance stores without fake FKs; wrong-version dispositions fail; clock rollback marker survives restart/DB-write failure; replayed clock reconciliation cannot clear another hold |
 
 Fixture review must cover success, rejection, cancellation and recovery at the exact implementation
 head. The repository's full live-connection gate applies separately before connecting real hosts.
