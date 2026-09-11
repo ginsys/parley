@@ -686,6 +686,23 @@ class RunTrialTests(unittest.TestCase):
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['ack'], 'observed')
 
+    def test_a_turn_ending_close_to_the_cap_extends_the_wait_past_it(self):
+        # A turn ending at 850s (within BUSY_CAP=900) still owes turn_start/ack the full 120s
+        # window from that end -- out to 970s -- even though that lands past the cap itself.
+        # `min(deadline, ...)` could only shorten the cap-based deadline, never stretch it,
+        # so the old code stopped polling at 900s and lost the ack sitting at 970s.
+        clock = FakeClock()
+        turn_end = 1850.0  # wall time; submitted_at is 1000.0, so this is 850s in
+        early = Observation(outcomes={'visible': 1012.0})
+        mid = Observation(outcomes={'visible': 1012.0, 'turn_start': 1840.0}, turn_end=turn_end)
+        late = Observation(outcomes={'visible': 1012.0, 'turn_start': 1840.0, 'ack': 1900.0},
+                            turn_end=turn_end)
+        driver = FakeDriver(observations=[early, mid, late], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=890.0)
+        self.assertEqual(run.turn_end, turn_end)
+        self.assertEqual(run.outcomes.get('ack'), 1900.0)
+        self.assertGreater(clock.elapsed, 900)  # polled past BUSY_CAP to cover the real end
+
     def test_requested_state_is_validated_and_carried_into_the_result(self):
         clock = FakeClock()
         run = self.run_one(FakeDriver(clock=clock), clock, state='busy')
