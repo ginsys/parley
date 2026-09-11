@@ -142,26 +142,32 @@ class PtyProcess:
         return written
 
     def close(self):
-        if self.pid is not None:
-            # Inspect without reaping: keep the PID reserved while killing any
-            # descendants in the disposable group. Preserve a natural exit status.
-            ended = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-            self.cleanup_requested = ended is None
-            try:
-                os.killpg(self.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                # forkpty session setup may not have finished in the child yet.
+        try:
+            if self.pid is not None:
+                # Inspect without reaping: keep the PID reserved while killing any
+                # descendants in the disposable group. Preserve a natural exit status.
+                ended = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                self.cleanup_requested = self.cleanup_requested or ended is None
                 try:
-                    os.kill(self.pid, signal.SIGKILL)
+                    os.killpg(self.pid, signal.SIGKILL)
                 except ProcessLookupError:
-                    pass
-            _, self.wait_status = os.waitpid(self.pid, 0)
-            self.exit_code = os.waitstatus_to_exitcode(self.wait_status)
-            self.pid = None
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
-        self.selector.close()
+                    # forkpty session setup may not have finished in the child yet.
+                    try:
+                        os.kill(self.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                _, self.wait_status = os.waitpid(self.pid, 0)
+                # Only a successful reap releases ownership. An interrupted/failed
+                # wait must leave this child available for a later cleanup attempt.
+                self.pid = None
+                self.exit_code = os.waitstatus_to_exitcode(self.wait_status)
+        finally:
+            try:
+                if self.fd is not None:
+                    fd, self.fd = self.fd, None
+                    os.close(fd)
+            finally:
+                self.selector.close()
 
     def __enter__(self):
         return self
