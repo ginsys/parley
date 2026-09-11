@@ -216,6 +216,13 @@ def publish_record(destination, record):
     finally:
         if temporary is not None:
             os.unlink(temporary)
+    # The file fsync above does not persist its new directory entry. Sync both
+    # the destination link and temporary-name removal before reporting success.
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 @contextmanager

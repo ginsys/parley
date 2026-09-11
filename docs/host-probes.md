@@ -39,7 +39,10 @@ process group, bounds captured input/output to 1 MiB, closes the PTY and kills/r
 exit. Terminal bytes are hex-encoded with monotonic timestamps rather than rendered as terminal
 control sequences. The CLI creates a fresh HOME and working directory, passes only HOME/PATH/TERM,
 and never writes input. Complete JSON is flushed to a temporary file beside the destination and
-published with an atomic no-replace hard link (then the temporary name is removed). This preserves
+published with an atomic no-replace hard link (then the temporary name is removed). The containing
+directory is fsynced before success is reported, persisting the new link and removal as well as
+the file contents. Directory-sync failures fail loudly; a visible file after such a failure does
+not prove durable publication. This preserves
 another capture even if it creates the destination during recording. Failed serialization leaves
 no empty final file. A caught interruption preserves partial events and returns a nonzero status;
 an uncatchable SIGKILL or power loss before publication cannot preserve an in-memory transcript.
