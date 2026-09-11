@@ -87,6 +87,24 @@ class SessionCreationUncaptured(NotImplementedError):
     """
 
 
+class AmbiguousSessionCreation(RuntimeError):
+    """Raised when `create()` cannot verify which single session, if any, it just created.
+
+    No candidate id is minted into the registry here: `require_owned`/`teardown` refusing any
+    session this run did not verifiably create is the whole safety guarantee
+    (`docs/host-probes.md`), and an ambiguous or unreadable post-create listing is, by
+    definition, not verified -- minting one anyway previously let `teardown()` accept and
+    `claude rm` an unrelated human session. A live background session may still exist under the
+    operator's real HOME after this raises; `candidates` carries whatever ids or diagnostic
+    detail were available so a human can investigate and clean it up out of band, deliberately
+    outside this runner's own ownership authority.
+    """
+
+    def __init__(self, message, *, candidates=()):
+        super().__init__(message)
+        self.candidates = tuple(candidates)
+
+
 class TeardownUnsupported(NotImplementedError):
     """Raised when this runner has captured no real teardown mechanism for a host session.
 
@@ -333,13 +351,16 @@ class ClaudeDriver:
         id appears afterward that did not before.
 
         An ambiguous diff (zero or more than one new id) still refuses to guess which one this
-        trial created, but every id in an *unexpected* diff is minted as owned before raising
-        rather than left out of the registry entirely: `claude --bg` already exited 0, so an
-        extra id it lists is a real, live background session under the operator's real HOME
-        regardless of whether this call can identify it, and leaving it unregistered would make
-        it permanently untrackable -- `teardown()` requires ownership, so an orphaned id could
-        never be torn down by this runner at all. Minting it at least leaves it reachable for
-        manual or caller-driven cleanup even though the ambiguity itself is unresolved.
+        trial created, and now refuses to mint any of them either: `claude --bg` already exited
+        0, so an extra id it lists is a real, live background session under the operator's real
+        HOME regardless of whether this call can identify it, but minting an unverified id gave
+        it the same teardown authority as a session this runner actually created -- letting
+        `teardown()` accept and `claude rm` a foreign, possibly human, session, contradicting the
+        ownership guarantee itself. `AmbiguousSessionCreation.candidates` surfaces the id(s) for
+        a human to investigate and clean up out of band instead. The post-create listing call can
+        itself fail (timeout, nonzero exit, malformed JSON) after `claude --bg` already
+        succeeded; that failure is caught the same way, since it leaves an equally real,
+        equally-unidentified session behind and must not propagate as an unrelated exception.
         """
         argv = ['claude', '--bg', '--cwd', self.cwd, '--print']
         if self.model:
@@ -351,15 +372,20 @@ class ClaudeDriver:
         result = self.run(argv, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')
-        new = self._background_session_ids() - before
+        try:
+            after = self._background_session_ids()
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            raise AmbiguousSessionCreation(
+                f'claude --bg exited 0 but the post-create listing under {self.cwd} could not '
+                f'be read ({error!r}); a background session may now be running with an id this '
+                'runner never learned', candidates=()) from error
+        new = after - before
         if len(new) != 1:
-            for extra in new:
-                self.registry.mint(extra)
-            raise RuntimeError(
+            raise AmbiguousSessionCreation(
                 f'claude --bg exited 0 but claude agents --json --all lists {len(new)} new '
                 f'background session(s) under {self.cwd} (expected exactly one): '
-                f'{sorted(new)!r} -- minted as owned so they remain reachable for teardown, '
-                'but this trial cannot tell which one it created')
+                f'{sorted(new)!r} -- none minted as owned; this runner cannot verify which, if '
+                'any, it created', candidates=sorted(new))
         return self.registry.mint(new.pop())
 
     def submit(self, session_id, message):
