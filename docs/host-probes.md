@@ -37,8 +37,11 @@ output or an echoed marker cannot establish acceptance, a new turn or acknowledg
 [pty.fork](https://docs.python.org/3/library/pty.html) and selectors. It owns a disposable child
 process group, bounds captured input/output to 1 MiB, closes the PTY and kills/reaps its child on
 exit. Terminal bytes are hex-encoded with monotonic timestamps rather than rendered as terminal
-control sequences. The CLI creates a fresh HOME and working directory, passes only HOME/PATH/TERM,
-and never writes input. Before exec, the child closes all non-stdio descriptors, including handles
+control sequences. By default (`--home disposable`) the CLI creates a fresh HOME and working
+directory, passes only HOME/PATH/TERM, and never writes input. `--home inherit` opts into the
+real HOME/environment instead, for driving an authenticated host session; the record's
+`home_mode` field makes that choice visible rather than implicit, and no HOME cleanup runs for
+it. Before exec, the child closes all non-stdio descriptors, including handles
 made inheritable by its launcher. This Linux harness requires `/proc/self/fd` to enumerate the
 actual descriptor range; enumeration failure aborts startup instead of launching with unknown
 handles. The parent's descriptors remain unchanged. SIGINT is blocked across fork until the parent
@@ -108,8 +111,9 @@ not that a trial completed or a host delivered anything. Failed/interrupted reco
 supply negative wake findings. Even a
 `complete` passive recording is not host-readiness evidence, and early EOF does not complete an
 outcome observation window. Neither EOF nor a captured marker is
-promoted to host acceptance. The command runs under a fresh HOME with no copied host credentials.
-The Python `PtyProcess` API allows explicit writes only with a matching observer-supplied generation
+promoted to host acceptance. In disposable mode (the default) the command runs under a fresh HOME
+with no copied host credentials; `--home inherit` trades that away deliberately, and its records
+say so via `home_mode`. The Python `PtyProcess` API allows explicit writes only with a matching observer-supplied generation
 and observed idle-agent state. It records partial writes as ambiguous and refuses other states.
 It does not authenticate the observer, discover a current host identity or make PTY injection
 safe by itself. Descendants which deliberately escape the child process group are outside this
@@ -144,6 +148,55 @@ Result codes: `observed`, `not_observed` (not observed within the window), `unob
 `unsupported`, `inconclusive`. No negative classification proves nondelivery. Record which signal
 established each positive result, not just a timestamp.
 
+## Matrix runner
+
+[`host_trials.py`](../scripts/probe/host_trials.py) drives a real host through one trial —
+create a session, submit a synthetic marker message, observe the four outcomes — and feeds the
+result into `wake_probe.py`'s own `Trial`/`aggregate` classification unmodified. It is tooling
+only: filling the matrix (running it against installed hosts three times per mechanism/state)
+is separate evidence, landed in a later change once trials actually run.
+
+Every session it creates is tracked in a `SessionRegistry`; `submit`/`observe`/`teardown` refuse
+an id the registry did not itself mint (`ForeignSessionError`). This matters concretely: `claude
+agents --json --all` lists every background session on the workstation, including ordinary human
+work, so a driver bug here could otherwise stop or message someone else's session. Trials run
+under the real HOME (`wake_probe.py --home inherit`, or equivalently a driver's own `run`
+callable inheriting the environment) so the host session is actually authenticated, per the
+owner's 2026-09-11 decision — disposable at the *session* level, not the HOME level. Every
+matrix cell this produces therefore carries the developer's real credentials and config; it is
+not the clean-room isolation `--home disposable` gives the PTY fixtures above.
+
+Outcome detection is grounded in captured real output, not assumed formats:
+- `claude agents --json [--all] [--cwd <dir>]` uses different field names by session `kind`: a
+  `background` session (created by `claude --bg`, what this runner uses) reports `state`
+  (e.g. `"done"`); an `interactive` session reports `status` instead. `background_sessions()`
+  filters to the former; nothing here ever touches the latter.
+- `claude logs <id>` fails once a background session's daemon has exited — observed as
+  `connect ENOENT /tmp/cc-daemon-*/*/control.sock` against a session already `state: "done"`.
+  Observation must happen *before* teardown; a failed read is treated as `{}` (no signal), never
+  as a negative outcome.
+- Codex's rollout JSONL (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`) is one JSON object
+  per line; a chat turn is `{"type": "response_item", "payload": {"type": "message", "role":
+  "user"|"assistant"|"developer", "content": [{"type": "input_text"|"output_text", "text":
+  ...}]}}` with a record-level ISO-8601 `timestamp`. Only `user`/`assistant` roles count as
+  transcript turns; `developer` carries fixed instructions, not conversation.
+- OpenCode's `export <sessionID>` shape has **no captured sample yet** — no local session existed
+  to export from at investigation time (`opencode --pure session list` printed nothing).
+  `OpenCodeDriver` raises `NotImplementedError` rather than guess at an unconfirmed format; this
+  is the scope gap the owner-recorded third-host requirement still has open.
+
+The marker each trial submits is a fresh high-entropy token (`marker_token()`), so an
+acknowledgement can never be satisfied by chance text or a terminal echoing the input back —
+`detect_outcomes()` only counts an assistant event as `ack` when the marker itself appears in it,
+distinct from `turn_start`, which any assistant activity satisfies.
+
+One documented deviation from `Trial`'s "same monotonic clock" contract: `wake_probe.py`'s own
+PTY capture stays in one process and can use `time.monotonic()`, but a real host's transcript
+carries only wall-clock/ISO-8601 timestamps from another process. `host_trials.py` standardizes
+on `time.time()` throughout; `Trial.result()` only requires one consistent clock across
+`submitted`/`outcomes`/`now`, not monotonicity, so this is safe as long as every value on a given
+`Trial` uses the same clock.
+
 ## Real-host evidence still required
 
 Probe Claude Channels and plain MCP separately, Codex queue and reachable IPC separately, and
@@ -153,6 +206,12 @@ Missing prerequisites must be recorded and resolved or explicitly scoped out by 
 No herdr installation is assumed. Publish sanitized manifests and observations here or in durable
 issue-linked artifacts; never copy real credentials, administrator sessions or ordinary work
 messages into fixtures. The recorder does not provision host authentication.
+
+Claude's `--channels` mechanism does not exist at the installed version (`claude --version`
+`2.1.268`): absent from `claude --help`, and no channels plugin is present in the official
+marketplace cache. The two upstream reports motivating this investigation describe a mechanism
+this installation does not have; that is a legitimate `unsupported` classification for that
+mechanism at this version, not evidence about Channels generally or about other versions.
 
 Direct-host investigation does not connect live sessions through Parley. That connection still
 requires the complete fixture gate in [AGENTS.md](../AGENTS.md#record-evidence-and-decisions),

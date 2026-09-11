@@ -238,6 +238,36 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
         self.assertNotEqual(ran.returncode, 0)
         self.assertEqual(output.read_bytes(), original)
 
+    def test_home_inherit_uses_real_environment_and_skips_temporary_home(self):
+        output = Path(self.tmp.name, 'inherit.json')
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--home', 'inherit',
+                '--', sys.executable, '-u', '-c', "import os; print(os.environ.get('HOME'), flush=True)"]
+        with patch.object(sys, 'argv', args), \
+                patch('wake_probe.tempfile.TemporaryDirectory',
+                      side_effect=AssertionError('inherit mode must not create a throwaway HOME')):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        self.assertEqual(record['home_mode'], 'inherit')
+        self.assertIsNone(record['home_cleanup_error'])
+        printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
+        self.assertIn(os.environ['HOME'].encode(), printed)
+
+    def test_home_missing_for_inherit_mode_is_a_usage_error(self):
+        output = Path(self.tmp.name, 'no-home.json')
+        args = ['wake_probe', '--output', str(output), '--home', 'inherit', '--', 'fixture']
+        with patch.object(sys, 'argv', args), patch.dict(os.environ, {'HOME': ''}):
+            with self.assertRaises(SystemExit):
+                main()
+        self.assertFalse(output.exists())
+
+    def test_disposable_is_the_default_home_mode(self):
+        output = Path(self.tmp.name, 'disposable.json')
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--',
+                sys.executable, '-u', '-c', "print('default mode', flush=True)"]
+        with patch.object(sys, 'argv', args):
+            self.assertEqual(main(), 0)
+        self.assertEqual(json.loads(output.read_text())['home_mode'], 'disposable')
+
     def test_missing_command_and_nonzero_exit_are_failed_captures(self):
         for command, expected in (([str(Path(self.tmp.name, 'missing-host'))], 127),
                                   ([sys.executable, '-c', 'raise SystemExit(23)'], 23)):
