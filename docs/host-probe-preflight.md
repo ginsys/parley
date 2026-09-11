@@ -75,7 +75,15 @@ runner](host-probes.md#matrix-runner) for how `scripts/probe/host_trials.py` use
 Two limits of that alternative, both observed here rather than assumed. Nothing in the surface
 above submits a message to an *already-running* background session: `--bg` carries its prompt at
 creation, `attach` is interactive, and `--remote-control` / `--input-format=stream-json` remain
-unexercised — so a Claude submission trial is `unsupported` at this version until one of those is
-actually captured. And `claude logs` prints no per-entry timestamp, so its transcript cannot be
-ordered against a submission instant; that makes it `unobservable` for window classification,
-not negative evidence. Both are version-pinned observations, not product-wide claims.
+unexercised — so a Claude submission trial cannot be run at this version until one of those is
+actually captured. That is a gap in this runner's tooling, not a demonstrated absence of a host
+capability: `--channels` is absent from the help text and the plugin cache, which is evidence
+about the mechanism, whereas "we captured no submission path" is evidence about us.
+
+Second, `claude logs` output has **never been read successfully here** — the one attempt failed
+with ENOENT against an already-exited daemon (table above). The parser in
+`scripts/probe/host_trials.py` therefore assumes an untimestamped `User:`/`Assistant:` line
+format, and because an untimestamped entry cannot be ordered against a submission instant, it
+classifies such a read `unobservable` rather than negative. Both the format and the absence of
+timestamps remain **hypotheses to reproduce against a running background session**, not
+observations; the fail-closed handling is what makes acting on an unconfirmed format safe.

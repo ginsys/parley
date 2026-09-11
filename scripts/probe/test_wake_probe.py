@@ -279,7 +279,8 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
         with patch.object(sys, 'argv', args):
             self.assertEqual(main(), 0)
         record = json.loads(output.read_text())
-        self.assertEqual(record['cwd'], os.path.abspath(self.tmp.name))
+        # realpath, not abspath: the record must name the directory the child actually reached.
+        self.assertEqual(record['cwd'], os.path.realpath(self.tmp.name))
         printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
         self.assertIn(os.path.realpath(self.tmp.name).encode(), printed)
 

@@ -167,9 +167,11 @@ class CodexParsingTests(unittest.TestCase):
         self.assertLess(events[0].time, events[1].time)
         self.assertEqual(undated, 0)
 
-    def test_malformed_and_non_message_lines_are_skipped_not_fatal(self):
+    def test_unparseable_lines_count_as_unusable_while_other_record_types_do_not(self):
+        # A record this runner has no use for is not a failed read; a line that is not JSON is.
         lines = ['not json', json.dumps({'payload': {'type': 'world_state'}}), '']
-        self.assertEqual(codex_rollout_events(lines), ([], 0))
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+        self.assertEqual(codex_rollout_events([json.dumps({'payload': {'type': 'world_state'}})]), ([], 0))
 
     def test_message_records_without_a_usable_timestamp_are_dropped_and_counted(self):
         lines = [
@@ -185,11 +187,16 @@ class CodexParsingTests(unittest.TestCase):
         lines = [
             json.dumps({'timestamp': '2026-09-11T00:00:05.000Z', 'payload': {'type': 'message'}}),
             json.dumps({'timestamp': '2026-09-11T00:00:01.000Z', 'type': 'session_meta'}),
-            'not json',
         ]
         expected = datetime.datetime(2026, 9, 11, 0, 0, 1, tzinfo=datetime.UTC).timestamp()
         self.assertEqual(rollout_started_at(lines), expected)
-        self.assertIsNone(rollout_started_at(['not json', '']))
+
+    def test_rollout_started_at_fails_closed_on_an_unparseable_line(self):
+        # The unreadable line could be the earliest record, so a minimum taken over whatever
+        # survived would let a thread older than this run pass the provenance check.
+        lines = ['not json', json.dumps({'timestamp': '2026-09-11T00:00:01.000Z', 'type': 'session_meta'})]
+        self.assertIsNone(rollout_started_at(lines))
+        self.assertIsNone(rollout_started_at(['']))
 
 
 class ClaudeDriverTests(unittest.TestCase):
@@ -366,6 +373,19 @@ class CodexDriverTests(unittest.TestCase):
         self.assertEqual(set(observation.outcomes), {'turn_start', 'ack'})
         self.assertTrue(observation.observable)
 
+    def test_observe_is_unobservable_when_the_rollout_holds_unparseable_content(self):
+        # Opening the file proved nothing about reading it: a truncated or corrupt rollout
+        # would otherwise yield an empty, observable read and classify as not_observed.
+        registry = SessionRegistry()
+        registry.mint('thread-1')
+        with tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False) as handle:
+            handle.write('{"timestamp": "2026-09-11T00:00:0\n')
+            path = handle.name
+        self.addCleanup(os.unlink, path)
+        observation = self.driver(registry, path).observe('thread-1', marker=MARKER, submitted_at=0.0)
+        self.assertEqual(observation.outcomes, {})
+        self.assertFalse(observation.observable)
+
     def test_observe_is_unobservable_when_the_rollout_holds_an_undated_message(self):
         registry = SessionRegistry()
         registry.mint('thread-1')
@@ -484,14 +504,25 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(set(run.outcomes), {'accepted', 'visible'})
         self.assertTrue(run.observable['visible'])
 
-    def test_an_unreadable_channel_marks_only_the_unseen_outcomes_unobservable(self):
+    def test_a_channel_that_dies_mid_window_leaves_the_unseen_outcomes_unobservable(self):
+        # One early readable poll does not cover the rest of the window: the acknowledgement
+        # could have arrived into a transcript nobody could read by the deadline.
         clock = FakeClock()
         seen = Observation(outcomes={'visible': 1000.0}, observable=True)
         dead = Observation(observable=False)
         driver = FakeDriver(observations=[seen, dead], clock=clock)
         run = self.run_one(driver, clock, poll_interval=60.0)
         self.assertTrue(run.observable['visible'])  # a positive stands on its own evidence
-        self.assertTrue(run.observable['ack'])  # one readable poll proves the channel existed
+        self.assertFalse(run.observable['ack'])  # the tail of the window went unread
+
+    def test_a_readable_final_poll_covers_an_earlier_failed_one(self):
+        # A transcript is cumulative, so the last successful read sees everything the failed
+        # earlier read would have; a transient failure is not a permanent loss of coverage.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(observable=False),
+                                           Observation(outcomes={'visible': 1000.0})], clock=clock)
+        run = self.run_one(driver, clock, poll_interval=60.0)
+        self.assertTrue(all(run.observable.values()))
 
     def test_a_channel_that_never_reads_leaves_missing_outcomes_unobservable(self):
         clock = FakeClock()
