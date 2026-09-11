@@ -180,6 +180,44 @@ class PtyTests(unittest.TestCase):
                 main()
         self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
 
+    def test_teardown_failure_preserves_events_and_original_capture_error(self):
+        original_read = PtyProcess.read
+        original_close = PtyProcess.close
+        for capture_interrupted in (False, True):
+            for failure in (OSError, KeyboardInterrupt):
+                with self.subTest(capture_interrupted=capture_interrupted, failure=failure):
+                    output = Path(self.tmp.name, f'cleanup-{capture_interrupted}-{failure.__name__}.json')
+                    children = []
+
+                    def read(child, timeout):
+                        data = original_read(child, timeout)
+                        if data and capture_interrupted:
+                            raise KeyboardInterrupt
+                        return data
+
+                    def fail_close(child):
+                        children.append(child)
+                        raise failure
+
+                    args = ['wake_probe', '--output', str(output), '--seconds', '2', '--',
+                            sys.executable, '-u', '-c', "print('before cleanup', flush=True)"]
+                    try:
+                        with patch.object(sys, 'argv', args), patch.object(PtyProcess, 'read', read), \
+                                patch.object(PtyProcess, 'close', fail_close):
+                            result = main()
+                        record = json.loads(output.read_text())
+                        self.assertIn(b'before cleanup', b''.join(bytes.fromhex(e['hex']) for e in record['events']))
+                        self.assertEqual(record['cleanup_error'], failure.__name__)
+                        self.assertEqual(record['error'], 'KeyboardInterrupt' if capture_interrupted else 'cleanup_failed')
+                        interrupted = capture_interrupted or failure is KeyboardInterrupt
+                        self.assertEqual(result, 130 if interrupted else 1)
+                        self.assertEqual(record['capture_status'], 'interrupted' if interrupted else 'failed')
+                        self.assertIsNone(record['exit_code'])
+                        self.assertGreaterEqual(record['ended'], record['started'])
+                    finally:
+                        for child in children:
+                            original_close(child)
+
     def test_publication_race_preserves_winner(self):
         output = Path(self.tmp.name, 'winner.json')
         output.write_text('existing evidence')

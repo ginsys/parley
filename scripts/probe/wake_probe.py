@@ -211,7 +211,7 @@ def main():
     record = {'utc': datetime.datetime.now(datetime.UTC).isoformat(),
               'command': command, 'duration': args.seconds, 'started': time.monotonic(),
               'kind': 'passive_capture', 'delivery_claim': None, 'events': [],
-              'eof': False, 'error': None, 'wait_status': None, 'exit_code': None,
+              'eof': False, 'error': None, 'cleanup_error': None, 'wait_status': None, 'exit_code': None,
               'cleanup_requested': False, 'capture_status': 'failed', 'stop_reason': 'startup'}
     result = 0
     child = None
@@ -233,9 +233,23 @@ def main():
             record['capture_status'] = 'interrupted' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'failed'
         finally:
             if child is not None:
-                child.close()
-                record.update(events=child.events, eof=child.eof, wait_status=child.wait_status,
-                              exit_code=child.exit_code, cleanup_requested=child.cleanup_requested)
+                try:
+                    child.close()
+                except BaseException as exc:
+                    # Preserve both failures if capture was already interrupted.
+                    # Teardown failure must not discard the captured transcript or
+                    # classify an unknown child status as a successful recording.
+                    record['cleanup_error'] = type(exc).__name__
+                    record['error'] = record['error'] or 'cleanup_failed'
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        record['capture_status'] = 'interrupted'
+                    if isinstance(exc, KeyboardInterrupt):
+                        result = 130
+                    elif result == 0:
+                        result = 1
+                finally:
+                    record.update(events=child.events, eof=child.eof, wait_status=child.wait_status,
+                                  exit_code=child.exit_code, cleanup_requested=child.cleanup_requested)
             record['ended'] = time.monotonic()
         if record['error'] is None:
             if child.exit_code > 0 or (child.exit_code < 0 and
