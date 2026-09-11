@@ -497,6 +497,18 @@ class CodexDriverTests(unittest.TestCase):
         with self.assertRaises(SessionCreationUncaptured):
             self.driver(SessionRegistry(), None).create('hi')
 
+    def test_register_existing_refuses_without_a_sessions_root(self):
+        # Without sessions_root there is no way to rule out a concurrent human thread at all --
+        # this fixture's own driver() helper always supplies one, so the refusal path needs its
+        # own direct construction to stay covered.
+        registry = SessionRegistry()
+        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
+        driver = CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
+                             rollout_path_for=lambda _id: mine, started_at=self.RUN_STARTED,
+                             sessions_root=None)
+        with self.assertRaises(ForeignSessionError):
+            driver.register_existing('thread-1')
+
     def test_adoption_ignores_an_older_neighbour_but_refuses_a_concurrent_one(self):
         # "Started after this run did" is equally true of a thread the human opened meanwhile,
         # so a second fresh rollout under the sessions root makes the adopted one ambiguous.
