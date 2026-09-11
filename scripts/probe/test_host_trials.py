@@ -726,6 +726,10 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(run.observable['turn_start'])
         self.assertFalse(run.observable['ack'])
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
+        # Known immediately as a fact, but classify_trial has no "already resolved" input --
+        # `accepted`'s own 10s window must still actually elapse before it reports that fact.
+        with self.assertRaises(ValueError):
+            classify_trial(trial, run.submitted_at, observable=run.observable)
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['accepted'], 'not_observed')
         self.assertEqual(classified['visible'], 'unobservable')
