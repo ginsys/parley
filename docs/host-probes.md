@@ -41,7 +41,13 @@ control sequences. The CLI creates a fresh HOME and working directory, passes on
 and never writes input. Before exec, the child closes all non-stdio descriptors, including handles
 made inheritable by its launcher. This Linux harness requires `/proc/self/fd` to enumerate the
 actual descriptor range; enumeration failure aborts startup instead of launching with unknown
-handles. The parent's descriptors remain unchanged. Complete JSON is flushed to a temporary file beside the destination and
+handles. The parent's descriptors remain unchanged. SIGINT is blocked across fork until the parent
+owns the child PID and PTY descriptor, then the original signal mask is restored in both processes.
+A pending Ctrl-C can then trigger cleanup without losing ownership. Before exec, the child sets
+the PTY to 80 columns by 24 rows; the record includes this configured `terminal_size` so trials
+use reproducible geometry instead of a zero-sized terminal.
+
+Complete JSON is flushed to a temporary file beside the destination and
 published with an atomic no-replace hard link (then the temporary name is removed). The containing
 directory is fsynced before success is reported, persisting the new link and removal as well as
 the file contents. Directory-sync failures fail loudly; a visible file after such a failure does
@@ -83,7 +89,10 @@ not whether every descendant exited naturally. `complete` requires observed PTY 
 direct-child exit zero, without a capture/cleanup error; it does not certify descendant outcomes.
 If the child closes its terminal before exiting, the recorder waits for its natural exit within
 the original capture deadline. EOF does not trigger immediate termination or start a new window.
-Deadline and interruption handling still apply while waiting after EOF.
+Deadline and interruption handling still apply while waiting after EOF. An exit first observable
+after the deadline remains `stopped`, even if its eventual status is zero: the nonblocking status
+query supplies no exit timestamp proving it happened within the window. Cleanup preserves the
+actual exit status but does not retroactively certify capture completion.
 CLI zero means the record was published successfully (including an intentionally stopped capture),
 not that a trial completed or a host delivered anything. Failed/interrupted recordings cannot
 supply negative wake findings. Even a
