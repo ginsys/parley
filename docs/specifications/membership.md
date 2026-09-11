@@ -251,6 +251,7 @@ schema actually shipped then; do not reserve version 5 now (the current core is 
 
 | Table | Key and required constraints |
 | --- | --- |
+| `conversations` | Preserve `name` uniqueness and creation time; rebuild with `id TEXT NOT NULL PRIMARY KEY` |
 | `grants` | Preserve `(conversation, grant_version)` PK with both columns explicitly NOT NULL, conversation FK, lifecycle/accounting fields and one-active partial unique index; replace positional fields with `policy_kind NOT NULL` and CHECK in the three allowed tags |
 | `grant_members` | PK `(conversation, grant_version, peer_id)` with all three columns explicitly NOT NULL; FK to grants; role NOT NULL and CHECK in `member`, `lead` |
 | `grant_edges` | PK `(conversation, grant_version, from_peer, to_peer)` with all four columns explicitly NOT NULL; two composite FKs to grant_members; `CHECK(from_peer <> to_peer)` with binary identifier comparison |
@@ -261,9 +262,21 @@ including the retained envelope conversation/version/sender/recipient columns. D
 from PRIMARY KEY or CHECK: SQLite rowid tables allow null composite primary-key values, a null
 child-key component skips the FK check, and a CHECK expression evaluating to NULL passes.
 A single `TEXT PRIMARY KEY` also permits NULL in a rowid table: explicitly require non-null
-envelope IDs for settlement and reply lookup. Reject legacy NULL IDs before copying, retaining
-source evidence; never manufacture replacement IDs. Optional references such as `in_reply_to`
-remain nullable.
+conversation and envelope IDs for lookup, settlement and replies. Rebuild conversations before
+its dependent tables, even though its other fields do not change. Reject legacy NULL keys before
+copying, retaining source evidence; never manufacture replacement IDs. Optional references such
+as `in_reply_to` remain nullable.
+
+Every identifier column in this graph must store TEXT, with `CHECK(typeof(column) = 'text')`
+in addition to the stated NOT NULL constraints. Apply this to conversation id/name, grant
+conversation, member peer/conversation, edge endpoints/conversation and envelope id/conversation/
+sender/recipient. The optional envelope reply reference uses
+`CHECK(in_reply_to IS NULL OR typeof(in_reply_to) = 'text')`. Do not rely on TEXT affinity or binary
+collation alone: SQLite can preserve BLOB values in these columns, and TEXT `'a'` differs from
+BLOB `X'61'` in equality and uniqueness despite having the same identifier bytes. Reject non-TEXT
+legacy identifiers before backfill rather than silently casting or merging identities. With a
+single storage class, binary equality/uniqueness enforces the exact-byte contract. This storage
+constraint does not rewrite Unicode history or replace the ASCII validation at API boundaries.
 
 Named policies have no stored edge rows. Cross-row rules (minimum membership, exactly one lead
 for `lead_only`, policy-compatible roles/edges) are validated as a whole inside the insertion
@@ -299,7 +312,7 @@ constraints pass. The operator must resolve incompatible history explicitly befo
 ### Preflight for an existing pair database
 
 Before scheduling the stopped-service upgrade, open the existing database read-only, for example
-with `sqlite3 -readonly /absolute/path/to/parley.db`, and run the query below. It reads all grant
+with `sqlite3 -readonly /absolute/path/to/parley.db`, and run both queries below. The first reads all grant
 versions and envelope states, not just the active grant or queued messages. Since `grant_members`
 does not exist before the room migration, `expected_members` projects exactly the membership that
 the backfill will create from each historical pair. It makes no persistent tables or changes.
@@ -352,9 +365,46 @@ stored bytes, including spaces, separators, newlines, NUL and malformed UTF-8. H
 default pipe/newline output unambiguous; `quote()` alone leaves embedded newlines and truncates at
 NUL. Decode hex only for exact-key inspection; it is not a new identity or a repair operation. A
 missing grant produces missing-peer diagnostics too. No rows means these membership/self-send
-checks passed for that read snapshot, not that all migration checks passed. A missing file, SQL
+checks passed for that read snapshot; both queries must return no findings before these
+preflight checks pass, and migration still performs the full validation. A missing file, SQL
 error or unsupported schema is a failed preflight, never a clean result. This query is for the
 pre-room pair schema; after migration, membership checks use the real `grant_members` table.
+
+The second query inventories identifier storage in **every conversation row**, every grant
+version and every envelope. It catches NULL conversation/envelope keys and non-TEXT identifiers,
+including BLOB endpoints that the first query could compare differently despite equal bytes.
+The optional NULL `in_reply_to` is the only allowed exception. Output includes the source table,
+SQLite rowid and field, so even a row without an ID is locatable; rowid is a diagnostic locator
+for this read snapshot, never a new public identity. Non-null values are exact uppercase hex;
+the literal `NULL` distinguishes missing values from empty bytes.
+
+```sql
+WITH identifier_fields AS (
+    SELECT 'conversations' AS source_table, rowid AS source_rowid,
+           'id' AS field, id AS value FROM conversations
+    UNION ALL SELECT 'conversations', rowid, 'name', name FROM conversations
+    UNION ALL SELECT 'grants', rowid, 'conversation', conversation FROM grants
+    UNION ALL SELECT 'grants', rowid, 'peer_a_id', peer_a_id FROM grants
+    UNION ALL SELECT 'grants', rowid, 'peer_b_id', peer_b_id FROM grants
+    UNION ALL SELECT 'envelopes', rowid, 'id', id FROM envelopes
+    UNION ALL SELECT 'envelopes', rowid, 'conversation', conversation FROM envelopes
+    UNION ALL SELECT 'envelopes', rowid, 'from_peer', from_peer FROM envelopes
+    UNION ALL SELECT 'envelopes', rowid, 'to_peer', to_peer FROM envelopes
+    UNION ALL SELECT 'envelopes', rowid, 'in_reply_to', in_reply_to FROM envelopes
+)
+SELECT source_table, source_rowid, field, typeof(value) AS storage_class,
+       CASE WHEN value IS NULL THEN 'NULL'
+            ELSE hex(CAST(value AS BLOB)) END AS value_hex
+FROM identifier_fields
+WHERE typeof(value) <> 'text'
+  AND NOT (source_table = 'envelopes' AND field = 'in_reply_to' AND value IS NULL)
+ORDER BY source_table, source_rowid, field;
+```
+
+This storage query does not test the ASCII alphabet: valid TEXT containing historical Unicode
+still needs the separate identifier inventory before enabling the text API. It does reject
+non-TEXT bytes rather than authorizing a storage-class conversion. Both preflight queries target
+the known rowid-table pair schemas; unknown layouts fail full catalog validation.
 
 Keep the reported identifiers and resolve their disposition explicitly before scheduling the
 upgrade; this document supplies no automatic repair or deletion query. Re-run these checks inside
@@ -431,7 +481,8 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | Inject failure during copy/drop/rename/index/version update; terminate before commit | Restart sees intact old schema/version/data; no partial shadow catalog |
 | Self-edge, repeated member, missing FK and invalid policy after migration | Database constraints or transactional graph validator reject as specified |
 | NULL in each composite-key component or policy_kind, supplied explicitly or omitted | NOT NULL rejects the row; no unbound member/edge or policy-less grant |
-| NULL or omitted envelope ID; legacy rows with NULL IDs | NOT NULL rejects new rows; preflight reports legacy rows and the migration rolls back without inventing IDs |
+| NULL or omitted conversation/envelope ID; legacy rows with NULL IDs | NOT NULL rejects new rows; inventory covers every conversation including unreferenced rows; migration rolls back without inventing IDs |
+| Identical TEXT/BLOB identifier bytes and non-TEXT identifiers in any inventoried field | Storage preflight rejects the source intact; typeof CHECK rejects new BLOB storage; no duplicate byte-identical members or self-edge bypass |
 | Envelope sender or recipient exists only in another conversation/version | Its respective membership FK rejects insert/update; no partial mutation |
 | Historical envelope after member removal; eligible reply carried to a successor | Historical FK remains valid; successor members precede the atomic reply version update |
 | Attempt to delete membership still referenced by a historical envelope | FK rejects deletion; no cascading loss of evidence |
