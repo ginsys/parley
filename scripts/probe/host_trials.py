@@ -252,7 +252,7 @@ def background_sessions(raw):
     return [entry for entry in entries if isinstance(entry, dict) and entry.get('kind') == 'background']
 
 
-def parse_claude_transcript(raw, *, marker):
+def parse_claude_transcript(raw):
     """Parse `claude logs <id>` plain-text output into normalized Events.
 
     Only two roles are attributed: a line opening with `User:` or `Assistant:` starts a new
@@ -262,6 +262,9 @@ def parse_claude_transcript(raw, *, marker):
     rather than counting entries that cannot be ordered against submission. This format has not
     yet been captured against a running background session (observe() could not reach a `done`
     one's daemon) and must be reconciled with real output before being relied on for evidence.
+
+    Marker matching is `detect_outcomes`' job, not this parser's: whether a marker appears in
+    any event is a fact about the caller's outcomes, not about whether the transcript parsed.
     """
     events = []
     role = None
@@ -273,8 +276,6 @@ def parse_claude_transcript(raw, *, marker):
             events.append(Event(role=role, text=match.group(2)))
         elif role is not None and stripped:
             events[-1].text += '\n' + stripped
-    if marker and not any(marker in event.text for event in events):
-        pass  # absence is a legitimate not_observed outcome, not a parse error
     return events
 
 
@@ -388,7 +389,7 @@ class ClaudeDriver:
         result = self.run(['claude', 'logs', session_id], capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             return Observation(observable=False)
-        events = parse_claude_transcript(result.stdout, marker=marker)
+        events = parse_claude_transcript(result.stdout)
         if not events and result.stdout.strip():
             return Observation(observable=False)
         return detect_outcomes(events, marker, submitted_at=submitted_at)

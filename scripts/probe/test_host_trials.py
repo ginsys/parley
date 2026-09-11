@@ -156,7 +156,7 @@ class ClaudeParsingTests(unittest.TestCase):
 
     def test_transcript_parses_role_prefixed_multiline_blocks(self):
         raw = f'User: hello {MARKER}\ncontinued\nAssistant: got it\nstill talking\n'
-        events = parse_claude_transcript(raw, marker=MARKER)
+        events = parse_claude_transcript(raw)
         self.assertEqual(len(events), 2)
         self.assertEqual(events[0].role, 'user')
         self.assertEqual(events[0].text, f'hello {MARKER}\ncontinued')
@@ -164,7 +164,7 @@ class ClaudeParsingTests(unittest.TestCase):
         self.assertEqual(events[1].text, 'got it\nstill talking')
 
     def test_transcript_without_marker_does_not_raise(self):
-        events = parse_claude_transcript('User: hi\nAssistant: hello\n', marker=MARKER)
+        events = parse_claude_transcript('User: hi\nAssistant: hello\n')
         self.assertEqual(len(events), 2)
 
 
