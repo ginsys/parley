@@ -269,20 +269,104 @@ class PtyTests(unittest.TestCase):
                 self.assertEqual(list(Path(self.tmp.name).glob('.parley-capture-*')), [])
 
     def test_signal_exit_is_distinct_from_deadline_cleanup(self):
-        for code, duration, expected, status in (
-            ('import os, signal; os.kill(os.getpid(), signal.SIGTERM)', '2', -signal.SIGTERM, 'failed'),
-            ('import time; print("running", flush=True); time.sleep(30)', '0.2', -signal.SIGKILL, 'stopped'),
+        for code, expected, status in (
+            ('import os, signal; os.kill(os.getpid(), signal.SIGTERM)', -signal.SIGTERM, 'failed'),
+            ('import time; print("running", flush=True); time.sleep(30)', -signal.SIGKILL, 'stopped'),
         ):
             with self.subTest(status=status):
                 output = Path(self.tmp.name, status + '.json')
-                args = ['wake_probe', '--output', str(output), '--seconds', duration, '--',
+                original_read, monotonic = PtyProcess.read, time.monotonic
+                now = 0
+                watchdog = monotonic() + 10
+                observed = bytearray()
+
+                def read(child, timeout):
+                    nonlocal now
+                    if monotonic() >= watchdog:
+                        self.fail('fixture did not reach its synchronized outcome')
+                    data = original_read(child, timeout)
+                    observed.extend(data)
+                    # The capture clock cannot expire during fork/exec. Only the
+                    # observed running marker advances the deadline-cleanup case.
+                    if status == 'stopped' and b'running' in observed:
+                        now = 120
+                    return data
+
+                args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
                         sys.executable, '-u', '-c', code]
-                with patch.object(sys, 'argv', args):
+                with patch.object(sys, 'argv', args), patch.object(PtyProcess, 'read', read), \
+                        patch('wake_probe.time.monotonic', side_effect=lambda: now):
                     result = main()
                 record = json.loads(output.read_text())
                 self.assertEqual(record['exit_code'], expected)
                 self.assertEqual(record['capture_status'], status)
                 self.assertEqual(result, 1 if status == 'failed' else 0)
+
+    def test_eof_waits_for_exit_without_losing_deadline_or_interruption(self):
+        for outcome, expected, status, result_code in (
+            ('success', 0, 'complete', 0), ('failure', 23, 'failed', 1),
+            ('signal', -signal.SIGTERM, 'failed', 1),
+            ('deadline', -signal.SIGKILL, 'stopped', 0),
+            ('interrupt', -signal.SIGKILL, 'interrupted', 130),
+        ):
+            with self.subTest(outcome=outcome):
+                output = Path(self.tmp.name, outcome + '.json')
+                release = Path(self.tmp.name, outcome + '.release')
+                code = f"""
+import os, signal, time
+print('before eof', flush=True)
+for fd in (0, 1, 2):
+    os.close(fd)
+while not os.path.exists({str(release)!r}):
+    time.sleep(.01)
+if {outcome!r} == 'signal':
+    os.kill(os.getpid(), signal.SIGTERM)
+os._exit({expected if expected >= 0 else 0})
+"""
+                test = self
+                now = 0
+                monotonic = time.monotonic
+                watchdog = monotonic() + 10
+                waited = []
+
+                class SynchronizedProcess(PtyProcess):
+                    def read(self, timeout):
+                        if monotonic() >= watchdog:
+                            test.fail('fixture did not close its terminal')
+                        return super().read(timeout)
+
+                    def wait_for_exit(self, deadline):
+                        nonlocal now
+                        test.assertTrue(self.eof)
+                        test.assertIsNone(os.waitid(os.P_PID, self.pid,
+                                                  os.WEXITED | os.WNOHANG | os.WNOWAIT))
+                        waited.append(self.pid)
+                        if outcome == 'interrupt':
+                            raise KeyboardInterrupt
+                        if outcome == 'deadline':
+                            now = deadline
+                        else:
+                            release.touch()
+                        # Keep the real wait bounded even if the fixture fails to
+                        # exit. The deadline case tests the expired capture clock.
+                        with patch('wake_probe.time.monotonic', monotonic):
+                            return super().wait_for_exit(monotonic() if now else watchdog)
+
+                args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
+                        sys.executable, '-u', '-c', code]
+                with patch.object(sys, 'argv', args), patch('wake_probe.PtyProcess', SynchronizedProcess), \
+                        patch('wake_probe.time.monotonic', side_effect=lambda: now):
+                    result = main()
+                record = json.loads(output.read_text())
+                self.assertTrue(waited, 'recorder killed the child without waiting after EOF')
+                self.assertEqual(record['exit_code'], expected)
+                self.assertEqual(record['capture_status'], status)
+                self.assertEqual(result, result_code)
+                self.assertTrue(record['eof'])
+                self.assertEqual(record['stop_reason'], 'deadline' if outcome == 'deadline' else
+                                 'capture' if outcome == 'interrupt' else 'eof')
+                self.assertIn(b'before eof', b''.join(bytes.fromhex(e['hex']) for e in record['events']))
+                self.assertFalse(Path(f'/proc/{waited[0]}').exists())
 
     def test_deadline_with_exited_leader_and_live_descendant_is_stopped(self):
         output = Path(self.tmp.name, 'descendant.json')
