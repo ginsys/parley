@@ -298,6 +298,15 @@ class ClaudeDriver:
         diffs `claude agents --json --all` (the same verified listing `submit()` checks
         membership against) from before to after the command: the session created is whichever
         id appears afterward that did not before.
+
+        An ambiguous diff (zero or more than one new id) still refuses to guess which one this
+        trial created, but every id in an *unexpected* diff is minted as owned before raising
+        rather than left out of the registry entirely: `claude --bg` already exited 0, so an
+        extra id it lists is a real, live background session under the operator's real HOME
+        regardless of whether this call can identify it, and leaving it unregistered would make
+        it permanently untrackable -- `teardown()` requires ownership, so an orphaned id could
+        never be torn down by this runner at all. Minting it at least leaves it reachable for
+        manual or caller-driven cleanup even though the ambiguity itself is unresolved.
         """
         argv = ['claude', '--bg', '--cwd', self.cwd, '--print']
         if self.model:
@@ -311,10 +320,13 @@ class ClaudeDriver:
             raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')
         new = self._background_session_ids() - before
         if len(new) != 1:
+            for extra in new:
+                self.registry.mint(extra)
             raise RuntimeError(
                 f'claude --bg exited 0 but claude agents --json --all lists {len(new)} new '
-                f'background session(s) under {self.cwd} (expected exactly one); cannot '
-                'identify which one this trial created')
+                f'background session(s) under {self.cwd} (expected exactly one): '
+                f'{sorted(new)!r} -- minted as owned so they remain reachable for teardown, '
+                'but this trial cannot tell which one it created')
         return self.registry.mint(new.pop())
 
     def submit(self, session_id, message):

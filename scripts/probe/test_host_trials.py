@@ -328,6 +328,24 @@ class ClaudeDriverTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '2 new'):
             driver.create('probe prompt')
 
+    def test_create_mints_ambiguous_sessions_before_raising_so_they_stay_reachable(self):
+        # claude --bg already exited 0, so every id in an unexpected diff is a real, live
+        # background session under the operator's real HOME regardless of whether create() can
+        # tell which one this trial made -- leaving it out of the registry would make it
+        # permanently untrackable, since teardown() requires ownership.
+        registry = SessionRegistry()
+        before = json.dumps([])
+        after = json.dumps([{'id': 'a', 'kind': 'background'}, {'id': 'b', 'kind': 'background'}])
+        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=''), FakeResult(0, stdout=after)])
+
+        def fake_run(argv, **kwargs):
+            return next(responses)
+
+        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
+        with self.assertRaisesRegex(RuntimeError, '2 new'):
+            driver.create('probe prompt')
+        self.assertEqual(registry.created, {'a', 'b'})
+
     def test_submit_refuses_a_foreign_session(self):
         driver = ClaudeDriver(SessionRegistry(), run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
         with self.assertRaises(ForeignSessionError):
