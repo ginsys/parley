@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from unittest.mock import patch
 
 from host_trials import (
+    AmbiguousSessionCreation,
     ClaudeDriver,
     CodexDriver,
     Event,
@@ -363,11 +364,11 @@ class ClaudeDriverTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '2 new'):
             driver.create('probe prompt')
 
-    def test_create_mints_ambiguous_sessions_before_raising_so_they_stay_reachable(self):
-        # claude --bg already exited 0, so every id in an unexpected diff is a real, live
-        # background session under the operator's real HOME regardless of whether create() can
-        # tell which one this trial made -- leaving it out of the registry would make it
-        # permanently untrackable, since teardown() requires ownership.
+    def test_create_never_mints_an_ambiguous_session_so_teardown_cannot_reach_a_foreign_one(self):
+        # Minting an unverified id gave it the same teardown authority as a session this runner
+        # actually created -- teardown() would then accept and `claude rm` a session that could
+        # be an unrelated human's, contradicting the ownership guarantee. Candidates are surfaced
+        # on the exception for a human to investigate out of band, never minted into the registry.
         registry = SessionRegistry()
         before = json.dumps([])
         after = json.dumps([{'id': 'a', 'kind': 'background'}, {'id': 'b', 'kind': 'background'}])
@@ -377,9 +378,25 @@ class ClaudeDriverTests(unittest.TestCase):
             return next(responses)
 
         driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
-        with self.assertRaisesRegex(RuntimeError, '2 new'):
+        with self.assertRaises(AmbiguousSessionCreation) as ctx:
             driver.create('probe prompt')
-        self.assertEqual(registry.created, {'a', 'b'})
+        self.assertEqual(ctx.exception.candidates, ('a', 'b'))
+        self.assertEqual(registry.created, set())
+
+    def test_create_raises_when_the_post_create_listing_itself_fails(self):
+        # claude --bg can succeed and still leave a real, live session with an unknown id if the
+        # follow-up listing call times out, exits nonzero, or returns malformed JSON -- that
+        # failure must not propagate as an unrelated exception from _background_session_ids().
+        responses = iter([FakeResult(0, stdout=json.dumps([])), FakeResult(0, stdout=''),
+                          FakeResult(1, stderr='daemon unavailable')])
+
+        def fake_run(argv, **kwargs):
+            return next(responses)
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaises(AmbiguousSessionCreation) as ctx:
+            driver.create('probe prompt')
+        self.assertEqual(ctx.exception.candidates, ())
 
     def test_submit_refuses_a_foreign_session(self):
         driver = ClaudeDriver(SessionRegistry(), run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
