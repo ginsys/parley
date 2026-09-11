@@ -24,6 +24,7 @@ from host_trials import (
     classify_trial,
     codex_rollout_events,
     detect_outcomes,
+    marker_message,
     marker_token,
     parse_claude_transcript,
     rollout_started_at,
@@ -727,9 +728,10 @@ class FakeDriver:
         self.order.append('register_existing')
         return session_id
 
-    def submit(self, session_id, marker):
+    def submit(self, session_id, message):
         assert session_id == 'sid'
         self.order.append('submit')
+        self.submitted_message = message
         if self.submit_error is not None:
             raise self.submit_error
         if self.clock is not None:
@@ -745,6 +747,17 @@ class RunTrialTests(unittest.TestCase):
     def run_one(self, driver, clock, **kwargs):
         return run_trial(driver, prompt='hi', marker=MARKER, clock=clock.time,
                           monotonic=clock.monotonic, sleep=clock.sleep, **kwargs)
+
+    def test_submission_asks_the_host_to_echo_the_marker_rather_than_sending_it_bare(self):
+        # A bare opaque token gives an awake host no reason to quote it back; detect_outcomes
+        # only recognizes acknowledgement when the marker appears in the reply, so a correct,
+        # non-quoting answer to a bare token would misclassify as not_observed.
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock)
+        self.run_one(driver, clock)
+        self.assertIn(MARKER, driver.submitted_message)
+        self.assertNotEqual(driver.submitted_message, MARKER)
+        self.assertEqual(driver.submitted_message, marker_message(MARKER))
 
     def test_accepted_submission_is_stamped_when_submit_returns_not_before_it(self):
         # Submission can block for seconds; stamping acceptance at submitted_at backdated a

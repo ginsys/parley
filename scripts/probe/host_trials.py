@@ -129,6 +129,19 @@ def marker_token():
     return f'PARLEY-PROBE-{uuid.uuid4().hex}'
 
 
+def marker_message(marker):
+    """The literal text submitted to the host: an explicit instruction to echo `marker`.
+
+    `detect_outcomes` treats the marker's appearance in an assistant message as acknowledgement,
+    but a genuinely awake host asked only to receive an opaque token has no reason to quote it
+    back verbatim -- a correct, non-quoting reply would misclassify as `not_observed`, confusing
+    a probe artifact with real wake behavior. Asking explicitly removes that ambiguity without
+    weakening the check itself, which still matches on the raw token appearing anywhere in the
+    reply, not on this instruction's exact wording.
+    """
+    return f'Automated probe: reply with exactly this token to confirm receipt: {marker}'
+
+
 @dataclass
 class Event:
     """One transcript entry, normalized across hosts.
@@ -825,7 +838,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     deadline = monotonic() + (BUSY_CAP if state == 'busy' else LAST_WINDOW)
     accepted_unobservable = False
     try:
-        accepted = driver.submit(session_id, marker)
+        accepted = driver.submit(session_id, marker_message(marker))
     except SubmissionUnsupported:
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
                         outcomes={}, state=state,
