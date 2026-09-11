@@ -75,6 +75,9 @@ failed records. A deadline cannot produce `complete`: an otherwise successful ca
 capture/child failures still take precedence. `cleanup_requested` describes intervention on the direct child,
 not whether every descendant exited naturally. `complete` requires observed PTY EOF and natural
 direct-child exit zero, without a capture/cleanup error; it does not certify descendant outcomes.
+If the child closes its terminal before exiting, the recorder waits for its natural exit within
+the original capture deadline. EOF does not trigger immediate termination or start a new window.
+Deadline and interruption handling still apply while waiting after EOF.
 CLI zero means the record was published successfully (including an intentionally stopped capture),
 not that a trial completed or a host delivered anything. Failed/interrupted recordings cannot
 supply negative wake findings. Even a

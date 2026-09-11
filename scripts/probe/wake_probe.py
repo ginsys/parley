@@ -152,6 +152,14 @@ class PtyProcess:
             raise OSError('partial PTY write; delivery ambiguous')
         return written
 
+    def wait_for_exit(self, deadline):
+        """Observe the leader without reaping it or extending the capture deadline."""
+        while time.monotonic() < deadline:
+            if os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+            time.sleep(min(.01, max(0, deadline - time.monotonic())))
+        return False
+
     def close(self):
         try:
             if self.pid is not None:
@@ -262,7 +270,10 @@ def main():
             record['stop_reason'] = 'capture'
             while not child.eof and time.monotonic() < deadline:
                 child.read(min(.1, max(0, deadline - time.monotonic())))
-            record['stop_reason'] = 'eof' if child.eof else 'deadline'
+            # Terminal EOF can precede process exit. Keep the same deadline and
+            # preserve a natural exit status before cleanup kills the owned group.
+            exited = child.eof and child.wait_for_exit(deadline)
+            record['stop_reason'] = 'eof' if exited else 'deadline'
         except BaseException as exc:
             record['error'] = type(exc).__name__
             result = 130 if isinstance(exc, KeyboardInterrupt) else 1
