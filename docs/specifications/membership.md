@@ -252,6 +252,62 @@ version, a historical self-send or identical A/B members aborts the whole migrat
 source schema and evidence; do not invent membership, delete rows or rewrite IDs/versions to make
 constraints pass. The operator must resolve incompatible history explicitly before retry.
 
+### Preflight for an existing pair database
+
+Before scheduling the stopped-service upgrade, open the existing database read-only, for example
+with `sqlite3 -readonly /absolute/path/to/parley.db`, and run the query below. It reads all grant
+versions and envelope states, not just the active grant or queued messages. Since `grant_members`
+does not exist before the room migration, `expected_members` projects exactly the membership that
+the backfill will create from each historical pair. It makes no persistent tables or changes.
+
+```sql
+WITH expected_members AS (
+    SELECT conversation, grant_version, peer_a_id AS peer_id FROM grants
+    UNION
+    SELECT conversation, grant_version, peer_b_id AS peer_id FROM grants
+), findings AS (
+    SELECT 'sender_missing' AS diagnostic, e.conversation, e.grant_version,
+           e.id AS envelope_id
+    FROM envelopes AS e
+    WHERE NOT EXISTS (
+        SELECT 1 FROM expected_members AS m
+        WHERE m.conversation = e.conversation AND m.grant_version = e.grant_version
+          AND m.peer_id = e.from_peer
+    )
+    UNION ALL
+    SELECT 'recipient_missing', e.conversation, e.grant_version, e.id
+    FROM envelopes AS e
+    WHERE NOT EXISTS (
+        SELECT 1 FROM expected_members AS m
+        WHERE m.conversation = e.conversation AND m.grant_version = e.grant_version
+          AND m.peer_id = e.to_peer
+    )
+    UNION ALL
+    SELECT 'self_send', conversation, grant_version, id
+    FROM envelopes WHERE from_peer = to_peer
+    UNION ALL
+    SELECT 'identical_pair', conversation, grant_version, NULL
+    FROM grants WHERE peer_a_id = peer_b_id
+)
+SELECT diagnostic, conversation, grant_version, envelope_id
+FROM findings
+ORDER BY conversation, grant_version, envelope_id, diagnostic;
+```
+
+Each result identifies incompatible history; one envelope can have multiple diagnostics. An
+identical-pair result identifies the grant by conversation/version and has no envelope ID. A
+missing grant produces missing-peer diagnostics too. No rows means these membership/self-send
+checks passed for that read snapshot, not that all migration checks passed. A missing file, SQL
+error or unsupported schema is a failed preflight, never a clean result. This query is for the
+pre-room pair schema; after migration, membership checks use the real `grant_members` table.
+
+Keep the reported identifiers and resolve their disposition explicitly before scheduling the
+upgrade; this document supplies no automatic repair or deletion query. Re-run these checks inside
+the exclusive migration transaction: a preflight against a running service can become stale.
+The migration still checks the complete known catalog, foreign keys and integrity atomically.
+
+### Atomic migration
+
 Migration procedure, within the existing immediate transaction and `user_version` discipline:
 
 1. Require exclusive server ownership before opening storage. Run numbered predecessors first;
@@ -314,6 +370,7 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | Historical envelope after member removal; eligible reply carried to a successor | Historical FK remains valid; successor members precede the atomic reply version update |
 | Attempt to delete membership still referenced by a historical envelope | FK rejects deletion; no cascading loss of evidence |
 | Incompatible historical nonmember envelope, self-send/identical pair or unrecognized dependent table | Whole migration fails, leaving source schema and evidence unchanged; no synthetic membership repair |
+| Preflight on valid history, peers present only in other versions/conversations, missing grant, self-send and identical pair | Exact diagnostic rows across all states/versions; valid historical removal is not flagged; read-only execution leaves data unchanged |
 | Inbox/audit references, queue ordering/indexes and uncertain rows after migration | References and state unchanged; uncertainty never automatically replayed |
 
 ## Source basis and review boundary
