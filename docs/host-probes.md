@@ -267,9 +267,15 @@ passed, so observing only to 120s would leave those two cells unclassifiable by 
 a busy trial therefore polls to the 900s cap. When the transcript reports its own `turn_end`
 the deadline collapses back to the last window measured from that boundary, which is what
 lets the cell classify without waiting the cap out. If the window closes with no `turn_end`
-seen, the outcomes that depend on it are marked `observable=False` rather than recorded as
-negative evidence — but only those not positively observed, since the classifier does accept
-an event that actually arrived during the preceding turn.
+seen, what happens next depends on whether the host demonstrated a turn-boundary stream at all
+during the cap. Without one — Claude today, no turn-boundary events captured — the outcomes
+that depend on it are marked `observable=False` rather than recorded as negative evidence, but
+only those not positively observed, since the classifier does accept an event that actually
+arrived during the preceding turn. With one — a Codex-style host whose channel stayed readable
+through the whole cap but never emitted the boundary — `Trial.result()`'s own
+`turn_end_observable` branch classifies the cell `inconclusive` instead: the channel was
+readable the whole time and simply never resolved, which is a different, positive fact from an
+unavailable channel and must not collapse into the same `unobservable` result.
 
 It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state`,
 `supported`, `observable`, `turn_end`, `turn_end_observable`) carrying exactly what
