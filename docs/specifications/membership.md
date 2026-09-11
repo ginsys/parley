@@ -2,7 +2,8 @@
 
 Draft for [#20](https://github.com/ginsys/parley/issues/20), grounded in the owner's accepted
 [membership decision](../architecture.md#accepted-membership-model). The model and migration
-**timing** are accepted; the concrete contracts below are proposed for specification review.
+**timing** and the ASCII identifier rule below are accepted; other concrete contracts remain
+proposed for specification review.
 This document adds no runtime or schema implementation. GitHub owns acceptance and dependencies.
 
 ## Scope and implementation stages
@@ -42,10 +43,10 @@ positive maxima/versions; fractional, overflowing and negative values are invali
 }
 ```
 
-`conversation` and `peer_id` are opaque exact identifiers. For new identifiers, require valid
-UTF-8 in addition to existing nonempty/metadata validation; never trim, case-fold,
-Unicode-normalize or rewrite historical IDs. The existing-ID treatment in
-[the proposed compatibility decision](#proposed-utf-8-compatibility-decision) requires owner approval.
+`conversation` and `peer_id` are opaque exact identifiers restricted to printable ASCII bytes
+`0x20` through `0x7E`, inclusive. Empty and space-only values are invalid; permitted spaces remain
+part of the key. Never trim, case-fold, normalize or rewrite IDs. See the
+[accepted identifier rule](#accepted-ascii-identifier-rule) for existing data.
 Each member has exactly one role (`member` or `lead`) per grant version. Duplicate IDs, duplicate edges and edges
 with endpoints outside membership are invalid. At least two distinct members are required;
 removing the penultimate member requires revocation instead of activating a one-member grant.
@@ -59,7 +60,7 @@ A policy is a tagged union, with unknown tags/fields rejected rather than ignore
   allowed. An empty edge set permits no sends. Member addition never creates an edge implicitly.
 
 Roles outside their policy's allowed shape are rejected, not silently discarded. Self-send is
-always rejected, regardless of policy or lifecycle. Responses order members by exact UTF-8 bytes,
+always rejected, regardless of policy or lifecycle. Responses order members by exact identifier bytes,
 and edges by `(from, to)` using the same order. This canonical output order does not change IDs or
 rewrite legacy A/B positions. Request array ordering has no authorization meaning.
 
@@ -69,61 +70,36 @@ membership, roles and policy are immutable within a version. Existing `revoked_a
 supersession time; preserve that historical meaning instead of treating every non-null value as
 an actual revocation event. Status distinguishes revoked from superseded history.
 
-## Proposed UTF-8 compatibility decision
+## Accepted ASCII identifier rule
 
-**Proposed for owner ruling, not an accepted change to deployed behavior.** This closes a current
-defect as well as a future-protocol gap: `ValidateMetadata` at the source baseline ranges over
-invalid bytes as replacement runes without rejecting them. Distinct keys such as bytes `61FF`
-and `61FE` can therefore both be enrolled but serialize as the same JSON string. Merely changing
-the future wire format would leave the existing enrollment/delivery defect unaddressed.
+The owner approved printable ASCII for **both peer IDs and conversation names** on 2026-09-11.
+Use a byte-range check (`0x20`–`0x7E`) and reject empty/space-only values. This excludes malformed
+UTF-8 as well as valid non-ASCII names such as `José` and U+FFFD. Preserve permitted leading and
+trailing spaces and punctuation exactly. Message bodies are unaffected by this identifier rule.
 
-The proposed policy is valid UTF-8 for new identity operations, with byte-preserving inspection
-and revocation for incompatible history:
+This simple restriction replaces the proposed Unicode identifier policy and encoded-ID recovery
+API. The current validator can accept distinct malformed byte strings (`61FF`, `61FE`) that Go
+JSON encodes identically. ASCII validation rejects both, including replacement characters produced
+by a JSON decoder; no custom Unicode decoder or encoded public identity representation is needed.
+Validate identifiers before storage, authorization, wrapping or public serialization.
 
-- Validate new conversation/peer identifiers before storage or authorization, and identifiers
-  before wrapping, routing or serialization. In Go this requires `utf8.ValidString`, not rejection
-  of every `utf8.RuneError`: a genuinely encoded U+FFFD is valid text and remains unchanged.
-- Reject malformed UTF-8 input and unpaired JSON surrogate escapes before a decoder can replace
-  them. Validation after a lossy JSON decode is insufficient. This is a losslessness requirement
-  for whichever control framing is selected, not a decision to adopt JSON-RPC.
-- Retain every historical identifier byte-for-byte. Invalid UTF-8 alone does not authorize
-  rewriting IDs, deleting history, merging identities, or resetting ACK/budget state. The later
-  room backfill preserves these bytes; existing membership/self-send/FK incompatibilities still
-  abort migration as specified below.
-- Treat an active grant containing an invalid conversation/member identifier as unavailable for
-  new sends, claims, reply ingestion, renewal or membership replacement. This is a validation
-  failure, not an implicit revocation or status rewrite. Existing queued rows stay inspectable;
-  the administrator can revoke to cancel them. Already-dispatching/handed-off outcomes keep their
-  normal settlement rules. Invalid historical versions do not disable unrelated valid grants.
-- Keep affected grants revocable by their exact stored conversation key. Current human CLI
-  revocation already performs an exact lookup without validating peer metadata; preserve that
-  escape path when hardening enrollment. After revocation, explicit enrollment with valid IDs
-  creates a new version/conversation as appropriate; it never renames or revives old history.
-- Before replacing the current CLI with a JSON-facing administrator, provide authenticated
-  administrative inspection and revocation using a canonical uppercase hexadecimal selector for
-  the exact conversation bytes plus the expected grant version. Hex input is a maintenance
-  selector only, never a peer identity alias and never an enrollment, renewal or message route.
-  Decode it directly to the stored lookup bytes without Unicode conversion. The control spec
-  defines the method/field names and retains the same human-administration boundary.
-- Normal text API responses encountering incompatible identifiers fail explicitly with
-  `incompatible_identifier`; they must not replace bytes, omit affected records silently or emit
-  a partly encoded snapshot. Administrative inspection instead reports table/field, grant version,
-  and hex-encoded lookup/value bytes. Those ASCII diagnostics are lossless even when the
-  conversation key itself is invalid. Valid text responses remain the members-shaped API above.
+For an existing database, first check stored conversation names and peer IDs as raw bytes against
+this rule, across all historical versions and envelope endpoints. A read-only query/script with
+escaped or hex diagnostics is sufficient; do not build a recovery service on speculation. No
+inventory of an operator's database is claimed by this specification. If the check finds no
+incompatible IDs, no identifier migration or recovery feature is needed.
 
-Read-only preflight must scan identifier fields in conversations, grants and envelopes as raw
-bytes, validate them strictly, and report exact hex locations before enabling the first text API;
-do not wait for the room migration. Include envelope IDs and reply references, not just enrolled
-peers. SQLite membership queries below do not detect UTF-8 validity. An inspection implementation
-must fetch bytes (for example via `CAST(column AS BLOB)`) rather than a decoder that repairs text.
-The same checks at mutation/read boundaries prevent a stale preflight from authorizing bad data.
+Never rewrite or delete incompatible history automatically. Keep current exact-key human
+revocation available; applying validation to enrollment/renewal must not strand that escape path.
+Incompatible IDs must fail new authorization and text responses explicitly, without replacement
+or silent omission. Existing attempts retain their settlement rules. If an inventory finds
+incompatible history, record its disposition before moving that database behind a text-only
+administration interface; this decision does not pre-authorize a new recovery API. Unaffected
+grants remain usable. The later room backfill preserves historical bytes and still rejects the
+independent membership/self-send/FK incompatibilities described below.
 
-Alternative: carry arbitrary identifier bytes losslessly in every public API using a tagged or
-encoded identifier representation. That preserves continued use of invalid historical IDs but
-changes every address and consumer, rather than limiting byte encoding to administrative recovery.
-Automatic replacement with U+FFFD is never an acceptable alternative because it merges identities.
-Owner acceptance of the policy above is required before the live validation fix is implemented;
-that fix needs its own implementation issue/PR, not a claim that this specification repairs code.
+The implementation is tracked separately in #40. This document records an accepted target rule;
+it does not claim that shipped code enforces ASCII today.
 
 ## First-runtime subset and exact translation
 
@@ -255,7 +231,7 @@ Names below are logical error classes; transport codes/envelopes are defined els
 | Error | Examples | Mutation |
 | --- | --- | --- |
 | `invalid_membership` | Duplicate/self/nonmember edge, invalid role/tag/shape/identifier, fewer than two members | None |
-| `incompatible_identifier` | Historical identifier cannot be represented losslessly as valid UTF-8 | No new authorization or lossy response; exact-byte administrative inspection/revocation remains available |
+| `incompatible_identifier` | Historical conversation/peer ID violates the ASCII rule | No new authorization or lossy response; current exact-key human revocation remains available |
 | `unsupported_membership` | Valid model outside the first-runtime subset | None |
 | `stale_grant_version` / `no_active_grant` / `already_active` | Failed operation precondition | None |
 | `not_permitted` / `grant_expired` | Invalid acceptance edge or expired grant | No accepted message or budget claim |
@@ -417,9 +393,9 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | Pair object → storage → object across restart | Preserve kind, roles, edge and exact IDs; no caller-order meaning |
 | `lead_only`, two-edge/empty directed, larger members on first runtime | Explicit unsupported error and byte-for-byte unchanged durable state |
 | Invalid roles, duplicate IDs/edges, missing endpoints, control-bearing IDs, unknown fields | Invalid error; no version/budget/queue mutation |
-| Distinct invalid UTF-8 byte sequences, malformed JSON UTF-8/surrogates, and valid U+FFFD | Reject invalid new identifiers before replacement; preserve valid U+FFFD and all other valid exact bytes |
-| Historical invalid conversation/peer IDs | Block new authorization/renewal, preserve rows byte-for-byte, expose exact hex inspection and allow only authenticated exact-key revocation; unaffected grants still work |
-| Room backfill containing otherwise compatible invalid UTF-8 history | Preserve raw identifier bytes and relationships; do not silently replace, merge or drop history |
+| ASCII boundaries, punctuation, permitted spaces, empty/space-only strings, control bytes, DEL, non-ASCII Unicode and malformed UTF-8 | Accept only nonempty printable ASCII containing a non-space byte; preserve accepted keys exactly; no durable mutation on rejection |
+| Historical incompatible conversation/peer IDs | Read-only inventory reports exact escaped/hex locations; rows unchanged; new authorization/renewal rejected, exact-key human revocation retained; unaffected grants still work |
+| Room backfill containing otherwise compatible non-ASCII history | Preserve raw identifier bytes and relationships; do not silently replace, merge or drop history |
 | Lead plus D1/D2, then add D3 under lead_only | Lead↔each developer allowed, developer↔developer forbidden |
 | Same members under open / explicit directed | All distinct edges / only enumerated edges; directed does not expand on add |
 | Enroll/re-enroll/renew/replace with stale concurrent expected versions | One winner; monotonic history and one active row; no partial loser mutation |
