@@ -752,7 +752,12 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     entirely instead of falling through to it: `accepted` itself stays observable (a failed
     submission is genuine, true negative evidence), but the transcript outcomes are marked
     unobservable rather than polled to an eventual `not_observed`, since no delivered message
-    could ever have produced a signal for them.
+    could ever have produced a signal for them. A `subprocess.TimeoutExpired` from `submit`
+    itself is neither of those: the host process may already have received the marker before
+    the hard-coded subprocess timeout fired, so this is treated as acceptance proceeding
+    (polling continues, in case a delivered marker still produces transcript evidence) with
+    `accepted` alone marked unobservable, rather than propagating the exception and losing the
+    trial's evidence entirely.
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
@@ -761,6 +766,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     settle()
     submitted_at = clock()
     deadline = monotonic() + (BUSY_CAP if state == 'busy' else LAST_WINDOW)
+    accepted_unobservable = False
     try:
         accepted = driver.submit(session_id, marker)
     except SubmissionUnsupported:
@@ -774,6 +780,14 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
                         supported={name: True for name in OUTCOME_NAMES},
                         observable={name: False for name in OUTCOME_NAMES},
                         turn_end_observable=False)
+    except subprocess.TimeoutExpired:
+        # The subprocess may already have handed the marker to the host before the hard-coded
+        # submission timeout fired; the runner just never learned whether it did. Propagating
+        # this would lose the trial (and any transcript evidence a delivered marker produced)
+        # entirely, so acceptance itself is recorded unobservable rather than assumed either
+        # way, and observation continues exactly as if submission had returned True.
+        accepted = True
+        accepted_unobservable = True
     if not accepted:
         # A clean nonzero exit (not an exception) is a definitive, observed failure to accept --
         # 'not_observed' is the true classification for `accepted` itself -- but nothing was
@@ -787,7 +801,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
                         outcomes={}, state=state,
                         supported={name: True for name in OUTCOME_NAMES}, observable=observable,
                         turn_end_observable=False)
-    accepted_at = clock()
+    accepted_at = None if accepted_unobservable else clock()
     outcomes = {}
     turn_end = None
     channel_readable = False
@@ -826,8 +840,9 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     if accepted_at is not None:
         outcomes['accepted'] = accepted_at
     # A positively observed outcome stands on its own evidence; only the ones still missing at
-    # the deadline depend on whether the transcript could be read at all.
-    observable = {'accepted': True}
+    # the deadline depend on whether the transcript could be read at all. `accepted` itself is
+    # unobservable only when the submission call itself timed out without confirming either way.
+    observable = {'accepted': not accepted_unobservable}
     for name in TRANSCRIPT_OUTCOMES:
         observable[name] = True if name in outcomes else channel_readable
     if state == 'busy' and turn_end is None and not turn_stream_capable:
