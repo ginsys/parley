@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
+from unittest.mock import patch
 
 from host_trials import (
     ClaudeDriver,
@@ -597,15 +598,20 @@ class CodexDriverTests(unittest.TestCase):
     def test_an_unlistable_sibling_directory_is_treated_as_an_unruled_out_rival(self):
         # glob.glob swallows an OSError from an unreadable directory and just returns fewer
         # matches, with no signal anything was skipped -- a real rival hiding there would read
-        # as "no rivals found" instead of "could not check".
+        # as "no rivals found" instead of "could not check". Mock the walk failure directly
+        # rather than chmod(0o000): running as root (e.g. in CI containers) ignores directory
+        # permission bits entirely, so os.walk would succeed and the test would pass for the
+        # wrong reason -- or not raise at all.
         registry = SessionRegistry()
         mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
-        locked = os.path.join(self.sessions_root, 'locked')
-        os.mkdir(locked)
-        os.chmod(locked, 0o000)
-        self.addCleanup(os.chmod, locked, 0o755)
-        with self.assertRaises(ForeignSessionError):
-            self.driver(registry, mine).register_existing('thread-1')
+
+        def fake_walk(root, onerror=None, **kwargs):
+            onerror(OSError('permission denied (simulated)'))
+            return iter(())
+
+        with patch('host_trials.os.walk', side_effect=fake_walk):
+            with self.assertRaises(ForeignSessionError):
+                self.driver(registry, mine).register_existing('thread-1')
 
     def test_a_neighbour_untouched_since_before_the_run_is_skipped_without_being_opened(self):
         # A file whose mtime hasn't moved since before started_at cannot contain a record newer
