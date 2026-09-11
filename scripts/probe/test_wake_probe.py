@@ -226,6 +226,34 @@ class PtyTests(unittest.TestCase):
         self.assertEqual(output.read_text(), 'existing evidence')
         self.assertEqual(list(Path(self.tmp.name).iterdir()), [output])
 
+    def test_sigint_during_publication_preserves_record_and_restores_handler(self):
+        for module, name in ((json, 'dump'), (os, 'fsync'), (os, 'link'), (os, 'unlink')):
+            with self.subTest(operation=name):
+                output = Path(self.tmp.name, f'publication-{name}.json')
+                original = getattr(module, name)
+                handler = signal.getsignal(signal.SIGINT)
+
+                def interrupted(*args, **kwargs):
+                    signal.raise_signal(signal.SIGINT)
+                    signal.raise_signal(signal.SIGINT)
+                    return original(*args, **kwargs)
+
+                args = ['wake_probe', '--output', str(output), '--seconds', '5', '--',
+                        sys.executable, '-u', '-c', "print('publication fixture', flush=True)"]
+                with patch.object(sys, 'argv', args), patch.object(module, name, interrupted):
+                    try:
+                        result = main()
+                    except KeyboardInterrupt:
+                        self.fail('publication SIGINT escaped before evidence was preserved')
+                self.assertEqual(result, 130)
+                record = json.loads(output.read_text())
+                self.assertEqual(record['capture_status'], 'complete')
+                self.assertEqual(record['exit_code'], 0)
+                self.assertTrue(record['eof'])
+                self.assertIn(b'publication fixture', b''.join(bytes.fromhex(e['hex']) for e in record['events']))
+                self.assertEqual(signal.getsignal(signal.SIGINT), handler)
+                self.assertEqual(list(Path(self.tmp.name).glob('.parley-capture-*')), [])
+
     def test_signal_exit_is_distinct_from_deadline_cleanup(self):
         for code, duration, expected, status in (
             ('import os, signal; os.kill(os.getpid(), signal.SIGTERM)', '2', -signal.SIGTERM, 'failed'),
