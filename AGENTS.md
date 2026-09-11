@@ -170,3 +170,10 @@ instead of accepting grants whose messages will always fail wrapping. Do not sil
 during grant/revoke/renew: existing spaced and unspaced names
 can coexist, and normalization could retarget an operation or strand a historical grant. Any
 future canonicalization requires an identity policy and migration design, not CLI-only cleanup.
+
+Owner-approved target rule (2026-09-11): both conversation names and peer IDs use printable ASCII
+bytes `0x20`–`0x7E`, excluding empty/space-only values; preserve all permitted bytes exactly.
+This supersedes Unicode-capable enrollment when implemented, not message-body encoding. First
+inventory existing identifiers without modifying them; retain exact-key revocation and do not
+invent a recovery API without affected data. See the [accepted identifier rule](docs/specifications/membership.md#accepted-ascii-identifier-rule).
+The shipped validator does not yet enforce this restriction.
