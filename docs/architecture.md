@@ -222,7 +222,9 @@ this target contract; current runtime validation has not yet been changed.
 There is no process wiring these components into a live bridge. Channels delivery, rollout
 watching, identity binding and runtime lifecycle still need contracts and live evidence;
 [issue #12](https://github.com/ginsys/parley/issues/12) owns that separate work. Durable inbox
-semantics are separately tracked in [issue #6](https://github.com/ginsys/parley/issues/6).
+semantics are separately tracked in [issue #6](https://github.com/ginsys/parley/issues/6). The
+[follow-up proposal](specifications/follow-ups.md) describes explicit two-peer dispositions and
+checkpoint summaries for owner review; it changes neither envelope states nor execution authority.
 
 ## Grants and renewal
 
