@@ -417,6 +417,19 @@ class CodexDriverTests(unittest.TestCase):
             self.driver(registry, undated).register_existing('thread-1')
         self.assertEqual(registry.created, set())
 
+    def test_an_unlistable_sibling_directory_is_treated_as_an_unruled_out_rival(self):
+        # glob.glob swallows an OSError from an unreadable directory and just returns fewer
+        # matches, with no signal anything was skipped -- a real rival hiding there would read
+        # as "no rivals found" instead of "could not check".
+        registry = SessionRegistry()
+        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
+        locked = os.path.join(self.sessions_root, 'locked')
+        os.mkdir(locked)
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o755)
+        with self.assertRaises(ForeignSessionError):
+            self.driver(registry, mine).register_existing('thread-1')
+
     def test_register_existing_refuses_an_unreadable_rollout_rather_than_raising_oserror(self):
         registry = SessionRegistry()
         missing = os.path.join(self.tmp_missing(), 'never-written.jsonl')
