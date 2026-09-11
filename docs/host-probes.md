@@ -195,23 +195,39 @@ Outcome detection is grounded in captured real output, not assumed formats:
 - No captured mechanism at `2.1.268` submits a message to an *existing* background session:
   `claude --bg` takes its prompt at creation, `attach` is an interactive PTY, and
   `--remote-control` / `--print --input-format=stream-json` are unexercised. `ClaudeDriver.submit()`
-  raises `SubmissionUnsupported`, rather than confirming the session is listed and reporting
+  raises `SubmissionUncaptured`, rather than confirming the session is listed and reporting
   acceptance for a marker the host never received. Guessing an unconfirmed submission flag is the
   same evidence violation as guessing OpenCode's export shape; capturing a real path is stage 3
-  work. **Known limitation:** `run_trial` currently turns that refusal into `supported=False` for
-  every outcome, which reads as a claim about the *host* when the evidence only supports a claim
-  about this runner's tooling — unlike `--channels`, whose absence from the help text and plugin
-  cache is mechanism evidence. Until that is separated, treat a Claude `unsupported` cell as "no
-  trial was performed", and do not aggregate it as a host-capability result.
+  work. The two refusals are distinct types and classify differently. `SubmissionUnsupported`
+  says the *host* has no such mechanism — Claude's `--channels`, absent from both the help text
+  and the plugin cache — and yields `supported=False`. `SubmissionUncaptured` says *this runner*
+  has captured no path, and yields `observable=False`, so the cell classifies `unobservable`:
+  "no trial was performed", never "the host cannot do this". The listing `submit` checks first
+  is `claude agents --json --all`, the same call `background_sessions()` makes, and a nonzero
+  exit from that listing is a failed read rather than evidence the session is gone.
 - A Codex thread is adopted only when its rollout's earliest record timestamp is at or after the
   run's own start (`CodexDriver(started_at=...)`). Minting whatever id a caller passed defeated
   the registry guarantee, since `submit` then queues a message to it — a mistyped id could reach
   an ordinary human thread. This orders a thread against the run; it does not authenticate it.
+  "Started at or after this run" is equally true of a human thread opened in the same minute, so
+  adoption additionally requires that no *other* rollout under `sessions_root` shares that
+  property: `register_existing` walks the tree and raises `ForeignSessionError` when any
+  neighbour is an unruled-out rival, counting a neighbour it cannot read or cannot date as a
+  rival rather than as an absence. A driver constructed without `sessions_root` cannot run that
+  check and is refused outright instead of adopting on the weaker test.
+- No captured mechanism *creates* a Codex thread non-interactively either: `codex queue` targets
+  a thread that already exists, and no creation output shape has been captured to parse an id
+  out of. `CodexDriver.create()` raises `SessionCreationUncaptured`, so a Codex cell is run as
+  `run_trial(..., existing_session=<thread id>)` against a thread the caller made themselves.
 - Codex's rollout JSONL (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`) is one JSON object
   per line; a chat turn is `{"type": "response_item", "payload": {"type": "message", "role":
   "user"|"assistant"|"developer", "content": [{"type": "input_text"|"output_text", "text":
   ...}]}}` with a record-level ISO-8601 `timestamp`. Only `user`/`assistant` roles count as
-  transcript turns; `developer` carries fixed instructions, not conversation.
+  transcript turns; `developer` carries fixed instructions, not conversation. Turn boundaries
+  are taken from the host rather than inferred: `{"type": "event_msg", "payload": {"type":
+  "task_started"|"task_complete"|"turn_aborted"}}` records become `turn_start`/`turn_end`
+  pseudo-role events, so on Codex `turn_start` means the host's own task start rather than
+  whichever assistant message happened to be read first.
 - OpenCode's `export <sessionID>` shape has **no captured sample yet** — no local session existed
   to export from at investigation time (`opencode --pure session list` printed nothing).
   `OpenCodeDriver` raises `NotImplementedError` rather than guess at an unconfirmed format; this
@@ -229,8 +245,21 @@ arrived comfortably inside their window, which is precisely the delay the window
 measure. Observability is decided by the *final* poll, not by whether any poll ever succeeded:
 a transcript is cumulative, so a late successful read covers earlier gaps, but if the last read
 failed then the tail of the window was never seen and a missing outcome is `unobservable`
-rather than negative. An outcome already observed keeps its own evidence either way. It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state`,
-`supported`, `observable`) carrying exactly what `Trial`/`classify_trial` need; acceptance is
+rather than negative. An outcome already observed keeps its own evidence either way.
+
+A `busy` trial is the exception to that 120s ceiling. `wake_probe.py` refuses to rule on
+`turn_start` or `ack` for a busy host until the turn already running has ended or 900s have
+passed, so observing only to 120s would leave those two cells unclassifiable by construction;
+a busy trial therefore polls to the 900s cap. When the transcript reports its own `turn_end`
+the deadline collapses back to the last window measured from that boundary, which is what
+lets the cell classify without waiting the cap out. If the window closes with no `turn_end`
+seen, the outcomes that depend on it are marked `observable=False` rather than recorded as
+negative evidence — but only those not positively observed, since the classifier does accept
+an event that actually arrived during the preceding turn.
+
+It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state`,
+`supported`, `observable`, `turn_end`, `turn_end_observable`) carrying exactly what
+`Trial`/`classify_trial` need; acceptance is
 stamped when `submit` *returns*, since a submission that blocks for seconds would otherwise be
 backdated into its 10s window. The requested `state` is validated and carried into the result,
 but establishing a busy/approval/disconnected/restarted precondition is the caller's `settle`

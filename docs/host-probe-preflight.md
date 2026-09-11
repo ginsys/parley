@@ -45,12 +45,12 @@ a preflight run on a different day.
 | --- | --- |
 | `claude --version` | Exit 0: `2.1.268 (Claude Code)` |
 | `claude --help` | No `--channels` flag anywhere in the option list (`grep -in channel` on the full help text: no match) |
-| `~/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/` | Contains `asana context7 discord fakechat firebase github gitlab imessage laravel-boost linear playwright serena telegram terraform`; no channels plugin |
+| Official plugin marketplace cache, `external_plugins/` | Contains `asana context7 discord fakechat firebase github gitlab imessage laravel-boost linear playwright serena telegram terraform`; no channels plugin |
 | `claude agents --json --all` | Background sessions report `{id, kind: "background", state, cwd, sessionId, name, startedAt}`; `state` values seen: `"done"` |
 | `claude agents --json` (no `--all`) | Interactive sessions report a *different* schema: `{pid, kind: "interactive", status, cwd, sessionId, name, startedAt}` — `status`, not `state` |
 | `claude logs e9f3bf35` (a `state: "done"` background session) | Exit nonzero: `Couldn't read logs for e9f3bf35 — connect ENOENT /tmp/cc-daemon-1000/9a97f840/control.sock`; the session's daemon has already exited |
 | `ls /tmp/cc-daemon-1000/` | Empty except the directory itself — no background session's daemon was live at observation time |
-| Codex rollout sample (`~/.codex/sessions/2026/09/11/rollout-*.jsonl`) | Confirmed real shape: one JSON object per line, a chat turn is `{"type": "response_item", "payload": {"type": "message", "role": "developer"\|"user"\|"assistant", "content": [{"type": "input_text"\|"output_text", "text": ...}]}}`, record-level ISO-8601 `timestamp` |
+| Codex rollout sample (`~/.codex/sessions/2026/09/11/rollout-*.jsonl`) | Confirmed real shape: one JSON object per line, a chat turn is `{"type": "response_item", "payload": {"type": "message", "role": "developer"\|"user"\|"assistant", "content": [{"type": "input_text"\|"output_text", "text": ...}]}}`, record-level ISO-8601 `timestamp`. The same file carries `{"type": "event_msg", "payload": {"type": "task_started"\|"task_complete"\|"turn_aborted", ...}}` records, each with its own record-level `timestamp` — the host's own turn boundaries |
 | `opencode --pure session list` | Exit 0, no output — no local OpenCode session exists to sample an `export` from |
 
 No message was queued and no session created by this preflight; these are read-only inspections
