@@ -295,14 +295,18 @@ def main():
               'command': command, 'duration': args.seconds, 'started': time.monotonic(),
               'kind': 'passive_capture', 'delivery_claim': None, 'events': [],
               'terminal_size': {'rows': PTY_SIZE[0], 'columns': PTY_SIZE[1]},
-              'eof': False, 'error': None, 'cleanup_error': None, 'wait_status': None, 'exit_code': None,
+              'eof': False, 'error': None, 'cleanup_error': None, 'home_cleanup_error': None,
+              'wait_status': None, 'exit_code': None,
               'cleanup_requested': False, 'capture_status': 'failed', 'stop_reason': 'startup'}
     result = 0
     child = None
+    temporary_home = None
     # No final file exists until a complete (possibly interrupted/failed) record
     # is ready. HOME/cwd never inherit host authentication.
-    with defer_sigint() as interrupted, tempfile.TemporaryDirectory(prefix='parley-probe-') as home:
+    with defer_sigint() as interrupted:
         try:
+            temporary_home = tempfile.TemporaryDirectory(prefix='parley-probe-')
+            home = temporary_home.name
             child = PtyProcess(command, cwd=home,
                                env={'HOME': home, 'PATH': os.environ.get('PATH', os.defpath), 'TERM': 'dumb'},
                                generation='disposable')
@@ -343,6 +347,18 @@ def main():
                 finally:
                     record.update(events=child.events, eof=child.eof, wait_status=child.wait_status,
                                   exit_code=child.exit_code, cleanup_requested=child.cleanup_requested)
+            if temporary_home is not None:
+                try:
+                    temporary_home.cleanup()
+                except BaseException as exc:
+                    record['home_cleanup_error'] = type(exc).__name__
+                    record['error'] = record['error'] or 'home_cleanup_failed'
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        record['capture_status'] = 'interrupted'
+                    if isinstance(exc, KeyboardInterrupt):
+                        result = 130
+                    elif result == 0:
+                        result = 1
             record['ended'] = time.monotonic()
             if record['error'] is None:
                 if child.exit_code > 0 or (child.exit_code < 0 and
@@ -359,9 +375,8 @@ def main():
                     complete = record['stop_reason'] == 'eof' and child.eof and not child.cleanup_requested
                     record['capture_status'] = 'complete' if complete else 'stopped'
             publish_record(args.output, record)
-            if interrupted[0]:
-                result = 130
-    return result
+    # Include a signal remembered during the guard's final restoration, too.
+    return 130 if interrupted[0] else result
 
 
 if __name__ == '__main__':
