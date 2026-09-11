@@ -111,8 +111,10 @@ run against an installed host CLI under the operator's **real HOME**
 credentials and would measure an unauthenticated session rather than a wake. Isolation is at the
 *session* level — a throwaway host session torn down after the trial — never at the HOME level,
 so every matrix cell is produced with real credentials and configuration and must be sanitized
-before it is published. The PTY fixtures keep `--home disposable`, and no ordinary test may
-launch an installed host CLI. See [host probes](docs/host-probes.md#matrix-runner).
+before it is published. The PTY fixtures keep `--home disposable`, except the coverage for
+`--home inherit` itself, which exercises that mode's real environment-passing behavior against a
+controlled synthetic child process, never an installed host CLI. No ordinary test may launch an
+installed host CLI, regardless of HOME mode. See [host probes](docs/host-probes.md#matrix-runner).
 
 ## Transactions and schema upgrades
 
