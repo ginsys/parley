@@ -71,6 +71,8 @@ acceptance and native dependencies; this section records architectural direction
 
 The owner approved [decision #17](https://github.com/ginsys/parley/issues/17) on 2026-09-10.
 These are target contracts; the implemented core still uses the pair representation described below.
+The [draft membership specification](specifications/membership.md) expands them into proposed API,
+storage, lifecycle and verification contracts for owner review.
 
 Grants have immutable versioned members (one exact peer ID and role per version) and a policy:
 

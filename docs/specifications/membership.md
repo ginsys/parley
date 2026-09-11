@@ -1,0 +1,311 @@
+# Membership and authorization specification
+
+Draft for [#20](https://github.com/ginsys/parley/issues/20), grounded in the owner's accepted
+[membership decision](../architecture.md#accepted-membership-model). The model and migration
+**timing** are accepted; the concrete contracts below are proposed for specification review.
+This document adds no runtime or schema implementation. GitHub owns acceptance and dependencies.
+
+## Scope and implementation stages
+
+| Stage | Public membership representation | Durable representation |
+| --- | --- | --- |
+| First runtime and two-peer inbox | Members and policy, using the supported subset below | Existing `grants.peer_a_id`, `peer_b_id`, `direction`; no members table |
+| Later rooms | Same representation, expanded capabilities | Versioned members/policies/edges, migrated after the inbox |
+
+The first stage must not create shadow membership state in a side table, file or memory-only
+cache. The representation must round-trip across restart using the existing pair columns.
+The room migration, not runtime ownership or control-client work, creates/backfills membership
+tables and retires positional storage. No simultaneous pair and room writers are supported.
+
+This specification covers membership, allowed communication, grant lifecycle, routing and
+historical migration. It does not choose transport/framing, connection authentication, credential
+enrollment, event subscriptions, request deduplication, inbox dispositions or broadcast behavior.
+Those contracts consume this model. An authenticated principal is an input from the identity
+binding layer, never a claimed sender field. Membership administration remains human-controlled;
+message delivery never grants execution authority.
+
+## Data contract
+
+The logical object shape is transport-independent; JSON below illustrates names and structure,
+not an approved JSON-RPC method. Integer encoding, frame limits and transport error envelopes
+belong to the control specification. Grant versions and budgets are signed 64-bit integers with
+positive maxima/versions; fractional, overflowing and negative values are invalid.
+
+```json
+{
+  "conversation": "synthetic-room",
+  "members": [
+    {"peer_id": "fixture-a", "role": "member"},
+    {"peer_id": "fixture-b", "role": "member"}
+  ],
+  "policy": {"kind": "directed", "edges": [{"from": "fixture-a", "to": "fixture-b"}]}
+}
+```
+
+`conversation` and `peer_id` are opaque exact identifiers. Apply existing nonempty/metadata
+validation; never trim, case-fold, Unicode-normalize or rewrite historical IDs. Each member has
+exactly one role (`member` or `lead`) per grant version. Duplicate IDs, duplicate edges and edges
+with endpoints outside membership are invalid. At least two distinct members are required;
+removing the penultimate member requires revocation instead of activating a one-member grant.
+
+A policy is a tagged union, with unknown tags/fields rejected rather than ignored:
+
+- `open`: no `edges`; all roles are `member`; every distinct pair is allowed.
+- `lead_only`: no `edges`; exactly one `lead`, others `member`; only lead/member edges in both
+  directions are allowed. Adding/removing a member recalculates the allowed pairs from the policy.
+- `directed`: explicit `edges` array; all roles are `member`; only listed ordered pairs are
+  allowed. An empty edge set permits no sends. Member addition never creates an edge implicitly.
+
+Roles outside their policy's allowed shape are rejected, not silently discarded. Self-send is
+always rejected, regardless of policy or lifecycle. Responses order members by exact UTF-8 bytes,
+and edges by `(from, to)` using the same order. This canonical output order does not change IDs or
+rewrite legacy A/B positions. Request array ordering has no authorization meaning.
+
+A grant snapshot adds server-owned `grant_version`, `status`, `max_exchanges`, `exchanges_used`,
+`granted_at`, `expires_at`, `revoked_at` and `cancel_pending_replies`. Accounting/status may mutate;
+membership, roles and policy are immutable within a version. Existing `revoked_at` also records
+supersession time; preserve that historical meaning instead of treating every non-null value as
+an actual revocation event. Status distinguishes revoked from superseded history.
+
+## First-runtime subset and exact translation
+
+The first runtime accepts **exactly two `member` roles**, either `open` or `directed` with exactly
+one edge. Other well-formed models return `unsupported_membership`; malformed models return
+`invalid_membership`. Validation is completed before any durable mutation.
+
+This deliberately rejects a two-member `lead_only` policy, a two-edge `directed` policy, and an
+empty directed policy until rooms. They cannot round-trip through the existing pair columns
+without losing policy/role intent. In particular, an explicit two-edge policy is not silently
+converted to `open`, since adding a member would then mean something different. Accepting these
+shapes earlier requires a reviewed specification change, not hidden supplemental storage.
+
+| Existing Direction | External model | Exactly allowed sends |
+| --- | --- | --- |
+| `bidirectional` | `open` with A and B both members | A→B and B→A |
+| `a_to_b` | `directed`, edge A→B | A→B only |
+| `b_to_a` | `directed`, edge B→A | B→A only |
+
+For newly created pair grants choose A/B in canonical member order, then derive `direction` from
+the requested edge. For reads of existing grants, derive edges from their stored A/B positions
+before sorting the output. Never infer the direction from the output order. Renewal without a
+membership replacement copies the existing A/B fields exactly. Legacy CLI flags translate to
+these objects; positional peer fields must not appear in the new public protocol.
+
+Capabilities expose stage support (`max_members = 2` and the supported policy forms). Larger or
+unsupported requests fail explicitly, without allocating a conversation/version, changing status,
+cancelling messages or consuming budget. The capability/error transport representation is defined
+by the control specification; this semantic contract does not select a wire protocol.
+
+## Authorization and operation boundary
+
+Define `AllowsEdge(members, policy, from, to)` independently of expiry, accounting and historical
+status. It rejects self/nonmember edges, then applies the policy. Historical superseded grants
+can therefore be inspected without falsely rejecting their edges because of lifecycle fields.
+
+Ordinary acceptance and dispatch claim require the active grant, its unexpired expiry and an
+allowed edge. A dispatch claim additionally requires the queued envelope's exact grant version
+and available budget. Authorization and mutation run in the **same immediate writer transaction**;
+no reader-pool snapshot may authorize a later write. A failed conditional budget update is
+classified by re-reading current authorization/state, not assumed to mean exhaustion.
+
+Logical administration operations (actual method names belong to the control specification):
+
+| Operation | Required precondition | Atomic result |
+| --- | --- | --- |
+| Enroll/re-enroll | No active grant; expected latest version (0 if none) | New version `max(history)+1`, active, zero used budget |
+| Renew | Exact expected active version | Same membership/policy; new version, budget/expiry as below |
+| Replace membership/policy | Exact expected active version; complete valid replacement | New version with replacement; lifecycle rules below |
+| Revoke | Exact expected active version | Mark revoked, cancel queued rows, report already dispatching/handed off |
+
+A stale expected version causes `stale_grant_version` with no mutation. A concurrent create or
+renewal cannot partially replace state. Version overflow fails without changes. New operations
+preserve the existing one-active-grant invariant; mark the old grant superseded before inserting
+its successor, within the same transaction. Message interfaces cannot invoke these operations.
+
+Renewal/replacement retains the maximum and expiry when omitted (legacy budget zero translates
+to omission), or accepts an explicit positive maximum and future expiry. It starts the successor
+with zero exchanges used, as today. Retaining an already-expired expiry keeps delivery blocked;
+explicitly supplying an expired timestamp is invalid. This contract adds no implicit clear-expiry
+operation. Revocation and administrative errors do not refund attempted messages.
+
+Request replay after an ambiguous network response is handled by the control protocol's durable
+idempotency contract, before applying a new mutation. An identical body alone is not authority
+to repeat a renewal and replenish a budget. This specification does not invent request IDs or
+choose their persistence schema.
+
+## Version changes, queued messages and budgets
+
+Every member/role/policy change creates a new version. In that writer transaction:
+
+1. Validate the full successor and expected active version; reject the whole operation if invalid.
+2. Supersede the old active version and insert the new version/membership with zero used budget.
+3. Carry eligible queued trusted replies to the successor before cancelling remaining old-version
+   queued messages. Record cancellation/carry counts and already-dispatching/handed-off counts.
+4. Commit all state together. Failure rolls back version, counters, membership and queue effects.
+
+Ordinary old-version queued messages are cancelled, even if the same edge remains permitted.
+Trusted replies carry by default because their originals are already acknowledged. A reply may
+carry only with trusted ingestion provenance: the original is acknowledged, in the same
+conversation and has exactly reversed sender/recipient. A caller-supplied `in_reply_to` is not
+provenance. Member removal or loss of its edge cancels a reply durably and reports the cancellation;
+the acknowledged original is not reset or replayed.
+
+Crossing versions requires a contiguous readable history, no actual revocation, no successor
+`cancel_pending_replies` flag, and the reply's edge permitted by **every crossed membership/policy
+snapshot**, not just the final one. Thus remove-and-readd or deny-and-reallow cannot rescue an
+in-flight old reply past an intervening denial. Ignore historical superseded status when evaluating
+its edge; do not ignore an actual revoked boundary. Missing history fails closed. Expiry is not a
+carry barrier: an otherwise eligible reply may wait queued under an expired successor, but claim
+still requires a current unexpired grant. A reply cannot carry across a revocation.
+
+Already-dispatching/handed-off messages cannot be recalled. Settlement must match its original
+version, durable attempt token and `dispatching` state. A never-attempted result refunds only its
+original grant once; if rescue to a successor is needed, re-evaluate the entire history above.
+Ambiguous handoff remains uncertain and is never automatically replayed. A delayed result cannot
+rewrite a newer attempt or reopen a cancelled reply.
+
+There is one budget pool for the active conversation grant. Each successful dispatch claim,
+including a reply claim, consumes one exchange; ACK alone does not. Budget exhaustion can leave
+an accepted message queued. Preserve current refund/settlement rules. A chatty member can exhaust
+the room budget for everyone, including the lead. There are no per-member quotas, reservations or
+fairness guarantees. Only human administration may create a successor budget.
+
+## Fresh sends and replies
+
+Fresh send input is `(conversation, to, text, optional in_reply_to)`. Sender comes from the bound
+principal. An ordinary send never gains trusted provenance from the optional reference.
+
+Reply ingestion resolves the conversation from the globally unique original envelope ID; an
+optional supplied conversation must match it, never override it. Require original recipient equal
+to the authenticated respondent, explicit reply recipient equal to original sender, original state
+`handed_off`, and current authorization of the reverse edge. Wrong recipient/replier/conversation,
+unknown original or other final states reject without ACK or reply insertion. `dispatching`
+returns retryable `delivery_pending`; durable ingestion must not advance its cursor past that event.
+ACK and trusted reply insertion commit together, with the reply stamped under the current grant.
+An older delivered original may anchor a newly authorized reply; this never revives a previously
+cancelled queued reply. A duplicate original ACK fails its expected-state transition.
+
+Fresh and reply messages have exactly one recipient; no implicit broadcast or topology fan-out.
+Inboxes remain linked to envelope IDs, not an assumed opposite peer. Historical membership rows
+remain available for provenance; whether a removed member may read or dispose of an inbox item
+belongs to the inbox specification, not an automatic membership-to-inbox permission inference.
+
+## Errors and rejection guarantees
+
+Names below are logical error classes; transport codes/envelopes are defined elsewhere.
+
+| Error | Examples | Mutation |
+| --- | --- | --- |
+| `invalid_membership` | Duplicate/self/nonmember edge, invalid role/tag/shape/identifier, fewer than two members | None |
+| `unsupported_membership` | Valid model outside the first-runtime subset | None |
+| `stale_grant_version` / `no_active_grant` / `already_active` | Failed operation precondition | None |
+| `not_permitted` / `grant_expired` | Invalid acceptance edge or expired grant | No accepted message or budget claim |
+| `budget_exhausted` | Authorized claim with no remaining exchanges | Envelope stays queued; no host attempt |
+| `delivery_pending` | Reply original still dispatching | No ACK/reply; source event retained for retry |
+| `wrong_recipient` / `wrong_replier` / `stale_reply` | Invalid reply provenance or state | No ACK/reply |
+| `migration_incompatible` | Invalid history or constraints, unexpected dependent schema | Entire migration rolls back |
+
+Claim-time authorization denial preserves current behavior: cancel an ordinary queued row;
+a trusted reply whose only failure is expiry stays queued for renewal. Failed acceptance is not
+claim-time cancellation. Cancellation and settlement use expected state/attempt checks.
+
+## Room-stage storage and migration
+
+These tables appear only after the two-peer inbox. Allocate the next numbered migration from the
+schema actually shipped then; do not reserve version 5 now (the current core is version 4).
+
+| Table | Key and required constraints |
+| --- | --- |
+| `grants` | Preserve `(conversation, grant_version)` PK, conversation FK, lifecycle/accounting fields and one-active partial unique index; replace positional fields with `policy_kind` CHECK in the three allowed tags |
+| `grant_members` | PK `(conversation, grant_version, peer_id)`; FK to grants; NOT NULL exact ID and role; role CHECK in `member`, `lead` |
+| `grant_edges` | PK `(conversation, grant_version, from_peer, to_peer)`; two composite FKs to grant_members; `CHECK(from_peer <> to_peer)` with binary identifier comparison |
+| `envelopes` | Preserve IDs, all existing fields and grant FK; add `CHECK(from_peer <> to_peer)` |
+
+Named policies have no stored edge rows. Cross-row rules (minimum membership, exactly one lead
+for `lead_only`, policy-compatible roles/edges) are validated as a whole inside the insertion
+transaction before activation, not claimed to be expressible by a row CHECK. Unique membership
+prevents repeated-peer entries. Sender/recipient self-edge CHECKs belong on tables that actually
+have those columns. Keep exact identifier validation at the application boundary as well.
+
+Do not add a historical envelope-to-membership FK: old envelope history may include rejected or
+previously accepted unenrolled sends and must remain inspectable. The existing grant-version FK
+and new self-send CHECK serve different purposes. Historical self-send rows or identical A/B
+members that cannot satisfy the required new constraints abort migration, without deleting or
+rewriting evidence. The operator must resolve such incompatible history explicitly before retry.
+
+Migration procedure, within the existing immediate transaction and `user_version` discipline:
+
+1. Require exclusive server ownership before opening storage. Run numbered predecessors first;
+   use the known schema version, not per-column sniffing. Reject future/unknown layouts. Preserve
+   frozen legacy-adoption SQL unchanged. Admit no readers, workers or clients during migration.
+2. Build new tables under temporary names, with their foreign keys pointing to the corresponding
+   new parents. Backfill **all** active, superseded and revoked grant versions using the exact
+   mapping above, preserving stored peer IDs, historical counters, dates and cancellation flags.
+3. Rebuild the closed set of tables referencing replaced parents, including envelopes and any
+   inbox/audit tables that have landed by then. Copy rows parent-first, preserving all IDs and
+   references, before dropping any original table. Enumerate that graph from the shipped schema
+   in the migration definition; an unrecognized dependency fails migration, not a best-effort copy.
+4. Drop original dependent tables leaf-first, then original parents, so foreign keys stay enabled.
+   Rename new parents and their dependent tables into their final names. Recreate the version's
+   known indexes/triggers/views after data copying; do not fire application audit triggers while
+   rebuilding. Do not rename an original parent to a backup name first, which rewrites references.
+5. Verify full row/value equivalence except the explicit representation/constraint changes,
+   exact allowed-edge equivalence for every legacy version, no orphan FKs, and valid catalog.
+   `PRAGMA foreign_key_check` must return no rows. Check database integrity and required queue
+   indexes. Only then advance `user_version` and commit. Every intermediate failure rolls back.
+
+This is an application-specific rebuild of the complete dependent graph with foreign keys enabled,
+not a single-table drop under active dependents. The eventual migration PR must instantiate the
+then-current inbox/audit schemas and prove the graph ordering against the pinned SQLite driver;
+it cannot silently disable foreign keys or use `writable_schema` if that ordering is insufficient.
+SQLite's [schema-change documentation](https://www.sqlite.org/lang_altertable.html) explains the
+create/copy/drop/rename pattern and rename-reference hazards; its
+[foreign-key documentation](https://www.sqlite.org/foreignkeys.html) governs dependent drops.
+
+No data migration runs twice, no migration statement is replayed after partial execution, and
+no old/new writers coexist. Pre-room readers derive historical members on demand; post-room
+readers use only migrated representation. Downgrade requires a stopped-service consistent backup
+restore, not dual-write compatibility or an automatic destructive reverse migration.
+
+## Required contract fixtures
+
+These are specified assertions for implementation PRs, **not tests claimed to exist or pass today**.
+Use temporary file-backed WAL databases for migration/concurrency claims.
+
+| Fixture | Required result |
+| --- | --- |
+| Every legacy Direction, both member input orders and all candidate sender/recipient pairs | Exact old/new edge equivalence; reject outsiders and self-send |
+| Pair object → storage → object across restart | Preserve kind, roles, edge and exact IDs; no caller-order meaning |
+| `lead_only`, two-edge/empty directed, larger members on first runtime | Explicit unsupported error and byte-for-byte unchanged durable state |
+| Invalid roles, duplicate IDs/edges, missing endpoints, control-bearing IDs, unknown fields | Invalid error; no version/budget/queue mutation |
+| Lead plus D1/D2, then add D3 under lead_only | Lead↔each developer allowed, developer↔developer forbidden |
+| Same members under open / explicit directed | All distinct edges / only enumerated edges; directed does not expand on add |
+| Enroll/re-enroll/renew/replace with stale concurrent expected versions | One winner; monotonic history and one active row; no partial loser mutation |
+| Remove recipient or deny its edge during queued reply and during an in-flight never-attempted result | Cancel/report, do not reset original ACK; no rescue past removal |
+| Remove then re-add / deny then re-allow before late settlement | Intervening denial still blocks carry |
+| Ordinary renewal; opt-out; revoke; expired successor | Preserve ordinary cancellation, default eligible carry, sticky barriers and expiry waiting |
+| Two senders race for final budget unit | Exactly one claim; shared budget exhausted; no per-member reserve |
+| Duplicate settlement/refund and stale attempt result | Exactly one original-version refund; no successor/new-attempt overwrite |
+| Reply unknown/wrong recipient/replier/conversation, malformed/duplicate/stale marker | Reject atomically; no ACK or trusted insertion |
+| Reply original dispatching, then handed off; duplicate ingestion | Retry pending event, then one ACK/reply; duplicate cannot ACK again |
+| All known version-zero schemas and every numbered predecessor, including revoked/superseded history | Complete backfill preserving keys, values, provenance and edge sets |
+| Inject failure during copy/drop/rename/index/version update; terminate before commit | Restart sees intact old schema/version/data; no partial shadow catalog |
+| Self-edge, repeated member, missing FK and invalid policy after migration | Database constraints or transactional graph validator reject as specified |
+| Incompatible historical self-send/identical pair or unrecognized dependent table | Whole migration fails, leaving source evidence unchanged |
+| Inbox/audit references, queue ordering/indexes and uncertain rows after migration | References and state unchanged; uncertainty never automatically replayed |
+
+## Source basis and review boundary
+
+At core baseline `a8beeffd1bbbfaf0033e086e68af74c5108cb56a`, compare
+[Grant.PermitsDirection](../../internal/store/types.go),
+[controller enrollment/renewal](../../internal/controller/controller.go),
+[budget claims/refunds](../../internal/store/grants.go),
+[carry-forward and attempt settlement](../../internal/store/envelopes.go),
+[dispatch authorization](../../internal/dispatch/dispatch.go),
+[atomic reply ingestion](../../internal/adapter/codex/ingest.go) and
+[numbered migrations](../../internal/store/migrations.go).
+
+Specification review must assess the first-runtime supported subset, error/operation contracts,
+full-history carry predicate and foreign-key-preserving migration strategy, in addition to the
+already accepted policy model/timing. Passing `mise run verify` validates repository checks and
+links; it does not approve these proposed contracts or prove the future migration implementation.
