@@ -18,6 +18,7 @@ from host_trials import (
     SessionRegistry,
     SubmissionUncaptured,
     SubmissionUnsupported,
+    TeardownUnsupported,
     background_sessions,
     classify_trial,
     codex_rollout_events,
@@ -571,6 +572,20 @@ class CodexDriverTests(unittest.TestCase):
         registry.mint('thread-1')
         self.assertEqual(self.driver(registry, None).observe('thread-1', marker=MARKER, submitted_at=0.0),
                           Observation(outcomes={}, observable=False))
+
+    def test_teardown_refuses_and_retains_ownership(self):
+        # codex has no `queue --stop`; releasing the registry entry anyway would make the
+        # runner believe a live, authenticated host session had been cleaned up when it had
+        # not.
+        registry = SessionRegistry()
+        registry.mint('thread-1')
+        with self.assertRaises(TeardownUnsupported):
+            self.driver(registry, None).teardown('thread-1')
+        registry.require_owned('thread-1')  # still ours: nothing was actually torn down
+
+    def test_teardown_refuses_a_foreign_thread(self):
+        with self.assertRaises(ForeignSessionError):
+            self.driver(SessionRegistry(), None).teardown('not-mine')
 
 
 class OpenCodeDriverTests(unittest.TestCase):

@@ -229,6 +229,10 @@ Outcome detection is grounded in captured real output, not assumed formats:
   a thread that already exists, and no creation output shape has been captured to parse an id
   out of. `CodexDriver.create()` raises `SessionCreationUncaptured`, so a Codex cell is run as
   `run_trial(..., existing_session=<thread id>)` against a thread the caller made themselves.
+  Teardown is equally uncaptured: `codex queue` has no `--stop`/`--delete`/equivalent, so
+  `CodexDriver.teardown()` raises `TeardownUnsupported` and retains registry ownership rather
+  than silently releasing it — releasing on a no-op would read as a live, authenticated host
+  session having been cleaned up when it had not.
 - Codex's rollout JSONL (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`) is one JSON object
   per line; a chat turn is `{"type": "response_item", "payload": {"type": "message", "role":
   "user"|"assistant"|"developer", "content": [{"type": "input_text"|"output_text", "text":
