@@ -631,6 +631,24 @@ class RunTrialTests(unittest.TestCase):
         self.assertNotIn('accepted', run.outcomes)
         self.assertIsNone(run.accepted_at)
 
+    def test_rejected_submission_skips_polling_and_marks_transcript_outcomes_unobservable(self):
+        # A clean nonzero exit is a real, observed failure to accept -- 'not_observed' is the
+        # true classification for `accepted` itself -- but nothing was delivered, so polling for
+        # transcript outcomes and eventually reporting them `not_observed` would be negative
+        # evidence for a marker the host never received.
+        clock = FakeClock()
+        driver = FakeDriver(accepted=False, clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertNotIn('observe', driver.order)
+        self.assertTrue(run.observable['accepted'])
+        self.assertFalse(run.observable['visible'])
+        self.assertFalse(run.observable['turn_start'])
+        self.assertFalse(run.observable['ack'])
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
+        classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
+        self.assertEqual(classified['accepted'], 'not_observed')
+        self.assertEqual(classified['visible'], 'unobservable')
+
     def test_observation_continues_through_the_windows_instead_of_one_snapshot(self):
         # The outcome lands on a later poll: a single immediate snapshot reported it
         # not_observed even though it arrived inside its own window.
