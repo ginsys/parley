@@ -37,9 +37,12 @@ creation or joining; a waiting conversation has no active communication grant un
 human administration approves the actual pair and its limits. An offline member does not free a
 place. This is a target workflow; discovery, waiting and admission are not implemented yet.
 
-The [identity proposal](docs/identity-proposal.md) covers registration, credentials, discovery and
-reconnect for owner review. Its proposed authentication and session-lifetime rules are not accepted
-exceptions to the protected-controller boundary or evidence of live host identity binding.
+The [accepted identity decision](docs/identity-proposal.md) binds each peer to one native host
+session with a private credential, explicit discovery and exclusive reconnect generations.
+Revocation holds survive credential recovery; database restoration requires reconciliation before
+ordinary work resumes. The [connection specification](docs/specifications/connections.md) develops
+these contracts for review. Neither document proves live host identity binding or changes the
+protected-controller boundary.
 
 ## Start from the work item
 
