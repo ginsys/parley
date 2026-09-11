@@ -263,6 +263,15 @@ class CodexParsingTests(unittest.TestCase):
                                          'content': ['not-a-part', {'text': 'hi'}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
+    def test_a_part_omitting_text_entirely_makes_the_whole_record_unusable(self):
+        # `.get('text', '')` let a part with no `text` key default to an empty string and pass
+        # as captured -- an unreadable marker message would join down to an ordinary-looking
+        # empty string, negative evidence rather than the unusable read it actually is.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                             'payload': {'type': 'message', 'role': 'assistant',
+                                         'content': [{'type': 'text'}]}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
     def test_a_non_object_record_is_unusable_rather_than_an_attributeerror(self):
         # Valid JSON is not necessarily an object -- a damaged or schema-drifted line can decode
         # to `null`, a number or a list -- and `record.get(...)` on any of those raises instead

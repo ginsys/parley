@@ -580,13 +580,15 @@ def codex_rollout_events(lines):
             continue
         texts = []
         for part in content:
-            part_text = part.get('text', '') if isinstance(part, dict) else None
+            part_text = part.get('text') if isinstance(part, dict) else None
             if not isinstance(part_text, str):
-                # A non-dict part or a non-string `text` value (e.g. explicit `null`) is a shape
-                # this runner has not captured. Silently dropping just that part let an
-                # unreadable marker message join down to an empty, ordinary-looking string --
-                # negative evidence rather than the unusable read it actually is -- and
-                # `''.join` on a non-string value raised outright. Fail the whole record closed
+                # A non-dict part, a missing `text` key, or a non-string `text` value (e.g.
+                # explicit `null`) is a shape this runner has not captured. `.get('text', '')`
+                # let a part that omits `text` entirely default to an empty string and pass as
+                # captured; silently dropping a part (dict or not) the same way let an unreadable
+                # marker message join down to an ordinary-looking empty string -- negative
+                # evidence rather than the unusable read it actually is, and could even produce a
+                # false `turn_start` from an assistant record. Fail the whole record closed
                 # instead of guessing at a partial join.
                 texts = None
                 break
