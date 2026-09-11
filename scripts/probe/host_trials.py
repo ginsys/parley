@@ -553,6 +553,14 @@ class CodexDriver:
         (docs/host-probes.md, Trial protocol) could never be satisfied for a host with no
         creation path. Excluding it does not weaken the guarantee this method exists for: an
         outside human thread is still caught, since it was never registered here.
+
+        A file's own last-modified time not having moved since before `started_at` proves every
+        record inside it predates the run too — the run could not have written to a rollout it
+        had not started yet — so such a file is skipped without opening or parsing it. On an
+        operator's real, long-lived `$CODEX_HOME/sessions` this is the overwhelming majority of
+        rollouts: only the handful touched since this run began need the actual read. Anything
+        modified at or after `started_at` still gets the full read; the mtime check only ever
+        turns "definitely too old to matter" into a skip, never a rival into a non-rival.
         """
         adopted = os.path.realpath(adopted)
         already_owned = {os.path.realpath(self.rollout_path_for(thread_id))
@@ -571,6 +579,8 @@ class CodexDriver:
                 if other == adopted or other in already_owned:
                     continue
                 try:
+                    if os.path.getmtime(other) < self.started_at:
+                        continue
                     with open(other, encoding='utf-8') as handle:
                         started = rollout_started_at(handle)
                 except (OSError, UnicodeDecodeError):
