@@ -157,6 +157,18 @@ class ClaudeParsingTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             driver._background_session_ids()
 
+    def test_background_sessions_raises_on_a_non_dict_list_entry(self):
+        # A malformed entry silently dropped by the filter, rather than rejected, lets a
+        # snapshot read as "just fewer sessions" instead of "untrustworthy for diffing" -- a
+        # race where a real background session is malformed in one snapshot and well-formed in
+        # the next could then have create() mint it as this trial's own.
+        with self.assertRaises(RuntimeError):
+            background_sessions(json.dumps([{'id': 'a', 'kind': 'background'}, 'not-an-object']))
+
+    def test_background_sessions_raises_on_an_empty_string_id(self):
+        with self.assertRaises(RuntimeError):
+            background_sessions(json.dumps([{'id': '', 'kind': 'background'}]))
+
     def test_transcript_parses_role_prefixed_multiline_blocks(self):
         raw = f'User: hello {MARKER}\ncontinued\nAssistant: got it\nstill talking\n'
         events = parse_claude_transcript(raw)
