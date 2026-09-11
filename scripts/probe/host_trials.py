@@ -87,6 +87,15 @@ class SessionCreationUncaptured(NotImplementedError):
     """
 
 
+class TeardownUnsupported(NotImplementedError):
+    """Raised when this runner has captured no real teardown mechanism for a host session.
+
+    Releasing the registry entry anyway would make the runner believe a live, authenticated
+    host session had been cleaned up when it had not; ownership is retained instead, so the id
+    stays inspectable and a caller cannot mistake this for a successful teardown.
+    """
+
+
 @dataclass
 class SessionRegistry:
     """Tracks session ids created by *this run*; refuses to touch anything else.
@@ -614,8 +623,18 @@ class CodexDriver:
         return observation
 
     def teardown(self, thread_id):
+        """Refuse: no real teardown mechanism has been captured for a Codex thread.
+
+        `codex queue` has no `--stop`/`--delete`/equivalent. Releasing the registry entry
+        anyway would make the runner believe a live, authenticated host session had been
+        cleaned up when it had not, leaving it running under the operator's real HOME with no
+        cleanup (AGENTS.md, Test isolation). Ownership is retained rather than released, so the
+        thread stays inspectable and a caller cannot mistake this for a successful teardown.
+        """
         self.registry.require_owned(thread_id)
-        self.registry.release(thread_id)  # codex has no `queue --stop`; nothing to tear down
+        raise TeardownUnsupported(
+            f'codex has no captured teardown mechanism; thread {thread_id} remains registered '
+            'and its host session is still live')
 
 
 class OpenCodeDriver:
