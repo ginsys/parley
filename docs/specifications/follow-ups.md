@@ -55,7 +55,7 @@ positive signed 64-bit integers, checked before increment. No implicit trimming.
 | --- | --- |
 | Follow-up | `follow_up_id`; unique `envelope_id` FK; immutable `conversation`, `original_sender`, `original_recipient`, `accepted_grant_version`; `assignee` initially recipient, restricted to the original pair; `disposition` = `open`, `deferred`, `resolved`; positive `version`; `priority` = `routine`, `blocker`; `created_at`, `updated_at`; nullable `defer_reason`, `defer_until`, `resolution_code` |
 | Assignment offer | Unique `offer_id`, follow-up FK, `from_peer`, `to_peer`, creation and finite expiry; `pending`, `accepted`, `declined`, `cancelled`, `expired`; positive version; at most one pending offer per item; two distinct original peers only |
-| Disposition event | Unique `event_id`, follow-up FK, actor binding/credential provenance or tagged server timer, previous/new item version, operation kind, reason/result code, server time; append-only; no original message body |
+| Disposition event | Unique `event_id`, follow-up FK, actor binding/credential provenance or tagged server timer, previous/new item version, operation kind, reason/result code, server time; nullable `offer_id`, `previous_offer_version`, `new_offer_version` with the offer-change constraints below; append-only; no original message body |
 | Mutation receipt | Unique `(binding_id, operation_id)`, method, canonical typed request digest and committed result; immutable; no credentials or original text; durable with its mutation |
 | Checkpoint receipt | Unique `(binding_id, checkpoint_id)`, exact conversation, caller's last-seen revision, committed response metadata and response revision; immutable; no message bodies |
 | Inbox revision | Monotonic revision per `(conversation, binding_id, view)`; advance only when that authorized projection changes, including access invalidation; no global revision exposed as a substitute and no promise of a durable event stream |
@@ -64,6 +64,14 @@ Store checks enforce disjoint disposition fields: only deferred rows have both d
 resolved rows have `resolution_code`. Offer source must equal the current assignee when created;
 acceptance verifies it again transactionally. FKs and immutable original provenance survive grant
 renewal even if the envelope's delivery grant version changes. Never use a display name as identity.
+
+Every event that creates or changes an offer carries its exact `offer_id` and new offer version,
+including timer expiry and cancellation caused by resolve, defer or reopen. Its composite
+`(follow_up_id, offer_id)` FK must identify that item's offer. Creation has a null previous offer
+version and new version one; other changes require positive previous/new versions with exactly one
+increment. Events without an offer change have all three offer fields null. Enforce these variants
+with checks, append the event with the offer/item update, and retain offer rows as historical FK
+targets. Sequential offers and server-timer events must be reconstructable without a client receipt.
 
 Follow-up creation and envelope acceptance commit together with authenticating provenance and the
 send's idempotency record. Reject malformed metadata before creating either. Supported metadata is
@@ -74,8 +82,9 @@ ordinary explicit send is the only creation path in this milestone. Historic env
 guessed follow-ups during migration. Schema failures roll back without modifying historical delivery
 evidence.
 
-Retain records, receipts and disposition events for the lifetime of their envelope history; no
-automatic purge is specified. They contain no extra free-form task text. Database restore must
+Retain follow-up records, receipts, offers and disposition events for the installation lifetime; no
+automatic purge is specified. Human payload retirement must preserve their metadata, original
+envelope identity and permanent replay evidence. They contain no extra free-form task text. Database restore must
 reconcile them along with delivery, grant, security-hold and replay state before ordinary operation.
 A new process epoch or credential must not make an old operation ID executable again.
 
@@ -126,11 +135,30 @@ defer_until`, the writer reopens the item and clears defer fields. Deadline proc
 host or invents an agent actor. Clock/restore recovery barriers prevent ordinary timer mutation
 until reconciled.
 
-Process due deadlines before reading or mutating the affected item. A bounded checkpoint may advance
-at most 100 due rows; if more remain it returns `refresh_required`, no complete-summary claim, and
-the next check continues. Due indexes and writer batches must avoid a database-wide scan. Offer
-expiry and deferral are observed durably; backward wall time cannot undo recorded transitions. All
-return-time calculations use trusted server time, not client timestamps.
+Before any fresh list or checkpoint response, process due deadlines in its authorized conversation
+and projection, including rows whose deadlines would change the requested filter's membership.
+Each request advances at most 100 due records in one writer batch, ordered by deadline, record kind
+and ID; an indexed 101st-record probe detects remaining work. If more remain, commit the batch and
+return `refresh_required` with no item page, counts, cursor or complete-summary claim. The next
+request continues from the now-persisted deadlines. This applies to every `inbox.list` page as well
+as `inbox.checkpoint`; an old pagination revision invalidated by the batch requires a fresh first page.
+
+Capture a server-time cutoff in the serialized writer, advance the batch, and establish the
+authorized read snapshot/revision against that same cutoff before releasing the coordinator gate.
+The response's `server_time` is this as-of instant; deadlines that become due later are handled by
+the next request. Never silently move the cutoff forward after the due pass. Hidden records must
+not trigger refresh or expose their existence to this projection. Indexed due lookups, the writer
+batch, coordinator/pool waits and snapshot materialization all share the read's five-second total
+deadline. Do not loop over further batches within one request; deadline exhaustion returns `busy`
+without a partial page. A batch already committed before that timeout remains durable.
+
+A fresh single-item read or mutation processes only that authorized item's deferral and pending
+offer (at most two due records) with the same cutoff rule, before checking expected versions or
+returning current detail. Due events may therefore commit even when the requested client mutation
+then fails its version check; report the authorized current version, not a partially successful
+client mutation. Authorized receipt replay returns the historical result directly and does not
+advance deadlines. Offer expiry and deferral are observed durably; backward wall time cannot undo
+recorded transitions. All return-time calculations use trusted server time, not client timestamps.
 
 Authenticate and authorize before receipt lookup; a currently revoked peer cannot retrieve an old
 success. A same-principal, same-operation, identical typed request returns its committed result
@@ -232,20 +260,39 @@ ID to refresh. An adapter records consumed checkpoint IDs durably and must not k
 same response twice. A crash between rendering and recording can repeat the metadata notice; it
 cannot guarantee exactly-once display. Original instructions are never embedded.
 
-Limit inbox requests to one in flight per binding, list/detail to 60 requests/minute and checkpoints
-to six/minute. On startup give each binding zero tokens, refill uniformly to those capacities;
-reconnect shares the binding's bucket and does not refill it. Return `rate_limited` with bounded
-retry delay before database work. There is no periodic reminder timer, automatic host enqueue,
-notification exchange charge, or claimed maximum blocker-response latency. A busy agent may not see
-a blocker until its next checkpoint; that is the explicit proposed tradeoff. Budgeted ordinary
-message delivery and host readiness keep their existing independent rules.
+All inbox and follow-up requests share one in-flight slot per binding. Apply independent per-binding
+token buckets: list/detail 60 requests/minute, checkpoints six/minute, and all `follow_up.*` mutation
+methods together 30/minute. `follow_up.get` belongs to the list/detail bucket. Count retries and
+invalid/stale requests too; fresh operation IDs, alternating defer/reopen, switching conversations,
+credential rotation and reconnect cannot bypass the shared mutation bucket. On startup give each
+binding zero tokens and refill uniformly to those capacities using monotonic time. Return
+`rate_limited` with bounded retry delay before database work; rejection creates no durable receipt.
+Server deadline advancement is not an agent mutation and instead obeys the per-request batch bound.
+
+Rate limits bound growth speed, not lifetime storage. Apply the connection specification's
+[permanent replay and capacity contract](connections.md#operation-replay-and-errors) to follow-ups,
+events, offers and both receipt types. Capacity checks cover all rows needed by a transaction;
+insufficient provisioned storage or a storage-full write rolls back that transaction and returns
+`capacity_exceeded`, with no partial disposition, offer, event or receipt. New checkpoint IDs also
+consume storage even when their result is unchanged. Never evict receipts/events or reset IDs to
+make space; authorized replay of an existing receipt needs no new allocation. If a due batch cannot
+commit for lack of capacity, return `capacity_exceeded` rather than a stale page or summary. A
+successful prior due batch remains durable if a later client-receipt transaction runs out of space.
+Recovery follows the human-controlled storage/replay contract; this feature grants no cleanup or
+budget authority. An unknown commit outcome must be recovered with the same ID, never reported as
+a proven rollback or retried with a fresh ID.
+
+There is no periodic reminder timer, automatic host enqueue, notification exchange charge, or
+claimed maximum blocker-response latency. A busy agent may not see a blocker until its next
+checkpoint; that is the explicit proposed tradeoff. Budgeted ordinary message delivery and host
+readiness keep their existing independent rules.
 
 ## Errors and implementation fixtures
 
 Stable codes: `invalid_request`, `unauthenticated`, `not_found_or_forbidden`, `version_conflict`,
 `operation_conflict`, `invalid_transition`, `delivery_not_eligible`, `held`, `offer_expired`,
-`refresh_required`, `rate_limited`, `recovery_required`, `busy`, `counter_exhausted`. Check
-visibility before item-specific codes; errors and logs contain neither message bodies nor secrets.
+`refresh_required`, `rate_limited`, `capacity_exceeded`, `recovery_required`, `busy`,
+`counter_exhausted`, `outcome_unknown`. Check visibility before item-specific codes; errors and logs contain neither message bodies nor secrets.
 Transport mapping must preserve these meanings; the admin control protocol cannot turn an agent into
 a human.
 
@@ -259,8 +306,8 @@ calls; run the repository's full `mise run verify` for each implementation incre
 | F01 | Ordinary send, actionable send, malformed flags, duplicate accepted send | Zero/one follow-up as requested; malformed metadata creates neither record; duplicate creates one item and original only. |
 | F02 | Original transitions queued → dispatching → handed_off → acked; normal/trusted reply arrives | Eligibility changes; disposition stays open; ingestion cannot create or finish a follow-up from prose. |
 | F03 | Assignee resolves/defer/reopens; sender/third peer tries same; inspect one-way grant | Correct versioned transitions and fixed codes; unauthorized changes fail; sender learns no recipient state, revision change or cursor invalidation on a one-way edge. |
-| F04 | Deferral at boundary, 101 due items, clock rollback/restart | Due items durably reopen in bounded passes; incomplete summary signals refresh; observed transitions never reverse. |
-| F05 | Offer, decline, cancel, accept; simultaneous accept/resolve; expired offer | Responsibility stays until exact-version acceptance; one winner; no third peer or self-transfer; no replayed original. |
+| F04 | Deferral at boundary, 101 and 250 due items after downtime; first/continued list pages, checkpoint, detail, mutation; clock rollback/restart and a deadline crossed during snapshot setup | List/checkpoint advances at most 100 plus one indexed probe and returns refresh without stale data while more are due; detail/mutation touches only its item; five-second total deadline and fixed cutoff hold; invalidated cursors restart; committed due batches survive later errors and observed transitions never reverse. |
+| F05 | Multiple sequential offers: decline, cancel, accept; simultaneous accept/resolve; timer expiry and cancellation through resolve/defer/reopen | Responsibility stays until exact-version acceptance; one winner; no third peer or self-transfer; no replayed original. Every offer-changing event carries the exact offer FK and version transition, including timer and side-effect events; malformed/null variants reject; audit reconstruction needs no client receipt. |
 | F06 | Lost mutation response; repeated operation ID with identical/different arguments; crash before commit | Exactly one committed change or no change; conflict on changed request; original receipt marked historical. |
 | F07 | Two conversations with same peers; another authenticated peer guesses IDs/cursors | Explicit scoping; no cross-conversation data/count leak; generic inaccessible response. |
 | F08 | Renewal preserving original edge, removal, revoke/re-enroll, binding rotation/revocation | Preserved authorized history only; no history inheritance or hold bypass; revoked actor cannot replay receipts. |
@@ -270,7 +317,8 @@ calls; run the repository's full `mise run verify` for each implementation incre
 | F12 | Paginated listing with concurrent disposition, authorization change, restart and cursor tampering | Stable page or explicit refresh/rejection; bounded read lifetime; no mixed or unauthorized pages. |
 | F13 | Unknown fields, oversized/invalid IDs, counter/time overflow, invalid actor/offer FKs | Fail without partial rows, receipt or event; database constraints and transaction checks both exercised. |
 | F14 | Failed/cancelled/uncertain original; migration and restore of old data | No invented completion, receipt or retry, and no pre-handoff body retrieval bypass; blocked work remains evidence; historic envelopes not auto-classified; restore reconciles receipts and holds. |
-| F15 | Reconnect/restart and repeated checks over configured rates; missing/stale checkpoint revision | Shared binding limits and cold-start refill hold; unchanged revision suppresses reminders; null revision yields only one bounded notice. |
+| F15 | Reconnect/rotation/restart, cross-conversation alternating defer/reopen with fresh IDs, duplicate/stale requests and all mutation methods; missing/stale checkpoint revision | Shared binding slot and each bucket hold, including the combined 30/minute mutation rate and cold-start refill; rejected requests append nothing; unchanged revision suppresses reminders; null revision yields one bounded notice. |
+| F16 | Capacity exhausted during offer/resolve/event/receipt creation, unchanged checkpoint, due batch and existing-receipt replay; injected storage-full failure and unknown commit outcome | Definite failed transaction rolls back all its rows with capacity_exceeded; no stale page on failed deadline advancement; prior committed batch remains; no replay-state eviction; authorized existing receipt remains replayable without allocation; unknown outcome uses the original ID. |
 
 Owner review must assess the two-peer walkthrough, explicit actionability, transfer acceptance,
 post-revoke visibility and checkpoint-only blocker policy. This does not solve live wake delivery,
