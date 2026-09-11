@@ -56,6 +56,20 @@ class ObservationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             aggregate(['observed'])
 
+    def test_invalid_observation_inputs_cannot_be_classified(self):
+        cases = [(Trial(0, state='buisy'), 200), (Trial(10), 0),
+                 (Trial(0, outcomes={'ACK': 1}), 200),
+                 (Trial(0, outcomes={'accepted': 300}), 200),
+                 (Trial(0, state='busy', turn_end=-1, outcomes={'ack': 1}), 200),
+                 (Trial(0, state='busy', turn_end=300, outcomes={'ack': 1}), 200)]
+        for invalid in (float('nan'), float('inf'), -float('inf')):
+            cases.extend([(Trial(invalid), 200), (Trial(0), invalid),
+                          (Trial(0, state='busy', turn_end=invalid), 200),
+                          (Trial(0, outcomes={'ack': invalid}), 200)])
+        for trial, now in cases:
+            with self.subTest(trial=trial, now=now), self.assertRaises(ValueError):
+                trial.result('ack', now)
+
 
 class PtyTests(unittest.TestCase):
     def setUp(self):

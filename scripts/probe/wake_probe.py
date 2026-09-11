@@ -6,6 +6,7 @@ prompt state/session generation; the recorder cannot infer either from terminal 
 
 import errno
 import json
+import math
 import os
 import pty
 import selectors
@@ -31,14 +32,25 @@ class Trial:
 
     def result(self, outcome, now, *, supported=True, observable=True):
         window = WINDOWS[outcome]
+        if self.state not in ('idle', 'busy', 'approval', 'disconnected', 'restarted'):
+            raise ValueError('unknown trial state')
+        if any(key not in WINDOWS for key in self.outcomes):
+            raise ValueError('unknown observed outcome')
+        timestamps = [self.submitted, now, *self.outcomes.values()]
+        if self.turn_end is not None:
+            timestamps.append(self.turn_end)
+        if not all(math.isfinite(value) for value in timestamps) or now < self.submitted:
+            raise ValueError('invalid observation clock')
+        if self.turn_end is not None and not self.submitted <= self.turn_end <= now:
+            raise ValueError('turn end outside trial')
+        if any(not self.submitted <= value <= now for value in self.outcomes.values()):
+            raise ValueError('observation outside trial')
         if not supported:
             return 'unsupported'
         if not observable:
             return 'unobservable'
         start = self.submitted
         observed = self.outcomes.get(outcome)
-        if observed is not None and not self.submitted <= observed <= now:
-            raise ValueError('observation outside trial')
         if self.state == 'busy' and outcome in ('turn_start', 'ack'):
             # An early independently observed event is usable without a turn-end signal.
             if (observed is not None and observed <= self.submitted + 900
@@ -50,8 +62,6 @@ class Trial:
                 if now < self.submitted + 900:
                     raise ValueError('current-turn observation window still open')
                 return 'inconclusive'
-            if not self.submitted <= self.turn_end <= now:
-                raise ValueError('turn end outside trial')
             start = self.turn_end
         if observed is not None and observed <= start + window:
             return 'observed'

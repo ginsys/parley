@@ -106,6 +106,10 @@ wait at most 15 minutes for the existing turn to finish. If it does not finish w
 dependent outcomes are inconclusive; if completion cannot be detected, they are unobservable.
 Earlier independently observed outcomes count immediately. Keep later evidence separately.
 `Trial.result` refuses to finalize a still-open observation window.
+Its state values are `idle`, `busy`, `approval`, `disconnected` and `restarted`; unknown states
+are rejected instead of silently receiving idle timing. Clock values must be finite, with
+submission no later than now and every observed outcome/turn end inside that interval. Unknown
+outcome names and invalid timestamps are errors, never a classified trial result.
 
 Result codes: `observed`, `not_observed` (not observed within the window), `unobservable`,
 `unsupported`, `inconclusive`. No negative classification proves nondelivery. Record which signal
