@@ -42,9 +42,11 @@ positive maxima/versions; fractional, overflowing and negative values are invali
 }
 ```
 
-`conversation` and `peer_id` are opaque exact identifiers. Apply existing nonempty/metadata
-validation; never trim, case-fold, Unicode-normalize or rewrite historical IDs. Each member has
-exactly one role (`member` or `lead`) per grant version. Duplicate IDs, duplicate edges and edges
+`conversation` and `peer_id` are opaque exact identifiers. For new identifiers, require valid
+UTF-8 in addition to existing nonempty/metadata validation; never trim, case-fold,
+Unicode-normalize or rewrite historical IDs. The existing-ID treatment in
+[the proposed compatibility decision](#proposed-utf-8-compatibility-decision) requires owner approval.
+Each member has exactly one role (`member` or `lead`) per grant version. Duplicate IDs, duplicate edges and edges
 with endpoints outside membership are invalid. At least two distinct members are required;
 removing the penultimate member requires revocation instead of activating a one-member grant.
 
@@ -66,6 +68,62 @@ A grant snapshot adds server-owned `grant_version`, `status`, `max_exchanges`, `
 membership, roles and policy are immutable within a version. Existing `revoked_at` also records
 supersession time; preserve that historical meaning instead of treating every non-null value as
 an actual revocation event. Status distinguishes revoked from superseded history.
+
+## Proposed UTF-8 compatibility decision
+
+**Proposed for owner ruling, not an accepted change to deployed behavior.** This closes a current
+defect as well as a future-protocol gap: `ValidateMetadata` at the source baseline ranges over
+invalid bytes as replacement runes without rejecting them. Distinct keys such as bytes `61FF`
+and `61FE` can therefore both be enrolled but serialize as the same JSON string. Merely changing
+the future wire format would leave the existing enrollment/delivery defect unaddressed.
+
+The proposed policy is valid UTF-8 for new identity operations, with byte-preserving inspection
+and revocation for incompatible history:
+
+- Validate new conversation/peer identifiers before storage or authorization, and identifiers
+  before wrapping, routing or serialization. In Go this requires `utf8.ValidString`, not rejection
+  of every `utf8.RuneError`: a genuinely encoded U+FFFD is valid text and remains unchanged.
+- Reject malformed UTF-8 input and unpaired JSON surrogate escapes before a decoder can replace
+  them. Validation after a lossy JSON decode is insufficient. This is a losslessness requirement
+  for whichever control framing is selected, not a decision to adopt JSON-RPC.
+- Retain every historical identifier byte-for-byte. Invalid UTF-8 alone does not authorize
+  rewriting IDs, deleting history, merging identities, or resetting ACK/budget state. The later
+  room backfill preserves these bytes; existing membership/self-send/FK incompatibilities still
+  abort migration as specified below.
+- Treat an active grant containing an invalid conversation/member identifier as unavailable for
+  new sends, claims, reply ingestion, renewal or membership replacement. This is a validation
+  failure, not an implicit revocation or status rewrite. Existing queued rows stay inspectable;
+  the administrator can revoke to cancel them. Already-dispatching/handed-off outcomes keep their
+  normal settlement rules. Invalid historical versions do not disable unrelated valid grants.
+- Keep affected grants revocable by their exact stored conversation key. Current human CLI
+  revocation already performs an exact lookup without validating peer metadata; preserve that
+  escape path when hardening enrollment. After revocation, explicit enrollment with valid IDs
+  creates a new version/conversation as appropriate; it never renames or revives old history.
+- Before replacing the current CLI with a JSON-facing administrator, provide authenticated
+  administrative inspection and revocation using a canonical uppercase hexadecimal selector for
+  the exact conversation bytes plus the expected grant version. Hex input is a maintenance
+  selector only, never a peer identity alias and never an enrollment, renewal or message route.
+  Decode it directly to the stored lookup bytes without Unicode conversion. The control spec
+  defines the method/field names and retains the same human-administration boundary.
+- Normal text API responses encountering incompatible identifiers fail explicitly with
+  `incompatible_identifier`; they must not replace bytes, omit affected records silently or emit
+  a partly encoded snapshot. Administrative inspection instead reports table/field, grant version,
+  and hex-encoded lookup/value bytes. Those ASCII diagnostics are lossless even when the
+  conversation key itself is invalid. Valid text responses remain the members-shaped API above.
+
+Read-only preflight must scan identifier fields in conversations, grants and envelopes as raw
+bytes, validate them strictly, and report exact hex locations before enabling the first text API;
+do not wait for the room migration. Include envelope IDs and reply references, not just enrolled
+peers. SQLite membership queries below do not detect UTF-8 validity. An inspection implementation
+must fetch bytes (for example via `CAST(column AS BLOB)`) rather than a decoder that repairs text.
+The same checks at mutation/read boundaries prevent a stale preflight from authorizing bad data.
+
+Alternative: carry arbitrary identifier bytes losslessly in every public API using a tagged or
+encoded identifier representation. That preserves continued use of invalid historical IDs but
+changes every address and consumer, rather than limiting byte encoding to administrative recovery.
+Automatic replacement with U+FFFD is never an acceptable alternative because it merges identities.
+Owner acceptance of the policy above is required before the live validation fix is implemented;
+that fix needs its own implementation issue/PR, not a claim that this specification repairs code.
 
 ## First-runtime subset and exact translation
 
@@ -197,6 +255,7 @@ Names below are logical error classes; transport codes/envelopes are defined els
 | Error | Examples | Mutation |
 | --- | --- | --- |
 | `invalid_membership` | Duplicate/self/nonmember edge, invalid role/tag/shape/identifier, fewer than two members | None |
+| `incompatible_identifier` | Historical identifier cannot be represented losslessly as valid UTF-8 | No new authorization or lossy response; exact-byte administrative inspection/revocation remains available |
 | `unsupported_membership` | Valid model outside the first-runtime subset | None |
 | `stale_grant_version` / `no_active_grant` / `already_active` | Failed operation precondition | None |
 | `not_permitted` / `grant_expired` | Invalid acceptance edge or expired grant | No accepted message or budget claim |
@@ -216,10 +275,15 @@ schema actually shipped then; do not reserve version 5 now (the current core is 
 
 | Table | Key and required constraints |
 | --- | --- |
-| `grants` | Preserve `(conversation, grant_version)` PK, conversation FK, lifecycle/accounting fields and one-active partial unique index; replace positional fields with `policy_kind` CHECK in the three allowed tags |
-| `grant_members` | PK `(conversation, grant_version, peer_id)`; FK to grants; NOT NULL exact ID and role; role CHECK in `member`, `lead` |
-| `grant_edges` | PK `(conversation, grant_version, from_peer, to_peer)`; two composite FKs to grant_members; `CHECK(from_peer <> to_peer)` with binary identifier comparison |
+| `grants` | Preserve `(conversation, grant_version)` PK with both columns explicitly NOT NULL, conversation FK, lifecycle/accounting fields and one-active partial unique index; replace positional fields with `policy_kind NOT NULL` and CHECK in the three allowed tags |
+| `grant_members` | PK `(conversation, grant_version, peer_id)` with all three columns explicitly NOT NULL; FK to grants; role NOT NULL and CHECK in `member`, `lead` |
+| `grant_edges` | PK `(conversation, grant_version, from_peer, to_peer)` with all four columns explicitly NOT NULL; two composite FKs to grant_members; `CHECK(from_peer <> to_peer)` with binary identifier comparison |
 | `envelopes` | Preserve IDs, all existing fields and grant FK; add version-scoped sender/recipient FKs to grant_members as below, and `CHECK(from_peer <> to_peer)` |
+
+All columns participating in these composite primary/foreign keys are explicitly NOT NULL,
+including the retained envelope conversation/version/sender/recipient columns. Do not infer this
+from PRIMARY KEY or CHECK: SQLite rowid tables allow null composite primary-key values, a null
+child-key component skips the FK check, and a CHECK expression evaluating to NULL passes.
 
 Named policies have no stored edge rows. Cross-row rules (minimum membership, exactly one lead
 for `lead_only`, policy-compatible roles/edges) are validated as a whole inside the insertion
@@ -353,6 +417,9 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | Pair object → storage → object across restart | Preserve kind, roles, edge and exact IDs; no caller-order meaning |
 | `lead_only`, two-edge/empty directed, larger members on first runtime | Explicit unsupported error and byte-for-byte unchanged durable state |
 | Invalid roles, duplicate IDs/edges, missing endpoints, control-bearing IDs, unknown fields | Invalid error; no version/budget/queue mutation |
+| Distinct invalid UTF-8 byte sequences, malformed JSON UTF-8/surrogates, and valid U+FFFD | Reject invalid new identifiers before replacement; preserve valid U+FFFD and all other valid exact bytes |
+| Historical invalid conversation/peer IDs | Block new authorization/renewal, preserve rows byte-for-byte, expose exact hex inspection and allow only authenticated exact-key revocation; unaffected grants still work |
+| Room backfill containing otherwise compatible invalid UTF-8 history | Preserve raw identifier bytes and relationships; do not silently replace, merge or drop history |
 | Lead plus D1/D2, then add D3 under lead_only | Lead↔each developer allowed, developer↔developer forbidden |
 | Same members under open / explicit directed | All distinct edges / only enumerated edges; directed does not expand on add |
 | Enroll/re-enroll/renew/replace with stale concurrent expected versions | One winner; monotonic history and one active row; no partial loser mutation |
@@ -366,6 +433,7 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | All known version-zero schemas and every numbered predecessor, including revoked/superseded history | Complete backfill preserving keys, values, provenance and edge sets |
 | Inject failure during copy/drop/rename/index/version update; terminate before commit | Restart sees intact old schema/version/data; no partial shadow catalog |
 | Self-edge, repeated member, missing FK and invalid policy after migration | Database constraints or transactional graph validator reject as specified |
+| NULL in each composite-key component or policy_kind, supplied explicitly or omitted | NOT NULL rejects the row; no unbound member/edge or policy-less grant |
 | Envelope sender or recipient exists only in another conversation/version | Its respective membership FK rejects insert/update; no partial mutation |
 | Historical envelope after member removal; eligible reply carried to a successor | Historical FK remains valid; successor members precede the atomic reply version update |
 | Attempt to delete membership still referenced by a historical envelope | FK rejects deletion; no cascading loss of evidence |
