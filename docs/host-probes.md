@@ -218,6 +218,13 @@ Outcome detection is grounded in captured real output, not assumed formats:
   neighbour is an unruled-out rival, counting a neighbour it cannot read or cannot date as a
   rival rather than as an absence. A driver constructed without `sessions_root` cannot run that
   check and is refused outright instead of adopting on the weaker test.
+  **Residual risk, not closed by the above:** recency and uniqueness order and isolate a thread,
+  they do not prove *this run* created it. If a human opens the only other thread after
+  `started_at` and its id is the one passed to `register_existing`, no rival exists and it is
+  minted as owned before `submit` ever messages it. Binding adoption to the runner's own creation
+  action is out of scope for this stage — `CodexDriver.create()` already refuses rather than
+  guess (above) — so the caller passing `existing_session=` is trusted to have just created that
+  exact thread itself.
 - No captured mechanism *creates* a Codex thread non-interactively either: `codex queue` targets
   a thread that already exists, and no creation output shape has been captured to parse an id
   out of. `CodexDriver.create()` raises `SessionCreationUncaptured`, so a Codex cell is run as
