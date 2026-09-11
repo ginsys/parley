@@ -185,15 +185,24 @@ Outcome detection is grounded in captured real output, not assumed formats:
   still `unobservable` today: an undated entry cannot be ordered against submission, and
   counting it would let the assistant turn produced by the session-creation prompt stand in as
   this trial's `turn_start` before the marker existed. The same fail-closed rule applies to a
-  Codex rollout record whose `timestamp` is missing or malformed — it is dropped and the read
-  reported unobservable, never promoted into the current window.
+  Codex rollout record whose `timestamp` is missing or malformed, and to a line that is not
+  valid JSON at all (a truncated or corrupt rollout): opening a file successfully does not
+  establish that its transcript was read successfully, so the read is reported unobservable
+  rather than yielding an empty outcome map that would classify as `not_observed`. A record
+  type this runner has no use for (`event_msg`, `token_usage_record`, ...) is not a failed read
+  and is skipped silently. Provenance is stricter still: `rollout_started_at` returns nothing at
+  all on an unparseable line, since the line it could not read may be the earliest one.
 - No captured mechanism at `2.1.268` submits a message to an *existing* background session:
   `claude --bg` takes its prompt at creation, `attach` is an interactive PTY, and
   `--remote-control` / `--print --input-format=stream-json` are unexercised. `ClaudeDriver.submit()`
-  raises `SubmissionUnsupported` and the cell classifies `unsupported`, rather than confirming the
-  session is listed and reporting acceptance for a marker the host never received. Guessing an
-  unconfirmed submission flag is the same evidence violation as guessing OpenCode's export shape;
-  capturing a real path is stage 3 work.
+  raises `SubmissionUnsupported`, rather than confirming the session is listed and reporting
+  acceptance for a marker the host never received. Guessing an unconfirmed submission flag is the
+  same evidence violation as guessing OpenCode's export shape; capturing a real path is stage 3
+  work. **Known limitation:** `run_trial` currently turns that refusal into `supported=False` for
+  every outcome, which reads as a claim about the *host* when the evidence only supports a claim
+  about this runner's tooling — unlike `--channels`, whose absence from the help text and plugin
+  cache is mechanism evidence. Until that is separated, treat a Claude `unsupported` cell as "no
+  trial was performed", and do not aggregate it as a host-capability result.
 - A Codex thread is adopted only when its rollout's earliest record timestamp is at or after the
   run's own start (`CodexDriver(started_at=...)`). Minting whatever id a caller passed defeated
   the registry guarantee, since `submit` then queues a message to it — a mistyped id could reach
@@ -217,7 +226,10 @@ distinct from `turn_start`, which any assistant activity satisfies.
 (120s) has elapsed, merging each poll's evidence and keeping the first timestamp per outcome. A
 single immediate snapshot — what it took before — reported `not_observed` for events that
 arrived comfortably inside their window, which is precisely the delay the windows exist to
-measure. It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state`,
+measure. Observability is decided by the *final* poll, not by whether any poll ever succeeded:
+a transcript is cumulative, so a late successful read covers earlier gaps, but if the last read
+failed then the tail of the window was never seen and a missing outcome is `unobservable`
+rather than negative. An outcome already observed keeps its own evidence either way. It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state`,
 `supported`, `observable`) carrying exactly what `Trial`/`classify_trial` need; acceptance is
 stamped when `submit` *returns*, since a submission that blocks for seconds would otherwise be
 backdated into its 10s window. The requested `state` is validated and carried into the result,

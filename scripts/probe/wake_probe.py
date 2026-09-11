@@ -327,8 +327,13 @@ def main():
                 temporary_home = tempfile.TemporaryDirectory(prefix='parley-probe-')
                 home = temporary_home.name
                 env = {'HOME': home, 'PATH': os.environ.get('PATH', os.defpath), 'TERM': 'dumb'}
-            record['cwd'] = os.path.abspath(args.cwd or home)
-            child = PtyProcess(command, cwd=record['cwd'], env=env, generation='disposable')
+            child_cwd = args.cwd or home
+            # realpath, not abspath: abspath normalizes `..` lexically, before the kernel
+            # resolves symlinks, so recording it could name a different directory than the one
+            # chdir actually reaches. The child keeps the caller's own string either way — the
+            # record describes where it ran, it does not redirect it.
+            record['cwd'] = os.path.realpath(child_cwd)
+            child = PtyProcess(command, cwd=child_cwd, env=env, generation='disposable')
             if interrupted[0]:
                 raise KeyboardInterrupt
             deadline = record['started'] + args.seconds

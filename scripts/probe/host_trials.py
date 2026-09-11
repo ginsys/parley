@@ -287,6 +287,10 @@ def rollout_started_at(lines):
 
     Provenance, not transcript: every record type counts here (`session_meta` included), because
     the question is when the thread itself came into existence, not when it was spoken in.
+
+    An unparseable line makes the whole answer None rather than being skipped: skipping it means
+    the earliest record might be the one that failed to parse, so a thread that predates the run
+    could pass the provenance check on the minimum of whatever happened to survive.
     """
     stamps = []
     for line in lines:
@@ -296,7 +300,7 @@ def rollout_started_at(lines):
         try:
             record = json.loads(line)
         except ValueError:
-            continue
+            return None
         when = record_time(record)
         if when is not None:
             stamps.append(when)
@@ -304,19 +308,21 @@ def rollout_started_at(lines):
 
 
 def codex_rollout_events(lines):
-    """Extract message Events from rollout JSONL lines; returns `(events, undated)`.
+    """Extract message Events from rollout JSONL lines; returns `(events, unusable)`.
 
     Skips `developer`-role entries (fixed instructions, not conversation turns) and any record
     missing the expected shape; a rollout file accumulates non-message record types this runner
-    has no use for (event_msg, token_usage_record, world_state, turn_context, ...).
+    has no use for (event_msg, token_usage_record, world_state, turn_context, ...). Those are
+    skipped silently: a record this runner has no use for is not evidence it failed to read.
 
-    `undated` counts message records dropped because their `timestamp` was missing or malformed.
-    Such a record cannot be ordered against submission, and emitting it with `time=None` let an
-    old untimestamped assistant message be read as this trial's `turn_start`. The caller reports
-    the read unobservable instead of promoting an undated record into the current window.
+    `unusable` counts content that *should* have been readable and was not — a line that is not
+    valid JSON (a corrupt or half-written rollout), or a message record whose `timestamp` is
+    missing or malformed. Neither can be ordered against submission, and opening a file
+    successfully does not establish that its transcript was read successfully. The caller reports
+    such a read unobservable rather than letting absent outcomes become negative evidence.
     """
     events = []
-    undated = 0
+    unusable = 0
     for line in lines:
         line = line.strip()
         if not line:
@@ -324,6 +330,7 @@ def codex_rollout_events(lines):
         try:
             record = json.loads(line)
         except ValueError:
+            unusable += 1
             continue
         payload = record.get('payload')
         if not isinstance(payload, dict) or payload.get('type') != 'message':
@@ -333,11 +340,11 @@ def codex_rollout_events(lines):
             continue
         when = record_time(record)
         if when is None:
-            undated += 1
+            unusable += 1
             continue
         text = ''.join(part.get('text', '') for part in payload.get('content', []) if isinstance(part, dict))
         events.append(Event(role=role, text=text, time=when))
-    return events, undated
+    return events, unusable
 
 
 class CodexDriver:
@@ -394,13 +401,13 @@ class CodexDriver:
             return Observation(observable=False)  # no rollout to read is a dead channel
         try:
             with open(path, encoding='utf-8') as handle:
-                events, undated = codex_rollout_events(handle)
+                events, unusable = codex_rollout_events(handle)
         except OSError:
             # Same rule as a failed `claude logs`: an unreadable channel is unobservable, not
             # an absence of outcomes. A rollout is created lazily, so an early poll can precede it.
             return Observation(observable=False)
         observation = detect_outcomes(events, marker, submitted_at=submitted_at)
-        if undated:
+        if unusable:
             return Observation(outcomes=observation.outcomes, observable=False)
         return observation
 
@@ -490,12 +497,15 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
                         observable={name: True for name in OUTCOME_NAMES})
     accepted_at = clock() if accepted else None
     outcomes = {}
-    channel_seen = False
+    channel_readable = False
     while True:
         observation = driver.observe(session_id, marker=marker, submitted_at=submitted_at)
-        # One readable poll proves the channel existed; a later failure (a finished session's
-        # daemon socket disappearing) must not retract evidence already collected.
-        channel_seen = channel_seen or observation.observable
+        # The *final* read decides observability, not whether any read ever worked. A transcript
+        # is cumulative, so one successful read late in the window covers the earlier gaps; but
+        # if the last read failed — a finished Claude session's daemon socket disappearing is
+        # exactly this — the tail of the window was never seen, and an outcome missing from a
+        # transcript nobody could read at the end is not negative evidence.
+        channel_readable = observation.observable
         for name, when in observation.outcomes.items():
             outcomes.setdefault(name, when)
         remaining = deadline - monotonic()
@@ -508,7 +518,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     # the deadline depend on whether the transcript could be read at all.
     observable = {'accepted': True}
     for name in TRANSCRIPT_OUTCOMES:
-        observable[name] = True if name in outcomes else channel_seen
+        observable[name] = True if name in outcomes else channel_readable
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
                     outcomes=outcomes, state=state,
                     supported={name: True for name in OUTCOME_NAMES}, observable=observable)
