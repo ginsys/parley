@@ -136,20 +136,29 @@ class PtyProcess:
         self.events.append({'time': time.monotonic(), 'kind': kind, 'hex': data.hex()})
 
     def read(self, timeout):
-        if self.eof or not self.selector.select(max(0, timeout)):
+        was_eof = self.eof
+        if not was_eof and not self.selector.select(max(0, timeout)):
             return b''
         try:
             data = os.read(self.fd, 4096)
         except BlockingIOError:
+            if was_eof:
+                # An open but currently quiet slave is no longer EOF.
+                self.selector.register(self.fd, selectors.EVENT_READ)
+                self.eof = False
             return b''
         except OSError as error:
             if error.errno != errno.EIO:
                 raise
             data = b''
         if not data:
+            if not was_eof:
+                self.selector.unregister(self.fd)
             self.eof = True
-            self.selector.unregister(self.fd)
             return b''
+        if was_eof:
+            self.selector.register(self.fd, selectors.EVENT_READ)
+            self.eof = False
         self._record('output', data)
         return data
 
@@ -167,12 +176,19 @@ class PtyProcess:
             raise OSError('partial PTY write; delivery ambiguous')
         return written
 
-    def wait_for_exit(self, deadline):
-        """Observe the leader without reaping it or extending the capture deadline."""
+    def wait_for_exit(self, deadline, *, interrupted=None):
+        """Observe the leader and drain reopened terminal output within the deadline."""
         while time.monotonic() < deadline:
-            if os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+            if interrupted is not None and interrupted[0]:
+                raise KeyboardInterrupt
+            ended = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            data = self.read(0)
+            if ended is not None and self.eof:
                 return True
-            time.sleep(min(.01, max(0, deadline - time.monotonic())))
+            # EOF is provisional while the leader lives. Retry without spinning
+            # on EIO; a reopened slave may produce more than one buffer of output.
+            if not data:
+                time.sleep(min(.01, max(0, deadline - time.monotonic())))
         # A later status has no exit timestamp proving completion within the window.
         return False
 
@@ -243,10 +259,10 @@ def publish_record(destination, record):
 
 @contextmanager
 def defer_sigint():
-    """Let CLI finalization finish before honoring Ctrl-C, including repeated signals.
+    """Remember Ctrl-C across CLI ownership transitions, capture and finalization.
 
     Install only on the main thread. The caller returns 130 after publishing if
-    interrupted; capture status still describes capture, not the publication phase.
+    interrupted. Capture explicitly checks this flag; finalization only remembers it.
     """
     interrupted = [False]
 
@@ -285,59 +301,64 @@ def main():
     child = None
     # No final file exists until a complete (possibly interrupted/failed) record
     # is ready. HOME/cwd never inherit host authentication.
-    with tempfile.TemporaryDirectory(prefix='parley-probe-') as home:
+    with defer_sigint() as interrupted, tempfile.TemporaryDirectory(prefix='parley-probe-') as home:
         try:
             child = PtyProcess(command, cwd=home,
                                env={'HOME': home, 'PATH': os.environ.get('PATH', os.defpath), 'TERM': 'dumb'},
                                generation='disposable')
+            if interrupted[0]:
+                raise KeyboardInterrupt
             deadline = record['started'] + args.seconds
             record['stop_reason'] = 'capture'
             while not child.eof and time.monotonic() < deadline:
+                if interrupted[0]:
+                    raise KeyboardInterrupt
                 child.read(min(.1, max(0, deadline - time.monotonic())))
             # Terminal EOF can precede process exit. Keep the same deadline and
             # preserve a natural exit status before cleanup kills the owned group.
-            exited = child.eof and child.wait_for_exit(deadline)
+            exited = child.eof and child.wait_for_exit(deadline, interrupted=interrupted)
+            if interrupted[0]:
+                raise KeyboardInterrupt
             record['stop_reason'] = 'eof' if exited else 'deadline'
         except BaseException as exc:
             record['error'] = type(exc).__name__
             result = 130 if isinstance(exc, KeyboardInterrupt) else 1
             record['capture_status'] = 'interrupted' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'failed'
         finally:
-            with defer_sigint() as interrupted:
-                if child is not None:
-                    try:
-                        child.close()
-                    except BaseException as exc:
-                        # Preserve both failures if capture was already interrupted.
-                        # Teardown failure must not discard the captured transcript or
-                        # classify an unknown child status as a successful recording.
-                        record['cleanup_error'] = type(exc).__name__
-                        record['error'] = record['error'] or 'cleanup_failed'
-                        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                            record['capture_status'] = 'interrupted'
-                        if isinstance(exc, KeyboardInterrupt):
-                            result = 130
-                        elif result == 0:
-                            result = 1
-                    finally:
-                        record.update(events=child.events, eof=child.eof, wait_status=child.wait_status,
-                                      exit_code=child.exit_code, cleanup_requested=child.cleanup_requested)
-                record['ended'] = time.monotonic()
-                if record['error'] is None:
-                    if child.exit_code > 0 or (child.exit_code < 0 and
-                                               (not child.cleanup_requested or child.exit_code != -signal.SIGKILL)):
-                        # 127 includes failed exec; a program can also deliberately return
-                        # 127, so it is not proof of which startup stage failed. Neither is
-                        # valid negative wake evidence. Record the exact status, fail closed.
-                        record.update(capture_status='failed', error='child_exit_nonzero')
+            if child is not None:
+                try:
+                    child.close()
+                except BaseException as exc:
+                    # Preserve both failures if capture was already interrupted.
+                    # Teardown failure must not discard the captured transcript or
+                    # classify an unknown child status as a successful recording.
+                    record['cleanup_error'] = type(exc).__name__
+                    record['error'] = record['error'] or 'cleanup_failed'
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        record['capture_status'] = 'interrupted'
+                    if isinstance(exc, KeyboardInterrupt):
+                        result = 130
+                    elif result == 0:
                         result = 1
-                    else:
-                        # A successful leader may leave descendants holding the PTY.
-                        # Only observed EOF plus natural leader success proves capture
-                        # completion; reaching the deadline always truncates capture.
-                        complete = record['stop_reason'] == 'eof' and child.eof and not child.cleanup_requested
-                        record['capture_status'] = 'complete' if complete else 'stopped'
-                publish_record(args.output, record)
+                finally:
+                    record.update(events=child.events, eof=child.eof, wait_status=child.wait_status,
+                                  exit_code=child.exit_code, cleanup_requested=child.cleanup_requested)
+            record['ended'] = time.monotonic()
+            if record['error'] is None:
+                if child.exit_code > 0 or (child.exit_code < 0 and
+                                           (not child.cleanup_requested or child.exit_code != -signal.SIGKILL)):
+                    # 127 includes failed exec; a program can also deliberately return
+                    # 127, so it is not proof of which startup stage failed. Neither is
+                    # valid negative wake evidence. Record the exact status, fail closed.
+                    record.update(capture_status='failed', error='child_exit_nonzero')
+                    result = 1
+                else:
+                    # A successful leader may leave descendants holding the PTY.
+                    # Only observed EOF plus natural leader success proves capture
+                    # completion; reaching the deadline always truncates capture.
+                    complete = record['stop_reason'] == 'eof' and child.eof and not child.cleanup_requested
+                    record['capture_status'] = 'complete' if complete else 'stopped'
+            publish_record(args.output, record)
             if interrupted[0]:
                 result = 130
     return result

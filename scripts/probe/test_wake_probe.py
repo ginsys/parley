@@ -1,6 +1,7 @@
 """Controlled subprocesses only: no installed host CLI is launched by these tests."""
 
 import fcntl
+import inspect
 import json
 import os
 import pty
@@ -277,6 +278,99 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
         self.assertTrue(record['cleanup_requested'])
         self.assertFalse(Path(f'/proc/{seen[0]}').exists())
 
+    def test_sigint_at_caller_ownership_and_finalization_handoffs(self):
+        source, first_line = inspect.getsourcelines(main)
+        finalization_line = first_line + next(i for i, line in enumerate(source)
+                                             if line == '        finally:\n') + 1
+        for stage in ('constructor_return', 'finalization_entry'):
+            with self.subTest(stage=stage):
+                output = Path(self.tmp.name, stage + '.json')
+                children = []
+                triggered = []
+                previous_handler = signal.getsignal(signal.SIGINT)
+
+                def construct(*args, **kwargs):
+                    child = PtyProcess(*args, **kwargs)
+                    children.append(child)
+                    if stage == 'constructor_return':
+                        signal.raise_signal(signal.SIGINT)
+                        triggered.append(stage)
+                    return child
+
+                def trace(frame, event, arg):
+                    if (stage == 'finalization_entry' and not triggered
+                            and frame.f_code is main.__code__ and event == 'line'
+                            and frame.f_lineno == finalization_line):
+                        triggered.append(stage)
+                        signal.raise_signal(signal.SIGINT)
+                    return trace
+
+                args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
+                        sys.executable, '-u', '-c', "print('handoff fixture', flush=True)"]
+                old_trace = sys.gettrace()
+                try:
+                    with patch.object(sys, 'argv', args), patch('wake_probe.PtyProcess', construct):
+                        sys.settrace(trace)
+                        result = main()
+                    self.assertEqual(result, 130)
+                    self.assertEqual(triggered, [stage])
+                    record = json.loads(output.read_text())
+                    self.assertEqual(record['capture_status'],
+                                     'interrupted' if stage == 'constructor_return' else 'complete')
+                    self.assertIsNotNone(record['wait_status'])
+                    self.assertTrue(all(c.pid is None and c.fd is None for c in children))
+                    self.assertEqual(signal.getsignal(signal.SIGINT), previous_handler)
+                finally:
+                    sys.settrace(old_trace)
+                    for child in children:
+                        child.close()
+
+    def test_quiet_reopened_slave_clears_provisional_eof(self):
+        child = self.spawn()
+        self.until(child, b'READY')
+        # Model the previously observed hangup; the real live slave is open and
+        # quiet now, so the nonblocking read returns EAGAIN rather than EOF.
+        child.selector.unregister(child.fd)
+        child.eof = True
+        self.assertEqual(child.read(0), b'')
+        self.assertFalse(child.eof)
+        self.assertIn(child.fd, child.selector.get_map())
+
+    def test_reopened_slave_output_is_captured_before_completion(self):
+        output = Path(self.tmp.name, 'reopened.json')
+        release = Path(self.tmp.name, 'reopen.release')
+        code = f"""
+import os, time
+name = os.ttyname(0)
+print('before close', flush=True)
+for fd in (0, 1, 2):
+    os.close(fd)
+while not os.path.exists({str(release)!r}):
+    time.sleep(.01)
+fd = os.open(name, os.O_RDWR)
+os.write(fd, b'after reopen\\n' * 1000)
+os.close(fd)
+"""
+        original = PtyProcess.wait_for_exit
+        observed_eof = []
+
+        def release_after_eof(child, deadline, **kwargs):
+            self.assertTrue(child.eof)
+            observed_eof.append(True)
+            release.touch()
+            return original(child, deadline, **kwargs)
+
+        args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
+                sys.executable, '-u', '-c', code]
+        with patch.object(sys, 'argv', args), patch.object(PtyProcess, 'wait_for_exit', release_after_eof):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        transcript = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
+        self.assertEqual(observed_eof, [True])
+        self.assertEqual(transcript.count(b'after reopen'), 1000)
+        self.assertEqual(record['capture_status'], 'complete')
+        self.assertEqual(record['exit_code'], 0)
+
     def test_failed_dump_leaves_no_empty_destination_or_temporary_file(self):
         output = Path(self.tmp.name, 'failed.json')
 
@@ -462,14 +556,14 @@ os._exit({expected if expected >= 0 else 0})
                             test.fail('fixture did not close its terminal')
                         return super().read(timeout)
 
-                    def wait_for_exit(self, deadline):
+                    def wait_for_exit(self, deadline, **kwargs):
                         nonlocal now
                         test.assertTrue(self.eof)
                         test.assertIsNone(os.waitid(os.P_PID, self.pid,
                                                   os.WEXITED | os.WNOHANG | os.WNOWAIT))
                         waited.append(self.pid)
                         if outcome == 'interrupt':
-                            raise KeyboardInterrupt
+                            signal.raise_signal(signal.SIGINT)
                         if outcome == 'deadline':
                             now = deadline
                         else:
@@ -477,7 +571,7 @@ os._exit({expected if expected >= 0 else 0})
                         # Keep the real wait bounded even if the fixture fails to
                         # exit. The deadline case tests the expired capture clock.
                         with patch('wake_probe.time.monotonic', monotonic):
-                            return super().wait_for_exit(monotonic() if now else watchdog)
+                            return super().wait_for_exit(monotonic() if now else watchdog, **kwargs)
 
                 args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
                         sys.executable, '-u', '-c', code]
@@ -498,6 +592,8 @@ os._exit({expected if expected >= 0 else 0})
     def test_exit_first_observable_after_deadline_is_not_completion(self):
         child = object.__new__(PtyProcess)
         child.pid = 123  # virtual child: all process observation is mocked
+        child.eof = True
+        child.read = lambda _: b''
         now = 0
         exited = object()
 

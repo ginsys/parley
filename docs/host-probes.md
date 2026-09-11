@@ -55,8 +55,10 @@ not prove durable publication. This preserves
 another capture even if it creates the destination during recording. Failed serialization leaves
 no empty final file. A caught interruption preserves partial events and returns a nonzero status;
 an uncatchable SIGKILL or power loss before publication cannot preserve an in-memory transcript.
-Once capture ends, the CLI defers SIGINT through child cleanup and evidence publication, then
-returns 130 if Ctrl-C was requested. Repeated Ctrl-C during JSON serialization, flush/sync or
+The CLI installs one non-raising SIGINT handler before acquiring the child and retains it through
+cleanup and evidence publication. Capture checks the remembered interruption between bounded reads
+and while waiting after EOF; ownership assignment and entry into finalization have no unguarded
+signal transition. The CLI returns 130 if Ctrl-C was requested. Repeated Ctrl-C during JSON serialization, flush/sync or
 link/unlink cannot interrupt that finalization. The record keeps the actual capture outcome;
 an interruption requested only during publication does not turn completed capture into failure.
 The CLI restores the previous signal handler afterward, including on filesystem errors. This
@@ -87,8 +89,11 @@ failed records. A deadline cannot produce `complete`: an otherwise successful ca
 capture/child failures still take precedence. `cleanup_requested` describes intervention on the direct child,
 not whether every descendant exited naturally. `complete` requires observed PTY EOF and natural
 direct-child exit zero, without a capture/cleanup error; it does not certify descendant outcomes.
-If the child closes its terminal before exiting, the recorder waits for its natural exit within
-the original capture deadline. EOF does not trigger immediate termination or start a new window.
+If the child closes its terminal before exiting, EOF is provisional: the recorder continues
+nonblocking reads while awaiting natural exit within the original capture deadline. A reopened
+slave resumes capture, including output buffered when the child exits; an open but quiet slave
+clears EOF too. Completion requires EOF after observing leader exit. EOF does not trigger immediate
+termination or start a new window.
 Deadline and interruption handling still apply while waiting after EOF. An exit first observable
 after the deadline remains `stopped`, even if its eventual status is zero: the nonblocking status
 query supplies no exit timestamp proving it happened within the window. Cleanup preserves the
