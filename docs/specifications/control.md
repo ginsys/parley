@@ -38,8 +38,11 @@ into commands. Server help and client help/argument validation work without DB/s
 ## Wire profile and limits
 
 Protocol name: `parley-control/1`. This deliberately restricts JSON-RPC 2.0 to one request object
-per LF-terminated UTF-8 frame, with named-object parameters and string correlation IDs. Requests
-require exactly `jsonrpc`, `id`, `method`, `params`; `jsonrpc` must be `"2.0"`. IDs are 1–64 printable
+per LF-terminated UTF-8 frame, with named-object parameters and string correlation IDs. First
+classify a syntactically valid top-level object by whether it contains `id`. An ID-less object
+always follows the no-response close rule below, even if other envelope fields are invalid; it
+never receives `-32600`. Only ID-bearing requests proceed to envelope validation: they require
+exactly `jsonrpc`, `id`, `method`, `params`, and `jsonrpc` must be `"2.0"`. IDs are 1–64 printable
 ASCII bytes, nonblank; method names are 1–64 ASCII letters/digits/dots/underscores, case-sensitive,
 and cannot use the reserved `rpc.` prefix. Unknown fields, duplicate object keys, invalid UTF-8,
 unpaired surrogate escapes, nonfinite numbers, top-level arrays and positional params are invalid.
@@ -57,8 +60,9 @@ constants initially; changing them requires an advertised protocol capability re
 Mutations additionally carry `params.operation_id`, a canonical lowercase UUID distinct from the
 JSON-RPC correlation ID. A retry may use a new correlation ID but must keep its operation ID and
 identical logical payload. Correlation IDs cannot be reused while outstanding on the same socket.
-Client notifications (missing ID) are not executed and receive no response; close with a bounded
-operational diagnostic. Batches are rejected as a profile violation without executing elements.
+ID-less client objects (including notifications) are not executed and receive no response; close
+with a bounded operational diagnostic. An explicitly null/invalid `id` is an ID-bearing envelope
+violation, not this exception; return `-32600` with null ID when it cannot be echoed safely. Batches are rejected as a profile violation without executing elements.
 This is an application profile, not unrestricted JSON-RPC conformance.
 
 All domain 64-bit counters, versions and budgets are canonical nonnegative decimal **strings**:
@@ -313,7 +317,8 @@ are preserved, and an audit record never asserts exactly-once host execution.
 JSON-RPC envelope failures use `-32700` (parse), `-32600` (profile/envelope), `-32601` (method),
 `-32602` (params), `-32603` (unexpected internal failure). Domain errors use `-32000` with a fixed
 `error.data.code` and safe summary. A server cannot disclose credential IDs, paths, bodies or raw
-transport errors in any error. A valid notification receives no error response, as specified above.
+transport errors in any error. The ID-less-object exception takes precedence over envelope/parameter errors. Invalid JSON is
+still a parse error, and arrays are still batch/profile violations; neither is an ID-less object.
 An unreadable/oversize/partial frame may be closed without a response or echoed ID.
 
 | Domain code | Consequence |
@@ -430,7 +435,7 @@ controlled subprocesses. No host CLI, real credentials or protected-controller i
 
 | Fixture | Required evidence |
 | --- | --- |
-| P01 Framing/profile | Exact/over-limit frame, partial EOF, slow frame, invalid UTF-8/surrogate, duplicate keys, depth, arrays, missing ID and ID collision produce bounded rejection with no mutation |
+| P01 Framing/profile | Exact/over-limit frame, partial EOF, slow frame, invalid UTF-8/surrogate, duplicate keys, depth, arrays, ID collision and ID-less objects produce their exact bounded rejection/close outcome with no mutation; ID-less objects never receive an error response |
 | P02 Authority | Wrong UID/server path, agent credential on admin socket, payload role forgery, unsupported method and retired admin identity cannot administer; same-admin-account limitation is demonstrated |
 | P03 Command retry | Drop response after commit; reconnect/same operation yields same receipt/audit and one version/budget effect; conflicting payload and recorded rejection remain terminal |
 | P04 Stale human action | Admission, renewal/revoke and binding/hold/recovery version races cannot retarget an action or partially mutate state |
