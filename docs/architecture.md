@@ -118,6 +118,22 @@ reply may reference an older delivered original; it cannot revive a cancelled qu
 No implicit broadcast is introduced. Session authentication, control framing and inbox disposition
 permissions remain separate contracts.
 
+## Accepted identifier alphabet
+
+On 2026-09-11 the owner chose printable ASCII for both conversation names and peer IDs:
+bytes `0x20`–`0x7E`, with empty and space-only values rejected. Preserve permitted spaces and
+punctuation exactly; message bodies retain their existing encoding rules. This simplifies identity
+round-tripping by rejecting malformed UTF-8 and all non-ASCII names, including otherwise valid
+Unicode names. The rejected alternatives were unrestricted Unicode plus compatibility machinery,
+and encoded byte identifiers across public APIs.
+
+Before upgrading an existing database, inventory stored identifiers read-only. If all comply,
+no identifier migration or recovery feature is needed. Preserve incompatible historical bytes and
+current exact-key human revocation; determine any necessary disposition from actual findings
+before replacing the administration interface. No encoded-ID recovery API is approved.
+The [membership specification](specifications/membership.md#accepted-ascii-identifier-rule) records
+this target contract; current runtime validation has not yet been changed.
+
 ## Components
 
 | Package | Responsibility |
