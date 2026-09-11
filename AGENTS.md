@@ -31,6 +31,16 @@ The [accepted membership model](docs/architecture.md#accepted-membership-model) 
 members and open/lead-only/directed policies. Initial runtime/inbox APIs translate to the existing
 pair storage; members-table creation and backfill belong to the later room migration.
 
+The [accepted conversation admission model](docs/architecture.md#accepted-conversation-admission)
+separates host connection, conversation selection and human membership approval. Agents may request
+creation or joining; a waiting conversation has no active communication grant until authenticated
+human administration approves the actual pair and its limits. An offline member does not free a
+place. This is a target workflow; discovery, waiting and admission are not implemented yet.
+
+The [identity proposal](docs/identity-proposal.md) covers registration, credentials, discovery and
+reconnect for owner review. Its proposed authentication and session-lifetime rules are not accepted
+exceptions to the protected-controller boundary or evidence of live host identity binding.
+
 ## Start from the work item
 
 - Read the issue, its native GitHub dependencies, and existing code before changing anything. This

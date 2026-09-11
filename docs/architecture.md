@@ -67,6 +67,60 @@ transport should preserve application semantics; its implementation is outside t
 The product sequence is two-peer runtime, durable inbox, then shared rooms. GitHub owns scopes,
 acceptance and native dependencies; this section records architectural direction only.
 
+## Accepted conversation admission
+
+The owner approved the actual-pair admission direction in
+[decision #21](https://github.com/ginsys/parley/issues/21) on 2026-09-11. This is a target workflow,
+not an implemented API or a completed authentication design.
+
+Two-peer support limits participants per conversation, not the number of conversations. Several
+conversations may independently be waiting for a counterpart. Resuming a known host session does
+not choose its conversation: authenticated host identity, conversation membership and online
+presence are separate facts.
+
+An agent may request a named conversation with a short purpose, or select an existing conversation
+that it is permitted to discover. A single eligible result can be offered directly; multiple
+results require an explicit choice. Discovery identifies the conversation, its participants and
+actual availability; it does not expose private message bodies or credentials. An enrolled member
+being offline does not make their place available to another agent.
+
+A new conversation waits with its initiating participant and no active communication grant.
+There is no placeholder second peer and no dispatchable traffic under the pending request. The
+current controller requires two distinct peers when creating a grant, so waiting and join requests
+need a separate specified lifecycle before implementation; do not weaken the active-grant contract.
+
+For example, Alice requests `Review authentication` while Bob is waiting in `Debug deployment`.
+Carol lists eligible conversations and selects Alice's. That selection creates a join request,
+not membership. Authenticated human administration approves the actual Alice/Carol pair, direction,
+budget and expiry before the conversation can carry messages. Each recipient's readiness remains
+a delivery prerequisite. Agents cannot approve requests, mint grants or replenish budgets.
+
+Approval must revalidate the current request and conversation atomically with grant creation.
+Concurrent candidates cannot both occupy the second place; a stale approval fails and refreshes
+the choices. Retrying an approval after a lost response must not create another grant or reset its
+budget. Rejecting a candidate leaves the conversation waiting, without joining them elsewhere.
+Cancellation or expiry of a pending request invalidates later approval. Disconnecting an admitted
+member preserves membership; reconnect cannot silently replace them or select another conversation.
+
+This keeps the authorization decision concrete: the human knows both peers before communication
+is enabled. The cost is an admission approval when the counterpart arrives. Pre-authorizing any
+later eligible agent was considered but not selected for this initial workflow: it would require a
+separate bounded admission authorization with eligibility, expiry and limits. Discoverability or
+possession of a connection credential must not accidentally provide that authority.
+
+Identity credentials, discovery eligibility, pending-request ownership/timeouts and exact
+reconnect/replacement rules still require contracts. This ruling does not select wire methods,
+change the protected-controller restrictions, approve host execution, or prove production account
+isolation. Retained conversation context is a separate feature; context delivery cannot itself
+authorize admission. Implementation must exercise multiple waiting conversations, unauthorized
+discovery/join, competing candidates, stale approval, duplicate requests, restart and offline
+members with synthetic identities and controlled transports.
+
+The [identity and admission proposal](identity-proposal.md) provides a complete candidate for
+registration, per-binding credentials, discovery, reconnect, revocation and their verification
+cases. Those choices remain proposed for owner review; only the actual-pair admission direction
+above is approved.
+
 ## Accepted membership model
 
 The owner approved [decision #17](https://github.com/ginsys/parley/issues/17) on 2026-09-10.
