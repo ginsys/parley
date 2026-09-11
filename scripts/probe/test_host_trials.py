@@ -137,6 +137,23 @@ class ClaudeParsingTests(unittest.TestCase):
         sessions = background_sessions(self.RAW)
         self.assertEqual([s['id'] for s in sessions], ['e9f3bf35'])
 
+    def test_background_sessions_raises_on_a_daemon_error_object_not_a_list(self):
+        # A degraded daemon can print a valid-JSON error object and still exit 0; iterating it
+        # as the expected list-of-objects shape would raise an unrelated-looking AttributeError.
+        with self.assertRaises(RuntimeError):
+            background_sessions('{"error":"daemon restarting"}')
+
+    def test_background_sessions_raises_on_a_null_top_level(self):
+        with self.assertRaises(RuntimeError):
+            background_sessions('null')
+
+    def test_background_session_ids_raises_on_an_entry_with_no_id(self):
+        driver = ClaudeDriver(SessionRegistry(),
+                              run=lambda *a, **k: FakeResult(0, stdout='[{"kind":"background"}]'),
+                              cwd='/scratch')
+        with self.assertRaises(RuntimeError):
+            driver._background_session_ids()
+
     def test_transcript_parses_role_prefixed_multiline_blocks(self):
         raw = f'User: hello {MARKER}\ncontinued\nAssistant: got it\nstill talking\n'
         events = parse_claude_transcript(raw, marker=MARKER)
