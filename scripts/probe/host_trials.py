@@ -16,12 +16,13 @@ Two host-specific schemas are grounded in real, captured output rather than assu
   must happen before teardown, not after; `ClaudeDriver.observe()` documents this ordering
   requirement and does not retry past it. A failed read is an unavailable channel, reported as an
   unobservable `Observation`, never as a negative outcome.
-- `claude logs` output carries no per-entry timestamp, and no captured mechanism at 2.1.268
-  delivers a message to an *existing* background session (`--bg` takes its prompt at creation;
-  `attach` is an interactive PTY, `--remote-control` and `--input-format=stream-json` are
-  unexercised — docs/host-probe-preflight.md, 2026-09-11). `ClaudeDriver.submit()` therefore
-  raises `SubmissionUnsupported` rather than report acceptance for a marker the host never
-  received; the cell classifies `unsupported` until stage 3 captures a real submission path.
+- `claude logs` output is assumed to carry no per-entry timestamp — a hypothesis, since the one
+  read attempted here failed against an already-exited daemon — and no captured mechanism at
+  2.1.268 delivers a message to an *existing* background session (`--bg` takes its prompt at
+  creation; `attach` is an interactive PTY, `--remote-control` and `--input-format=stream-json`
+  are unexercised — docs/host-probe-preflight.md, 2026-09-11). `ClaudeDriver.submit()` therefore
+  raises `SubmissionUncaptured` rather than report acceptance for a marker the host never
+  received; the cell classifies `unobservable` until stage 3 captures a real submission path.
 - Codex's rollout JSONL (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`) is one JSON object per
   line; a chat turn is `{"type": "response_item", "payload": {"type": "message", "role": ...,
   "content": [{"type": "input_text"|"output_text", "text": ...}]}}` with a record-level ISO-8601
@@ -51,7 +52,7 @@ LAST_WINDOW = max(WINDOWS.values())  # 120s: the longest outcome window an obser
 # Mirrors the state values `wake_probe.Trial.result` accepts; validated at submission time so a
 # typo fails before a host is driven rather than at classification.
 TRIAL_STATES = frozenset({'idle', 'busy', 'approval', 'disconnected', 'restarted'})
-# A busy trial's dependent windows start at the turn already running, so `wake_probe.py:59-66`
+# A busy trial's dependent windows start at the turn already running, so `wake_probe.py:57-67`
 # refuses to classify `turn_start`/`ack` until either that turn ended or 900s passed. Observation
 # must last that long or the cell is unclassifiable; the constant is wake_probe's, restated here
 # because it is inline there.
