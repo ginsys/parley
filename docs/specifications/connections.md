@@ -1,10 +1,11 @@
 # Connection principals and session lifecycle specification
 
-Specification delivered for [#22](https://github.com/ginsys/parley/issues/22) in owner-enqueued
-PR #44, grounded in the accepted [identity decision](../identity-proposal.md) and
-[membership contract](membership.md). The landed artifact supplies the connection baseline;
-GitHub records its acceptance. This document adds no runtime or schema implementation.
-The [control specification](control.md) maps the logical operations to proposed wire contracts.
+Specification under review for [#22](https://github.com/ginsys/parley/issues/22), grounded in the
+accepted [identity decision](../identity-proposal.md) and [membership contract](membership.md).
+PR #44 supplies the prior landed baseline; the current legacy-quarantine and clock-recovery
+corrections require review and landing before completion is reassessed. GitHub owns acceptance.
+These proposed contracts add no runtime or schema implementation. The [control specification](control.md)
+maps the logical operations to proposed wire contracts.
 
 ## Scope and boundaries
 
@@ -27,7 +28,7 @@ retained context, inbox dispositions, multi-party membership or execution author
 ## Logical records and validation
 
 All records belong to the server-owned database except private credential files, live sockets and
-external recovery/clock markers. The following are logical storage contracts, not migration SQL.
+external recovery/clock markers. The following are proposed storage contracts, not migration SQL.
 
 | Record | Required fields and constraints |
 | --- | --- |
