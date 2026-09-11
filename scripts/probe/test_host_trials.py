@@ -543,6 +543,18 @@ class CodexDriverTests(unittest.TestCase):
         with self.assertRaises(ForeignSessionError):
             self.driver(registry, mine).register_existing('thread-1')
 
+    def test_a_neighbour_untouched_since_before_the_run_is_skipped_without_being_opened(self):
+        # A file whose mtime hasn't moved since before started_at cannot contain a record newer
+        # than that mtime, so its earliest record is provably older too -- it never needs
+        # opening. Garbage content that would otherwise read as an unruled-out rival proves the
+        # skip happened before any read was attempted, not just that the answer came out right.
+        registry = SessionRegistry()
+        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
+        old = self.rollout(lines=['not json\n'])
+        old_time = self.RUN_STARTED - 3600
+        os.utime(old, (old_time, old_time))
+        self.driver(registry, mine).register_existing('thread-1')
+
     def test_register_existing_refuses_an_unreadable_rollout_rather_than_raising_oserror(self):
         registry = SessionRegistry()
         missing = os.path.join(self.tmp_missing(), 'never-written.jsonl')
