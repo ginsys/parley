@@ -254,12 +254,16 @@ schema actually shipped then; do not reserve version 5 now (the current core is 
 | `grants` | Preserve `(conversation, grant_version)` PK with both columns explicitly NOT NULL, conversation FK, lifecycle/accounting fields and one-active partial unique index; replace positional fields with `policy_kind NOT NULL` and CHECK in the three allowed tags |
 | `grant_members` | PK `(conversation, grant_version, peer_id)` with all three columns explicitly NOT NULL; FK to grants; role NOT NULL and CHECK in `member`, `lead` |
 | `grant_edges` | PK `(conversation, grant_version, from_peer, to_peer)` with all four columns explicitly NOT NULL; two composite FKs to grant_members; `CHECK(from_peer <> to_peer)` with binary identifier comparison |
-| `envelopes` | Preserve IDs, all existing fields and grant FK; add version-scoped sender/recipient FKs to grant_members as below, and `CHECK(from_peer <> to_peer)` |
+| `envelopes` | Preserve IDs as `id TEXT NOT NULL PRIMARY KEY`, all other existing fields and grant FK; add version-scoped sender/recipient FKs to grant_members as below, and `CHECK(from_peer <> to_peer)` |
 
 All columns participating in these composite primary/foreign keys are explicitly NOT NULL,
 including the retained envelope conversation/version/sender/recipient columns. Do not infer this
 from PRIMARY KEY or CHECK: SQLite rowid tables allow null composite primary-key values, a null
 child-key component skips the FK check, and a CHECK expression evaluating to NULL passes.
+A single `TEXT PRIMARY KEY` also permits NULL in a rowid table: explicitly require non-null
+envelope IDs for settlement and reply lookup. Reject legacy NULL IDs before copying, retaining
+source evidence; never manufacture replacement IDs. Optional references such as `in_reply_to`
+remain nullable.
 
 Named policies have no stored edge rows. Cross-row rules (minimum membership, exactly one lead
 for `lead_only`, policy-compatible roles/edges) are validated as a whole inside the insertion
@@ -288,7 +292,7 @@ Legacy data still needs validation: [Send at pre-audit commit
 6f75867](https://github.com/ginsys/parley/blob/6f75867f5e52427a8d4c2adc90a8564100060f94/internal/dispatch/dispatch.go#L94-L122)
 could persist peers outside its stamped grant because it did not check authorization. That is
 incompatible history, not a reason to omit the new FKs. An envelope peer missing from its own
-version, a historical self-send or identical A/B members aborts the whole migration. Preserve the
+version, a NULL envelope ID, a historical self-send or identical A/B members aborts the whole migration. Preserve the
 source schema and evidence; do not invent membership, delete rows or rewrite IDs/versions to make
 constraints pass. The operator must resolve incompatible history explicitly before retry.
 
@@ -328,6 +332,9 @@ WITH expected_members AS (
     UNION ALL
     SELECT 'identical_pair', conversation, grant_version, NULL
     FROM grants WHERE peer_a_id = peer_b_id
+    UNION ALL
+    SELECT 'null_envelope_id', conversation, grant_version, id
+    FROM envelopes WHERE id IS NULL
 )
 SELECT diagnostic, hex(CAST(conversation AS BLOB)) AS conversation_hex, grant_version,
        CASE WHEN envelope_id IS NULL THEN 'NULL'
@@ -338,7 +345,9 @@ ORDER BY conversation, grant_version, envelope_id, diagnostic;
 
 Each result identifies incompatible history; one envelope can have multiple diagnostics. An
 identical-pair result identifies the grant by conversation/version and displays the literal `NULL`
-for its absent envelope ID. Both identifier columns otherwise contain uppercase hex of the exact
+for its absent envelope ID. A `null_envelope_id` finding uses the same sentinel for a corrupt
+envelope's missing key; its diagnostic distinguishes it from a grant-level finding. Both identifier
+columns otherwise contain uppercase hex of the exact
 stored bytes, including spaces, separators, newlines, NUL and malformed UTF-8. Hex keeps SQLite's
 default pipe/newline output unambiguous; `quote()` alone leaves embedded newlines and truncates at
 NUL. Decode hex only for exact-key inspection; it is not a new identity or a repair operation. A
@@ -359,18 +368,24 @@ Migration procedure, within the existing immediate transaction and `user_version
 1. Require exclusive server ownership before opening storage. Run numbered predecessors first;
    use the known schema version, not per-column sniffing. Reject future/unknown layouts. Preserve
    frozen legacy-adoption SQL unchanged. Admit no readers, workers or clients during migration.
-2. Build new tables under temporary names, with their foreign keys pointing to the corresponding
+2. Record the known dependent view/trigger definitions from the verified migration catalog.
+   Drop those triggers and views (including transitive dependent views, dependents first) inside
+   this transaction before replacing referenced tables. Otherwise an invalid view or trigger can
+   make SQLite reject a later table rename. Unrecognized dependent objects fail the migration;
+   rollback restores the original definitions. No application triggers may fire during copying.
+3. Build new tables under temporary names, with their foreign keys pointing to the corresponding
    new parents. Backfill **all** active, superseded and revoked grant versions using the exact
    mapping above, preserving stored peer IDs, historical counters, dates and cancellation flags.
-3. Rebuild the closed set of tables referencing replaced parents, including envelopes and any
+4. Rebuild the closed set of tables referencing replaced parents, including envelopes and any
    inbox/audit tables that have landed by then. Copy rows parent-first, preserving all IDs and
    references, before dropping any original table. Enumerate that graph from the shipped schema
    in the migration definition; an unrecognized dependency fails migration, not a best-effort copy.
-4. Drop original dependent tables leaf-first, then original parents, so foreign keys stay enabled.
+5. Drop original dependent tables leaf-first, then original parents, so foreign keys stay enabled.
    Rename new parents and their dependent tables into their final names. Recreate the version's
-   known indexes/triggers/views after data copying; do not fire application audit triggers while
-   rebuilding. Do not rename an original parent to a backup name first, which rewrites references.
-5. Verify full row/value equivalence except the explicit representation/constraint changes,
+   known indexes, then views in dependency order, then triggers after data copying and all renames.
+   Verify their definitions and query the restored views. Do not rename an original parent to a
+   backup name first, which rewrites references.
+6. Verify full row/value equivalence except the explicit representation/constraint changes,
    exact allowed-edge equivalence for every legacy version, no orphan FKs, and valid catalog.
    `PRAGMA foreign_key_check` must return no rows. Check database integrity and required queue
    indexes. Only then advance `user_version` and commit. Every intermediate failure rolls back.
@@ -416,6 +431,7 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | Inject failure during copy/drop/rename/index/version update; terminate before commit | Restart sees intact old schema/version/data; no partial shadow catalog |
 | Self-edge, repeated member, missing FK and invalid policy after migration | Database constraints or transactional graph validator reject as specified |
 | NULL in each composite-key component or policy_kind, supplied explicitly or omitted | NOT NULL rejects the row; no unbound member/edge or policy-less grant |
+| NULL or omitted envelope ID; legacy rows with NULL IDs | NOT NULL rejects new rows; preflight reports legacy rows and the migration rolls back without inventing IDs |
 | Envelope sender or recipient exists only in another conversation/version | Its respective membership FK rejects insert/update; no partial mutation |
 | Historical envelope after member removal; eligible reply carried to a successor | Historical FK remains valid; successor members precede the atomic reply version update |
 | Attempt to delete membership still referenced by a historical envelope | FK rejects deletion; no cascading loss of evidence |
@@ -423,6 +439,7 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | Preflight on valid history, peers present only in other versions/conversations, missing grant, self-send and identical pair | Exact diagnostic rows across all states/versions; valid historical removal is not flagged; read-only execution leaves data unchanged |
 | Preflight identifiers containing pipes, spaces, newlines, NUL and malformed UTF-8 | Exact hex round-trip, one output row per finding, no separator ambiguity; absent envelope is the literal NULL |
 | Inbox/audit references, queue ordering/indexes and uncertain rows after migration | References and state unchanged; uncertainty never automatically replayed |
+| Known views over rebuilt tables, transitive views and cross-table triggers; failure after dropping them | Drop before originals, restore after final renames, retain view results and trigger behavior; failure restores the entire original catalog/data |
 
 ## Source basis and review boundary
 
