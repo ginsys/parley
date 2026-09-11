@@ -12,6 +12,7 @@ import selectors
 import signal
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 WINDOWS = {'accepted': 10, 'visible': 30, 'turn_start': 60, 'ack': 120}
@@ -199,6 +200,25 @@ def publish_record(destination, record):
             os.unlink(temporary)
 
 
+@contextmanager
+def defer_sigint():
+    """Let CLI finalization finish before honoring Ctrl-C, including repeated signals.
+
+    Install only on the main thread. The caller returns 130 after publishing if
+    interrupted; capture status still describes capture, not the publication phase.
+    """
+    interrupted = [False]
+
+    def remember_interrupt(signum, frame):
+        interrupted[0] = True
+
+    previous = signal.signal(signal.SIGINT, remember_interrupt)
+    try:
+        yield interrupted
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def main():
     """Passively record a disposable command; injection requires an explicit observer."""
     import argparse
@@ -238,40 +258,43 @@ def main():
             result = 130 if isinstance(exc, KeyboardInterrupt) else 1
             record['capture_status'] = 'interrupted' if isinstance(exc, (KeyboardInterrupt, SystemExit)) else 'failed'
         finally:
-            if child is not None:
-                try:
-                    child.close()
-                except BaseException as exc:
-                    # Preserve both failures if capture was already interrupted.
-                    # Teardown failure must not discard the captured transcript or
-                    # classify an unknown child status as a successful recording.
-                    record['cleanup_error'] = type(exc).__name__
-                    record['error'] = record['error'] or 'cleanup_failed'
-                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                        record['capture_status'] = 'interrupted'
-                    if isinstance(exc, KeyboardInterrupt):
-                        result = 130
-                    elif result == 0:
+            with defer_sigint() as interrupted:
+                if child is not None:
+                    try:
+                        child.close()
+                    except BaseException as exc:
+                        # Preserve both failures if capture was already interrupted.
+                        # Teardown failure must not discard the captured transcript or
+                        # classify an unknown child status as a successful recording.
+                        record['cleanup_error'] = type(exc).__name__
+                        record['error'] = record['error'] or 'cleanup_failed'
+                        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                            record['capture_status'] = 'interrupted'
+                        if isinstance(exc, KeyboardInterrupt):
+                            result = 130
+                        elif result == 0:
+                            result = 1
+                    finally:
+                        record.update(events=child.events, eof=child.eof, wait_status=child.wait_status,
+                                      exit_code=child.exit_code, cleanup_requested=child.cleanup_requested)
+                record['ended'] = time.monotonic()
+                if record['error'] is None:
+                    if child.exit_code > 0 or (child.exit_code < 0 and
+                                               (not child.cleanup_requested or child.exit_code != -signal.SIGKILL)):
+                        # 127 includes failed exec; a program can also deliberately return
+                        # 127, so it is not proof of which startup stage failed. Neither is
+                        # valid negative wake evidence. Record the exact status, fail closed.
+                        record.update(capture_status='failed', error='child_exit_nonzero')
                         result = 1
-                finally:
-                    record.update(events=child.events, eof=child.eof, wait_status=child.wait_status,
-                                  exit_code=child.exit_code, cleanup_requested=child.cleanup_requested)
-            record['ended'] = time.monotonic()
-        if record['error'] is None:
-            if child.exit_code > 0 or (child.exit_code < 0 and
-                                       (not child.cleanup_requested or child.exit_code != -signal.SIGKILL)):
-                # 127 includes failed exec; a program can also deliberately return
-                # 127, so it is not proof of which startup stage failed. Neither is
-                # valid negative wake evidence. Record the exact status, fail closed.
-                record.update(capture_status='failed', error='child_exit_nonzero')
-                result = 1
-            else:
-                # A successful leader may leave descendants holding the PTY.
-                # Only observed EOF plus natural leader success proves capture
-                # completion; reaching the deadline always truncates capture.
-                complete = record['stop_reason'] == 'eof' and child.eof and not child.cleanup_requested
-                record['capture_status'] = 'complete' if complete else 'stopped'
-        publish_record(args.output, record)
+                    else:
+                        # A successful leader may leave descendants holding the PTY.
+                        # Only observed EOF plus natural leader success proves capture
+                        # completion; reaching the deadline always truncates capture.
+                        complete = record['stop_reason'] == 'eof' and child.eof and not child.cleanup_requested
+                        record['capture_status'] = 'complete' if complete else 'stopped'
+                publish_record(args.output, record)
+            if interrupted[0]:
+                result = 130
     return result
 
 

@@ -43,6 +43,14 @@ published with an atomic no-replace hard link (then the temporary name is remove
 another capture even if it creates the destination during recording. Failed serialization leaves
 no empty final file. A caught interruption preserves partial events and returns a nonzero status;
 an uncatchable SIGKILL or power loss before publication cannot preserve an in-memory transcript.
+Once capture ends, the CLI defers SIGINT through child cleanup and evidence publication, then
+returns 130 if Ctrl-C was requested. Repeated Ctrl-C during JSON serialization, flush/sync or
+link/unlink cannot interrupt that finalization. The record keeps the actual capture outcome;
+an interruption requested only during publication does not turn completed capture into failure.
+The CLI restores the previous signal handler afterward, including on filesystem errors. This
+uses Python's [main-thread signal handling](https://docs.python.org/3/library/signal.html#signals-and-threads);
+direct library calls to `publish_record` do not install the CLI's signal guard. Disk/write errors
+still fail loudly, and no guarantee is made that storage will complete within a fixed time.
 If child teardown raises, publication still runs: `cleanup_error` records the exception class
 separately from any earlier capture error. Such a record is failed/interrupted, and a missing exit
 status remains unknown. Cleanup may be incomplete; the record does not assert the child was reaped.
