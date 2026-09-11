@@ -41,7 +41,11 @@ control sequences. By default (`--home disposable`) the CLI creates a fresh HOME
 directory, passes only HOME/PATH/TERM, and never writes input. `--home inherit` opts into the
 real HOME/environment instead, for driving an authenticated host session; the record's
 `home_mode` field makes that choice visible rather than implicit, and no HOME cleanup runs for
-it. Before exec, the child closes all non-stdio descriptors, including handles
+it. `--cwd` overrides the child's working directory, and the record's `cwd` field carries the
+resolved directory the child actually ran in — host behaviour varies with repository-level
+configuration and instructions, so without it two captures of the same command in different
+directories are indistinguishable and cannot satisfy the reproduction requirement below.
+Before exec, the child closes all non-stdio descriptors, including handles
 made inheritable by its launcher. This Linux harness requires `/proc/self/fd` to enumerate the
 actual descriptor range; enumeration failure aborts startup instead of launching with unknown
 handles. The parent's descriptors remain unchanged. SIGINT is blocked across fork until the parent
@@ -173,8 +177,27 @@ Outcome detection is grounded in captured real output, not assumed formats:
   filters to the former; nothing here ever touches the latter.
 - `claude logs <id>` fails once a background session's daemon has exited — observed as
   `connect ENOENT /tmp/cc-daemon-*/*/control.sock` against a session already `state: "done"`.
-  Observation must happen *before* teardown; a failed read is treated as `{}` (no signal), never
-  as a negative outcome.
+  Observation must happen *before* teardown; a failed read returns an `Observation` marked
+  `observable=False`, which classifies `unobservable`. An empty outcome map is not enough: with
+  observability defaulting to true, "nothing read" would become `not_observed`, i.e. negative
+  evidence from a channel that was never available.
+- `claude logs` output carries **no per-entry timestamp**, so a reachable Claude transcript is
+  still `unobservable` today: an undated entry cannot be ordered against submission, and
+  counting it would let the assistant turn produced by the session-creation prompt stand in as
+  this trial's `turn_start` before the marker existed. The same fail-closed rule applies to a
+  Codex rollout record whose `timestamp` is missing or malformed — it is dropped and the read
+  reported unobservable, never promoted into the current window.
+- No captured mechanism at `2.1.268` submits a message to an *existing* background session:
+  `claude --bg` takes its prompt at creation, `attach` is an interactive PTY, and
+  `--remote-control` / `--print --input-format=stream-json` are unexercised. `ClaudeDriver.submit()`
+  raises `SubmissionUnsupported` and the cell classifies `unsupported`, rather than confirming the
+  session is listed and reporting acceptance for a marker the host never received. Guessing an
+  unconfirmed submission flag is the same evidence violation as guessing OpenCode's export shape;
+  capturing a real path is stage 3 work.
+- A Codex thread is adopted only when its rollout's earliest record timestamp is at or after the
+  run's own start (`CodexDriver(started_at=...)`). Minting whatever id a caller passed defeated
+  the registry guarantee, since `submit` then queues a message to it — a mistyped id could reach
+  an ordinary human thread. This orders a thread against the run; it does not authenticate it.
 - Codex's rollout JSONL (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`) is one JSON object
   per line; a chat turn is `{"type": "response_item", "payload": {"type": "message", "role":
   "user"|"assistant"|"developer", "content": [{"type": "input_text"|"output_text", "text":
@@ -190,12 +213,28 @@ acknowledgement can never be satisfied by chance text or a terminal echoing the 
 `detect_outcomes()` only counts an assistant event as `ack` when the marker itself appears in it,
 distinct from `turn_start`, which any assistant activity satisfies.
 
+`run_trial()` keeps observing until every transcript outcome is seen or the longest window
+(120s) has elapsed, merging each poll's evidence and keeping the first timestamp per outcome. A
+single immediate snapshot — what it took before — reported `not_observed` for events that
+arrived comfortably inside their window, which is precisely the delay the windows exist to
+measure. It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state`,
+`supported`, `observable`) carrying exactly what `Trial`/`classify_trial` need; acceptance is
+stamped when `submit` *returns*, since a submission that blocks for seconds would otherwise be
+backdated into its 10s window. The requested `state` is validated and carried into the result,
+but establishing a busy/approval/disconnected/restarted precondition is the caller's `settle`
+callable — passing `state='busy'` with a no-op `settle` still exercises an idle host, and no
+code here can detect that for the caller.
+
 One documented deviation from `Trial`'s "same monotonic clock" contract: `wake_probe.py`'s own
 PTY capture stays in one process and can use `time.monotonic()`, but a real host's transcript
-carries only wall-clock/ISO-8601 timestamps from another process. `host_trials.py` standardizes
-on `time.time()` throughout; `Trial.result()` only requires one consistent clock across
-`submitted`/`outcomes`/`now`, not monotonicity, so this is safe as long as every value on a given
-`Trial` uses the same clock.
+carries only wall-clock/ISO-8601 timestamps from another process, and no monotonic-to-wall
+calibration exists to convert them. Every *compared* value therefore comes from `time.time()`;
+`Trial.result()` only requires one consistent clock across `submitted`/`outcomes`/`now`, not
+monotonicity, so this is safe as long as every value on a given `Trial` uses the same clock.
+The local polling deadline is the exception and uses `time.monotonic()`, because an elapsed
+interval measured inside this process must not move when NTP steps the clock. A wall-clock step
+mid-trial still distorts the recorded timestamps themselves; that is a known limitation of
+cross-process evidence, not something the runner can correct.
 
 ## Real-host evidence still required
 
