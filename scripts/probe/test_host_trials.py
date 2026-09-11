@@ -226,6 +226,18 @@ class CodexParsingTests(unittest.TestCase):
                                          'content': {'type': 'tool_call', 'name': 'x'}}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
+    def test_a_non_object_record_is_unusable_rather_than_an_attributeerror(self):
+        # Valid JSON is not necessarily an object -- a damaged or schema-drifted line can decode
+        # to `null`, a number or a list -- and `record.get(...)` on any of those raises instead
+        # of reading as an unrecognized shape, aborting the whole read rather than just the line.
+        lines = [json.dumps(None), json.dumps([1, 2]), json.dumps(3),
+                json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                            'payload': {'type': 'message', 'role': 'user',
+                                        'content': [{'text': 'hi'}]}})]
+        events, unusable = codex_rollout_events(lines)
+        self.assertEqual(unusable, 3)
+        self.assertEqual(len(events), 1)
+
     def test_rollout_started_at_takes_the_earliest_record_of_any_type(self):
         lines = [
             json.dumps({'timestamp': '2026-09-11T00:00:05.000Z', 'payload': {'type': 'message'}}),
@@ -250,6 +262,13 @@ class CodexParsingTests(unittest.TestCase):
         lines = ['not json', json.dumps({'timestamp': '2026-09-11T00:00:01.000Z', 'type': 'session_meta'})]
         self.assertIsNone(rollout_started_at(lines))
         self.assertIsNone(rollout_started_at(['']))
+
+    def test_rollout_started_at_fails_closed_on_a_non_object_record(self):
+        # Same shape as an unparseable line: valid JSON that isn't an object carries no
+        # `.get`-able timestamp, and treating it as skippable could let the earliest real
+        # record's own poisoning go unnoticed.
+        lines = [json.dumps(None), json.dumps({'timestamp': '2026-09-11T00:00:01.000Z'})]
+        self.assertIsNone(rollout_started_at(lines))
 
 
 class ClaudeDriverTests(unittest.TestCase):
