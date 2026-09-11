@@ -269,9 +269,18 @@ def background_sessions(raw):
     A daemon-restarting or otherwise degraded CLI can print valid JSON that is not the expected
     list-of-objects shape -- an error object, `null`, or a bare scalar -- and `claude agents`
     still exits 0 when it does. Raising a clear RuntimeError here, rather than letting a
-    non-list top level or a non-dict entry escape as an uncaught TypeError/AttributeError from
-    the caller's own iteration, keeps this failure in the same reportable class as a nonzero
-    exit instead of crashing the trial with an unrelated-looking exception.
+    non-list top level escape as an uncaught TypeError/AttributeError from the caller's own
+    iteration, keeps this failure in the same reportable class as a nonzero exit instead of
+    crashing the trial with an unrelated-looking exception.
+
+    A malformed individual entry (non-dict, or a `background` entry with no usable `id`) is
+    likewise rejected rather than silently dropped: `create()` diffs two calls to this function
+    to identify the session it just made, and a malformed entry that is simply missing from one
+    snapshot's *filtered* output is indistinguishable from a session that never existed there.
+    If that entry happened to be a real, unrelated background session becoming well-formed only
+    in the later snapshot -- a listing race, not a probe session -- silently dropping it from the
+    earlier snapshot would make the diff mint it as this trial's own. Rejecting the whole read
+    instead keeps a listing race from ever reaching the diff at all.
     """
     try:
         entries = json.loads(raw)
@@ -280,7 +289,17 @@ def background_sessions(raw):
     if not isinstance(entries, list):
         raise RuntimeError(
             f'claude agents --json produced a non-list top level ({type(entries).__name__}): {raw!r}')
-    return [entry for entry in entries if isinstance(entry, dict) and entry.get('kind') == 'background']
+    sessions = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError(f'claude agents --json listed a non-object entry: {entry!r}')
+        if entry.get('kind') != 'background':
+            continue
+        if not isinstance(entry.get('id'), str) or not entry['id']:
+            raise RuntimeError(
+                f'claude agents --json listed a background session with an invalid id: {entry!r}')
+        sessions.append(entry)
+    return sessions
 
 
 def parse_claude_transcript(raw):
@@ -331,12 +350,7 @@ class ClaudeDriver:
                           capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             raise RuntimeError(f'claude agents exited {result.returncode}: {result.stderr}')
-        ids = set()
-        for entry in background_sessions(result.stdout):
-            if 'id' not in entry:
-                raise RuntimeError(f'claude agents --json listed a background session with no id: {entry!r}')
-            ids.add(entry['id'])
-        return ids
+        return {entry['id'] for entry in background_sessions(result.stdout)}
 
     def create(self, prompt):
         """Start a background session and identify it from a listing diff, never from stdout.
