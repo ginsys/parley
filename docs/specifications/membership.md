@@ -329,13 +329,19 @@ WITH expected_members AS (
     SELECT 'identical_pair', conversation, grant_version, NULL
     FROM grants WHERE peer_a_id = peer_b_id
 )
-SELECT diagnostic, conversation, grant_version, envelope_id
+SELECT diagnostic, hex(CAST(conversation AS BLOB)) AS conversation_hex, grant_version,
+       CASE WHEN envelope_id IS NULL THEN 'NULL'
+            ELSE hex(CAST(envelope_id AS BLOB)) END AS envelope_id_hex
 FROM findings
 ORDER BY conversation, grant_version, envelope_id, diagnostic;
 ```
 
 Each result identifies incompatible history; one envelope can have multiple diagnostics. An
-identical-pair result identifies the grant by conversation/version and has no envelope ID. A
+identical-pair result identifies the grant by conversation/version and displays the literal `NULL`
+for its absent envelope ID. Both identifier columns otherwise contain uppercase hex of the exact
+stored bytes, including spaces, separators, newlines, NUL and malformed UTF-8. Hex keeps SQLite's
+default pipe/newline output unambiguous; `quote()` alone leaves embedded newlines and truncates at
+NUL. Decode hex only for exact-key inspection; it is not a new identity or a repair operation. A
 missing grant produces missing-peer diagnostics too. No rows means these membership/self-send
 checks passed for that read snapshot, not that all migration checks passed. A missing file, SQL
 error or unsupported schema is a failed preflight, never a clean result. This query is for the
@@ -415,6 +421,7 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | Attempt to delete membership still referenced by a historical envelope | FK rejects deletion; no cascading loss of evidence |
 | Incompatible historical nonmember envelope, self-send/identical pair or unrecognized dependent table | Whole migration fails, leaving source schema and evidence unchanged; no synthetic membership repair |
 | Preflight on valid history, peers present only in other versions/conversations, missing grant, self-send and identical pair | Exact diagnostic rows across all states/versions; valid historical removal is not flagged; read-only execution leaves data unchanged |
+| Preflight identifiers containing pipes, spaces, newlines, NUL and malformed UTF-8 | Exact hex round-trip, one output row per finding, no separator ambiguity; absent envelope is the literal NULL |
 | Inbox/audit references, queue ordering/indexes and uncertain rows after migration | References and state unchanged; uncertainty never automatically replayed |
 
 ## Source basis and review boundary
