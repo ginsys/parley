@@ -284,14 +284,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seconds', type=float, default=10)
     parser.add_argument('--output', required=True, help='new JSON evidence file (never overwritten)')
+    parser.add_argument('--home', choices=('disposable', 'inherit'), default='disposable',
+                         help="disposable (default): fresh throwaway HOME, no host credentials. "
+                              "inherit: the real HOME/environment, for driving an authenticated "
+                              "host session; the record is marked home_mode='inherit' since it is "
+                              "not the credential-free capture the disposable mode records.")
+    parser.add_argument('--cwd', help='working directory for the child (default: the chosen HOME)')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command or not 0 < args.seconds <= 1020:
         parser.error('command and duration in (0, 1020] required')
+    if args.home == 'inherit' and not os.environ.get('HOME'):
+        parser.error('--home inherit requires HOME in the environment')
     if os.path.lexists(args.output):
         raise FileExistsError(args.output)
-    record = {'utc': datetime.datetime.now(datetime.UTC).isoformat(),
+    record = {'utc': datetime.datetime.now(datetime.UTC).isoformat(), 'home_mode': args.home,
               'command': command, 'duration': args.seconds, 'started': time.monotonic(),
               'kind': 'passive_capture', 'delivery_claim': None, 'events': [],
               'terminal_size': {'rows': PTY_SIZE[0], 'columns': PTY_SIZE[1]},
@@ -301,15 +309,20 @@ def main():
     result = 0
     child = None
     temporary_home = None
-    # No final file exists until a complete (possibly interrupted/failed) record
-    # is ready. HOME/cwd never inherit host authentication.
+    # No final file exists until a complete (possibly interrupted/failed) record is
+    # ready. In disposable mode (the default) HOME/cwd never inherit host authentication;
+    # inherit mode is opt-in and the record's home_mode makes that visible to a reader.
     with defer_sigint() as interrupted:
         try:
-            temporary_home = tempfile.TemporaryDirectory(prefix='parley-probe-')
-            home = temporary_home.name
-            child = PtyProcess(command, cwd=home,
-                               env={'HOME': home, 'PATH': os.environ.get('PATH', os.defpath), 'TERM': 'dumb'},
-                               generation='disposable')
+            if args.home == 'inherit':
+                home = os.environ['HOME']
+                env = dict(os.environ)
+                env['TERM'] = 'dumb'
+            else:
+                temporary_home = tempfile.TemporaryDirectory(prefix='parley-probe-')
+                home = temporary_home.name
+                env = {'HOME': home, 'PATH': os.environ.get('PATH', os.defpath), 'TERM': 'dumb'}
+            child = PtyProcess(command, cwd=args.cwd or home, env=env, generation='disposable')
             if interrupted[0]:
                 raise KeyboardInterrupt
             deadline = record['started'] + args.seconds
