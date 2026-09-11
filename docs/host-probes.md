@@ -43,6 +43,9 @@ published with an atomic no-replace hard link (then the temporary name is remove
 another capture even if it creates the destination during recording. Failed serialization leaves
 no empty final file. A caught interruption preserves partial events and returns a nonzero status;
 an uncatchable SIGKILL or power loss before publication cannot preserve an in-memory transcript.
+If child teardown raises, publication still runs: `cleanup_error` records the exception class
+separately from any earlier capture error. Such a record is failed/interrupted, and a missing exit
+status remains unknown. Cleanup may be incomplete; the record does not assert the child was reaped.
 
 For a synthetic recording, choose a new output filename:
 
