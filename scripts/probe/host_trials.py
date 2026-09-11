@@ -312,13 +312,20 @@ class ClaudeDriver:
         """Read logs before teardown: a `done` session's daemon socket is already gone.
 
         A nonzero read is an unavailable channel, returned unobservable so classification
-        cannot turn a dead daemon socket into `not_observed`.
+        cannot turn a dead daemon socket into `not_observed`. Non-empty output that yields no
+        recognized `User:`/`Assistant:` block is an unrecognized transcript shape, not "read
+        cleanly, nothing there yet" — those two must not collapse into the same empty,
+        `observable=True` result, or a format this runner cannot parse reads as a host that
+        stayed silent.
         """
         self.registry.require_owned(session_id)
         result = self.run(['claude', 'logs', session_id], capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             return Observation(observable=False)
-        return detect_outcomes(parse_claude_transcript(result.stdout, marker=marker), marker, submitted_at=submitted_at)
+        events = parse_claude_transcript(result.stdout, marker=marker)
+        if not events and result.stdout.strip():
+            return Observation(observable=False)
+        return detect_outcomes(events, marker, submitted_at=submitted_at)
 
     def teardown(self, session_id):
         """Release ownership only after a confirmed removal.
@@ -401,10 +408,13 @@ def codex_rollout_events(lines):
     record this runner has no use for is not evidence it failed to read.
 
     `unusable` counts content that *should* have been readable and was not — a line that is not
-    valid JSON (a corrupt or half-written rollout), or a message record whose `timestamp` is
-    missing or malformed. Neither can be ordered against submission, and opening a file
-    successfully does not establish that its transcript was read successfully. The caller reports
-    such a read unobservable rather than letting absent outcomes become negative evidence.
+    valid JSON (a corrupt or half-written rollout), a message record whose `timestamp` is
+    missing or malformed, or a message record whose `content` is not the list of parts every
+    captured shape carries (missing, explicit `null`, or a single object rather than a list —
+    a structured/tool-call payload this runner has not captured a shape for). Neither can be
+    ordered against submission, and opening a file successfully does not establish that its
+    transcript was read successfully. The caller reports such a read unobservable rather than
+    letting absent outcomes become negative evidence.
     """
     events = []
     unusable = 0
@@ -437,7 +447,15 @@ def codex_rollout_events(lines):
         if when is None:
             unusable += 1
             continue
-        text = ''.join(part.get('text', '') for part in payload.get('content', []) if isinstance(part, dict))
+        content = payload.get('content')
+        if not isinstance(content, list):
+            # `.get('content', [])` only substitutes the default when the key is absent; an
+            # explicit `"content": null` or a single structured object both slip past it and
+            # would otherwise raise iterating None or silently yield empty text for a shape
+            # this runner has not captured.
+            unusable += 1
+            continue
+        text = ''.join(part.get('text', '') for part in content if isinstance(part, dict))
         events.append(Event(role=role, text=text, time=when))
     return events, unusable
 
