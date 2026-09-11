@@ -379,7 +379,13 @@ def record_time(record):
     against `submitted_at` as a silently wrong instant. Every captured rollout record carries a
     trailing `Z` (docs/host-probe-preflight.md, 2026-09-11), so a naive one is an unknown
     producer and fails closed like any other undatable record.
+
+    Valid JSON is not necessarily an object -- a damaged or schema-drifted line can decode to
+    `null`, a number or a list -- and `.get` on any of those raises rather than reading as
+    undated, so that shape is checked here rather than at every caller.
     """
+    if not isinstance(record, dict):
+        return None
     stamp = record.get('timestamp')
     if not isinstance(stamp, str):
         return None
@@ -453,6 +459,12 @@ def codex_rollout_events(lines):
         try:
             record = json.loads(line)
         except ValueError:
+            unusable += 1
+            continue
+        if not isinstance(record, dict):
+            # Valid JSON that isn't an object -- e.g. a bare `null` from a damaged or
+            # schema-drifted rollout -- makes `record.get` raise instead of reading as an
+            # unrecognized shape, aborting the whole read rather than just this record.
             unusable += 1
             continue
         payload = record.get('payload')
