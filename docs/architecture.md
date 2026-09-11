@@ -19,7 +19,7 @@ policy tools can supplement these boundaries but are neither implemented nor req
 ## Accepted runtime direction
 
 The owner-approved roadmap changes the target deployment, not the current behavior above.
-The decision provenance and remaining protocol ruling are recorded in
+The decision provenance and accepted protocol ruling are recorded in
 [control-plane decision #19](https://github.com/ginsys/parley/issues/19).
 
 A standing server will own SQLite. `parleyctl` will become a deterministic client of authenticated
@@ -60,12 +60,60 @@ and validation remain server-independent. Migration documentation must cover hum
 stopped-service consistent backup/relocation, WAL/SHM and ownership, and must not silently create a
 replacement database at a new location.
 
-Unix-first NDJSON JSON-RPC remains a proposal. Session authentication follows the
-[accepted identity decision](#accepted-peer-identity). Protocol v1 must use the accepted membership
-model below even for a two-member-only implementation. Unsupported larger topologies must fail explicitly. Future TCP
+The human control plane uses the accepted Unix-first JSON-RPC profile below. Session authentication
+follows the [accepted identity decision](#accepted-peer-identity). Protocol v1 must use the accepted
+membership model below even for a two-member-only implementation. Unsupported larger topologies
+must fail explicitly. Future TCP
 transport should preserve application semantics; its implementation is outside the first milestone.
 The product sequence is two-peer runtime, durable inbox, then shared rooms. GitHub owns scopes,
 acceptance and native dependencies; this section records architectural direction only.
+
+## Accepted human control protocol
+
+On 2026-09-11 the owner accepted [decision #19](https://github.com/ginsys/parley/issues/19): a
+protected pathname Unix stream socket carrying a bounded, newline-delimited JSON-RPC 2.0
+single-call profile. A deterministic CLI/TUI can issue commands and receive change notifications
+on one connection. Batches and fire-and-forget mutations are excluded from the initial profile;
+this is not unrestricted JSON-RPC conformance. TCP remains future work.
+
+The server authenticates administration against configured trusted administrator OS accounts using
+kernel socket credentials; the client verifies the trusted server UID and protected socket path.
+A stable administrator principal is separate from every agent binding. Agent credentials and
+endpoint names cannot confer administrator capability. This identifies the trusted account, not
+human intent within it: any process with that account's authority could administer Parley.
+Production therefore requires the already-decided separate non-sudo agent accounts and trusted
+administrator login path. Same-account development does not prove that separation.
+
+The control plane carries membership approval/renewal/revocation and reviewed identity/recovery
+administration. It carries neither process spawning nor host execution approval. `parleyctl`
+becomes a deterministic client with no direct-DB fallback, while offline help/validation remain
+available. This is the accepted change to the target runtime's administration boundary; the
+current protected-controller restrictions still apply until implementation lands.
+
+The initial surface observes conversations/members, bounded state snapshots and pending-human
+items; subscribes to change hints; and invokes the named membership, admission, identity and
+recovery operations. There is no generic execute or arbitrary pending-item action. A snapshot
+returns a server epoch/view revision. Subscription succeeds only while that view is current;
+a change in the gap requires resnapshot. Reconnect, restart or notification-buffer overflow also
+requires a fresh snapshot. Hints are not a historical event journal; durable state and audit own
+history. A client must expose an unsynchronized view during sustained churn, not hide a gap.
+
+Every mutation uses a durable operation identity, exact expected versions and current authority.
+An ambiguous retry returns the recorded result, never a second grant or replenished budget.
+Stale approvals fail without retargeting. Mutation/result/audit commit together; audit records
+trusted principal, exact affected identities/versions, outcome and server time without secrets,
+message bodies or raw transport errors. Restoration reconciles audit and replay state too.
+
+Alternatives considered: HTTP/REST plus SSE/WebSocket suits a browser gateway but adds another
+transport/event contract for the first local CLI; gRPC adds protobuf and code-generation tooling;
+immediate TCP adds remote identity/confidentiality requirements. A second database-reading process
+would not itself provide runtime commands or push consistency. A durable notification journal
+could reduce resnapshot cost, but current-view observation and durable command audit meet the
+initial need without its replay-retention contract. These alternatives remain possible later.
+
+The [control specification](specifications/control.md) develops exact framing, operations,
+snapshot coordination, concurrency, ownership and failure fixtures for review. Neither this
+decision nor its specification claims an implemented server or proven production isolation.
 
 ## Accepted conversation admission
 
