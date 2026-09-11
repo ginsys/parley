@@ -163,6 +163,12 @@ class Observation:
     outcomes: dict = field(default_factory=dict)
     observable: bool = True
     turn_end: float | None = None
+    # True when this read came from a host that emits its own turn-boundary events
+    # (`detect_outcomes`' `turn_stream`), so a captured turn_start/ack is independent evidence
+    # of a *new* turn even before turn_end appears. False means the host offers no such signal
+    # at all, and any assistant text after submission is indistinguishable from the tail of a
+    # turn that was already running -- `run_trial` must not trust it either.
+    turn_stream: bool = False
 
 
 def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
@@ -217,7 +223,8 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
         outcomes.pop('turn_start', None)
         if started is not None:
             outcomes['turn_start'] = started
-    return Observation(outcomes=outcomes, observable=not undated, turn_end=turn_end)
+    return Observation(outcomes=outcomes, observable=not undated, turn_end=turn_end,
+                       turn_stream=turn_stream)
 
 
 # --- Claude: `claude agents --json [--all] [--cwd ...]` and `claude logs <id>` -----------------
@@ -631,7 +638,7 @@ class CodexDriver:
         observation = detect_outcomes(events, marker, submitted_at=submitted_at, turn_stream=True)
         if unusable:
             return Observation(outcomes=observation.outcomes, observable=False,
-                               turn_end=observation.turn_end)
+                               turn_end=observation.turn_end, turn_stream=True)
         return observation
 
     def teardown(self, thread_id):
@@ -716,10 +723,14 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     even when it lands past `BUSY_CAP` itself. A turn ending at, say, 890s still owes its
     dependent outcomes the window out to 1010s; only a turn ending *after* `BUSY_CAP` gets no
     such extension, because `Trial.result` classifies that case `inconclusive` regardless of how
-    much longer polling would wait. If the turn's end never appears at all, those two outcomes
-    are reported unobservable: the runner cannot tell "the host ignored us" from "the earlier
-    turn was still going", and only a host that emits turn boundaries (`turn_stream` in
-    `detect_outcomes`) can.
+    much longer polling would wait. If the turn's end never appears at all, a host with no
+    turn-boundary stream (`turn_stream` in `detect_outcomes`) has those two outcomes reported
+    unobservable outright, captured value or not — it cannot tell "the host ignored us" from "the
+    earlier turn was still going" even when an assistant message did show up, since either could
+    have produced it. A host that *does* emit turn boundaries keeps `Trial.result`'s own
+    distinction instead: an early turn_start/ack is trusted as independent evidence on its own,
+    and a channel that stayed readable through the whole cap with no boundary at all reaches
+    `inconclusive` via `turn_end_observable` rather than being forced `unobservable` here.
 
     Deliberate, bounded deviation from `Trial`'s "same monotonic clock" docstring: every
     timestamp that is *compared* — `submitted_at`, `accepted_at`, each `Event.time` — comes from
@@ -780,6 +791,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     outcomes = {}
     turn_end = None
     channel_readable = False
+    turn_stream_capable = False
     while True:
         observation = driver.observe(session_id, marker=marker, submitted_at=submitted_at)
         # The *final* read decides observability, not whether any read ever worked. A transcript
@@ -788,6 +800,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         # exactly this — the tail of the window was never seen, and an outcome missing from a
         # transcript nobody could read at the end is not negative evidence.
         channel_readable = observation.observable
+        turn_stream_capable = turn_stream_capable or observation.turn_stream
         for name, when in observation.outcomes.items():
             outcomes.setdefault(name, when)
         if state == 'busy' and turn_end is None and observation.turn_end is not None:
@@ -817,13 +830,15 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     observable = {'accepted': True}
     for name in TRANSCRIPT_OUTCOMES:
         observable[name] = True if name in outcomes else channel_readable
-    if state == 'busy' and turn_end is None:
-        # No turn-boundary evidence: the windows for these two never started, so an *absence*
-        # measures nothing. Fail closed rather than let it read as the host staying silent.
-        # An event that was positively seen keeps its own evidence (`wake_probe.py:57-61`).
+    if state == 'busy' and turn_end is None and not turn_stream_capable:
+        # No turn-boundary stream at all: this runner cannot tell a still-running prior turn's
+        # tail from a genuinely new one (`detect_outcomes`' docstring), so a captured value is
+        # exactly that ambiguity rather than evidence and must not be trusted either way — unlike
+        # a turn-stream host, where an early turn_start/ack is independent evidence on its own
+        # (`wake_probe.py:57-61`) and a channel that stayed readable with no boundary at all is
+        # itself `Trial.result`'s own `inconclusive` case via `turn_end_observable`, not this one.
         for name in ('turn_start', 'ack'):
-            if name not in outcomes:
-                observable[name] = False
+            observable[name] = False
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
                     outcomes=outcomes, state=state,
                     supported={name: True for name in OUTCOME_NAMES}, observable=observable,

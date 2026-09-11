@@ -824,6 +824,40 @@ class RunTrialTests(unittest.TestCase):
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['turn_start'], 'unobservable')
 
+    def test_a_busy_trial_without_turn_stream_never_trusts_a_bare_assistant_message(self):
+        # Without a turn-boundary stream, an assistant message after submission cannot be told
+        # apart from the tail of the turn already running (`detect_outcomes`' docstring) -- a
+        # captured value here is exactly that ambiguity, not evidence, even though the general
+        # "positively seen" rule would otherwise let it stand on its own.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'turn_start': 1005.0})], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0)
+        self.assertIsNone(run.turn_end)
+        self.assertIn('turn_start', run.outcomes)
+        self.assertFalse(run.observable['turn_start'])
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
+                      turn_end=run.turn_end, turn_end_observable=run.turn_end_observable)
+        classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
+        self.assertEqual(classified['turn_start'], 'unobservable')
+
+    def test_a_turn_stream_hosts_readable_busy_timeout_stays_inconclusive(self):
+        # A channel that stayed readable for the whole cap but never emitted a boundary is
+        # itself evidence the earlier turn never finished -- Trial.result's own `inconclusive`
+        # case via `turn_end_observable` -- not an unreadable channel, and must not be forced to
+        # `unobservable` here the way a non-turn-stream host's ambiguity is.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(turn_stream=True)], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0)
+        self.assertIsNone(run.turn_end)
+        self.assertTrue(run.turn_end_observable)
+        self.assertTrue(run.observable['turn_start'])
+        self.assertTrue(run.observable['ack'])
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
+                      turn_end=run.turn_end, turn_end_observable=run.turn_end_observable)
+        classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
+        self.assertEqual(classified['turn_start'], 'inconclusive')
+        self.assertEqual(classified['ack'], 'inconclusive')
+
     def test_an_observed_turn_end_shortens_the_busy_wait_and_reaches_classification(self):
         clock = FakeClock()
         seen = Observation(outcomes={'visible': 1000.0, 'turn_start': 1040.0, 'ack': 1041.0},
