@@ -245,6 +245,22 @@ class CodexParsingTests(unittest.TestCase):
                                          'content': {'type': 'tool_call', 'name': 'x'}}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
+    def test_a_non_string_part_text_is_unusable_rather_than_a_typeerror(self):
+        # A list-shaped content whose part carries a non-string `text` (e.g. explicit null) made
+        # ''.join(...) raise instead of reading as an unrecognized shape.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                             'payload': {'type': 'message', 'role': 'user',
+                                         'content': [{'text': None}]}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
+    def test_a_non_dict_part_makes_the_whole_record_unusable_not_silently_shorter(self):
+        # Silently skipping just the non-dict part let an unreadable marker message join down to
+        # an empty, ordinary-looking string -- negative evidence rather than unusable.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                             'payload': {'type': 'message', 'role': 'user',
+                                         'content': ['not-a-part', {'text': 'hi'}]}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
     def test_a_non_object_record_is_unusable_rather_than_an_attributeerror(self):
         # Valid JSON is not necessarily an object -- a damaged or schema-drifted line can decode
         # to `null`, a number or a list -- and `record.get(...)` on any of those raises instead
