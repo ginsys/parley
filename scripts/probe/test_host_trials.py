@@ -203,6 +203,15 @@ class CodexParsingTests(unittest.TestCase):
         self.assertLess(events[0].time, events[1].time)
         self.assertEqual(undated, 0)
 
+    def test_an_unknown_message_role_is_unusable_not_silently_skipped(self):
+        # A missing or schema-drifted role (e.g. a future "model") is not the same as the known,
+        # intentionally-ignored `developer` role -- treating it the same way could silently drop
+        # a current-turn assistant message while the rollout still reads observable=True.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                             'payload': {'type': 'message', 'role': 'model',
+                                         'content': [{'text': MARKER}]}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
     def test_unparseable_lines_count_as_unusable_while_other_record_types_do_not(self):
         # A record this runner has no use for is not a failed read; a line that is not JSON is.
         lines = ['not json', json.dumps({'payload': {'type': 'world_state'}}), '']

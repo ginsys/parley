@@ -578,7 +578,15 @@ def codex_rollout_events(lines):
         if kind != 'message':
             continue
         role = payload.get('role')
+        if role == 'developer':
+            continue
         if role not in ('user', 'assistant'):
+            # A missing or schema-drifted role (e.g. a future "model") is not the same as the
+            # known, intentionally-ignored `developer` role -- treating it the same way could
+            # silently drop a current-turn assistant message from the observation while the
+            # rollout still reads observable=True, producing a false not_observed instead of
+            # reporting the uncaptured shape as unusable.
+            unusable += 1
             continue
         when = record_time(record)
         if when is None:
