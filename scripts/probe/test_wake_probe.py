@@ -242,6 +242,54 @@ class PtyTests(unittest.TestCase):
                 self.assertEqual(record['capture_status'], status)
                 self.assertEqual(result, 1 if status == 'failed' else 0)
 
+    def test_deadline_with_exited_leader_and_live_descendant_is_stopped(self):
+        output = Path(self.tmp.name, 'descendant.json')
+        code = '''
+import os, signal, time
+r, w = os.pipe()
+if os.fork() == 0:
+    os.close(r)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    os.write(w, b'R')
+    os.close(w)
+    print('descendant ready', flush=True)
+    time.sleep(30)
+else:
+    os.close(w)
+    os.read(r, 1)
+    os.close(r)
+    os._exit(0)
+'''
+        original_read, monotonic = PtyProcess.read, time.monotonic
+        advance = 0
+
+        def read(child, timeout):
+            nonlocal advance
+            data = original_read(child, timeout)
+            if data:
+                # Force the deadline only after proving leader exit, without a
+                # timeout assumption about how quickly fork/exec must finish.
+                end = monotonic() + 5
+                while os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                    if monotonic() >= end:
+                        self.fail('fixture leader did not exit')
+                    original_read(child, .01)
+                advance = 120
+            return data
+
+        args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
+                sys.executable, '-u', '-c', code]
+        with patch.object(sys, 'argv', args), patch.object(PtyProcess, 'read', read), \
+                patch('wake_probe.time.monotonic', side_effect=lambda: monotonic() + advance):
+            result = main()
+        record = json.loads(output.read_text())
+        self.assertEqual(record['stop_reason'], 'deadline')
+        self.assertFalse(record['eof'])
+        self.assertEqual(record['exit_code'], 0)
+        self.assertFalse(record['cleanup_requested'])
+        self.assertEqual(record['capture_status'], 'stopped')
+        self.assertEqual(result, 0)
+
     def test_constructor_failure_produces_complete_failure_record(self):
         output = Path(self.tmp.name, 'startup.json')
         with patch.object(sys, 'argv', ['wake_probe', '--output', str(output), '--', 'fixture']), \

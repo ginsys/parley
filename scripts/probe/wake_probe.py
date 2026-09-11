@@ -266,7 +266,11 @@ def main():
                 record.update(capture_status='failed', error='child_exit_nonzero')
                 result = 1
             else:
-                record['capture_status'] = 'stopped' if child.cleanup_requested else 'complete'
+                # A successful leader may leave descendants holding the PTY.
+                # Only observed EOF plus natural leader success proves capture
+                # completion; reaching the deadline always truncates capture.
+                complete = record['stop_reason'] == 'eof' and child.eof and not child.cleanup_requested
+                record['capture_status'] = 'complete' if complete else 'stopped'
         publish_record(args.output, record)
     return result
 
