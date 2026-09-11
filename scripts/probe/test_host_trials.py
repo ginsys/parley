@@ -779,6 +779,17 @@ class RunTrialTests(unittest.TestCase):
         self.assertNotIn('create', driver.order)
         self.assertEqual(run.session_id, 'sid')
 
+    def test_an_idle_trial_never_adopts_a_turn_end(self):
+        # Observation.turn_end means "completion of the turn already running at submission"
+        # (its own docstring). An idle trial has no such turn: a turn boundary the host emits
+        # after submission is the completion of *this trial's own* marker turn, not one left
+        # running before it, and must not be mislabeled as the busy-only field.
+        clock = FakeClock()
+        seen = Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0, 'ack': 1002.0},
+                           turn_end=1002.0)
+        run = self.run_one(FakeDriver(observations=[seen], clock=clock), clock)
+        self.assertIsNone(run.turn_end)
+
     def test_a_busy_trial_without_a_turn_end_leaves_its_dependent_outcomes_unobservable(self):
         # The host never said the running turn finished, so the turn_start/ack windows never
         # started: their absence measures nothing and must not read as host silence.

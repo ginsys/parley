@@ -778,7 +778,12 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         channel_readable = observation.observable
         for name, when in observation.outcomes.items():
             outcomes.setdefault(name, when)
-        if turn_end is None and observation.turn_end is not None:
+        if state == 'busy' and turn_end is None and observation.turn_end is not None:
+            # Only a busy trial has a turn "already running at submission" for this field to
+            # mean (Observation's docstring). For every other state, the first turn boundary
+            # after submission is the completion of the turn *this trial's own marker* started,
+            # not a pre-existing one — adopting it here would mislabel that turn as something
+            # left running before the trial began.
             turn_end = observation.turn_end
             # The dependent windows run from the turn's end: adjust the deadline to match,
             # shortening it when they close early rather than sitting out the rest of the cap,
@@ -787,7 +792,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
             # at e.g. 890s to the 900s cap instead of the 1010s its own window earns it. A turn
             # ending *past* the cap gets no such extension: `Trial.result` classifies that
             # `inconclusive` no matter how much longer polling would wait.
-            if state != 'busy' or turn_end - submitted_at <= BUSY_CAP:
+            if turn_end - submitted_at <= BUSY_CAP:
                 deadline = monotonic() + max(0.0, LAST_WINDOW - (clock() - turn_end))
         remaining = deadline - monotonic()
         if remaining <= 0 or all(name in outcomes for name in TRANSCRIPT_OUTCOMES):
