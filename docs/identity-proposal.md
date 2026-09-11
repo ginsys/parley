@@ -60,6 +60,11 @@ flag. Explicit recipients and conversation selection remain necessary; they do n
 the sender. Replies still resolve and validate their original envelope under the membership
 contract, after the ingestion source has been bound to the authenticated peer.
 
+Record the accepting binding and credential version with every admitted message, reply and pending
+request. Preserve that provenance through grant renewal/carry and credential rotation; do not
+replace it with the version current at dispatch. Existing work without credential provenance must
+be reviewed before enabling a legacy binding, not silently attributed to a new credential.
+
 An enabled binding has current, non-revoked enrollment and a current unexpired credential. This
 does not mean its adapter is online. New sends/replies require an authenticated current sender and
 an enabled recipient binding; an offline recipient may queue work without a host attempt. Dispatch
@@ -119,6 +124,7 @@ connection generation and grant version are separate counters; reconnect never r
 | --- | --- |
 | First connection | Validate credential, expiry, UID and immutable binding; allocate a generation; remain not-ready until host verification/readiness |
 | Same socket repeats authentication after a lost response | Return its existing result; do not allocate a second generation |
+| Authentication response and its socket are lost | Authenticate a read-only generation lookup on a new socket, then use the observed generation for an ordinary reconnect once the old slot is inactive |
 | Another socket connects while the first is live | Reject as already connected; never silently evict the live connection |
 | Prior connection has closed or failed its bounded liveness check | Authenticate again; compare-and-increment the durable generation; one concurrent reconnect wins |
 | A second reconnect loses the race | Return a conflict; do not retry by automatically displacing the winner |
@@ -130,8 +136,19 @@ connection generation and grant version are separate counters; reconnect never r
 Generation allocation and eligibility checks are serialized with the server's writer. Client
 reconnect requests use an expected generation; failed attempts cannot mutate it. Generation
 overflow fails closed. A reconnect response must include server-owned generation/epoch, never
-trust an arbitrary client epoch as proof that an old connection is current. Liveness durations,
-response-loss details and retry limits belong in the connection specification and its fixtures.
+trust an arbitrary client epoch as proof that an old connection is current.
+
+Provide an authenticated read-only lookup of the binding's current server epoch, committed
+generation and active/inactive connection status. Validate credential, expiry, UID and immutable
+binding before returning only that binding's state. The lookup grants no operational principal or
+readiness, allocates no generation, and cannot reserve or evict a connection. It is available before
+ordinary attachment so a lost response cannot strand a client behind its own committed generation.
+For example, if attachment advanced generation 5 to 6 but its response and socket were lost, a new
+socket observes 6; after the old slot is inactive, its normal compare-and-increment attaches at 7.
+Repeated lookups have no effect. A concurrent winner still causes a conflict, never a takeover.
+Close/liveness callbacks must match their exact epoch/generation before releasing a slot; an old
+callback cannot clear the winner. Liveness durations and bounded retry limits belong in the
+connection specification and its fixtures.
 
 Reject stale-connection mutations using current credential/binding status and generation in the
 same writer transaction as message acceptance, admission changes or reply ingestion. A check at
@@ -141,25 +158,41 @@ cannot be recalled when revocation races with a response.
 
 ## Revocation, in-flight work and durable ingestion
 
-Credential revocation disables that binding across all conversations. It does not itself rewrite
-grants, reset budgets, cancel historical envelopes or authorize another peer. Disable discovery,
-new create/join requests and admission of a revoked binding; its pending requests cannot become
-grants through a stale approval. Pending rows and grant history remain available to administration.
-Queued envelopes remain subject to their existing grant/lifecycle rules and cannot dispatch while
-the required binding is unavailable. Expiry follows the same authentication gate.
+Credential revocation disables that binding across all conversations and atomically places a
+durable security hold on its outstanding authored work, including pending admission requests and
+never-attempted messages/replies. Cover all its credential versions by default: a stolen old
+credential may have queued work before a routine rotation. Keep acceptance provenance for review.
+The hold is independent of the envelope's delivery state and grant lifecycle; its storage and
+operations require specification. Revocation does not rewrite grants, reset budgets or authorize
+another peer. Disable discovery, new create/join requests and admission of a revoked binding;
+neither a stale approval nor later restoration may consume a held pending request.
 
 Human rotation/re-enrollment for the same verified native session can restore access under still
-valid membership; it does not revive cancelled messages or revoked grants. Replacing the host
-session is a different-peer admission and follows the approved membership/version-change rules.
-The human must separately revoke conversation grants when withdrawing conversation permission.
+valid membership, but cannot release these holds. Neither grant renewal/carry nor ordinary expiry
+and rotation may remove an existing hold. Only explicit human disposition may cancel or release
+reviewed individual work; release still requires every current membership, provenance, readiness
+and budget check. It cannot revive cancelled messages or revoked grants, refund/reset budgets,
+reset an acknowledged original or authorize replay of an uncertain attempt. Pending rows and grant
+history remain available to administration. The human must separately revoke conversation grants
+when withdrawing conversation permission.
 
-Before a dispatch claim consumes budget, validate the current required bindings and recipient
-readiness with the grant in the writer transaction. After a claim, connection invalidation cancels
+Routine expiry/rotation closes the authentication gate without declaring earlier work compromised;
+queued work may resume when the required bindings are enabled, subject to any existing hold.
+Messages authored by an unaffected peer for an unavailable recipient wait for that recipient's
+restored access; they are not automatically attributed to its compromised credential. Replacing
+the host session is a different-peer admission and follows the approved membership/version rules.
+
+Before a dispatch claim consumes budget, validate the current required bindings, absence of a
+security/recovery hold and recipient readiness with the grant in the writer transaction. After a
+claim, connection invalidation cancels
 the old transport context and must never redirect that attempt to a newly connected transport.
 Cancellation is cooperative: an already-started host attempt may complete and cannot be recalled.
 Normal settlement still records the exact original grant version and durable attempt token;
 revoked credentials do not erase accounting evidence. Ambiguous outcomes remain uncertain with
 no automatic retry. Do not treat an internal settlement as a new request from a revoked agent.
+If settlement proves no host attempt occurred, any requeued/carried work retains the security hold,
+including when settlement arrives after revocation or restoration. Apply any ordinary exact-token
+refund only once. A held trusted reply does not undo its original's already-recorded ACK.
 
 Host ingestion sources are tied to immutable bindings, not a caller-supplied transcript path.
 The adapter must verify native session provenance using a supported host-specific mechanism.
@@ -181,9 +214,29 @@ message; same-ID/different-request attempts fail. Reauthentication/current acces
 to retrieve a prior result. The wire format, retention and expired-ID behavior require explicit
 contracts; a cache eviction must not turn an old mutation into an authorized new one.
 
-Restoring an old database can restore old credential verifiers and undo recorded revocations.
-Require human credential reconciliation/rotation before admitting clients after backup restore;
-a new process epoch alone does not solve that rollback. Do not claim automatic restore detection.
+### Backup restoration
+
+Restoring an old database can undo revocations and rewind operation results, ingestion cursors and
+deduplication, envelope states/attempt tokens, membership/grant versions and consumed budgets.
+Credential rotation and a new process epoch cannot reconcile effects already observed by a host.
+
+Before starting from a restored database, the human must establish a recovery hold in trusted
+startup configuration outside the restored SQLite state. While held, permit human recovery
+inspection and explicit recovery dispositions, but no ordinary agent admission, pending-request
+or approval operations, dispatch or ingestion. Repeated restarts and credential rotation cannot
+clear the hold. The operational specification must define this startup gate and its explicit
+human completion procedure; do not
+claim automatic restore detection or make ordinary startup safe after an undisclosed restore.
+
+Recovery must reconcile credentials/revocations, security holds, operation results/tombstones,
+ingestion cursors/deduplication, membership/grant versions/budgets and envelope states/attempts
+against surviving host and operational evidence. Work whose external outcome or authorization
+cannot be established stays held or uncertain; it is never automatically requeued, re-ingested
+or given a replenished budget from the old snapshot. The human may retire affected work and
+explicitly authorize fresh work, but cannot claim to reconstruct missing evidence. Only explicit
+human disposition of the affected state allows the startup hold to be lifted. Unresolved work
+retains its own durable hold after that global gate opens. Restore fixtures must exercise lost
+delivery and replay evidence as well as restored credential verifiers.
 
 ## Discovery and pending conversations
 
@@ -219,7 +272,7 @@ It does not cryptographically attest that a language model produced particular t
 | Forged sender/host ID without a credential | Cannot acquire the named peer principal or obtain conversation access |
 | Valid credential for a different peer | Cannot select another binding or sender; its own membership still applies |
 | Credential stolen by another ordinary UID | Local UID check rejects it, assuming the production isolation checks hold |
-| Credential stolen by a process under the enrolled UID | Can impersonate that binding until expiry/revocation; connection exclusivity is not theft protection |
+| Credential stolen by a process under the enrolled UID | Can authorize new requests until expiry/revocation; revocation holds outstanding authored work but cannot retract prior effects; connection exclusivity is not theft protection |
 | Several agents under one account | Credentials prevent accidental mixups and unauthenticated claims, not malicious same-account theft, transcript tampering or adapter replacement |
 | Separate production server/admin and agent accounts | OS permissions can separate administration from agents; actual privilege routes still need deployment validation |
 | Server/adapter account or host compromised | This design cannot establish honest host provenance or defeat that account's authority |
@@ -261,12 +314,15 @@ protected administration executable from an agent session.
 | Public advertisement, named invitation and hidden waiting conversation | Only permitted metadata visible; ID guessing and full-conversation discovery cannot disclose private content |
 | Two candidates; approval vs cancellation/expiry/revocation | One valid pair or no pair; no third member, partial grant or stale approval |
 | Duplicate create/join/approval/send, including restart and conflicting payload | One durable effect; conflict rejected; grant budget never silently reset |
-| Two reconnects, old connection still live, lost authentication response | Exclusive winner; no repeated takeover or duplicate generation mutation |
+| Two reconnects, old connection still live, same-socket authentication replay | Exclusive winner; no repeated takeover or duplicate generation mutation |
+| Generation committed, response lost, socket closed | Authenticated lookup recovers the committed generation without mutation; one new attachment advances it once, resets readiness and preserves grants/budgets; stale close cannot clear it |
 | Old epoch/generation readiness ACK or ingestion event | Cannot ready a new transport, mutate a queue, ACK an original or advance the ingestion cursor |
 | Server restart and same native session resume | Fresh connection readiness, preserved memberships/budgets and no duplicate final-turn ingestion |
 | Fresh native session, same label or recycled PID | Cannot inherit the old binding or message rights |
 | Revocation before claim, after claim and after host startup | No pre-claim budget use; no retargeted attempt; exact settlement and conservative uncertainty retained |
-| Restore containing an old verifier | Recovery procedure prevents client admission until credentials are reconciled |
+| Stolen credential queues work while recipient offline; revoke then rotate/re-enroll/renew | Outstanding authored work across credential versions stays held until explicit human disposition; no dispatch or stale admission after access is restored |
+| Revocation followed by late never-attempted settlement or trusted-reply carry | Requeue/carry retains hold and original acceptance provenance; exact refund at most once; original ACK is not reset |
+| Restore snapshot predating delivery, ACK, approval, revocation or budget use | External recovery hold survives rotation/restart and blocks admission, mutation, dispatch and ingestion until all affected state is reconciled or explicitly retired/held; no duplicate host effect or snapshot-based budget replenishment |
 | Same-account stolen credential/compromised adapter | Demonstrate and document the limit; do not label it impersonation-proof |
 
 Owner review selects or amends this model. The follow-up specification must close every operation,
