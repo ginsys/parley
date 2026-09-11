@@ -239,8 +239,8 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
         self.assertEqual(output.read_bytes(), original)
 
     def test_missing_command_and_nonzero_exit_are_failed_captures(self):
-        for command in ([str(Path(self.tmp.name, 'missing-host'))],
-                        [sys.executable, '-c', 'raise SystemExit(23)']):
+        for command, expected in (([str(Path(self.tmp.name, 'missing-host'))], 127),
+                                  ([sys.executable, '-c', 'raise SystemExit(23)'], 23)):
             with self.subTest(command=command):
                 output = Path(self.tmp.name, 'result-' + str(len(command)) + '.json')
                 args = ['wake_probe', '--output', str(output), '--seconds', '2', '--', *command]
@@ -249,7 +249,7 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
                 self.assertEqual(result, 1)
                 record = json.loads(output.read_text())
                 self.assertEqual(record['capture_status'], 'failed')
-                self.assertIn(record['exit_code'], (127, 23))
+                self.assertEqual(record['exit_code'], expected)
                 self.assertEqual(record['error'], 'child_exit_nonzero')
 
     def test_interrupt_preserves_partial_events_and_reaps_child(self):
