@@ -547,8 +547,23 @@ def codex_rollout_events(lines):
             # this runner has not captured.
             unusable += 1
             continue
-        text = ''.join(part.get('text', '') for part in content if isinstance(part, dict))
-        events.append(Event(role=role, text=text, time=when))
+        texts = []
+        for part in content:
+            part_text = part.get('text', '') if isinstance(part, dict) else None
+            if not isinstance(part_text, str):
+                # A non-dict part or a non-string `text` value (e.g. explicit `null`) is a shape
+                # this runner has not captured. Silently dropping just that part let an
+                # unreadable marker message join down to an empty, ordinary-looking string --
+                # negative evidence rather than the unusable read it actually is -- and
+                # `''.join` on a non-string value raised outright. Fail the whole record closed
+                # instead of guessing at a partial join.
+                texts = None
+                break
+            texts.append(part_text)
+        if texts is None:
+            unusable += 1
+            continue
+        events.append(Event(role=role, text=''.join(texts), time=when))
     return events, unusable
 
 
