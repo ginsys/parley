@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -789,6 +790,24 @@ class RunTrialTests(unittest.TestCase):
         classified = classify_trial(trial, run.submitted_at + 1000,
                                     supported=run.supported, observable=run.observable)
         self.assertTrue(all(value == 'unobservable' for value in classified.values()))
+
+    def test_a_submission_timeout_is_unobservable_acceptance_but_still_polls_for_evidence(self):
+        # The subprocess may already have handed the marker to the host before its hard-coded
+        # timeout fired; losing the trial here would also lose any transcript evidence that
+        # delivery produced. Acceptance alone goes unobservable; observation still runs.
+        clock = FakeClock()
+        driver = FakeDriver(
+            observations=[Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0,
+                                                'ack': 1002.0})],
+            submit_error=subprocess.TimeoutExpired(cmd=['codex', 'queue'], timeout=15),
+            clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertIsNone(run.accepted_at)
+        self.assertNotIn('accepted', run.outcomes)
+        self.assertFalse(run.observable['accepted'])
+        self.assertTrue(run.observable['visible'])
+        self.assertEqual(run.outcomes['visible'], 1000.0)
+        self.assertEqual(run.outcomes['ack'], 1002.0)
 
     def test_an_existing_session_is_adopted_instead_of_created(self):
         clock = FakeClock()
