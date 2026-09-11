@@ -473,6 +473,23 @@ class CodexDriverTests(unittest.TestCase):
         with self.assertRaises(ForeignSessionError):
             self.driver(SessionRegistry(), mine).register_existing('thread-1')
 
+    def test_three_trials_can_each_adopt_a_distinct_thread_in_the_same_run(self):
+        # The 3-trials-per-cell protocol (docs/host-probes.md) needs three adoptions in one run.
+        # Counting an earlier trial's own already-owned thread as an unresolved rival made the
+        # second adoption always refuse; it must be excluded once this run has claimed it.
+        registry = SessionRegistry()
+        paths = {}
+        driver = CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
+                             rollout_path_for=paths.get, started_at=self.RUN_STARTED,
+                             sessions_root=self.sessions_root)
+        for tid in ('thread-1', 'thread-2', 'thread-3'):
+            # One thread created and adopted before the next exists, matching how a real trial
+            # sequence works: each rollout appears only once its own thread has been created.
+            paths[tid] = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z',
+                                       'type': 'session_meta'})
+            driver.register_existing(tid)
+        self.assertEqual(registry.created, {'thread-1', 'thread-2', 'thread-3'})
+
     def test_a_neighbour_that_cannot_be_dated_is_ambiguity_not_absence(self):
         registry = SessionRegistry()
         mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
