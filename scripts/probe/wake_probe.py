@@ -102,6 +102,11 @@ class PtyProcess:
             pid, fd = pty.fork()
             if pid == 0:
                 try:
+                    # A wrapper may pass authenticated sockets or other inheritable
+                    # handles. Inspect actual FDs, including those above a lowered
+                    # soft limit, and retain only the new PTY's standard streams.
+                    highest_fd = max(map(int, os.listdir('/proc/self/fd')), default=2)
+                    os.closerange(3, highest_fd + 1)
                     os.chdir(cwd)
                     os.execvpe(argv[0], argv, env)
                 except BaseException:
