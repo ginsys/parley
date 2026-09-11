@@ -518,6 +518,13 @@ class CodexDriver:
         orders and isolates a thread; it does not authenticate it, and creating it remains the
         caller's job (class docstring). A thread whose rollout is missing or carries no usable
         timestamp is refused rather than adopted on trust.
+
+        Residual risk this does not close: recency and uniqueness are not proof that *this run*
+        created the thread. A human opening the only other thread after `started_at` leaves no
+        rival, and this adopts their thread just as readily as one the caller actually made.
+        `thread_id` is trusted to be a thread the caller just created — real creation-binding is
+        out of scope for this stage (`create()` refuses to guess one, rather than provide a
+        false sense of that binding here).
         """
         path = self.rollout_path_for(thread_id)
         if path is None:
