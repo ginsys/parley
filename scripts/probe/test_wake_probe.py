@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -231,6 +232,36 @@ class PtyTests(unittest.TestCase):
                     finally:
                         for child in children:
                             original_close(child)
+
+    def test_publication_syncs_directory_and_reports_sync_failure(self):
+        for fail_directory in (False, True):
+            with self.subTest(fail_directory=fail_directory):
+                output = Path(self.tmp.name, f'durable-{fail_directory}.json')
+                original_sync = os.fsync
+                synced = []
+                directory_fds = []
+
+                def sync(fd):
+                    directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+                    synced.append('directory' if directory else 'file')
+                    if directory:
+                        directory_fds.append(fd)
+                        self.assertEqual(json.loads(output.read_text()), {'fixture': True})
+                        self.assertEqual(list(Path(self.tmp.name).glob('.parley-capture-*')), [])
+                        if fail_directory:
+                            raise OSError('directory sync failed')
+                    return original_sync(fd)
+
+                with patch('os.fsync', sync):
+                    if fail_directory:
+                        with self.assertRaisesRegex(OSError, 'directory sync failed'):
+                            publish_record(output, {'fixture': True})
+                    else:
+                        publish_record(output, {'fixture': True})
+                self.assertEqual(synced, ['file', 'directory'])
+                for fd in directory_fds:
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
 
     def test_publication_race_preserves_winner(self):
         output = Path(self.tmp.name, 'winner.json')
