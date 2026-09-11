@@ -71,3 +71,11 @@ Conclusion enabled: Claude's `--channels` is a legitimate `unsupported` classifi
 `claude logs` give a structured alternative for transcript-visibility and turn-start detection
 without PTY screen-scraping, *while the background session is still running*. See the [matrix
 runner](host-probes.md#matrix-runner) for how `scripts/probe/host_trials.py` uses this.
+
+Two limits of that alternative, both observed here rather than assumed. Nothing in the surface
+above submits a message to an *already-running* background session: `--bg` carries its prompt at
+creation, `attach` is interactive, and `--remote-control` / `--input-format=stream-json` remain
+unexercised — so a Claude submission trial is `unsupported` at this version until one of those is
+actually captured. And `claude logs` prints no per-entry timestamp, so its transcript cannot be
+ordered against a submission instant; that makes it `unobservable` for window classification,
+not negative evidence. Both are version-pinned observations, not product-wide claims.

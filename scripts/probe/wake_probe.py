@@ -299,7 +299,12 @@ def main():
         parser.error('--home inherit requires HOME in the environment')
     if os.path.lexists(args.output):
         raise FileExistsError(args.output)
+    # `cwd` is the resolved directory the child actually ran in, filled once the HOME choice is
+    # known below. Host behaviour varies with repository-level configuration and instructions,
+    # so two captures of the same command in different directories are otherwise
+    # indistinguishable and cannot satisfy the reproduction requirement in docs/host-probes.md.
     record = {'utc': datetime.datetime.now(datetime.UTC).isoformat(), 'home_mode': args.home,
+              'cwd': None,
               'command': command, 'duration': args.seconds, 'started': time.monotonic(),
               'kind': 'passive_capture', 'delivery_claim': None, 'events': [],
               'terminal_size': {'rows': PTY_SIZE[0], 'columns': PTY_SIZE[1]},
@@ -322,7 +327,8 @@ def main():
                 temporary_home = tempfile.TemporaryDirectory(prefix='parley-probe-')
                 home = temporary_home.name
                 env = {'HOME': home, 'PATH': os.environ.get('PATH', os.defpath), 'TERM': 'dumb'}
-            child = PtyProcess(command, cwd=args.cwd or home, env=env, generation='disposable')
+            record['cwd'] = os.path.abspath(args.cwd or home)
+            child = PtyProcess(command, cwd=record['cwd'], env=env, generation='disposable')
             if interrupted[0]:
                 raise KeyboardInterrupt
             deadline = record['started'] + args.seconds

@@ -266,7 +266,22 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
                 sys.executable, '-u', '-c', "print('default mode', flush=True)"]
         with patch.object(sys, 'argv', args):
             self.assertEqual(main(), 0)
-        self.assertEqual(json.loads(output.read_text())['home_mode'], 'disposable')
+        record = json.loads(output.read_text())
+        self.assertEqual(record['home_mode'], 'disposable')
+        self.assertIsNotNone(record['cwd'])  # the throwaway HOME, recorded not implied
+
+    def test_explicit_cwd_is_recorded_as_the_resolved_effective_directory(self):
+        # Host behaviour varies by directory-level configuration, so a capture that does not
+        # name where the child ran cannot be reproduced or compared against another.
+        output = Path(self.tmp.name, 'cwd.json')
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--cwd', self.tmp.name, '--',
+                sys.executable, '-u', '-c', "import os; print(os.getcwd(), flush=True)"]
+        with patch.object(sys, 'argv', args):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        self.assertEqual(record['cwd'], os.path.abspath(self.tmp.name))
+        printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
+        self.assertIn(os.path.realpath(self.tmp.name).encode(), printed)
 
     def test_missing_command_and_nonzero_exit_are_failed_captures(self):
         for command, expected in (([str(Path(self.tmp.name, 'missing-host'))], 127),
