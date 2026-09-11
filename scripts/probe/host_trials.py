@@ -806,7 +806,14 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     if not accepted:
         # A clean nonzero exit (not an exception) is a definitive, observed failure to accept --
         # 'not_observed' is the true classification for `accepted` itself -- but nothing was
-        # delivered, so no transcript signal could ever belong to this trial. Polling anyway and
+        # delivered, so no transcript signal could ever belong to this trial. `classify_trial`
+        # still won't report that 'not_observed' until `accepted`'s own 10s window has actually
+        # elapsed, though: `observable=True` with nothing in `outcomes` means "genuinely still
+        # pending" to `Trial.result`, the same as any other outcome, and it has no way to
+        # distinguish that from "already known, just tell me now" -- there is no such input to
+        # give it. A caller classifying immediately after this return still needs `now >=
+        # submitted_at + WINDOWS['accepted']`, same as every other outcome (run_trial's
+        # docstring already states callers must wait for windows, not guess). Polling anyway and
         # reporting the missing outcomes as `not_observed` would be negative evidence for a
         # marker the host never received, exactly the confusion `SubmissionUncaptured` exists to
         # prevent for the acceptance channel itself.
