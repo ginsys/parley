@@ -181,16 +181,19 @@ Outcome detection is grounded in captured real output, not assumed formats:
   `observable=False`, which classifies `unobservable`. An empty outcome map is not enough: with
   observability defaulting to true, "nothing read" would become `not_observed`, i.e. negative
   evidence from a channel that was never available.
-- `claude logs` output carries **no per-entry timestamp**, so a reachable Claude transcript is
-  still `unobservable` today: an undated entry cannot be ordered against submission, and
+- `claude logs` output is **assumed** to carry no per-entry timestamp — a hypothesis to
+  reproduce, since the one read attempted here failed against an already-exited daemon
+  (docs/host-probe-preflight.md, 2026-09-11) — so a reachable Claude transcript is treated as
+  `unobservable` today: an undated entry cannot be ordered against submission, and
   counting it would let the assistant turn produced by the session-creation prompt stand in as
   this trial's `turn_start` before the marker existed. The same fail-closed rule applies to a
   Codex rollout record whose `timestamp` is missing or malformed, and to a line that is not
   valid JSON at all (a truncated or corrupt rollout): opening a file successfully does not
   establish that its transcript was read successfully, so the read is reported unobservable
   rather than yielding an empty outcome map that would classify as `not_observed`. A record
-  type this runner has no use for (`event_msg`, `token_usage_record`, ...) is not a failed read
-  and is skipped silently. Provenance is stricter still: `rollout_started_at` returns nothing at
+  type this runner has no use for (`token_usage_record`, `world_state`, ...) is not a failed
+  read and is skipped silently — `event_msg` is no longer in that set, see the turn-boundary
+  rule below. Provenance is stricter still: `rollout_started_at` returns nothing at
   all on an unparseable line, since the line it could not read may be the earliest one.
 - No captured mechanism at `2.1.268` submits a message to an *existing* background session:
   `claude --bg` takes its prompt at creation, `attach` is an interactive PTY, and
