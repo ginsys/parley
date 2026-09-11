@@ -35,7 +35,6 @@ export from at investigation time) and is deliberately left unimplemented rather
 """
 
 import datetime
-import glob
 import json
 import os
 import re
@@ -472,19 +471,32 @@ class CodexDriver:
 
         Fail closed in both directions: a neighbour that started after this run did, and a
         neighbour that cannot be read or dated at all, are both ambiguity rather than absence.
+        This also covers a subdirectory that cannot even be listed: `glob.glob` swallows that
+        `OSError` internally and just returns fewer matches, with no signal that anything was
+        skipped, so an unreadable directory would read as "no rivals found" rather than "could
+        not check" — the same fail-open shape a per-file read failure is guarded against below.
+        `os.walk`'s `onerror` is the only way to observe that failure at all.
         """
         adopted = os.path.realpath(adopted)
         rivals = []
-        for other in glob.glob(os.path.join(self.sessions_root, '**', '*.jsonl'), recursive=True):
-            if os.path.realpath(other) == adopted:
-                continue
-            try:
-                with open(other, encoding='utf-8') as handle:
-                    started = rollout_started_at(handle)
-            except (OSError, UnicodeDecodeError):
-                started = None
-            if started is None or started >= self.started_at:
-                rivals.append(other)
+
+        def _cannot_list(error):
+            rivals.append(f'<unreadable directory: {error}>')
+
+        for root, _dirs, files in os.walk(self.sessions_root, onerror=_cannot_list):
+            for name in files:
+                if not name.endswith('.jsonl'):
+                    continue
+                other = os.path.join(root, name)
+                if os.path.realpath(other) == adopted:
+                    continue
+                try:
+                    with open(other, encoding='utf-8') as handle:
+                        started = rollout_started_at(handle)
+                except (OSError, UnicodeDecodeError):
+                    started = None
+                if started is None or started >= self.started_at:
+                    rivals.append(other)
         return rivals
 
     def register_existing(self, thread_id):
