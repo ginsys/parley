@@ -545,8 +545,18 @@ class CodexDriver:
         skipped, so an unreadable directory would read as "no rivals found" rather than "could
         not check" — the same fail-open shape a per-file read failure is guarded against below.
         `os.walk`'s `onerror` is the only way to observe that failure at all.
+
+        A rollout this run already adopted (an earlier trial's thread) is excluded alongside
+        `adopted` itself, not just `adopted`: it is provably a *different* thread this same run
+        claimed, not an unresolved competitor for this one, and counting it as a rival made a
+        second adoption in the same run always fail — the 3-trials-per-cell protocol
+        (docs/host-probes.md, Trial protocol) could never be satisfied for a host with no
+        creation path. Excluding it does not weaken the guarantee this method exists for: an
+        outside human thread is still caught, since it was never registered here.
         """
         adopted = os.path.realpath(adopted)
+        already_owned = {os.path.realpath(self.rollout_path_for(thread_id))
+                         for thread_id in self.registry.created}
         rivals = []
 
         def _cannot_list(error):
@@ -557,7 +567,8 @@ class CodexDriver:
                 if not name.endswith('.jsonl'):
                     continue
                 other = os.path.join(root, name)
-                if os.path.realpath(other) == adopted:
+                other = os.path.realpath(other)
+                if other == adopted or other in already_owned:
                     continue
                 try:
                     with open(other, encoding='utf-8') as handle:
@@ -579,7 +590,11 @@ class CodexDriver:
 
         "Started after this run did" is still not "created by this run": a human opening their
         own thread meanwhile satisfies it just as well. So adoption also requires that no other
-        rollout under `sessions_root` could be that thread — one candidate, or refuse. This
+        *unowned* rollout under `sessions_root` could be that thread — one candidate among the
+        threads this run hasn't already claimed, or refuse (`_unruled_out_threads` excludes
+        threads this run itself already adopted, so three trials against three distinct threads
+        in the same run — the protocol docs/host-probes.md requires — can each adopt in turn
+        instead of the second one always finding the first as an unresolved rival). This
         orders and isolates a thread; it does not authenticate it, and creating it remains the
         caller's job (class docstring). A thread whose rollout is missing or carries no usable
         timestamp is refused rather than adopted on trust.
