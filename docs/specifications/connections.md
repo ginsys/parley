@@ -1,10 +1,10 @@
 # Connection principals and session lifecycle specification
 
-Draft for [#22](https://github.com/ginsys/parley/issues/22), grounded in the owner's accepted
-[identity decision](../identity-proposal.md) and [membership contract](membership.md).
-The identity model is accepted; the detailed records, limits, operations and fixtures here are
-proposed for specification review. This document adds no runtime or schema implementation.
-GitHub owns scope, status and native dependencies.
+Specification delivered for [#22](https://github.com/ginsys/parley/issues/22) in owner-enqueued
+PR #44, grounded in the accepted [identity decision](../identity-proposal.md) and
+[membership contract](membership.md). The landed artifact supplies the connection baseline;
+GitHub records its acceptance. This document adds no runtime or schema implementation.
+The [control specification](control.md) maps the logical operations to proposed wire contracts.
 
 ## Scope and boundaries
 

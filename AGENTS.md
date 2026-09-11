@@ -27,6 +27,13 @@ The [accepted runtime direction](docs/architecture.md#accepted-runtime-direction
 owner-approved move to server-owned storage and authenticated human administration, with dedicated
 production accounts. It is a target contract, not an implemented exception to the restrictions above.
 
+The [accepted human control protocol](docs/architecture.md#accepted-human-control-protocol) uses a
+protected Unix socket and a JSON-RPC single-call profile. Trusted administrator-account identity
+is separate from agent credentials. Snapshots/subscriptions refresh explicitly across gaps;
+mutations retain durable operation results and audit. The [control specification](docs/specifications/control.md)
+defines the detailed contract for review; no runtime administration or execution authority is
+implicitly added to agent-facing requests.
+
 The [accepted membership model](docs/architecture.md#accepted-membership-model) uses versioned
 members and open/lead-only/directed policies. Initial runtime/inbox APIs translate to the existing
 pair storage; members-table creation and backfill belong to the later room migration.
