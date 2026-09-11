@@ -686,7 +686,12 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     `SubmissionUnsupported` and every outcome is `unsupported` — nothing was delivered, so no
     transcript signal could belong to this trial. A host where only *this runner* has captured
     no path raises `SubmissionUncaptured` and every outcome is `unobservable` instead: the same
-    empty result, but recorded against us rather than published as a host capability.
+    empty result, but recorded against us rather than published as a host capability. A clean
+    failed submission — `submit` returning `False` rather than raising — skips the polling loop
+    entirely instead of falling through to it: `accepted` itself stays observable (a failed
+    submission is genuine, true negative evidence), but the transcript outcomes are marked
+    unobservable rather than polled to an eventual `not_observed`, since no delivered message
+    could ever have produced a signal for them.
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
@@ -708,7 +713,20 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
                         supported={name: True for name in OUTCOME_NAMES},
                         observable={name: False for name in OUTCOME_NAMES},
                         turn_end_observable=False)
-    accepted_at = clock() if accepted else None
+    if not accepted:
+        # A clean nonzero exit (not an exception) is a definitive, observed failure to accept --
+        # 'not_observed' is the true classification for `accepted` itself -- but nothing was
+        # delivered, so no transcript signal could ever belong to this trial. Polling anyway and
+        # reporting the missing outcomes as `not_observed` would be negative evidence for a
+        # marker the host never received, exactly the confusion `SubmissionUncaptured` exists to
+        # prevent for the acceptance channel itself.
+        observable = {'accepted': True}
+        observable.update({name: False for name in TRANSCRIPT_OUTCOMES})
+        return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
+                        outcomes={}, state=state,
+                        supported={name: True for name in OUTCOME_NAMES}, observable=observable,
+                        turn_end_observable=False)
+    accepted_at = clock()
     outcomes = {}
     turn_end = None
     channel_readable = False
