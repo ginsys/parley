@@ -219,7 +219,7 @@ schema actually shipped then; do not reserve version 5 now (the current core is 
 | `grants` | Preserve `(conversation, grant_version)` PK, conversation FK, lifecycle/accounting fields and one-active partial unique index; replace positional fields with `policy_kind` CHECK in the three allowed tags |
 | `grant_members` | PK `(conversation, grant_version, peer_id)`; FK to grants; NOT NULL exact ID and role; role CHECK in `member`, `lead` |
 | `grant_edges` | PK `(conversation, grant_version, from_peer, to_peer)`; two composite FKs to grant_members; `CHECK(from_peer <> to_peer)` with binary identifier comparison |
-| `envelopes` | Preserve IDs, all existing fields and grant FK; add `CHECK(from_peer <> to_peer)` |
+| `envelopes` | Preserve IDs, all existing fields and grant FK; add version-scoped sender/recipient FKs to grant_members as below, and `CHECK(from_peer <> to_peer)` |
 
 Named policies have no stored edge rows. Cross-row rules (minimum membership, exactly one lead
 for `lead_only`, policy-compatible roles/edges) are validated as a whole inside the insertion
@@ -227,11 +227,30 @@ transaction before activation, not claimed to be expressible by a row CHECK. Uni
 prevents repeated-peer entries. Sender/recipient self-edge CHECKs belong on tables that actually
 have those columns. Keep exact identifier validation at the application boundary as well.
 
-Do not add a historical envelope-to-membership FK: old envelope history may include rejected or
-previously accepted unenrolled sends and must remain inspectable. The existing grant-version FK
-and new self-send CHECK serve different purposes. Historical self-send rows or identical A/B
-members that cannot satisfy the required new constraints abort migration, without deleting or
-rewriting evidence. The operator must resolve such incompatible history explicitly before retry.
+Both envelope peers must reference membership in the envelope's own grant version:
+
+```sql
+FOREIGN KEY (conversation, grant_version, from_peer)
+    REFERENCES grant_members(conversation, grant_version, peer_id),
+FOREIGN KEY (conversation, grant_version, to_peer)
+    REFERENCES grant_members(conversation, grant_version, peer_id)
+```
+
+These are immediate constraints with no cascading deletes or updates. Removing a member from a
+successor does not invalidate envelopes under retained historical versions. At the current core
+baseline, Send checks authorization before insertion; a rejected send leaves no envelope row.
+Renewal preserves peers, and the specified carry predicate requires membership and the allowed
+edge across every crossed snapshot. Insert the successor's members before carrying a reply's
+`grant_version` forward, in the same transaction. The FKs enforce membership, not direction,
+expiry or budget; transactional authorization remains necessary.
+
+Legacy data still needs validation: [Send at pre-audit commit
+6f75867](https://github.com/ginsys/parley/blob/6f75867f5e52427a8d4c2adc90a8564100060f94/internal/dispatch/dispatch.go#L94-L122)
+could persist peers outside its stamped grant because it did not check authorization. That is
+incompatible history, not a reason to omit the new FKs. An envelope peer missing from its own
+version, a historical self-send or identical A/B members aborts the whole migration. Preserve the
+source schema and evidence; do not invent membership, delete rows or rewrite IDs/versions to make
+constraints pass. The operator must resolve incompatible history explicitly before retry.
 
 Migration procedure, within the existing immediate transaction and `user_version` discipline:
 
@@ -291,7 +310,10 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | All known version-zero schemas and every numbered predecessor, including revoked/superseded history | Complete backfill preserving keys, values, provenance and edge sets |
 | Inject failure during copy/drop/rename/index/version update; terminate before commit | Restart sees intact old schema/version/data; no partial shadow catalog |
 | Self-edge, repeated member, missing FK and invalid policy after migration | Database constraints or transactional graph validator reject as specified |
-| Incompatible historical self-send/identical pair or unrecognized dependent table | Whole migration fails, leaving source evidence unchanged |
+| Envelope sender or recipient exists only in another conversation/version | Its respective membership FK rejects insert/update; no partial mutation |
+| Historical envelope after member removal; eligible reply carried to a successor | Historical FK remains valid; successor members precede the atomic reply version update |
+| Attempt to delete membership still referenced by a historical envelope | FK rejects deletion; no cascading loss of evidence |
+| Incompatible historical nonmember envelope, self-send/identical pair or unrecognized dependent table | Whole migration fails, leaving source schema and evidence unchanged; no synthetic membership repair |
 | Inbox/audit references, queue ordering/indexes and uncertain rows after migration | References and state unchanged; uncertainty never automatically replayed |
 
 ## Source basis and review boundary
