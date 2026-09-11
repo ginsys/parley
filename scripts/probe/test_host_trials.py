@@ -209,6 +209,22 @@ class CodexParsingTests(unittest.TestCase):
         ]
         self.assertEqual(codex_rollout_events(lines), ([], 2))
 
+    def test_null_content_is_unusable_rather_than_a_typeerror(self):
+        # payload.get('content', []) only substitutes [] when the key is absent; an explicit
+        # "content": null slips past that default and a bare iteration would raise TypeError.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                             'payload': {'type': 'message', 'role': 'user', 'content': None}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
+    def test_object_valued_content_is_unusable_not_silently_empty(self):
+        # A structured/tool-call payload shape (content as a single object, not a list of parts)
+        # must not parse as an empty-text event with observable=True -- that reads as "checked,
+        # nothing there" instead of "this shape was never captured".
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                             'payload': {'type': 'message', 'role': 'assistant',
+                                         'content': {'type': 'tool_call', 'name': 'x'}}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
     def test_rollout_started_at_takes_the_earliest_record_of_any_type(self):
         lines = [
             json.dumps({'timestamp': '2026-09-11T00:00:05.000Z', 'payload': {'type': 'message'}}),
@@ -326,6 +342,26 @@ class ClaudeDriverTests(unittest.TestCase):
         observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
         self.assertEqual(observation.outcomes, {})
         self.assertFalse(observation.observable)
+
+    def test_observe_of_an_unrecognized_transcript_shape_is_unobservable(self):
+        # Non-empty output that yields no recognized User:/Assistant: block is a format this
+        # runner cannot parse, not "read cleanly, no conversation yet" -- those must not
+        # collapse into the same empty, observable=True result.
+        registry = SessionRegistry()
+        registry.mint('abcd1234')
+        driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='some other format\n'),
+                              cwd='/scratch')
+        observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
+        self.assertEqual(observation, Observation(outcomes={}, observable=False))
+
+    def test_observe_of_genuinely_empty_output_is_still_observable(self):
+        # A session with no conversation yet (nothing sent, or a poll racing session creation)
+        # must not be conflated with an unrecognized shape: empty output is a legitimate read.
+        registry = SessionRegistry()
+        registry.mint('abcd1234')
+        driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='  \n'), cwd='/scratch')
+        observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
+        self.assertEqual(observation, Observation(outcomes={}, observable=True))
 
     def test_teardown_releases_the_registry_entry(self):
         registry = SessionRegistry()
