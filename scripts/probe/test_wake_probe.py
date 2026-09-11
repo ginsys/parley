@@ -655,6 +655,44 @@ else:
         self.assertEqual(record['capture_status'], 'stopped')
         self.assertEqual(result, 0)
 
+    def test_temporary_home_setup_failure_publishes_startup_evidence(self):
+        output = Path(self.tmp.name, 'home-setup.json')
+        args = ['wake_probe', '--output', str(output), '--', 'fixture']
+        with patch.object(sys, 'argv', args), \
+                patch('tempfile.TemporaryDirectory', side_effect=OSError('temporary root unavailable')):
+            self.assertEqual(main(), 1)
+        record = json.loads(output.read_text())
+        self.assertEqual(record['capture_status'], 'failed')
+        self.assertEqual(record['stop_reason'], 'startup')
+        self.assertEqual(record['error'], 'OSError')
+        self.assertIsNone(record['wait_status'])
+        self.assertEqual(record['events'], [])
+
+    def test_temporary_home_cleanup_preserves_interrupt_and_failure(self):
+        cleanup = tempfile.TemporaryDirectory.cleanup
+        for failure in ('interrupt', 'error'):
+            with self.subTest(failure=failure):
+                output = Path(self.tmp.name, f'home-cleanup-{failure}.json')
+                original_handler = signal.getsignal(signal.SIGINT)
+
+                def cleanup_then_fail(home):
+                    cleanup(home)
+                    if failure == 'interrupt':
+                        signal.raise_signal(signal.SIGINT)
+                    else:
+                        raise OSError('home cleanup fixture')
+
+                args = ['wake_probe', '--output', str(output), '--seconds', '60', '--',
+                        sys.executable, '-u', '-c', "print('cleanup fixture', flush=True)"]
+                with patch.object(sys, 'argv', args), \
+                        patch.object(tempfile.TemporaryDirectory, 'cleanup', cleanup_then_fail):
+                    self.assertEqual(main(), 130 if failure == 'interrupt' else 1)
+                record = json.loads(output.read_text())
+                self.assertEqual(record['capture_status'], 'complete' if failure == 'interrupt' else 'failed')
+                self.assertEqual(record['exit_code'], 0)
+                self.assertIn(b'cleanup fixture', b''.join(bytes.fromhex(e['hex']) for e in record['events']))
+                self.assertEqual(signal.getsignal(signal.SIGINT), original_handler)
+
     def test_constructor_failure_produces_complete_failure_record(self):
         output = Path(self.tmp.name, 'startup.json')
         with patch.object(sys, 'argv', ['wake_probe', '--output', str(output), '--', 'fixture']), \

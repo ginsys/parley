@@ -70,6 +70,11 @@ separately from any earlier capture error. Such a record is failed/interrupted, 
 status remains unknown. Cleanup may be incomplete; the record does not assert the child was reaped.
 PTY/selector descriptor cleanup runs even when process cleanup raises. The API retains the child
 PID until a successful reap so an interrupted wait can be retried without abandoning that child.
+Disposable-HOME acquisition is part of startup failure recording: if it fails while the output
+directory remains writable, the CLI publishes a failed record without a child status. HOME cleanup
+runs before publication under the same SIGINT handler, and its errors are recorded separately as
+`home_cleanup_error`; they cannot produce a successful capture record. Ctrl-C during HOME cleanup
+still returns 130 while preserving the earlier capture outcome.
 
 For a synthetic recording, choose a new output filename:
 
