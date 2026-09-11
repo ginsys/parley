@@ -263,6 +263,25 @@ class PtyTests(unittest.TestCase):
             os.waitpid(pid, os.WNOHANG)
         self.assertFalse(Path(f'/proc/{pid}').exists())
 
+    def test_reaping_errors_release_descriptors_and_keep_child_retryable(self):
+        for operation in ('waitid', 'killpg', 'waitpid'):
+            with self.subTest(operation=operation):
+                child = self.spawn()
+                self.until(child, b'READY')
+                fd, pid = child.fd, child.pid
+                with patch(f'os.{operation}', side_effect=OSError('injected cleanup failure')):
+                    with self.assertRaises(OSError):
+                        child.close()
+                self.assertIsNone(child.fd)
+                with self.assertRaises(OSError):
+                    os.fstat(fd)
+                self.assertIsNone(child.selector.get_map())
+                self.assertEqual(child.pid, pid)
+                child.close()
+                self.assertIsNone(child.pid)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+
 
 if __name__ == '__main__':
     unittest.main()

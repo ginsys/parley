@@ -46,6 +46,8 @@ an uncatchable SIGKILL or power loss before publication cannot preserve an in-me
 If child teardown raises, publication still runs: `cleanup_error` records the exception class
 separately from any earlier capture error. Such a record is failed/interrupted, and a missing exit
 status remains unknown. Cleanup may be incomplete; the record does not assert the child was reaped.
+PTY/selector descriptor cleanup runs even when process cleanup raises. The API retains the child
+PID until a successful reap so an interrupted wait can be retried without abandoning that child.
 
 For a synthetic recording, choose a new output filename:
 
