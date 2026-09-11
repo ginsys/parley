@@ -252,30 +252,59 @@ class CodexParsingTests(unittest.TestCase):
 
 
 class ClaudeDriverTests(unittest.TestCase):
-    def test_create_mints_the_printed_session_id(self):
+    def test_create_mints_the_new_session_id_from_a_listing_diff(self):
+        # `claude --bg --print`'s own stdout shape has never been captured against a real
+        # session, so a wrong guess parsed from it could mint a footer/informational line
+        # instead of the real id. Identify the session from what `claude agents --json --all`
+        # itself reports as new, never from stdout.
         registry = SessionRegistry()
         calls = []
+        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
+        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'abcd1234', 'kind': 'background'}])
+        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout='irrelevant footer text\n'),
+                          FakeResult(0, stdout=after)])
 
         def fake_run(argv, **kwargs):
             calls.append(argv)
-            return FakeResult(0, stdout='abcd1234\n')
+            return next(responses)
 
         driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
         session_id = driver.create('probe prompt')
         self.assertEqual(session_id, 'abcd1234')
         self.assertIn('abcd1234', registry.created)
-        self.assertEqual(calls[0][:3], ['claude', '--bg', '--cwd'])
+        self.assertEqual(calls[1][:3], ['claude', '--bg', '--cwd'])
 
     def test_create_raises_on_nonzero_exit(self):
-        driver = ClaudeDriver(SessionRegistry(), run=lambda *a, **k: FakeResult(1, stderr='boom'), cwd='/scratch')
+        def fake_run(argv, **kwargs):
+            return FakeResult(1, stderr='boom') if '--bg' in argv else FakeResult(0, stdout='[]')
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
         with self.assertRaises(RuntimeError):
             driver.create('probe prompt')
 
-    def test_create_reports_empty_output_instead_of_indexing_it(self):
-        # Exit 0 with no printed id: a background session may be running untracked, which is
-        # worth naming. Indexing splitlines()[-1] here raised a bare IndexError instead.
-        driver = ClaudeDriver(SessionRegistry(), run=lambda *a, **k: FakeResult(0, stdout='  \n'), cwd='/scratch')
-        with self.assertRaisesRegex(RuntimeError, 'without printing a session id'):
+    def test_create_raises_when_no_new_background_session_appears(self):
+        # claude --bg exiting 0 with no corresponding new listing entry must not be silently
+        # accepted: a background session may exist now, untracked, or none was created at all.
+        listing = json.dumps([{'id': 'old1', 'kind': 'background'}])
+
+        def fake_run(argv, **kwargs):
+            return FakeResult(0, stdout='  \n') if '--bg' in argv else FakeResult(0, stdout=listing)
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaisesRegex(RuntimeError, '0 new'):
+            driver.create('probe prompt')
+
+    def test_create_raises_when_multiple_new_background_sessions_appear(self):
+        # Ambiguity, not a guess: nothing here picks a winner among several new sessions.
+        before = json.dumps([])
+        after = json.dumps([{'id': 'a', 'kind': 'background'}, {'id': 'b', 'kind': 'background'}])
+        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=''), FakeResult(0, stdout=after)])
+
+        def fake_run(argv, **kwargs):
+            return next(responses)
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaisesRegex(RuntimeError, '2 new'):
             driver.create('probe prompt')
 
     def test_submit_refuses_a_foreign_session(self):

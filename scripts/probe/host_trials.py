@@ -259,23 +259,47 @@ class ClaudeDriver:
         self.model = model
         self.max_budget_usd = max_budget_usd
 
+    def _background_session_ids(self):
+        """`claude agents --json --all` background session ids under this driver's cwd.
+
+        `--all` is required: without it the listing carries only `kind: "interactive"` entries
+        (docs/host-probe-preflight.md, 2026-09-11).
+        """
+        result = self.run(['claude', 'agents', '--json', '--all', '--cwd', self.cwd],
+                          capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            raise RuntimeError(f'claude agents exited {result.returncode}: {result.stderr}')
+        return {entry['id'] for entry in background_sessions(result.stdout)}
+
     def create(self, prompt):
+        """Start a background session and identify it from a listing diff, never from stdout.
+
+        `claude --bg --print`'s own stdout shape has never been captured against a real
+        session — `docs/host-probe-preflight.md` never got far enough to create one — so
+        parsing an assumed last-line-is-the-id shape would mint whatever `claude --bg` happens
+        to print last, including an informational or footer line, as the owned session; a wrong
+        mint also leaves the real session unregistered and unable to be torn down. This instead
+        diffs `claude agents --json --all` (the same verified listing `submit()` checks
+        membership against) from before to after the command: the session created is whichever
+        id appears afterward that did not before.
+        """
         argv = ['claude', '--bg', '--cwd', self.cwd, '--print']
         if self.model:
             argv += ['--model', self.model]
         if self.max_budget_usd is not None:
             argv += ['--max-budget-usd', str(self.max_budget_usd)]
         argv.append(prompt)
+        before = self._background_session_ids()
         result = self.run(argv, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')
-        printed = result.stdout.strip()
-        if not printed:
-            # Exit 0 with no id still means a background session may exist, now untracked;
-            # indexing an empty list here would surface that as a bare IndexError.
-            raise RuntimeError('claude --bg exited 0 without printing a session id; '
-                               'an untracked background session may be running')
-        return self.registry.mint(printed.splitlines()[-1])
+        new = self._background_session_ids() - before
+        if len(new) != 1:
+            raise RuntimeError(
+                f'claude --bg exited 0 but claude agents --json --all lists {len(new)} new '
+                f'background session(s) under {self.cwd} (expected exactly one); cannot '
+                'identify which one this trial created')
+        return self.registry.mint(new.pop())
 
     def submit(self, session_id, message):
         """Refuse to report acceptance: no captured mechanism delivers `message` here.
@@ -297,12 +321,7 @@ class ClaudeDriver:
         listing is reported as such rather than reaching `json.loads` as a decode error.
         """
         self.registry.require_owned(session_id)
-        result = self.run(['claude', 'agents', '--json', '--all', '--cwd', self.cwd],
-                          capture_output=True, text=True, timeout=15)
-        if result.returncode != 0:
-            raise RuntimeError(f'claude agents exited {result.returncode}: {result.stderr}')
-        owned = {entry['id'] for entry in background_sessions(result.stdout)}
-        if session_id not in owned:
+        if session_id not in self._background_session_ids():
             raise ValueError(f'session not listed under {self.cwd}: {session_id}')
         raise SubmissionUncaptured(
             'claude has no captured message-submission path to an existing --bg session; '
