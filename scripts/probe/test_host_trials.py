@@ -25,6 +25,7 @@ from host_trials import (
     SessionCreationUncaptured,
     SessionRegistry,
     SettleFailed,
+    SubmissionFailed,
     SubmissionUncaptured,
     SubmissionUnsupported,
     TeardownUnsupported,
@@ -1149,6 +1150,18 @@ class RunTrialTests(unittest.TestCase):
             self.run_one(driver, clock, settle=interrupting_settle)
         self.assertEqual(caught.exception.session_id, 'sid')
         self.assertIsInstance(caught.exception.original, KeyboardInterrupt)
+
+    def test_an_unenumerated_submission_failure_also_carries_the_session_id(self):
+        # submit() runs after create()/settle() already produced a live, owned session; a
+        # pre-delivery failure that is not one of the four documented submission signals (a
+        # listing call's nonzero exit, here) previously propagated bare, discarding the only
+        # place that session_id is ever surfaced.
+        clock = FakeClock()
+        driver = FakeDriver(submit_error=RuntimeError('claude agents exited 1'), clock=clock)
+        with self.assertRaises(SubmissionFailed) as caught:
+            self.run_one(driver, clock)
+        self.assertEqual(caught.exception.session_id, 'sid')
+        self.assertIsInstance(caught.exception.original, RuntimeError)
 
     def test_rejected_submission_does_not_add_accepted(self):
         clock = FakeClock()

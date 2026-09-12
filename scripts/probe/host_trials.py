@@ -131,6 +131,24 @@ class SettleFailed(RuntimeError):
         self.original = original
 
 
+class SubmissionFailed(RuntimeError):
+    """Raised when `driver.submit()` raises anything other than a documented submission signal.
+
+    `submit()` runs after `create()`/`settle()` have already produced a live, owned session in
+    the requested state -- a pre-delivery failure inside it (a listing call's nonzero exit or
+    malformed output, a foreign/absent session, or any other runner bug) is not one of
+    `SubmissionUnsupported`/`SubmissionUncaptured`/`subprocess.TimeoutExpired`/
+    `KeyboardInterrupt`, all of which `run_trial` already handles without losing the session.
+    Left uncaught here, it would discard the only place that session id is ever surfaced, for
+    the same reason `SettleFailed` exists for `settle()`.
+    """
+
+    def __init__(self, session_id, original):
+        super().__init__(f'submit() failed for session {session_id!r}: {original!r}')
+        self.session_id = session_id
+        self.original = original
+
+
 @dataclass
 class SessionRegistry:
     """Tracks session ids created by *this run*; refuses to touch anything else.
@@ -1119,7 +1137,10 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     propagating `original` bare: `settle()` runs after `create()` has already produced a live,
     owned session, and the raw exception would discard the only place that id is ever surfaced,
     leaving an authenticated real-HOME session running with no way for the caller to find and
-    tear it down.
+    tear it down. Any exception from `submit()` other than the four handled above — a listing
+    call's nonzero exit or malformed output, a foreign/absent session, or any other runner bug —
+    raises `SubmissionFailed(session_id, original)` for the identical reason: the session is
+    already live, and its id must not be lost with it.
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
@@ -1184,6 +1205,13 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         accepted = True
         accepted_unobservable = True
         submit_interrupted = True
+    except Exception as error:
+        # Anything else from submit() -- a listing call's nonzero exit or malformed output, a
+        # foreign/absent session, or any other runner bug -- is a pre-delivery failure the
+        # trial cannot recover from, but the session is already live under the real HOME. Left
+        # uncaught, it would discard the only place that session id is ever surfaced, exactly
+        # the problem `SettleFailed` solves for `settle()`.
+        raise SubmissionFailed(session_id, error) from error
     if not accepted:
         # A clean nonzero exit (not an exception) is a definitive, observed failure to accept --
         # 'not_observed' is the true classification for `accepted` itself -- but nothing was
