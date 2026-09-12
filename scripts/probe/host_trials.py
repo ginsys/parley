@@ -480,6 +480,14 @@ class ClaudeDriver:
         best-effort basis (`_recoverable_candidates`) to surface whatever ids can be recovered;
         a further listing failure there is swallowed to an empty candidate set rather than
         raised, since the caller is already reporting the original timeout.
+
+        An operator's Ctrl-C while this call is blocked shares the identical ambiguity: `claude
+        --bg` may already have detached the background session before the interrupt reached this
+        frame, and letting `KeyboardInterrupt` propagate raw here would discard both the
+        candidate id and the fact that a session might exist at all. This handles it exactly like
+        the timeout above -- the same bounded, best-effort recovery -- while still honoring the
+        actual cancellation: the recovery listing carries its own 15s timeout, and nothing here
+        retries `claude --bg` or waits further, so the call still aborts immediately.
         """
         argv = ['claude', '--bg', '--cwd', self.cwd, '--print']
         if self.model:
@@ -494,6 +502,11 @@ class ClaudeDriver:
             raise AmbiguousSessionCreation(
                 f'claude --bg under {self.cwd} did not exit within its 30s timeout; it may have '
                 'already detached a background session before hanging',
+                candidates=sorted(self._recoverable_candidates(before))) from error
+        except KeyboardInterrupt as error:
+            raise AmbiguousSessionCreation(
+                f'interrupted while waiting for claude --bg under {self.cwd}; it may have '
+                'already detached a background session before the interrupt arrived',
                 candidates=sorted(self._recoverable_candidates(before))) from error
         if result.returncode != 0:
             raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')

@@ -570,6 +570,25 @@ class ClaudeDriverTests(unittest.TestCase):
             driver.create('probe prompt')
         self.assertEqual(ctx.exception.candidates, ())
 
+    def test_create_recovers_candidates_when_interrupted_while_claude_bg_is_blocked(self):
+        # A Ctrl-C while claude --bg is running shares the timeout case's ambiguity: the
+        # background session may already have detached before the interrupt landed. This must
+        # not propagate the bare KeyboardInterrupt and lose the candidate id.
+        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
+        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'new1', 'kind': 'background'}])
+        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=after)])
+
+        def fake_run(argv, **kwargs):
+            if '--bg' in argv:
+                raise KeyboardInterrupt()
+            return next(responses)
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaises(AmbiguousSessionCreation) as ctx:
+            driver.create('probe prompt')
+        self.assertEqual(ctx.exception.candidates, ('new1',))
+        self.assertIsInstance(ctx.exception.__cause__, KeyboardInterrupt)
+
     def test_submit_refuses_a_foreign_session(self):
         driver = ClaudeDriver(SessionRegistry(), run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
         with self.assertRaises(ForeignSessionError):
