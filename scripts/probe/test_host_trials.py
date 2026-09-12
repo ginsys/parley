@@ -616,6 +616,27 @@ class ClaudeDriverTests(unittest.TestCase):
             driver.create('probe prompt')
         self.assertEqual(ctx.exception.candidates, ())
 
+    def test_create_reports_no_candidates_when_a_second_interrupt_hits_the_recovery_listing(self):
+        # A second Ctrl-C while the best-effort recovery listing runs must not escalate into a
+        # bare KeyboardInterrupt -- the caller is already mid-raise of AmbiguousSessionCreation
+        # built from this method's return value, so letting it escape here would destroy that
+        # signal and its candidate-cleanup path for nothing; the original ambiguity is real
+        # either way.
+        before = json.dumps([])
+
+        def fake_run(argv, **kwargs):
+            if '--bg' in argv:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 30))
+            if not hasattr(fake_run, 'called'):
+                fake_run.called = True
+                return FakeResult(0, stdout=before)
+            raise KeyboardInterrupt()
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaises(AmbiguousSessionCreation) as ctx:
+            driver.create('probe prompt')
+        self.assertEqual(ctx.exception.candidates, ())
+
     def test_create_recovers_candidates_when_interrupted_during_the_post_create_listing(self):
         # claude --bg can exit 0 -- a background session definitely exists -- and then a Ctrl-C
         # lands while the post-create listing itself is being read. That listing's own except

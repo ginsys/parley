@@ -460,11 +460,16 @@ class ClaudeDriver:
         Called only when the run itself is already uncertain (a timeout) -- a further listing
         failure here is not this call's problem to raise, since the caller is already reporting
         the original uncertainty. An empty result means only "no candidates could be recovered",
-        never "no session was created".
+        never "no session was created". A second `KeyboardInterrupt` here (the operator pressing
+        Ctrl-C again while this best-effort listing runs) is swallowed the same way: every caller
+        of this method is already mid-`raise` of an `AmbiguousSessionCreation` built from its
+        return value, so letting a bare interrupt escape here would destroy that signal and its
+        candidate-cleanup path entirely, in exchange for nothing -- the original ambiguity is
+        real either way.
         """
         try:
             return self._background_session_ids() - before
-        except (RuntimeError, subprocess.TimeoutExpired):
+        except (RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt):
             return set()
 
     def create(self, prompt):
