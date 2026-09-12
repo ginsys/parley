@@ -16,7 +16,7 @@ import (
 // transaction. Only version-zero adoption examines historical column layouts.
 var migrations = []func(context.Context, *sql.Tx) error{adoptLegacySchema, addRenewalPolicy, addDeliveryOutcomes, addQueueOrdering}
 
-func migrate(ctx context.Context, db *sql.DB) error {
+func migrate(ctx context.Context, db *sql.DB, allowCreate bool) error {
 	tx, err := beginMigration(ctx, db)
 	if err != nil {
 		return err
@@ -28,6 +28,15 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	}
 	if version < 0 || version > len(migrations) {
 		return fmt.Errorf("unsupported schema version %d", version)
+	}
+	if version == 0 && !allowCreate {
+		catalog, err := readSchemaCatalog(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if len(catalog) == 0 {
+			return fmt.Errorf("database initialization required")
+		}
 	}
 	for version < len(migrations) {
 		if err := migrations[version](ctx, tx); err != nil {

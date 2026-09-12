@@ -42,9 +42,22 @@ func (s fixtureService) Wait() error {
 }
 func normal(context.Context, *store.DB) (RecoveryMode, error) { return Normal, nil }
 
-func seededRuntimeDB(t *testing.T) string {
+func initializedRuntimeDB(t *testing.T) string {
 	t.Helper()
 	path := privateDB(t)
+	db, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func seededRuntimeDB(t *testing.T) string {
+	t.Helper()
+	path := initializedRuntimeDB(t)
 	db, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +161,7 @@ func TestHeldOnlyStartsRecoveryServices(t *testing.T) {
 func TestStartupFailuresReleaseOwnership(t *testing.T) {
 	for _, phase := range []string{"inspector-missing", "writer", "migration", "recovery-inspection", "recovery-mode", "recovery-write", "readers", "service"} {
 		t.Run(phase, func(t *testing.T) {
-			path := privateDB(t)
+			path := initializedRuntimeDB(t)
 			inspector := normal
 			open := store.OpenExisting
 			stopped, waited := false, false
@@ -198,7 +211,7 @@ func TestStartupFailuresReleaseOwnership(t *testing.T) {
 }
 
 func TestShutdownOrderAndCancelledWait(t *testing.T) {
-	path := privateDB(t)
+	path := initializedRuntimeDB(t)
 	var mu sync.Mutex
 	var events []string
 	add := func(s string) { mu.Lock(); events = append(events, s); mu.Unlock() }
@@ -271,7 +284,7 @@ func TestShutdownOrderAndCancelledWait(t *testing.T) {
 
 func TestParentCancellationStopsRuntime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	r, err := Start(ctx, Config{DatabasePath: privateDB(t), InspectRecovery: normal})
+	r, err := Start(ctx, Config{DatabasePath: initializedRuntimeDB(t), InspectRecovery: normal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +317,7 @@ func TestRuntimeContenderChild(t *testing.T) {
 func TestContenderBeforeAndDuringMigration(t *testing.T) {
 	for _, phase := range []string{"before", "during"} {
 		t.Run(phase, func(t *testing.T) {
-			path := privateDB(t)
+			path := initializedRuntimeDB(t)
 			paused, release := make(chan struct{}), make(chan struct{})
 			var blocker *sql.Tx
 			var external *sql.DB
@@ -361,7 +374,7 @@ func TestContenderBeforeAndDuringMigration(t *testing.T) {
 }
 
 func TestCancelledPartialStartupCleansEveryService(t *testing.T) {
-	path := privateDB(t)
+	path := initializedRuntimeDB(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	entered := make(chan struct{})
