@@ -196,14 +196,17 @@ class ClaudeParsingTests(unittest.TestCase):
 class CodexParsingTests(unittest.TestCase):
     def test_rollout_extracts_user_and_assistant_skips_developer_and_other_types(self):
         lines = [
-            json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+            json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                         'payload': {'type': 'message', 'role': 'developer',
                                     'content': [{'type': 'input_text', 'text': 'system prompt'}]}}),
-            json.dumps({'timestamp': '2026-09-11T00:00:01.000Z',
+            json.dumps({'timestamp': '2026-09-11T00:00:01.000Z', 'type': 'response_item',
                         'payload': {'type': 'message', 'role': 'user',
                                     'content': [{'type': 'input_text', 'text': MARKER}]}}),
-            json.dumps({'timestamp': '2026-09-11T00:00:02.000Z', 'payload': {'type': 'event_msg'}}),
-            json.dumps({'timestamp': '2026-09-11T00:00:03.000Z',
+            # An unrelated outer record type whose payload.type happens to collide with a real
+            # inner type must not be read as evidence -- the outer type gates first.
+            json.dumps({'timestamp': '2026-09-11T00:00:02.000Z', 'type': 'turn_context',
+                        'payload': {'type': 'event_msg'}}),
+            json.dumps({'timestamp': '2026-09-11T00:00:03.000Z', 'type': 'response_item',
                         'payload': {'type': 'message', 'role': 'assistant',
                                     'content': [{'type': 'output_text', 'text': f'ack {MARKER}'}]}}),
         ]
@@ -217,7 +220,7 @@ class CodexParsingTests(unittest.TestCase):
         # A missing or schema-drifted role (e.g. a future "model") is not the same as the known,
         # intentionally-ignored `developer` role -- treating it the same way could silently drop
         # a current-turn assistant message while the rollout still reads observable=True.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                              'payload': {'type': 'message', 'role': 'model',
                                          'content': [{'text': MARKER}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
@@ -225,14 +228,25 @@ class CodexParsingTests(unittest.TestCase):
     def test_a_non_string_payload_type_is_unusable_rather_than_a_typeerror(self):
         # A schema-drifted, unhashable payload.type (e.g. a list) crashed the
         # `kind in TURN_BOUNDARY_ROLES` membership test with a TypeError.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'payload': {'type': []}})]
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'event_msg',
+                             'payload': {'type': []}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
+    def test_a_relevant_record_with_a_non_object_payload_is_unusable(self):
+        # A response_item/event_msg record is one of the two kinds this runner reads at all --
+        # a missing or malformed payload there is a corrupted or schema-drifted record, not one
+        # of the record kinds this runner has no use for.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
+                             'payload': None})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
     def test_unparseable_lines_count_as_unusable_while_other_record_types_do_not(self):
         # A record this runner has no use for is not a failed read; a line that is not JSON is.
-        lines = ['not json', json.dumps({'payload': {'type': 'world_state'}}), '']
+        lines = ['not json', json.dumps({'type': 'world_state', 'payload': {'type': 'world_state'}}), '']
         self.assertEqual(codex_rollout_events(lines), ([], 1))
-        self.assertEqual(codex_rollout_events([json.dumps({'payload': {'type': 'world_state'}})]), ([], 0))
+        self.assertEqual(
+            codex_rollout_events([json.dumps({'type': 'world_state', 'payload': {'type': 'world_state'}})]),
+            ([], 0))
 
     def test_turn_boundary_records_become_pseudo_role_events(self):
         # Captured shapes (docs/host-probe-preflight.md): these are the only evidence that a
@@ -260,9 +274,10 @@ class CodexParsingTests(unittest.TestCase):
 
     def test_message_records_without_a_usable_timestamp_are_dropped_and_counted(self):
         lines = [
-            json.dumps({'payload': {'type': 'message', 'role': 'assistant',
+            json.dumps({'type': 'response_item',
+                        'payload': {'type': 'message', 'role': 'assistant',
                                     'content': [{'type': 'output_text', 'text': 'undated'}]}}),
-            json.dumps({'timestamp': 'not-a-date',
+            json.dumps({'timestamp': 'not-a-date', 'type': 'response_item',
                         'payload': {'type': 'message', 'role': 'user',
                                     'content': [{'type': 'input_text', 'text': 'malformed'}]}}),
         ]
@@ -271,7 +286,7 @@ class CodexParsingTests(unittest.TestCase):
     def test_null_content_is_unusable_rather_than_a_typeerror(self):
         # payload.get('content', []) only substitutes [] when the key is absent; an explicit
         # "content": null slips past that default and a bare iteration would raise TypeError.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                              'payload': {'type': 'message', 'role': 'user', 'content': None}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
@@ -279,7 +294,7 @@ class CodexParsingTests(unittest.TestCase):
         # A structured/tool-call payload shape (content as a single object, not a list of parts)
         # must not parse as an empty-text event with observable=True -- that reads as "checked,
         # nothing there" instead of "this shape was never captured".
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                              'payload': {'type': 'message', 'role': 'assistant',
                                          'content': {'type': 'tool_call', 'name': 'x'}}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
@@ -287,7 +302,7 @@ class CodexParsingTests(unittest.TestCase):
     def test_a_non_string_part_text_is_unusable_rather_than_a_typeerror(self):
         # A list-shaped content whose part carries a non-string `text` (e.g. explicit null) made
         # ''.join(...) raise instead of reading as an unrecognized shape.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                              'payload': {'type': 'message', 'role': 'user',
                                          'content': [{'text': None}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
@@ -295,7 +310,7 @@ class CodexParsingTests(unittest.TestCase):
     def test_a_non_dict_part_makes_the_whole_record_unusable_not_silently_shorter(self):
         # Silently skipping just the non-dict part let an unreadable marker message join down to
         # an empty, ordinary-looking string -- negative evidence rather than unusable.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                              'payload': {'type': 'message', 'role': 'user',
                                          'content': ['not-a-part', {'text': 'hi'}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
@@ -304,7 +319,7 @@ class CodexParsingTests(unittest.TestCase):
         # `.get('text', '')` let a part with no `text` key default to an empty string and pass
         # as captured -- an unreadable marker message would join down to an ordinary-looking
         # empty string, negative evidence rather than the unusable read it actually is.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                              'payload': {'type': 'message', 'role': 'assistant',
                                          'content': [{'type': 'text'}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
@@ -314,12 +329,21 @@ class CodexParsingTests(unittest.TestCase):
         # to `null`, a number or a list -- and `record.get(...)` on any of those raises instead
         # of reading as an unrecognized shape, aborting the whole read rather than just the line.
         lines = [json.dumps(None), json.dumps([1, 2]), json.dumps(3),
-                json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                             'payload': {'type': 'message', 'role': 'user',
                                         'content': [{'text': 'hi'}]}})]
         events, unusable = codex_rollout_events(lines)
         self.assertEqual(unusable, 3)
         self.assertEqual(len(events), 1)
+
+    def test_an_unrelated_outer_record_type_is_skipped_regardless_of_payload_shape(self):
+        # The outer type gates first: session_meta/world_state/turn_context/token_usage_record
+        # records are skipped silently no matter what their payload happens to contain, so an
+        # unrelated record cannot masquerade as transcript evidence via a colliding payload.type.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'turn_context',
+                             'payload': {'type': 'message', 'role': 'user',
+                                         'content': [{'text': MARKER}]}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 0))
 
     def test_rollout_started_at_takes_the_earliest_record_of_any_type(self):
         lines = [
@@ -614,7 +638,8 @@ class CodexDriverTests(unittest.TestCase):
 
     @staticmethod
     def message(stamp, role, text):
-        return {'timestamp': stamp, 'payload': {'type': 'message', 'role': role,
+        return {'timestamp': stamp, 'type': 'response_item',
+                'payload': {'type': 'message', 'role': role,
                                                  'content': [{'type': 'output_text', 'text': text}]}}
 
     def driver(self, registry, path, *, run=None):
@@ -793,7 +818,8 @@ class CodexDriverTests(unittest.TestCase):
     def test_observe_is_unobservable_when_the_rollout_holds_an_undated_message(self):
         registry = SessionRegistry()
         registry.mint('thread-1')
-        path = self.rollout({'payload': {'type': 'message', 'role': 'assistant',
+        path = self.rollout({'type': 'response_item',
+                             'payload': {'type': 'message', 'role': 'assistant',
                                           'content': [{'type': 'output_text', 'text': f'ack {MARKER}'}]}})
         observation = self.driver(registry, path).observe('thread-1', marker=MARKER, submitted_at=0.0)
         self.assertEqual(observation.outcomes, {})
