@@ -645,13 +645,16 @@ class ClaudeDriver:
             raise RuntimeError(f'claude rm exited {result.returncode} for {session_id}: {result.stderr}')
         self.registry.release(self._key(session_id))
 
-    def version(self):
+    def version(self, _session_id):
         """Best-effort `claude --version` output, or None if it cannot be read.
 
         A matrix cell is version-scoped (docs/host-wake-matrix.md); a trial run against a
         binary that has drifted from the recorded preflight must say so rather than silently
         inherit a stale pin. A failed or missing read is this call's own problem, not the
-        trial's -- the same best-effort contract as `_recoverable_candidates`.
+        trial's -- the same best-effort contract as `_recoverable_candidates`. `session_id` is
+        accepted and ignored, only to keep a uniform `driver.version(session_id)` call site in
+        `run_trial`: unlike Codex's rollout-recorded version, a Claude session carries no
+        separate self-reported client version to disagree with the installed binary's.
         """
         try:
             result = self.run(['claude', '--version'], capture_output=True, text=True, timeout=15)
@@ -714,6 +717,32 @@ def rollout_started_at(lines):
             return None
         stamps.append(when)
     return min(stamps) if stamps else None
+
+
+def codex_session_version(lines):
+    """The rollout's own recorded `session_meta.payload.cli_version`, or None.
+
+    Confirmed shape from a real rollout on this workstation
+    (`~/.codex/sessions/2026/09/08/rollout-2026-09-08T16-42-57-*.jsonl`): a `session_meta` record
+    carries `payload.cli_version` as a plain string. This is a best-effort evidence enrichment,
+    not a provenance check like `rollout_started_at` -- an unparseable or malformed line is
+    skipped rather than invalidating the whole read, since a client-version fallback still exists
+    for the caller to use.
+    """
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get('type') != 'session_meta':
+            continue
+        payload = record.get('payload')
+        version = payload.get('cli_version') if isinstance(payload, dict) else None
+        return version if isinstance(version, str) else None
+    return None
 
 
 # Codex's own turn-boundary signals, captured in a real rollout (docs/host-probe-preflight.md,
@@ -1096,8 +1125,27 @@ class CodexDriver:
             f'codex has no captured teardown mechanism; thread {thread_id} remains registered '
             'and its host session is still live')
 
-    def version(self):
-        """Best-effort `codex --version` output, or None if it cannot be read. See ClaudeDriver."""
+    def version(self, thread_id):
+        """The adopted thread's own recorded version, falling back to the installed client's.
+
+        `codex --version` and a rollout's own `session_meta.cli_version` can disagree
+        (docs/host-probe-preflight.md, 2026-09-11: 0.154.0 vs 0.153.4 the same day). Every real
+        Codex trial adopts an existing thread (`create()` refuses), so the installed client's
+        version would misattribute the matrix cell to a binary that may not be the one that
+        actually produced the transcript being measured; the rollout's own record is preferred
+        whenever it can be read. Falls back to the client version only when the rollout is
+        missing, unreadable, or carries no `cli_version`, so a trial still learns something
+        rather than nothing.
+        """
+        path = self.rollout_path_for(thread_id)
+        if path is not None:
+            try:
+                with open(path, encoding='utf-8') as handle:
+                    version = codex_session_version(handle)
+            except (OSError, UnicodeDecodeError):
+                version = None
+            if version is not None:
+                return version
         try:
             result = self.run(['codex', '--version'], capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired):
@@ -1287,7 +1335,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
         # as an ordinary read failure costs nothing real, whereas letting it escape bare would
         # discard the only place session_id is surfaced for a session already live under the
         # real HOME.
-        version = driver.version()
+        version = driver.version(session_id)
     except (Exception, KeyboardInterrupt):
         version = None
     try:
