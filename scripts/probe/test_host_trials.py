@@ -1079,6 +1079,28 @@ class RunTrialTests(unittest.TestCase):
                                         'ack': SIGNAL_ASSISTANT_MESSAGE,
                                         'accepted': SIGNAL_SUBMIT_EXIT_STATUS})
 
+    def test_a_keyboardinterrupt_during_polling_finalizes_a_partial_result(self):
+        # A busy trial's poll loop can wait up to 900s; losing everything gathered so far to a
+        # propagated interrupt would discard real evidence instead of finalizing it. The channel
+        # stayed readable (observable=True, the default) right up to the interrupt, but that must
+        # not read as "definitively absent" for the outcomes the interrupted poll never reached.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'visible': 1000.0},
+                                                       signals={'visible': SIGNAL_USER_MESSAGE})],
+                            clock=clock)
+
+        def interrupting_sleep(seconds):
+            raise KeyboardInterrupt
+
+        run = run_trial(driver, prompt='hi', marker=MARKER, clock=clock.time,
+                        monotonic=clock.monotonic, sleep=interrupting_sleep)
+        self.assertEqual(run.outcomes.get('visible'), 1000.0)
+        self.assertNotIn('turn_start', run.outcomes)
+        self.assertNotIn('ack', run.outcomes)
+        self.assertTrue(run.observable['visible'])
+        self.assertFalse(run.observable['turn_start'])
+        self.assertFalse(run.observable['ack'])
+
     def test_settle_runs_between_create_and_submit(self):
         clock = FakeClock()
         driver = FakeDriver(clock=clock)
