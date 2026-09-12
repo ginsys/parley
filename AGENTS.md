@@ -13,7 +13,9 @@ parsing/validation (`internal/replymarker`), and the Codex-side transport/ingest
 (`internal/adapter/codex`) over `codex queue`. Also present: the internal Linux ownership/startup
 lifecycle (`internal/runtime`) and explicit
 read-only SQLite query pool. These have controlled fixtures, not executable/endpoint wiring.
-Not yet present: identity binding and a runnable bridge. Do not treat anything below `internal/` as wired to a live session yet —
+Also present: internal binding provisioning, authenticated attachment/readiness and audited binding
+lifecycle/holds. Their callers are controlled fixtures; authenticated ordinary-work integration and
+a runnable bridge remain pending. Do not treat anything below `internal/` as wired to a live session yet —
 `dispatch.Transport` is an interface with no real Channels implementation in this repo so far,
 `Handshake.sendProbe`/`Ack` are not wired to an actual Channels connection or the `reply` tool, and
 `codex.ExecSender`/`IngestTurn` are untested against an actual `codex` CLI or rollout file.
@@ -250,3 +252,20 @@ thirty-second attempt. Heartbeats only extend liveness; adapters send every ten 
 thirty seconds without one. Stale timers, ACKs, disconnects and retained command results cannot
 alter a successor slot. Internal callbacks and synthetic Unix socket tests do not establish a
 human endpoint, real host compatibility, authenticated ordinary dispatch or a live bridge.
+
+## Retained work and binding revocation
+
+Schema version 6 preserves every adopted envelope as immutable legacy provenance and separately
+quarantines outstanding work without changing delivery evidence. Only migration inserts legacy
+provenance/quarantine; new authenticated work records accepting binding and credential version.
+Binding revocation holds outstanding authored work across all credential versions and exact legacy
+sender keys. Recipient-only work is not attributed to that binding. Holds, quarantine and ingestion
+barriers are independent of delivery state, renewal and re-enrollment.
+
+Internal human lifecycle operations require trusted authorization, recovery guards and reviewed
+evidence providers. Disposition versions, bounded reason notes, evidence references and the exact
+principal/operation audit link are retained. Release clears only the named incident; cancel is
+terminal and changes only queued envelope state. Held originals cannot be acknowledged, cancelled
+work cannot requeue after late settlement, and exact attempt-token refunds remain unchanged.
+Recursive SQLite triggers are enabled on every store connection so replacement writes cannot
+bypass retained-evidence deletion guards. No automatic evidence eviction is permitted.

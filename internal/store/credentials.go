@@ -58,6 +58,15 @@ func (c CredentialRecord) Matches(secret [32]byte) bool {
 	return subtle.ConstantTimeCompare(c.Verifier[:], digest[:]) == 1
 }
 func RotateCredential(ctx context.Context, tx *sql.Tx, binding string, bindingVersion, credentialVersion int64, next CredentialRecord) error {
+	return replaceCredential(ctx, tx, binding, bindingVersion, credentialVersion, next, false)
+}
+
+// ReenrollCredential preserves the original tuple, all holds, and the ingestion
+// barrier. Its caller supplies fresh verified host evidence and a new secret.
+func ReenrollCredential(ctx context.Context, tx *sql.Tx, binding string, bindingVersion, credentialVersion int64, next CredentialRecord) error {
+	return replaceCredential(ctx, tx, binding, bindingVersion, credentialVersion, next, true)
+}
+func replaceCredential(ctx context.Context, tx *sql.Tx, binding string, bindingVersion, credentialVersion int64, next CredentialRecord, reenroll bool) error {
 	b, err := ReadBinding(ctx, tx, binding)
 	if err != nil {
 		return err
@@ -66,7 +75,7 @@ func RotateCredential(ctx context.Context, tx *sql.Tx, binding string, bindingVe
 	if err != nil {
 		return err
 	}
-	if b.Status != "enabled" {
+	if (!reenroll && b.Status != "enabled") || (reenroll && b.Status != "revoked") {
 		return BindingUnavailable
 	}
 	if b.Version != bindingVersion || old.Version != credentialVersion {
@@ -92,7 +101,7 @@ func RotateCredential(ctx context.Context, tx *sql.Tx, binding string, bindingVe
 	if _, err := tx.ExecContext(ctx, `INSERT INTO credential_publications(credential_id) VALUES(?)`, next.ID); err != nil {
 		return storageCode(err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE bindings SET binding_version=? WHERE binding_id=?`, bv, binding); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE bindings SET binding_version=?,status='enabled' WHERE binding_id=?`, bv, binding); err != nil {
 		return storageCode(err)
 	}
 	return nil
