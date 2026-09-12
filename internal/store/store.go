@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -36,6 +37,20 @@ func Open(ctx context.Context, path string) (*DB, error) {
 
 // OpenExisting is the runtime writer path: SQLite may not create a replacement DB.
 func OpenExisting(ctx context.Context, path string) (*DB, error) {
+	// Check before SQLite can set journal mode on an empty placeholder.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	var header [16]byte
+	_, readErr := f.ReadAt(header[:], 0)
+	closeErr := f.Close()
+	if readErr != nil || string(header[:]) != "SQLite format 3\x00" {
+		return nil, fmt.Errorf("database initialization required")
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
 	return open(ctx, path, true)
 }
 
@@ -66,7 +81,7 @@ func open(ctx context.Context, path string, existing bool) (*DB, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if err := migrate(ctx, db); err != nil {
+	if err := migrate(ctx, db, !existing); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate schema: %w", err)
 	}

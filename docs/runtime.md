@@ -60,7 +60,8 @@ paths while service runs. Simultaneous restored copies are not made safe by sepa
 ## Startup and shutdown
 
 `runtime.Start` requires an explicit recovery inspector. After ownership it opens the existing
-writer, performs ordered migrations, asks the inspector for `Normal` or `Held`, establishes permitted
+writer (rejecting missing files, empty placeholders and empty application catalogs), performs ordered
+migrations, asks the inspector for `Normal` or `Held`, establishes permitted
 recovery, opens readers, and starts registered services. Missing/unknown/failed inspection rejects
 startup. Normal mode applies `RecoverUncertain`: interrupted `dispatching` rows become `uncertain`
 without resetting attempts or refunding budget. Held mode makes no automatic envelope recovery

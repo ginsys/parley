@@ -288,3 +288,48 @@ func TestReaderDefaultDeadlineAndDetachedResults(t *testing.T) {
 		t.Fatalf("unexpected early timeout: %s", elapsed)
 	}
 }
+
+func TestRuntimeWriterRequiresExplicitInitialization(t *testing.T) {
+	ctx := context.Background()
+	for _, kind := range []string{"empty", "empty-catalog"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "uninitialized.db")
+			if err := os.WriteFile(path, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "empty-catalog" {
+				raw, err := sql.Open("sqlite", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := raw.Exec("VACUUM"); err != nil {
+					t.Fatal(err)
+				}
+				if err := raw.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if db, err := OpenExisting(ctx, path); err == nil {
+				db.Close()
+				t.Fatal("runtime initialized database")
+			}
+			if kind == "empty" {
+				info, err := os.Stat(path)
+				if err != nil || info.Size() != 0 {
+					t.Fatal("placeholder modified", err)
+				}
+			}
+			// Explicit library initialization remains available for the future human action.
+			db, err := Open(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
+			db, err = OpenExisting(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
+		})
+	}
+}
