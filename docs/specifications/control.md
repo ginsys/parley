@@ -1,10 +1,11 @@
 # Human control protocol, storage concurrency and ownership
 
-Draft for [#25](https://github.com/ginsys/parley/issues/25), expanding the accepted
+Accepted specification for [#25](https://github.com/ginsys/parley/issues/25), expanding the accepted
 [control decision](../architecture.md#accepted-human-control-protocol),
 [membership contract](membership.md) and [connection contract](connections.md).
-The direction is accepted; the exact methods, limits and coordination rules here remain subject
-to specification review. No server, client or migration is implemented by this document.
+GitHub owns acceptance and implementation completion. Methods, limits and coordination rules here
+are target contracts; this document does not claim a runnable server or client. See
+[Architecture](../architecture.md) for implemented behavior and remaining limitations.
 
 ## Authority and endpoint configuration
 

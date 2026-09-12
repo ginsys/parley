@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -480,11 +481,39 @@ func TestEmptyVersionedCatalogNeverAdmitsRecoveryService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"envelopes", "grants", "conversations"} {
-		if _, err := raw.Exec("DROP TABLE " + table); err != nil {
+	// Derive the complete application catalog: new numbered migrations may add
+	// tables, so deleting only the original message tables no longer seeds empty.
+	rows, err := raw.Query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT GLOB 'sqlite_*'")
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			rows.Close()
 			raw.Close()
 			t.Fatal(err)
 		}
+		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		raw.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	for _, table := range tables {
+		if _, err := raw.Exec(`DROP TABLE "` + strings.ReplaceAll(table, `"`, `""`) + `"`); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	var remaining int
+	if err := raw.QueryRow("SELECT count(*) FROM sqlite_master WHERE tbl_name NOT GLOB 'sqlite_*'").Scan(&remaining); err != nil || remaining != 0 {
+		raw.Close()
+		t.Fatalf("fixture catalog is not empty: objects=%d err=%v", remaining, err)
 	}
 	// Keep the initialized user_version while removing all application tables.
 	if err := raw.Close(); err != nil {
