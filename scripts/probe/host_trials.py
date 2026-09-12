@@ -1253,7 +1253,7 @@ class TrialRun:
     submission_diagnostic: str | None = None
 
 
-def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
+def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda session_id: None,
               existing_session=None,
               poll_interval=5.0, clock=time.time, monotonic=time.monotonic, sleep=time.sleep):
     """Create, submit and observe one trial through its windows; returns a `TrialRun`.
@@ -1271,7 +1271,10 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
 
     `settle` is what establishes the requested `state` (busy/approval/disconnected/restarted)
     before submission — this function cannot create those conditions itself, and the default
-    no-op is only correct for `idle`. `state` is validated here and carried into the result so
+    no-op is only correct for `idle`. It receives `session_id` so it can actually target the
+    session just created (send it a long-running prompt, detach the client, kill the host
+    process) rather than needing the caller to close over an id it cannot yet have when
+    `settle` is defined. `state` is validated here and carried into the result so
     the cell cannot be recorded under a state the trial never exercised; a caller passing
     `state='busy'` with a no-op `settle` is still exercising an idle host, which no code can
     detect for it. Teardown stays the caller's responsibility so a failed trial's session
@@ -1389,7 +1392,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
     except Exception:
         version = None
     try:
-        settle()
+        settle(session_id)
     except (Exception, KeyboardInterrupt) as error:
         # settle() runs after create() has already produced a live, owned session; letting its
         # failure or an interrupt during it propagate raw would discard the only place that

@@ -1356,7 +1356,7 @@ class RunTrialTests(unittest.TestCase):
         clock = FakeClock()
         driver = FakeDriver(version_error=KeyboardInterrupt(), clock=clock)
         with self.assertRaises(VersionProbeInterrupted) as ctx:
-            self.run_one(driver, clock, settle=lambda: driver.order.append('settle'))
+            self.run_one(driver, clock, settle=lambda session_id: driver.order.append('settle'))
         self.assertEqual(ctx.exception.session_id, 'sid')
         self.assertNotIn('settle', driver.order)
         self.assertNotIn('submit', driver.order)
@@ -1364,8 +1364,15 @@ class RunTrialTests(unittest.TestCase):
     def test_settle_runs_between_create_and_submit(self):
         clock = FakeClock()
         driver = FakeDriver(clock=clock)
-        self.run_one(driver, clock, settle=lambda: driver.order.append('settle'))
+        received = []
+
+        def settle(session_id):
+            received.append(session_id)
+            driver.order.append('settle')
+
+        self.run_one(driver, clock, settle=settle)
         self.assertEqual(driver.order[:4], ['create', 'version', 'settle', 'submit'])
+        self.assertEqual(received, ['sid'])  # settle must be able to target the created session
 
     def test_a_settle_failure_carries_the_session_id_rather_than_discarding_it(self):
         # settle() runs after create() already produced a live, owned session; letting its
@@ -1374,7 +1381,7 @@ class RunTrialTests(unittest.TestCase):
         clock = FakeClock()
         driver = FakeDriver(clock=clock)
 
-        def failing_settle():
+        def failing_settle(session_id):
             raise RuntimeError('could not confirm busy state')
 
         with self.assertRaises(SettleFailed) as caught:
@@ -1387,7 +1394,7 @@ class RunTrialTests(unittest.TestCase):
         clock = FakeClock()
         driver = FakeDriver(clock=clock)
 
-        def interrupting_settle():
+        def interrupting_settle(session_id):
             raise KeyboardInterrupt
 
         with self.assertRaises(SettleFailed) as caught:
