@@ -53,6 +53,9 @@ func (m *Manager) sessionTransition(ctx context.Context, s *Session,
 	if err == nil && code != "" {
 		err = code
 	}
+	if err == nil && s != nil && s.socket.ctx.Err() != nil {
+		err = store.AuthenticationFailed
+	}
 	if err == store.AuthenticationFailed && s != nil && s.socket != nil && s.socket.manager == m {
 		s.socket.Close()
 	}
