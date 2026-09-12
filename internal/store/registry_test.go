@@ -58,7 +58,7 @@ func TestRegistryMigrationPreservesIdentityAndLegacy(t *testing.T) {
 			t.Fatal("migration replaced installation identity")
 		}
 		var version, old, bindings, credentials int
-		if err := seed.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 5 {
+		if err := seed.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != len(migrations) {
 			t.Fatalf("version=%d err=%v", version, err)
 		}
 		for query, dest := range map[string]*int{"SELECT count(*) FROM conversations WHERE id='old'": &old, "SELECT count(*) FROM bindings": &bindings, "SELECT count(*) FROM credentials": &credentials} {

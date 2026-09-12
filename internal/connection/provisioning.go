@@ -68,6 +68,9 @@ func (f PublisherFunc) Publish(ctx context.Context, c CredentialFile) error { re
 // unsupported mechanism, and an error such as TemporarilyUnavailable for an
 // unavailable source. Only HostUnverified is a retained verification rejection.
 type ProvisioningConfig struct {
+	// ReenrollEvidence resolves a trusted immutable host-evidence reference.
+	// Absence disables reenrollment, while registration and rotation remain usable.
+	ReenrollEvidence  func(context.Context, string, NativeTuple) error
 	Store             *store.DB
 	Now               func() time.Time
 	Authorize         func(context.Context, *sql.Tx, store.CommandPrincipal) error
