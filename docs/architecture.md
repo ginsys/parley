@@ -53,13 +53,56 @@ access, creates no second audit or effect, and has no TTL or automatic eviction.
 failure rejects new mutations with capacity_exceeded rather than deleting evidence. Registration
 preserves that original error even when SQLite automatically rolls back and removes its savepoint.
 
-These are internal storage primitives with synthetic test callers, not authentication or a human
-administration endpoint. CommandPrincipal is trusted server input; passing identity fields does
+These are internal storage primitives used by trusted provisioning and controlled tests, not
+authentication or a human administration endpoint. CommandPrincipal is trusted server input; passing identity fields does
 not authenticate a socket. Registration handlers must supply verified native evidence, legacy
 eligibility and trusted provisioning before using the binding/credential insertion primitive.
 Existing controller, dispatch and ingestion callers are unchanged at this foundation stage.
 The [connection specification](specifications/connections.md) remains authoritative for attachment,
 readiness, holds, ingestion barriers and clock/restore recovery that subsequent slices implement.
+
+## Internal credential provisioning
+
+The internal connection Provisioner implements trusted binding registration and rotation. It
+requires explicit authority, recovery, host-verification, legacy-eligibility, target-resolution
+and connection-invalidation capabilities; none has an authentication-bypass default. These
+capabilities are synthetic in tests. There is no human CLI/RPC, runnable endpoint or real-host
+identity verifier. The protected executable's restrictions remain unchanged.
+
+Registration validates exact peer/native identifiers and a finite representable expiry, checks
+current authority before consulting host evidence or provisioning configuration, and creates one
+binding plus a random 32-byte credential without membership. Only its SHA-256 verifier is stored.
+The constant-time verifier comparison is separate from the UID/status/expiry/generation checks
+that authenticated attachment must supply. Rotation compares both expected versions, supersedes
+the old credential, increments binding/credential versions and invalidates runtime state after
+commit under the coordinator gate. Rejected or replayed rotation cannot invalidate a connection.
+Legacy enrollment requires the trusted eligibility provider; it is never inferred from a peer key.
+
+Authorized retries consult retained receipts before host/target checks or mutation preconditions.
+They return committed metadata and current publication evidence, never a secret or a second file.
+New publication runs after enrollment commits and outside the coordinator gate. Its independent
+five-second evidence context survives caller cancellation. File publication is not atomic with
+SQLite: failure, interruption or lost evidence leaves pending/unknown status requiring human
+inspection and a fresh rotation/revocation operation, never an old-secret fallback. Pending is not
+proof that no credential file exists. Binding status and publication evidence remain distinct.
+
+The Linux private publisher accepts a trusted XDG state directory and expected owner UID. Its
+existing state/parley/credentials directories must be private (0700); ancestors must be trusted
+and not writable by untrusted accounts. It opens each path component without following symlinks,
+creates a private singly linked regular temporary file (0600), writes/syncs/closes it, then uses
+[renameat2 with RENAME_NOREPLACE](https://man7.org/linux/man-pages/man2/rename.2.html) to publish only
+the generated credential-ID filename. It also [syncs the directory](https://man7.org/linux/man-pages/man2/fsync.2.html);
+a failure after rename remains ambiguous and does not remove the possibly published file.
+Unsupported no-replace rename fails closed. There is no mutable active-file pointer, overwrite,
+permission repair or cross-account ownership change; cross-account publication needs the trusted
+setup capability. Credential material is confined to the publisher's private file serialization,
+excluded from ordinary JSON results and redacted from standard diagnostic formatting.
+
+Controlled fixtures cover authorization before host/file work, duplicate replay, expiry equality,
+legacy denial, rotation/version conflicts, missing providers, unsafe publication paths, no overwrite
+and a directory-sync failure after rename. Controlled test subprocesses exit before file publication,
+after publication and after evidence recording; restart replays the receipt without publishing again.
+These cover provisioning portions of C01/C02/C14/C17 and do not satisfy the live-connection gate.
 
 ## Accepted runtime direction
 
