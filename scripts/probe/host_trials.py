@@ -352,6 +352,19 @@ class ClaudeDriver:
             raise RuntimeError(f'claude agents exited {result.returncode}: {result.stderr}')
         return {entry['id'] for entry in background_sessions(result.stdout)}
 
+    def _recoverable_candidates(self, before):
+        """Best-effort new session ids after an uncertain `claude --bg` outcome.
+
+        Called only when the run itself is already uncertain (a timeout) -- a further listing
+        failure here is not this call's problem to raise, since the caller is already reporting
+        the original uncertainty. An empty result means only "no candidates could be recovered",
+        never "no session was created".
+        """
+        try:
+            return self._background_session_ids() - before
+        except (RuntimeError, subprocess.TimeoutExpired):
+            return set()
+
     def create(self, prompt):
         """Start a background session and identify it from a listing diff, never from stdout.
 
@@ -375,6 +388,13 @@ class ClaudeDriver:
         itself fail (timeout, nonzero exit, malformed JSON) after `claude --bg` already
         succeeded; that failure is caught the same way, since it leaves an equally real,
         equally-unidentified session behind and must not propagate as an unrelated exception.
+
+        `claude --bg` itself can also exceed its own 30s timeout after it has already detached
+        the background session -- the subprocess call raises before returning, but the session
+        it forked is not thereby undone. That case attempts the same post-create listing on a
+        best-effort basis (`_recoverable_candidates`) to surface whatever ids can be recovered;
+        a further listing failure there is swallowed to an empty candidate set rather than
+        raised, since the caller is already reporting the original timeout.
         """
         argv = ['claude', '--bg', '--cwd', self.cwd, '--print']
         if self.model:
@@ -383,7 +403,13 @@ class ClaudeDriver:
             argv += ['--max-budget-usd', str(self.max_budget_usd)]
         argv.append(prompt)
         before = self._background_session_ids()
-        result = self.run(argv, capture_output=True, text=True, timeout=30)
+        try:
+            result = self.run(argv, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired as error:
+            raise AmbiguousSessionCreation(
+                f'claude --bg under {self.cwd} did not exit within its 30s timeout; it may have '
+                'already detached a background session before hanging',
+                candidates=sorted(self._recoverable_candidates(before))) from error
         if result.returncode != 0:
             raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')
         try:
