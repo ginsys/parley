@@ -635,13 +635,13 @@ def codex_rollout_events(lines):
 
     `unusable` counts content that *should* have been readable and was not — a line that is not
     valid JSON (a corrupt or half-written rollout), a `response_item`/`event_msg` record whose
-    `payload` is missing or not an object, a message record whose `timestamp` is missing or
-    malformed, or a message record whose `content` is not the list of parts every captured shape
-    carries (missing, explicit `null`, or a single object rather than a list — a structured/
-    tool-call payload this runner has not captured a shape for). Neither can be ordered against
-    submission, and opening a file successfully does not establish that its transcript was read
-    successfully. The caller reports such a read unobservable rather than letting absent
-    outcomes become negative evidence.
+    `payload` is missing or not an object, a payload whose `type` is missing or not a string, a
+    message record whose `timestamp` is missing or malformed, or a message record whose `content`
+    is not the list of parts every captured shape carries (missing, explicit `null`, or a single
+    object rather than a list — a structured/tool-call payload this runner has not captured a
+    shape for). Neither can be ordered against submission, and opening a file successfully does
+    not establish that its transcript was read successfully. The caller reports such a read
+    unobservable rather than letting absent outcomes become negative evidence.
     """
     events = []
     unusable = 0
@@ -672,11 +672,14 @@ def codex_rollout_events(lines):
             unusable += 1
             continue
         kind = payload.get('type')
-        if kind is not None and not isinstance(kind, str):
-            # A non-string type (e.g. a schema-drifted list or object) crashes the membership
-            # test below with an unhashable-type TypeError; it is also not one of the known
-            # record shapes this runner has no use for (token_usage_record, world_state, ...),
-            # so it is a corrupted or drifted record, not evidence of a successful read.
+        if not isinstance(kind, str):
+            # A missing or non-string type (e.g. a schema-drifted list, object, or omitted key)
+            # crashes the membership test below with an unhashable-type TypeError for a non-string
+            # value; a bare `None` previously fell through that check and was silently treated as
+            # one of the record kinds this runner has no use for. Both a `response_item` and an
+            # `event_msg` always carry a `payload.type` in every captured shape
+            # (docs/host-probe-preflight.md), so either shape here is a corrupted or drifted
+            # record, not evidence of a successful read.
             unusable += 1
             continue
         if outer_kind == CODEX_EVENT_RECORD_TYPE:
