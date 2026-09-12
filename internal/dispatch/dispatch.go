@@ -316,6 +316,10 @@ func (b *Bridge) settle(ctx context.Context, claimed *store.Envelope, deliverErr
 // still checked — an expired-but-otherwise-permitted grant is a valid
 // requeue target, a grant that never permitted this direction at all is not.
 func resolveRequeueVersion(ctx context.Context, tx *sql.Tx, e *store.Envelope) (int64, bool, error) {
+	cancelled, err := store.WorkCancelled(ctx, tx, store.WorkRef{Kind: "envelope", ID: e.ID})
+	if err != nil || cancelled {
+		return 0, false, err
+	}
 	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
 	if err != nil {
 		if errors.Is(err, store.ErrNoActiveGrant) {
@@ -388,6 +392,10 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 		return nil, false, authErr
 	}
 
+	held, err := store.WorkHeld(ctx, tx, store.WorkRef{Kind: "envelope", ID: e.ID})
+	if err != nil || held {
+		return nil, false, err
+	}
 	ok, err := store.ClaimExchange(ctx, tx, e.Conversation, e.GrantVersion)
 	if err != nil {
 		return nil, false, err

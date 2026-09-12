@@ -27,6 +27,7 @@ func readerDSN(path string) (string, error) {
 	q.Set("_query_only", "on")
 	q.Set("_busy_timeout", "5000")
 	q.Set("_foreign_keys", "on")
+	q.Add("_pragma", "recursive_triggers(1)")
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }

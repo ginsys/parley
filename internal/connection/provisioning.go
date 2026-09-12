@@ -62,6 +62,9 @@ func (f PublisherFunc) Publish(ctx context.Context, c CredentialFile) error { re
 // authority, legacy or recovery providers fail closed, including in development.
 // Target resolves a configured UUID reference, never a request-supplied path.
 type ProvisioningConfig struct {
+	// ReenrollEvidence resolves a trusted immutable host-evidence reference.
+	// Absence disables reenrollment, while registration and rotation remain usable.
+	ReenrollEvidence  func(context.Context, string, NativeTuple) error
 	Store             *store.DB
 	Now               func() time.Time
 	Authorize         func(context.Context, *sql.Tx, store.CommandPrincipal) error

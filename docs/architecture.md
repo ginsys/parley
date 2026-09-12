@@ -160,6 +160,54 @@ There is no runnable listener, wire parser, human credential CLI or live-session
 this slice. Grants continue through the existing protected controller; authenticated ordinary
 acceptance, dispatch and ingestion follow in the storage/recovery and caller-migration slices.
 
+## Internal retained work and binding lifecycle
+
+Migration 6 adds immutable accepting provenance, migration quarantine, independent security
+holds, binding revocation incidents and audited dispositions. Every historical envelope receives
+its exact original conversation/from/to/grant snapshot and an explicit legacy tag, with no
+invented binding or credential. Outstanding queued, dispatching, handed-off and uncertain work
+receives separate quarantine. Migration preserves delivery state, attempts, trusted-reply flags,
+ACKs and budget. Legacy adoption pages IDs inside the same transaction; invalid rows or late DDL
+failures roll back the whole upgrade. Only migration can create legacy provenance or quarantine.
+
+Authenticated work records the accepting binding and credential version using real foreign keys.
+Renewal may carry the envelope's effective grant forward without rewriting this provenance.
+Revocation and retirement disable the binding, terminalize its current credential, append an
+incident, hold outstanding authored work across all credential versions and pause ingestion in
+one audited transaction. Exact legacy sender matches receive independent security holds too.
+Work merely addressed to that binding is not treated as authored by it. Admission supplies its
+pending-work extension through trusted callbacks; no pending-request implementation ships here.
+Re-enrollment requires new reviewed host evidence and a fresh credential for the same tuple;
+it does not clear holds, quarantine, the earliest paused cursor or barrier incident history.
+
+The internal Lifecycle service exposes revoke, retire, hold disposition and legacy disposition;
+Provisioner adds re-enrollment. Current administrator authorization precedes private replay;
+evidence I/O occurs outside the writer and mutation guards recheck under the coordinator. Audit
+and effects commit before socket invalidation. Missing capabilities fail closed. These APIs have
+test-only callers until the ordinary caller migration; they add no human endpoint or credential
+CLI, and grants still come from the protected controller.
+
+Release changes only the selected hold or quarantine version. A second incident remains effective.
+Cancellation is terminal; only queued work changes to cancelled, while dispatched/uncertain and
+handed-off evidence stays intact. Legacy release is limited to queued or handed-off work with an
+exact reviewed evidence reference. Dispositions retain reason codes, bounded optional notes,
+version and a deferred composite foreign key to the same principal/operation audit record.
+Dispatch checks holds before budget claim, acknowledgment refuses held originals, and late
+never-attempted settlement cannot requeue cancelled work. Exact attempt settlement still refunds
+only once and preserves original provenance and prior ACKs.
+
+The same migration includes ingestion evidence/cursors/barriers, recovery incidents, retired
+principal namespaces, versioned clock checkpoints and audited recovery-floor dispositions.
+These reserve the complete storage shape for the separate ingestion/recovery implementation;
+they do not yet implement ingestion.resume, restore-marker I/O or clock reconciliation. There
+is no automatic detection claim for restores that bypass the trusted restore procedure.
+
+Controlled tests cover C11 authored-work attribution, repeated incidents and re-enrollment;
+C12 held claims/ACKs, late settlement and original provenance across renewal; and C15 migration
+rollback/rerun, incompatible historical identifiers and committed release/cancel dispositions.
+Pending admission extensions remain with #28. These tests do not replace the remaining controlled
+fixture or actual-host evidence required before connecting a live session.
+
 ## Accepted runtime direction
 
 The owner-approved roadmap changes the target deployment, not the current behavior above.
@@ -535,7 +583,10 @@ validates provenance and commits acknowledgement plus reply insertion atomically
 
 ## Storage and migrations
 
-SQLite connections use WAL, foreign keys, a bounded busy timeout and `_txlock=immediate`.
+SQLite connections use WAL, foreign keys, recursive triggers, a bounded busy timeout and `_txlock=immediate`.
+Recursive triggers are required because SQLite replacement writes fire deletion guards only when
+[recursive triggers are enabled](https://www.sqlite.org/lang_conflict.html); the setting is applied
+through every store-owned connection DSN, including reopened connections.
 `database/sql.Tx` owns cancellation and connection cleanup; no custom transaction wrapper exists.
 All migration steps and `PRAGMA user_version` changes run within one immediate transaction:
 
@@ -546,6 +597,7 @@ All migration steps and `PRAGMA user_version` changes run within one immediate t
 | 3 | Add dispatch attempt and fixed diagnostic fields |
 | 4 | Backfill numeric envelope timestamps and add the recipient queue index |
 | 5 | Add installation, bindings, credentials, publication evidence and permanent command results/audit |
+| 6 | Add work provenance/quarantine/holds and complete ingestion/recovery retention schema |
 
 `schema.sql` remains the frozen version-1 schema used for legacy adoption. Only version-zero
 bootstrap inspects column layouts; subsequent steps follow version numbers. Unknown legacy
