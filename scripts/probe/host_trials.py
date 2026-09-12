@@ -562,22 +562,32 @@ TURN_BOUNDARY_ROLES = {'task_started': 'turn_start',
                        'turn_aborted': 'turn_end'}
 
 
+# The two outer record kinds this runner reads at all (docs/host-probe-preflight.md,
+# 2026-09-11): a rollout also accumulates session_meta/world_state/turn_context/
+# token_usage_record records this runner has no use for, at either kind.
+CODEX_MESSAGE_RECORD_TYPE = 'response_item'
+CODEX_EVENT_RECORD_TYPE = 'event_msg'
+
+
 def codex_rollout_events(lines):
     """Extract message and turn-boundary Events from rollout JSONL; returns `(events, unusable)`.
 
-    Skips `developer`-role entries (fixed instructions, not conversation turns) and any record
-    missing the expected shape; a rollout file accumulates record types this runner has no use
-    for (token_usage_record, world_state, turn_context, ...). Those are skipped silently: a
-    record this runner has no use for is not evidence it failed to read.
+    Skips `developer`-role entries (fixed instructions, not conversation turns) and any outer
+    record type this runner has no use for (token_usage_record, world_state, turn_context,
+    session_meta, ...). Those are skipped silently: a record this runner has no use for is not
+    evidence it failed to read. The outer `type` is checked before the inner `payload.type` is
+    ever trusted: an unrelated record whose payload happens to carry `type: "message"` or a
+    boundary name must not be accepted as transcript evidence just because of that coincidence.
 
     `unusable` counts content that *should* have been readable and was not — a line that is not
-    valid JSON (a corrupt or half-written rollout), a message record whose `timestamp` is
-    missing or malformed, or a message record whose `content` is not the list of parts every
-    captured shape carries (missing, explicit `null`, or a single object rather than a list —
-    a structured/tool-call payload this runner has not captured a shape for). Neither can be
-    ordered against submission, and opening a file successfully does not establish that its
-    transcript was read successfully. The caller reports such a read unobservable rather than
-    letting absent outcomes become negative evidence.
+    valid JSON (a corrupt or half-written rollout), a `response_item`/`event_msg` record whose
+    `payload` is missing or not an object, a message record whose `timestamp` is missing or
+    malformed, or a message record whose `content` is not the list of parts every captured shape
+    carries (missing, explicit `null`, or a single object rather than a list — a structured/
+    tool-call payload this runner has not captured a shape for). Neither can be ordered against
+    submission, and opening a file successfully does not establish that its transcript was read
+    successfully. The caller reports such a read unobservable rather than letting absent
+    outcomes become negative evidence.
     """
     events = []
     unusable = 0
@@ -596,8 +606,16 @@ def codex_rollout_events(lines):
             # unrecognized shape, aborting the whole read rather than just this record.
             unusable += 1
             continue
+        outer_kind = record.get('type')
+        if outer_kind not in (CODEX_MESSAGE_RECORD_TYPE, CODEX_EVENT_RECORD_TYPE):
+            continue
         payload = record.get('payload')
         if not isinstance(payload, dict):
+            # A relevant outer record with no readable payload is a corrupted or schema-drifted
+            # record, not one of the record kinds this runner has no use for -- reporting it
+            # unusable rather than skipping it silently keeps observe() from reading a broken
+            # channel as a readable one with nothing worth reporting.
+            unusable += 1
             continue
         kind = payload.get('type')
         if kind is not None and not isinstance(kind, str):
@@ -607,7 +625,9 @@ def codex_rollout_events(lines):
             # so it is a corrupted or drifted record, not evidence of a successful read.
             unusable += 1
             continue
-        if kind in TURN_BOUNDARY_ROLES:
+        if outer_kind == CODEX_EVENT_RECORD_TYPE:
+            if kind not in TURN_BOUNDARY_ROLES:
+                continue
             when = record_time(record)
             if when is None:
                 unusable += 1
