@@ -11,6 +11,10 @@ from unittest.mock import patch
 
 from host_trials import (
     MARKER_PATTERN,
+    SIGNAL_ASSISTANT_MESSAGE,
+    SIGNAL_SUBMIT_EXIT_STATUS,
+    SIGNAL_TURN_BOUNDARY_EVENT,
+    SIGNAL_USER_MESSAGE,
     AmbiguousSessionCreation,
     ClaudeDriver,
     CodexDriver,
@@ -127,6 +131,29 @@ class DetectOutcomesTests(unittest.TestCase):
         observation = detect_outcomes(events, MARKER, submitted_at=9.0)
         self.assertEqual(observation.outcomes, {'visible': 10.0})
         self.assertFalse(observation.observable)
+
+    def test_signals_name_which_event_established_each_outcome(self):
+        events = [
+            Event(role='user', text=f'do the thing {MARKER}', time=10.0),
+            Event(role='assistant', text=f'ok, saw {MARKER}', time=11.0),
+        ]
+        observation = detect_outcomes(events, MARKER, submitted_at=9.0)
+        self.assertEqual(observation.signals,
+                          {'visible': SIGNAL_USER_MESSAGE, 'turn_start': SIGNAL_ASSISTANT_MESSAGE,
+                           'ack': SIGNAL_ASSISTANT_MESSAGE})
+
+    def test_turn_stream_signal_credits_the_boundary_event_not_the_assistant_message(self):
+        events = [Event(role='turn_start', text='', time=10.0),
+                  Event(role='assistant', text=f'ok, saw {MARKER}', time=11.0)]
+        observation = detect_outcomes(events, MARKER, submitted_at=9.0, turn_stream=True)
+        self.assertEqual(observation.outcomes['turn_start'], 10.0)
+        self.assertEqual(observation.signals['turn_start'], SIGNAL_TURN_BOUNDARY_EVENT)
+
+    def test_turn_stream_with_no_boundary_event_carries_no_turn_start_signal(self):
+        events = [Event(role='assistant', text='still finishing', time=11.0)]
+        observation = detect_outcomes(events, MARKER, submitted_at=9.0, turn_stream=True)
+        self.assertNotIn('turn_start', observation.outcomes)
+        self.assertNotIn('turn_start', observation.signals)
 
 
 class ClaudeParsingTests(unittest.TestCase):
@@ -982,6 +1009,20 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.submitted_at, 1000.0)
         self.assertEqual(run.accepted_at, 1012.0)
         self.assertEqual(run.outcomes['accepted'], 1012.0)
+
+    def test_the_result_carries_which_signal_established_each_outcome(self):
+        # docs/host-probes.md, Trial protocol: "Record which signal established each positive
+        # result, not just a timestamp" -- a bare TrialRun.outcomes timestamp cannot show this.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(
+            outcomes={'visible': 1000.0, 'turn_start': 1001.0, 'ack': 1002.0},
+            signals={'visible': SIGNAL_USER_MESSAGE, 'turn_start': SIGNAL_ASSISTANT_MESSAGE,
+                     'ack': SIGNAL_ASSISTANT_MESSAGE})], clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertEqual(run.signals, {'visible': SIGNAL_USER_MESSAGE,
+                                        'turn_start': SIGNAL_ASSISTANT_MESSAGE,
+                                        'ack': SIGNAL_ASSISTANT_MESSAGE,
+                                        'accepted': SIGNAL_SUBMIT_EXIT_STATUS})
 
     def test_settle_runs_between_create_and_submit(self):
         clock = FakeClock()

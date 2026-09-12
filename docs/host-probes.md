@@ -280,13 +280,19 @@ which is a different, positive fact from an unavailable channel and must not col
 same `unobservable` result.
 
 It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state`,
-`supported`, `observable`, `turn_end`, `turn_end_observable`) carrying exactly what
+`supported`, `observable`, `signals`, `turn_end`, `turn_end_observable`) carrying exactly what
 `Trial`/`classify_trial` need; acceptance is
 stamped when `submit` *returns*, since a submission that blocks for seconds would otherwise be
 backdated into its 10s window. The requested `state` is validated and carried into the result,
 but establishing a busy/approval/disconnected/restarted precondition is the caller's `settle`
 callable — passing `state='busy'` with a no-op `settle` still exercises an idle host, and no
 code here can detect that for the caller.
+
+`signals`, keyed the same as `outcomes`, names what established each positive result — a
+user-role transcript match, an assistant-role match, the host's own turn-boundary event, or the
+submit command's exit status — per the Trial protocol's requirement above to record the
+establishing signal, not just a timestamp. It travels alongside `outcomes` rather than replacing
+any of its values, since those floats feed `Trial`'s classification unmodified.
 
 One documented deviation from `Trial`'s "same monotonic clock" contract: `wake_probe.py`'s own
 PTY capture stays in one process and can use `time.monotonic()`, but a real host's transcript
