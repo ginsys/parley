@@ -225,3 +225,66 @@ func TestReaderQueryAndMaterializationCancellation(t *testing.T) {
 		})
 	}
 }
+
+func TestReadersPinWriterPath(t *testing.T) {
+	first, second := t.TempDir(), t.TempDir()
+	t.Chdir(first)
+	d, err := Open(context.Background(), "relative.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	t.Chdir(second)
+	if err := d.OpenReaders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(second, "relative.db")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("reader followed changed cwd:", err)
+	}
+}
+
+func TestReaderDefaultDeadlineAndDetachedResults(t *testing.T) {
+	d := readerTestDB(t)
+	pool := d.readers.Load()
+	for _, operation := range []func() error{
+		func() error {
+			_, _, err := d.Queries().QueueBatch(context.Background(), "c", "b", 100, &QueueCursor{ID: "tail", CreatedAtNS: 1})
+			return err
+		},
+		func() error {
+			_, err := d.Queries().Outcome(context.Background(), "missing")
+			if errors.Is(err, ErrEnvelopeNotFound) {
+				return nil
+			}
+			return err
+		},
+	} {
+		if err := operation(); err != nil {
+			t.Fatal(err)
+		}
+		if pool.Stats().InUse != 0 {
+			t.Fatal("query retained SQLite resources after returning")
+		}
+	}
+	var held []*sql.Conn
+	defer func() {
+		for _, c := range held {
+			c.Close()
+		}
+	}()
+	for range MaxReaders {
+		c, err := pool.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, c)
+	}
+	started := time.Now()
+	_, err := d.Queries().Outcome(context.Background(), "missing")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("unbounded read:", err)
+	}
+	if elapsed := time.Since(started); elapsed < ReadTimeout-100*time.Millisecond {
+		t.Fatalf("unexpected early timeout: %s", elapsed)
+	}
+}
