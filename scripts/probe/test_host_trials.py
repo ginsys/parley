@@ -1619,7 +1619,8 @@ class RunTrialTests(unittest.TestCase):
         # started: their absence measures nothing and must not read as host silence.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(outcomes={'visible': 1000.0})], clock=clock)
-        run = self.run_one(driver, clock, state='busy', poll_interval=300.0)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
         self.assertGreaterEqual(clock.elapsed, 900)  # BUSY_CAP, not the 120s idle window
         self.assertIsNone(run.turn_end)
         self.assertTrue(run.observable['visible'])
@@ -1636,7 +1637,8 @@ class RunTrialTests(unittest.TestCase):
         # "positively seen" rule would otherwise let it stand on its own.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(outcomes={'turn_start': 1005.0})], clock=clock)
-        run = self.run_one(driver, clock, state='busy', poll_interval=300.0)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
         self.assertIsNone(run.turn_end)
         self.assertIn('turn_start', run.outcomes)
         self.assertFalse(run.observable['turn_start'])
@@ -1652,7 +1654,8 @@ class RunTrialTests(unittest.TestCase):
         # `unobservable` here the way a non-turn-stream host's ambiguity is.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(turn_stream=True)], clock=clock)
-        run = self.run_one(driver, clock, state='busy', poll_interval=300.0)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
         self.assertIsNone(run.turn_end)
         self.assertTrue(run.turn_end_observable)
         self.assertTrue(run.observable['turn_start'])
@@ -1668,7 +1671,8 @@ class RunTrialTests(unittest.TestCase):
         seen = Observation(outcomes={'visible': 1000.0, 'turn_start': 1040.0, 'ack': 1041.0},
                            turn_end=1030.0)
         driver = FakeDriver(observations=[seen], clock=clock)
-        run = self.run_one(driver, clock, state='busy', poll_interval=300.0)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
         self.assertEqual(run.turn_end, 1030.0)
         self.assertLess(clock.elapsed, 900)  # the dependent windows closed before the cap
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
@@ -1688,17 +1692,28 @@ class RunTrialTests(unittest.TestCase):
         late = Observation(outcomes={'visible': 1012.0, 'turn_start': 1840.0, 'ack': 1900.0},
                             turn_end=turn_end)
         driver = FakeDriver(observations=[early, mid, late], clock=clock)
-        run = self.run_one(driver, clock, state='busy', poll_interval=890.0)
+        run = self.run_one(driver, clock, state='busy', poll_interval=890.0,
+                           settle=lambda session_id: None)
         self.assertEqual(run.turn_end, turn_end)
         self.assertEqual(run.outcomes.get('ack'), 1900.0)
         self.assertGreater(clock.elapsed, 900)  # polled past BUSY_CAP to cover the real end
 
     def test_requested_state_is_validated_and_carried_into_the_result(self):
         clock = FakeClock()
-        run = self.run_one(FakeDriver(clock=clock), clock, state='busy')
+        run = self.run_one(FakeDriver(clock=clock), clock, state='busy',
+                           settle=lambda session_id: None)
         self.assertEqual(run.state, 'busy')
         with self.assertRaises(ValueError):
             self.run_one(FakeDriver(clock=clock), clock, state='asleep')
+
+    def test_a_non_idle_state_without_an_explicit_settle_is_rejected(self):
+        # The default no-op settle only ever exercises an idle host; silently accepting it for
+        # busy/approval/disconnected/restarted would publish a result for a condition the
+        # experiment never established, with no code able to detect the gap afterwards.
+        clock = FakeClock()
+        for state in ('busy', 'approval', 'disconnected', 'restarted'):
+            with self.assertRaises(ValueError):
+                self.run_one(FakeDriver(clock=clock), clock, state=state)
 
     def test_poll_interval_is_validated_before_any_session_exists_or_marker_is_sent(self):
         # A negative or NaN interval previously stayed unnoticed until the first sleep() call
