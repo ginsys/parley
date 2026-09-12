@@ -1063,6 +1063,11 @@ class TrialRun:
     state: str
     supported: dict
     observable: dict
+    # The exact token submitted (docs/host-probes.md, Trial protocol: record the synthetic
+    # input alongside its evidence). Callers using the documented default (`run_trial` generates
+    # one) have no other way to learn or verify which token a reported signal matched, especially
+    # for an unobservable or negative trial where nothing else retains the submitted text.
+    marker: str
     # What established each entry in `outcomes`, keyed the same (docs/host-probes.md, Trial
     # protocol) -- see `Observation.signals`. An outcome absent here was never positively
     # observed, regardless of what `observable` says about the channel.
@@ -1211,12 +1216,12 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
         accepted = driver.submit(session_id, marker_message(marker))
     except SubmissionUnsupported:
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
-                        outcomes={}, state=state,
+                        outcomes={}, state=state, marker=marker,
                         supported={name: False for name in OUTCOME_NAMES},
                         observable={name: True for name in OUTCOME_NAMES})
     except SubmissionUncaptured:
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
-                        outcomes={}, state=state,
+                        outcomes={}, state=state, marker=marker,
                         supported={name: True for name in OUTCOME_NAMES},
                         observable={name: False for name in OUTCOME_NAMES},
                         turn_end_observable=False)
@@ -1264,7 +1269,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
         observable = {'accepted': True}
         observable.update({name: False for name in TRANSCRIPT_OUTCOMES})
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
-                        outcomes={}, state=state,
+                        outcomes={}, state=state, marker=marker,
                         supported={name: True for name in OUTCOME_NAMES}, observable=observable,
                         turn_end_observable=False)
     accepted_at = None if accepted_unobservable else clock()
@@ -1350,7 +1355,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
     # though the channel itself stayed readable up to the point of interruption.
     turn_end_observable = turn_end is not None or (channel_readable and not interrupted)
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
-                    outcomes=outcomes, state=state,
+                    outcomes=outcomes, state=state, marker=marker,
                     supported={name: True for name in OUTCOME_NAMES}, observable=observable,
                     signals=signals, turn_end=turn_end, turn_end_observable=turn_end_observable)
 

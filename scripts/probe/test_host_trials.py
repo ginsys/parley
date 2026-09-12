@@ -1207,6 +1207,7 @@ class RunTrialTests(unittest.TestCase):
         run = self.run_one(FakeDriver(accepted=False, clock=clock), clock)
         self.assertNotIn('accepted', run.outcomes)
         self.assertIsNone(run.accepted_at)
+        self.assertEqual(run.marker, MARKER)  # the submitted token is still evidence, even rejected
 
     def test_rejected_submission_skips_polling_and_marks_transcript_outcomes_unobservable(self):
         # A clean nonzero exit is a real, observed failure to accept -- 'not_observed' is the
@@ -1292,6 +1293,7 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.outcomes, {})
         self.assertFalse(any(run.supported.values()))
         self.assertNotIn('observe', driver.order)  # nothing was delivered, so nothing is ours
+        self.assertEqual(run.marker, MARKER)  # the submitted token is still evidence, even unsupported
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
         classified = classify_trial(trial, run.submitted_at + 1000, supported=run.supported)
         self.assertTrue(all(value == 'unsupported' for value in classified.values()))
@@ -1302,6 +1304,7 @@ class RunTrialTests(unittest.TestCase):
         run = self.run_one(driver, clock)
         self.assertTrue(all(run.supported.values()))  # no claim that the host lacks the path
         self.assertFalse(any(run.observable.values()))
+        self.assertEqual(run.marker, MARKER)  # the submitted token is still evidence, even unobservable
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
                       turn_end_observable=run.turn_end_observable)
         classified = classify_trial(trial, run.submitted_at + 1000,
@@ -1486,18 +1489,18 @@ class RunTrialTests(unittest.TestCase):
         # guarantees a fresh, unique token per trial.
         clock = FakeClock()
         first_driver = FakeDriver(clock=clock)
-        run_trial(first_driver, prompt='hi', clock=clock.time, monotonic=clock.monotonic,
-                  sleep=clock.sleep)
+        first_run = run_trial(first_driver, prompt='hi', clock=clock.time,
+                              monotonic=clock.monotonic, sleep=clock.sleep)
         clock = FakeClock()
         second_driver = FakeDriver(clock=clock)
-        run_trial(second_driver, prompt='hi', clock=clock.time, monotonic=clock.monotonic,
-                  sleep=clock.sleep)
+        second_run = run_trial(second_driver, prompt='hi', clock=clock.time,
+                               monotonic=clock.monotonic, sleep=clock.sleep)
+        self.assertNotEqual(first_run.marker, second_run.marker)
+        self.assertRegex(first_run.marker, MARKER_PATTERN)
+        self.assertRegex(second_run.marker, MARKER_PATTERN)
         prefix = 'Automated probe: reply with exactly this token to confirm receipt: '
-        first_marker = first_driver.submitted_message.removeprefix(prefix)
-        second_marker = second_driver.submitted_message.removeprefix(prefix)
-        self.assertNotEqual(first_marker, second_marker)
-        self.assertRegex(first_marker, MARKER_PATTERN)
-        self.assertRegex(second_marker, MARKER_PATTERN)
+        self.assertEqual(first_driver.submitted_message.removeprefix(prefix), first_run.marker)
+        self.assertEqual(second_driver.submitted_message.removeprefix(prefix), second_run.marker)
 
 
 class ClassifyTrialTests(unittest.TestCase):
