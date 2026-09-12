@@ -149,6 +149,23 @@ class SubmissionFailed(RuntimeError):
         self.original = original
 
 
+class ObservationFailed(RuntimeError):
+    """Raised when `driver.observe()` raises anything other than `KeyboardInterrupt`.
+
+    The polling loop calls `observe()` repeatedly after submission already succeeded -- a
+    mid-poll failure (an executable that disappeared, a listing call's nonzero exit, any other
+    runner bug) is not the ambiguity `KeyboardInterrupt` handling exists for, and the accumulated
+    partial evidence cannot rescue it into a trustworthy result. Left uncaught, it would discard
+    the only place that session id is ever surfaced, for the same reason `SettleFailed` and
+    `SubmissionFailed` exist for their own stages.
+    """
+
+    def __init__(self, session_id, original):
+        super().__init__(f'observe() failed for session {session_id!r}: {original!r}')
+        self.session_id = session_id
+        self.original = original
+
+
 @dataclass
 class SessionRegistry:
     """Tracks session ids created by *this run*; refuses to touch anything else.
@@ -1361,6 +1378,14 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
             # absent" -- an interrupted poll never reached its deadline, so the channel staying
             # readable up to this point is not proof the outcome would never have appeared.
             interrupted = True
+        except Exception as error:
+            # Anything else from observe() -- a vanished executable, a listing call's nonzero
+            # exit, any other runner bug -- is not the ambiguity KeyboardInterrupt handling
+            # exists for, and the partial evidence gathered so far cannot make it trustworthy.
+            # The session is already live under the real HOME; left uncaught, this would discard
+            # the only place its id is ever surfaced, exactly the problem `SettleFailed` and
+            # `SubmissionFailed` solve for their own stages.
+            raise ObservationFailed(session_id, error) from error
     if accepted_at is not None:
         outcomes['accepted'] = accepted_at
         signals['accepted'] = SIGNAL_SUBMIT_EXIT_STATUS

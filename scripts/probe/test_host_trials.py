@@ -21,6 +21,7 @@ from host_trials import (
     Event,
     ForeignSessionError,
     Observation,
+    ObservationFailed,
     OpenCodeDriver,
     SessionCreationUncaptured,
     SessionRegistry,
@@ -1122,10 +1123,12 @@ class FakeClock:
 class FakeDriver:
     """Scripted host: `observations` is consumed one entry per observe() call, last repeating."""
 
-    def __init__(self, *, observations=None, accepted=True, submit_error=None, clock=None):
+    def __init__(self, *, observations=None, accepted=True, submit_error=None,
+                 observe_error=None, clock=None):
         self.observations = list(observations or [Observation()])
         self.accepted = accepted
         self.submit_error = submit_error
+        self.observe_error = observe_error
         self.clock = clock
         self.order = []
 
@@ -1149,6 +1152,8 @@ class FakeDriver:
 
     def observe(self, session_id, *, marker, submitted_at):
         self.order.append('observe')
+        if self.observe_error is not None:
+            raise self.observe_error
         return self.observations.pop(0) if len(self.observations) > 1 else self.observations[0]
 
 
@@ -1259,6 +1264,17 @@ class RunTrialTests(unittest.TestCase):
         clock = FakeClock()
         driver = FakeDriver(submit_error=RuntimeError('claude agents exited 1'), clock=clock)
         with self.assertRaises(SubmissionFailed) as caught:
+            self.run_one(driver, clock)
+        self.assertEqual(caught.exception.session_id, 'sid')
+        self.assertIsInstance(caught.exception.original, RuntimeError)
+
+    def test_an_unenumerated_observation_failure_also_carries_the_session_id(self):
+        # observe() runs in the polling loop after submission already succeeded; a mid-poll
+        # failure that is not KeyboardInterrupt previously propagated bare, discarding the only
+        # place that session_id is ever surfaced and any outcomes already gathered.
+        clock = FakeClock()
+        driver = FakeDriver(observe_error=RuntimeError('claude agents exited 1'), clock=clock)
+        with self.assertRaises(ObservationFailed) as caught:
             self.run_one(driver, clock)
         self.assertEqual(caught.exception.session_id, 'sid')
         self.assertIsInstance(caught.exception.original, RuntimeError)
