@@ -407,3 +407,68 @@ func TestInspectionFailurePreservesAuthenticatedSocket(t *testing.T) {
 		})
 	}
 }
+
+func TestTransientIdentityReadFailurePreservesSocket(t *testing.T) {
+	for _, table := range []string{"credentials", "bindings"} {
+		t.Run(table, func(t *testing.T) {
+			m, auth, _ := attachmentFixture(t)
+			ctx := context.Background()
+			socket := acceptSocket(t, m)
+			session, err := m.Attach(ctx, socket, auth, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rename := func(reverse bool) {
+				t.Helper()
+				from, to := table, "temporarily_hidden_"+table
+				if reverse {
+					from, to = to, from
+				}
+				_, err := m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+					_, err := tx.ExecContext(ctx, "ALTER TABLE "+from+" RENAME TO "+to)
+					return store.TransitionResult{Changed: true}, err
+				}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			rename(false)
+			_, inspectionErr := m.Inspect(ctx, socket, auth)
+			rename(true)
+			if inspectionErr != store.TemporarilyUnavailable {
+				t.Errorf("read failure=%v", inspectionErr)
+			}
+			if err := m.Heartbeat(ctx, session); err != nil {
+				t.Fatalf("read failure consumed valid socket: %v", err)
+			}
+		})
+	}
+}
+func TestStaleTimerDuringWriterFailureUsesCurrentDeadline(t *testing.T) {
+	for _, due := range []bool{false, true} {
+		t.Run(map[bool]string{false: "refreshed", true: "due"}[due], func(t *testing.T) {
+			m, auth, now := attachmentFixture(t)
+			ctx := context.Background()
+			socket := acceptSocket(t, m)
+			session, err := m.Attach(ctx, socket, auth, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			*now = now.Add(20 * time.Second)
+			if err := m.Heartbeat(ctx, session); err != nil {
+				t.Fatal(err)
+			}
+			*now = now.Add(10 * time.Second)
+			if due {
+				*now = now.Add(20 * time.Second)
+			}
+			if err := m.store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m.expire(socket)
+			if (socket.Context().Err() != nil) != due {
+				t.Fatalf("due=%v closed=%v", due, socket.Context().Err())
+			}
+		})
+	}
+}
