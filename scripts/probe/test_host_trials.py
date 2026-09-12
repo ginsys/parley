@@ -817,6 +817,24 @@ class CodexDriverTests(unittest.TestCase):
         with self.assertRaises(ForeignSessionError):
             driver.register_existing('thread-1')
 
+    def test_register_existing_refuses_a_rollout_outside_sessions_root(self):
+        # _unruled_out_threads only ever walks sessions_root for rivals; an adopted rollout that
+        # actually lives outside that tree is invisible to that scan, so an inconsistent
+        # (sessions_root, rollout_path_for) pairing would otherwise silently disable the
+        # concurrent-thread guard instead of failing closed.
+        outside_root = tempfile.TemporaryDirectory()
+        self.addCleanup(outside_root.cleanup)
+        elsewhere = os.path.join(outside_root.name, 'rollout-elsewhere.jsonl')
+        with open(elsewhere, 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps({'timestamp': '2026-09-11T12:00:30.000Z',
+                                      'type': 'session_meta'}) + '\n')
+        registry = SessionRegistry()
+        driver = CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
+                             rollout_path_for=lambda _id: elsewhere, started_at=self.RUN_STARTED,
+                             sessions_root=self.sessions_root)
+        with self.assertRaises(ForeignSessionError):
+            driver.register_existing('thread-1')
+
     def test_adoption_ignores_an_older_neighbour_but_refuses_a_concurrent_one(self):
         # "Started after this run did" is equally true of a thread the human opened meanwhile,
         # so a second fresh rollout under the sessions root makes the adopted one ambiguous.

@@ -999,6 +999,17 @@ class CodexDriver:
             raise ForeignSessionError(f'thread predates this run and was not created by it: {thread_id}')
         if self.sessions_root is None:
             raise ForeignSessionError('sessions_root is required to rule out concurrent threads')
+        sessions_root = os.path.realpath(self.sessions_root)
+        adopted_real = os.path.realpath(path)
+        if os.path.commonpath([sessions_root, adopted_real]) != sessions_root:
+            # _unruled_out_threads only ever walks sessions_root looking for rivals; a rollout
+            # this driver would adopt from *outside* that tree is invisible to that scan by
+            # construction -- an inconsistent (sessions_root, rollout_path_for) pairing would
+            # silently disable the concurrent-thread guard rather than fail closed, exactly the
+            # ambiguity this method exists to catch.
+            raise ForeignSessionError(
+                f'rollout for thread {thread_id} ({adopted_real}) is not under sessions_root '
+                f'{sessions_root}; cannot rule out concurrent threads')
         rivals = self._unruled_out_threads(path)
         if rivals:
             raise ForeignSessionError(
