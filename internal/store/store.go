@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -45,11 +46,14 @@ func OpenExisting(ctx context.Context, path string) (*DB, error) {
 	var header [16]byte
 	_, readErr := f.ReadAt(header[:], 0)
 	closeErr := f.Close()
-	if readErr != nil || string(header[:]) != "SQLite format 3\x00" {
-		return nil, fmt.Errorf("database initialization required")
+	if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return nil, fmt.Errorf("read database header: %w", errors.Join(readErr, closeErr))
 	}
 	if closeErr != nil {
-		return nil, closeErr
+		return nil, fmt.Errorf("close database header: %w", closeErr)
+	}
+	if readErr != nil || string(header[:]) != "SQLite format 3\x00" {
+		return nil, fmt.Errorf("database initialization required")
 	}
 	return open(ctx, path, true)
 }
@@ -118,6 +122,28 @@ func normalizedDatabaseURL(path string) (*url.URL, error) {
 		if (key != "mode" && key != "cache") || len(values) != 1 {
 			return nil, fmt.Errorf("unsupported database URI option %q", key)
 		}
+	}
+	// url.Parse leaves file:relative.db in Opaque (still URI-escaped), unlike
+	// its decoded Path field. Pin every disk URI while preserving named memory
+	// identities and letting URL.String escape filesystem punctuation exactly once.
+	filename := u.Path
+	if u.Opaque != "" {
+		filename, err = url.PathUnescape(u.Opaque)
+		if err != nil {
+			return nil, fmt.Errorf("database URI path: %w", err)
+		}
+	}
+	if filename == ":memory:" {
+		u.Opaque, u.Path, u.RawPath = ":memory:", "", ""
+	} else if q.Get("mode") != "memory" {
+		if filename == "" {
+			return nil, fmt.Errorf("database URI path is required")
+		}
+		absolute, err := filepath.Abs(filename)
+		if err != nil {
+			return nil, err
+		}
+		u.Opaque, u.Path, u.RawPath = "", absolute, ""
 	}
 	u.RawQuery = q.Encode()
 	return u, nil

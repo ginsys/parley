@@ -5,8 +5,10 @@
 `store.Open` initializes the single immediate writer and ordered schema migrations. It retains
 library memory and URI support and does not run startup recovery automatically. The runtime writer
 entry point, `store.OpenExisting`, uses SQLite `mode=rw` so a missing file cannot become a silently
-created replacement database. Ordinary relative writer paths are pinned at open time so delayed
-reader initialization cannot follow a changed working directory.
+created replacement database. Relative disk paths, including escaped `file:` URIs, are pinned at
+writer open time so delayed reader initialization cannot follow a changed working directory. Named memory URI identities remain
+unchanged. Header I/O failures retain their underlying errors; only truncated or mismatched headers
+are classified as requiring initialization.
 
 After recovery, `DB.OpenReaders` explicitly initializes four file-backed connections and publishes
 one pool only after all connections open. The internal `readerDSN` shares writer path normalization

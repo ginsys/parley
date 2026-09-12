@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -25,7 +27,7 @@ func readerTestDB(t *testing.T) *DB {
 }
 
 func TestReaderDSNAndInitialization(t *testing.T) {
-	for _, path := range []string{":memory:", "file::memory:?cache=shared", "file:test?mode=memory", "file:test?_pragma=query_only(0)", "file:test?_query_only=off", "file:test?_txlock=immediate", "file:test?mode=ro&mode=rw"} {
+	for _, path := range []string{":memory:", "file::memory:?cache=shared", "file:%3Amemory%3A?cache=shared", "file:test?mode=memory", "file:test?_pragma=query_only(0)", "file:test?_query_only=off", "file:test?_txlock=immediate", "file:test?mode=ro&mode=rw"} {
 		if _, err := readerDSN(path); err == nil {
 			t.Fatalf("accepted %s", path)
 		}
@@ -227,19 +229,73 @@ func TestReaderQueryAndMaterializationCancellation(t *testing.T) {
 }
 
 func TestReadersPinWriterPath(t *testing.T) {
-	first, second := t.TempDir(), t.TempDir()
-	t.Chdir(first)
-	d, err := Open(context.Background(), "relative.db")
-	if err != nil {
-		t.Fatal(err)
+	for _, path := range []string{"relative.db", "file:relative.db", "file:./relative.db?cache=private", "file:relative%20%23%3F%25.db"} {
+		t.Run(path, func(t *testing.T) {
+			first, second := t.TempDir(), t.TempDir()
+			t.Chdir(first)
+			d, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Close()
+			if strings.Contains(path, "%20") {
+				if _, err := os.Stat(filepath.Join(first, "relative #?%.db")); err != nil {
+					t.Fatalf("URI filename decoded incorrectly: %v", err)
+				}
+			}
+			tx, err := d.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec("INSERT INTO conversations(id,name,created_at) VALUES('writer','writer','synthetic')"); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			t.Chdir(second)
+			// An initialized decoy proves we read the writer's DB, not merely any DB
+			// at the new cwd that happens to satisfy the reader-open requirements.
+			decoy, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer decoy.Close()
+			if err := d.OpenReaders(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if err := d.Queries().snapshot(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+				var n int
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM conversations WHERE id='writer'").Scan(&n); err != nil {
+					return err
+				}
+				if n != 1 {
+					t.Fatal("reader attached to a different database")
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
-	defer d.Close()
-	t.Chdir(second)
-	if err := d.OpenReaders(context.Background()); err != nil {
-		t.Fatal(err)
+}
+
+func TestOpenExistingPreservesHeaderReadFailure(t *testing.T) {
+	_, err := OpenExisting(context.Background(), t.TempDir())
+	if !errors.Is(err, syscall.EISDIR) {
+		t.Fatalf("directory read cause lost: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(second, "relative.db")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("reader followed changed cwd:", err)
+	if strings.Contains(err.Error(), "initialization required") {
+		t.Fatal("I/O error misclassified as initialization")
+	}
+	for _, content := range []string{"", "SQLite", "not a sqlite db!"} {
+		path := filepath.Join(t.TempDir(), "invalid.db")
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := OpenExisting(context.Background(), path); err == nil || !strings.Contains(err.Error(), "initialization required") {
+			t.Fatalf("invalid header: %v", err)
+		}
 	}
 }
 
@@ -331,5 +387,42 @@ func TestRuntimeWriterRequiresExplicitInitialization(t *testing.T) {
 			}
 			db.Close()
 		})
+	}
+}
+
+func TestNamedMemoryURIRetainsIdentityAcrossWorkingDirectories(t *testing.T) {
+	ctx := context.Background()
+	first, second := t.TempDir(), t.TempDir()
+	t.Chdir(first)
+	uri := "file:" + t.Name() + "?mode=memory&cache=shared"
+	a, err := Open(ctx, uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	tx, err := a.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec("INSERT INTO conversations(id,name,created_at) VALUES('shared','shared','synthetic')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(second)
+	b, err := Open(ctx, uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	tx, err = b.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var count int
+	if err := tx.QueryRow("SELECT count(*) FROM conversations WHERE id='shared'").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("memory identity changed: %d %v", count, err)
 	}
 }
