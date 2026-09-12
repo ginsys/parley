@@ -1084,7 +1084,14 @@ class CodexDriver:
         rival, and this adopts their thread just as readily as one the caller actually made.
         `thread_id` is trusted to be a thread the caller just created — real creation-binding is
         out of scope for this stage (`create()` refuses to guess one, rather than provide a
-        false sense of that binding here).
+        false sense of that binding here). Nor does provenance say anything about the thread's
+        own turn state: `run_trial` with `state='idle'` and no explicit `settle` submits
+        immediately after adoption, and if the caller's own creation is still processing its
+        first turn, that marker lands on a busy thread under an `idle` label with no way for
+        this runner to detect the mismatch — `codex queue`/the rollout give no confirmed
+        "still mid-turn" signal to check for, only the after-the-fact transcript this trial is
+        already measuring. Establishing genuine idleness before adoption remains the caller's
+        job, the same as creation itself.
         """
         path = self.rollout_path_for(thread_id)
         if path is None:
