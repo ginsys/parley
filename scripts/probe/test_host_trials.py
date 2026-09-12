@@ -1314,7 +1314,10 @@ class RunTrialTests(unittest.TestCase):
         # An empty or hand-typed marker can appear in a transcript for reasons unrelated to this
         # trial, silently promoting an unrelated message to `ack`; only marker_token()'s own
         # high-entropy shape is accepted.
-        for bad in ('', 'hello', MARKER.upper(), 'PARLEY-PROBE-tooshort'):
+        for bad in ('', 'hello', MARKER.upper(), 'PARLEY-PROBE-tooshort', MARKER + '\n'):
+            # `re.match` treats `$` as matching immediately before a trailing newline, so a
+            # marker with one appended still satisfied the old `.match()` check; `.fullmatch()`
+            # requires the match to span the entire string.
             clock = FakeClock()
             driver = FakeDriver(clock=clock)
             with self.assertRaises(ValueError):

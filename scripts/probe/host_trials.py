@@ -1062,7 +1062,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
-    if not MARKER_PATTERN.match(marker):
+    if not MARKER_PATTERN.fullmatch(marker):
         # An empty, guessable or hand-typed marker can appear in a transcript for reasons that
         # have nothing to do with this trial -- a short or low-entropy value risks colliding
         # with real conversation text, silently promoting an unrelated message to `ack`. Only
