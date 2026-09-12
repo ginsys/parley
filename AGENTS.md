@@ -269,3 +269,35 @@ terminal and changes only queued envelope state. Held originals cannot be acknow
 work cannot requeue after late settlement, and exact attempt-token refunds remain unchanged.
 Recursive SQLite triggers are enabled on every store connection so replacement writes cannot
 bypass retained-evidence deletion guards. No automatic evidence eviction is permitted.
+
+## Authenticated work and recovery
+
+Ordinary acceptance derives its author from a private, current Session capability. Dispatch
+rechecks immutable provenance, both bindings, grant/version, holds, readiness and budget in one
+coordinated claim, then captures the exact recipient capability for transport. Replacement cannot
+retarget an already claimed attempt. Attempt counters fail on signed-64-bit overflow without a
+budget mutation. These internal APIs currently have test-only callers pending caller migration.
+
+Ingestion retains native-event identity, source digest/revision and cursor edges permanently.
+Authenticate before retained-result lookup; exact terminal replay/conflict precedes fresh host I/O.
+Pending evidence cannot be bypassed by a cursor jump. ACK, authenticated reply provenance, result
+classification and cursor advancement commit together. Human ingestion.resume uses an immutable
+reviewed contiguous interval, classifies its events held and never acknowledges them. Its bounded
+materialization rejects oversized intervals without partially opening the barrier.
+
+Install recovery hooks before other services. Their preparation/flush runs outside the coordinator;
+one writer-validated instant governs credential/grant authorization inside a transaction. Compare
+and checkpoint time under the same writer acquisition. Every detected rollback retains its exact
+external marker and durable incident; failed marker publication requires the trusted supervisor's
+fail-stop callback. This callback must be nonblocking, perform no I/O and never reenter the store.
+Failed credential-expiry storage instead retains an exact credential denial and retries persistence;
+it does not stop unrelated credentials. That in-memory denial alone is not crash persistence.
+
+Recovery completion requires current trusted human identity, immutable reviewed evidence and exact
+versions. Audit reconciliation before exact marker removal plus directory fsync, then durably clear
+only that incident. Same-operation retry may finish committed cleanup without repeating mutation.
+A reused cleared incident marker refuses startup. Conservative restore completion retires every
+restored binding and holds all outstanding work; it does not import surviving history or rewrite
+ACKs, grants, budgets or attempt outcomes. A bad clock floor can be lowered only by the separate
+reviewed restore/retirement disposition covering every outstanding clock incident. No human CLI,
+real host source, live listener or automatic restore detection is established by these APIs.

@@ -16,7 +16,7 @@ func (m *Manager) sessionTransition(ctx context.Context, s *Session,
 ) error {
 	ctx, cancel := context.WithTimeout(ctx, store.AuthenticationDeadline)
 	defer cancel()
-	var expiredBinding string
+	var expiredBinding, expiredCredential string
 	code, err := m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, view store.CommitView) (store.TransitionResult, error) {
 		if s == nil || !m.owned(s.socket) || m.slots[s.token.BindingID] != s || s.token.Epoch != view.Epoch || m.expired(s.socket, m.now()) {
 			return store.TransitionResult{Code: store.AuthenticationFailed}, nil
@@ -32,11 +32,13 @@ func (m *Manager) sessionTransition(ctx context.Context, s *Session,
 		if b.Status != "enabled" || b.Generation != s.token.Generation || b.ConnectorUID != s.token.ConnectorUID || c.Status != "current" || c.Version != s.token.CredentialVersion {
 			return store.TransitionResult{Code: store.AuthenticationFailed}, nil
 		}
-		if !m.now().Before(time.Unix(0, c.ExpiresAtNS)) {
+		if !store.AuthorityTime(ctx, m.now).Before(time.Unix(0, c.ExpiresAtNS)) || m.store.CredentialExpiryObserved(c.ID) {
+			m.store.RememberCredentialExpiry(c)
 			if _, err := tx.ExecContext(ctx, "UPDATE credentials SET status='expired' WHERE credential_id=? AND status='current'", c.ID); err != nil {
 				return store.TransitionResult{}, err
 			}
 			expiredBinding = b.ID
+			expiredCredential = c.ID
 			return store.TransitionResult{Changed: true, Code: store.AuthenticationFailed}, nil
 		}
 		if err := m.guard(ctx, tx, b.ID); err != nil {
@@ -46,6 +48,7 @@ func (m *Manager) sessionTransition(ctx context.Context, s *Session,
 	}, func(store.CommitView) {
 		if expiredBinding != "" {
 			m.Invalidate(expiredBinding)
+			m.store.ForgetCredentialExpiry(expiredCredential)
 		} else if publish != nil {
 			publish()
 		}

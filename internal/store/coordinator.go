@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ginsys/parley/internal/bridgetext"
@@ -56,6 +57,9 @@ type Coordinator struct {
 	revision           int64
 	failed             bool
 	connectionsClaimed bool
+	// Exact credential expiries observed but not yet persisted survive failed calls.
+	credentialExpiries sync.Map
+	recovery           atomic.Pointer[RecoveryHooks]
 	now                func() time.Time
 }
 
@@ -83,7 +87,7 @@ func (c *Coordinator) lock(ctx context.Context) error {
 // version/hold checks belong in mutate so a valid replay precedes stale guards.
 // A terminal domain rejection is returned in Result.Code and commits an audit
 // with NO business effects. Infrastructure errors roll the entire transaction back.
-func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r CommandRequest,
+func (c *Coordinator) execute(ctx context.Context, p CommandPrincipal, r CommandRequest,
 	authorize func(context.Context, *sql.Tx) error,
 	mutate func(context.Context, *sql.Tx) (CommandResult, error),
 	publish func(CommitView),
@@ -103,6 +107,10 @@ func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r Command
 		return CommandReceipt{}, storageCode(err)
 	}
 	defer tx.Rollback()
+	ctx, err = c.transactionContext(ctx, tx, r.kind)
+	if err != nil {
+		return CommandReceipt{}, err
+	}
 	if err := authorize(ctx, tx); err != nil {
 		return CommandReceipt{}, storageCode(err)
 	}
@@ -127,7 +135,7 @@ func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r Command
 		c.failed = true
 		return CommandReceipt{}, err
 	}
-	now, err := InstantNanos(c.now())
+	now, err := InstantNanos(AuthorityTime(ctx, c.now))
 	if err != nil {
 		return CommandReceipt{}, err
 	}

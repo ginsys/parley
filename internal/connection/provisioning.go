@@ -147,7 +147,7 @@ func (p *Provisioner) Register(ctx context.Context, actor store.CommandPrincipal
 		if targetErr != nil || publisher == nil {
 			return rejection(store.Forbidden)
 		}
-		if !p.config.Now().Before(r.ExpiresAt) {
+		if !store.AuthorityTime(ctx, p.config.Now).Before(r.ExpiresAt) {
 			return rejection(store.InvalidRequest)
 		}
 		if err := p.config.LegacyEligibility(ctx, tx, r.PeerID); err != nil {
@@ -215,7 +215,7 @@ func (p *Provisioner) Rotate(ctx context.Context, actor store.CommandPrincipal, 
 		if targetErr != nil || publisher == nil {
 			return rejection(store.Forbidden)
 		}
-		if !p.config.Now().Before(r.ExpiresAt) {
+		if !store.AuthorityTime(ctx, p.config.Now).Before(r.ExpiresAt) {
 			return rejection(store.InvalidRequest)
 		}
 		cv, err := store.NextVersion(r.ExpectedCredentialVersion)
@@ -305,7 +305,7 @@ func (p *Provisioner) finish(ctx context.Context, actor store.CommandPrincipal, 
 			return result, store.OutcomeUnknown
 		}
 		_, err = p.config.Store.Coordinator().Execute(evidenceCtx, actor, operation, func(ctx context.Context, tx *sql.Tx) error { return p.config.Authorize(ctx, tx, actor) }, func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
-			ns, err := store.InstantNanos(p.config.Now())
+			ns, err := store.InstantNanos(store.AuthorityTime(ctx, p.config.Now))
 			if err != nil {
 				return store.CommandResult{}, err
 			}
