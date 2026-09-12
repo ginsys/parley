@@ -1279,10 +1279,16 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
     session_id = (driver.register_existing(existing_session) if existing_session is not None
                   else driver.create(prompt))
     try:
-        # Best-effort: a driver with no version() (e.g. a test double) or one whose read fails
-        # records None rather than losing the trial over an evidence field, not the trial itself.
+        # Best-effort: a driver with no version() (e.g. a test double), one whose read fails, or
+        # one interrupted mid-read records None rather than losing the trial -- and losing
+        # session_id with it -- over an evidence field, not the trial itself. Unlike the
+        # settle()/submit()/observe() stages, an interrupt here is not honored as cancellation:
+        # querying `--version` is a local, near-instant, non-host call, so treating it the same
+        # as an ordinary read failure costs nothing real, whereas letting it escape bare would
+        # discard the only place session_id is surfaced for a session already live under the
+        # real HOME.
         version = driver.version()
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         version = None
     try:
         settle()

@@ -1272,6 +1272,17 @@ class RunTrialTests(unittest.TestCase):
         self.assertIsNone(run.version)
         self.assertEqual(run.session_id, 'sid')  # the rest of the trial still completed normally
 
+    def test_a_version_read_interrupt_also_records_none_rather_than_losing_the_trial(self):
+        # A Ctrl-C mid version() read is not honored as cancellation the way it is during
+        # settle()/submit()/observe(): the query is local and near-instant, and letting the
+        # interrupt escape bare here would discard the only place session_id is surfaced for a
+        # session already live under the real HOME.
+        clock = FakeClock()
+        driver = FakeDriver(version_error=KeyboardInterrupt(), clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertIsNone(run.version)
+        self.assertEqual(run.session_id, 'sid')
+
     def test_settle_runs_between_create_and_submit(self):
         clock = FakeClock()
         driver = FakeDriver(clock=clock)
