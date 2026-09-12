@@ -183,6 +183,25 @@ class ObservationFailed(RuntimeError):
         self.original = original
 
 
+class VersionProbeInterrupted(RuntimeError):
+    """Raised when an operator's Ctrl-C lands during `driver.version()`, before settle/submit run.
+
+    An ordinary `version()` failure (no such method, a bad read) is swallowed to `None` and the
+    trial proceeds -- it is a local, near-instant, best-effort evidence field, not the trial
+    itself. A `KeyboardInterrupt` here is different: swallowing it the same way would let the
+    trial continue into `settle()`/`submit()`/polling (up to 900s for a busy trial), spending real
+    quota and host interaction despite the operator's explicit cancellation. This stops the trial
+    instead, while still carrying `session_id` so the caller can find and tear down the
+    already-live session -- the same reason `SettleFailed`/`SubmissionFailed`/`ObservationFailed`
+    exist for their own stages.
+    """
+
+    def __init__(self, session_id, original):
+        super().__init__(f'version() interrupted for session {session_id!r}: {original!r}')
+        self.session_id = session_id
+        self.original = original
+
+
 @dataclass
 class SessionRegistry:
     """Tracks session ids created by *this run*; refuses to touch anything else.
@@ -1356,16 +1375,18 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
     session_id = (driver.register_existing(existing_session) if existing_session is not None
                   else driver.create(prompt))
     try:
-        # Best-effort: a driver with no version() (e.g. a test double), one whose read fails, or
-        # one interrupted mid-read records None rather than losing the trial -- and losing
-        # session_id with it -- over an evidence field, not the trial itself. Unlike the
-        # settle()/submit()/observe() stages, an interrupt here is not honored as cancellation:
-        # querying `--version` is a local, near-instant, non-host call, so treating it the same
-        # as an ordinary read failure costs nothing real, whereas letting it escape bare would
-        # discard the only place session_id is surfaced for a session already live under the
-        # real HOME.
+        # Best-effort: a driver with no version() (e.g. a test double) or one whose read fails
+        # records None rather than losing the trial -- and losing session_id with it -- over an
+        # evidence field, not the trial itself.
         version = driver.version(session_id)
-    except (Exception, KeyboardInterrupt):
+    except KeyboardInterrupt as error:
+        # Unlike an ordinary read failure, an operator's Ctrl-C here is honored as an explicit
+        # cancellation rather than swallowed to None and continued past: `version()` is local and
+        # near-instant, but letting the trial proceed into settle()/submit()/polling (up to 900s)
+        # regardless would spend real quota and host interaction despite the interrupt. Raising
+        # carries session_id so the caller can still find and tear down the already-live session.
+        raise VersionProbeInterrupted(session_id, error) from error
+    except Exception:
         version = None
     try:
         settle()
