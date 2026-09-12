@@ -470,6 +470,15 @@ class CodexParsingTests(unittest.TestCase):
                                         'payload': {'cli_version': '0.153.4'}})]
         self.assertEqual(codex_session_version(lines), '0.153.4')
 
+    def test_codex_session_version_skips_a_valid_but_non_object_record(self):
+        # A bare JSON scalar, list or null is valid JSON -- json.loads() succeeds -- but calling
+        # .get() on it raises AttributeError, losing a later genuine session_meta record's
+        # version instead of skipping the record as this helper's docstring promises.
+        lines = ['null', '42', '[1, 2]', '"a string"',
+                 json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'session_meta',
+                            'payload': {'cli_version': '0.153.4'}})]
+        self.assertEqual(codex_session_version(lines), '0.153.4')
+
 
 class ClaudeDriverTests(unittest.TestCase):
     def test_create_mints_the_new_session_id_from_a_listing_diff(self):

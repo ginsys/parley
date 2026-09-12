@@ -778,7 +778,7 @@ def codex_session_version(lines):
             record = json.loads(line)
         except ValueError:
             continue
-        if record.get('type') != 'session_meta':
+        if not isinstance(record, dict) or record.get('type') != 'session_meta':
             continue
         payload = record.get('payload')
         version = payload.get('cli_version') if isinstance(payload, dict) else None
