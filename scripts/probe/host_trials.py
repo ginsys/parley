@@ -1257,6 +1257,10 @@ class TrialRun:
     # a rejected cell records only that `accepted` was False, with no way to tell a mechanism
     # rejection apart from a prerequisite or invocation failure, or to reproduce it.
     submission_diagnostic: str | None = None
+    # True when an operator Ctrl-C ended submit() or the polling loop early. Every other field
+    # is then fail-closed exactly like an uncaptured or unreadable run; only this tells them
+    # apart, so a caller looping over trials can stop instead of starting the next one.
+    interrupted: bool = False
 
 
 def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
@@ -1582,7 +1586,8 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
                     outcomes=outcomes, state=state, marker=marker, version=version,
                     supported={name: True for name in OUTCOME_NAMES}, observable=observable,
-                    signals=signals, turn_end=turn_end, turn_end_observable=turn_end_observable)
+                    signals=signals, turn_end=turn_end, turn_end_observable=turn_end_observable,
+                    interrupted=interrupted)
 
 
 def classify_trial(trial, now, *, supported=None, observable=None):

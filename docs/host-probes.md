@@ -264,6 +264,14 @@ a transcript is cumulative, so a late successful read covers earlier gaps, but i
 failed then the tail of the window was never seen and a missing outcome is `unobservable`
 rather than negative. An outcome already observed keeps its own evidence either way.
 
+A Ctrl-C during `submit()` or the polling loop does not propagate out of `run_trial()`: the
+trial finalizes with whatever it had gathered, every still-missing outcome marked unobservable,
+and `TrialRun.interrupted` set. Swallowing it is deliberate — a busy trial can spend minutes
+collecting evidence that a propagated exception would discard along with the session id — but
+it means the interrupt reaches nothing above the trial. A caller looping over trials must stop
+on `interrupted` and never pass such a run to `aggregate()`, since apart from that flag its
+fields are identical to an uncaptured or unreadable run's.
+
 A `busy` trial is the exception to that 120s ceiling. `wake_probe.py` refuses to rule on
 `turn_start` or `ack` for a busy host until the turn already running has ended or 900s have
 passed, so observing only to 120s would leave those two cells unclassifiable by construction;
@@ -282,9 +290,10 @@ the boundary — `Trial.result()`'s own `turn_end_observable` branch classifies 
 which is a different, positive fact from an unavailable channel and must not collapse into the
 same `unobservable` result.
 
-It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state`,
-`supported`, `observable`, `signals`, `turn_end`, `turn_end_observable`) carrying exactly what
-`Trial`/`classify_trial` need; acceptance is
+It returns a named `TrialRun` carrying what `Trial`/`classify_trial` need plus the evidence a
+matrix cell must cite alongside them — `session_id`, `marker`, `version`,
+`submission_diagnostic`, `interrupted` (the full field list is the dataclass in
+`host_trials.py`); acceptance is
 stamped when `submit` *returns*, since a submission that blocks for seconds would otherwise be
 backdated into its 10s window. The requested `state` is validated and carried into the result,
 but establishing a busy/approval/disconnected/restarted precondition is the caller's `settle`

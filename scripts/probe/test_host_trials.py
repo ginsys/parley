@@ -1348,6 +1348,7 @@ class RunTrialTests(unittest.TestCase):
         self.assertTrue(run.observable['visible'])
         self.assertFalse(run.observable['turn_start'])
         self.assertFalse(run.observable['ack'])
+        self.assertTrue(run.interrupted)
 
     def test_the_result_carries_the_driver_version_captured_at_trial_time(self):
         # A matrix cell is version-scoped (docs/host-wake-matrix.md); without this, a cell built
@@ -1557,6 +1558,7 @@ class RunTrialTests(unittest.TestCase):
         run = self.run_one(driver, clock)
         self.assertTrue(all(run.supported.values()))  # no claim that the host lacks the path
         self.assertFalse(any(run.observable.values()))
+        self.assertFalse(run.interrupted)  # fail-closed like an interrupt, but nobody cancelled
         self.assertEqual(run.marker, MARKER)  # the submitted token is still evidence, even unobservable
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
                       turn_end_observable=run.turn_end_observable)
@@ -1602,6 +1604,7 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(run.observable['ack'])
         self.assertEqual(run.outcomes, {})
         self.assertNotIn('observe', driver.order)
+        self.assertTrue(run.interrupted)
 
     def test_an_existing_session_is_adopted_instead_of_created(self):
         clock = FakeClock()
