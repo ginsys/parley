@@ -177,6 +177,15 @@ func TransitionToDispatching(ctx context.Context, tx *sql.Tx, id, updatedAt stri
 // SetState changes a known prior state, for cancellation or acknowledgement.
 // Dispatch outcomes use SettleDispatch to also match the attempt token.
 func SetState(ctx context.Context, tx *sql.Tx, id string, expected, state EnvelopeState, updatedAt string) error {
+	if state == Acked {
+		held, err := WorkHeld(ctx, tx, WorkRef{Kind: "envelope", ID: id})
+		if err != nil {
+			return err
+		}
+		if held {
+			return SecurityHold
+		}
+	}
 	res, err := tx.ExecContext(ctx, `UPDATE envelopes SET state = ?, updated_at = ? WHERE id = ? AND state = ?`,
 		string(state), updatedAt, id, string(expected))
 	if err != nil {
