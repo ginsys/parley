@@ -398,7 +398,7 @@ class ClaudeDriverTests(unittest.TestCase):
         driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
         session_id = driver.create('probe prompt')
         self.assertEqual(session_id, 'abcd1234')
-        self.assertIn('abcd1234', registry.created)
+        self.assertIn('claude:abcd1234', registry.created)
         self.assertEqual(calls[1][:3], ['claude', '--bg', '--cwd'])
 
     def test_create_raises_on_nonzero_exit(self):
@@ -517,7 +517,7 @@ class ClaudeDriverTests(unittest.TestCase):
         # `Uncaptured`, not `Unsupported` — we have not exercised a path, which is not the
         # same claim as Claude not having one.
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         present = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(
             0, stdout=json.dumps([{'id': 'abcd1234', 'kind': 'background', 'state': 'idle'}])), cwd='/scratch')
         with self.assertRaises(SubmissionUncaptured):
@@ -528,7 +528,7 @@ class ClaudeDriverTests(unittest.TestCase):
         # Without --all the listing carries interactive entries only, so every owned session
         # would fail the membership check; a nonzero exit is reported, not parsed as JSON.
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         seen = []
 
         def fake_run(argv, **kwargs):
@@ -542,7 +542,7 @@ class ClaudeDriverTests(unittest.TestCase):
 
     def test_submit_rejects_a_session_absent_from_the_listing_before_anything_else(self):
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         absent = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
         with self.assertRaises(ValueError) as caught:
             absent.submit('abcd1234', 'msg')
@@ -553,7 +553,7 @@ class ClaudeDriverTests(unittest.TestCase):
         # daemon socket is gone (ENOENT). A dead observation channel is not a negative result,
         # so it must not reach classification as an empty (hence not_observed) outcome map.
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(1, stderr='connect ENOENT'), cwd='/scratch')
         self.assertEqual(driver.observe('abcd1234', marker=MARKER, submitted_at=0.0),
                           Observation(outcomes={}, observable=False))
@@ -562,7 +562,7 @@ class ClaudeDriverTests(unittest.TestCase):
         # A stalled claude logs raised TimeoutExpired uncaught, aborting the whole trial instead
         # of returning the same unobservable result a nonzero exit already produces.
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
 
         def fake_run(argv, **kwargs):
             raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 15))
@@ -576,7 +576,7 @@ class ClaudeDriverTests(unittest.TestCase):
         # ordered against submission: the create() prompt's own turn would otherwise be read as
         # this trial's turn_start before the marker existed.
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         raw = f'User: {MARKER}\nAssistant: ack {MARKER}\n'
         driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout=raw), cwd='/scratch')
         observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
@@ -588,7 +588,7 @@ class ClaudeDriverTests(unittest.TestCase):
         # runner cannot parse, not "read cleanly, no conversation yet" -- those must not
         # collapse into the same empty, observable=True result.
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='some other format\n'),
                               cwd='/scratch')
         observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
@@ -598,26 +598,26 @@ class ClaudeDriverTests(unittest.TestCase):
         # A session with no conversation yet (nothing sent, or a poll racing session creation)
         # must not be conflated with an unrecognized shape: empty output is a legitimate read.
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='  \n'), cwd='/scratch')
         observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
         self.assertEqual(observation, Observation(outcomes={}, observable=True))
 
     def test_teardown_releases_the_registry_entry(self):
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0), cwd='/scratch')
         driver.teardown('abcd1234')
         with self.assertRaises(ForeignSessionError):
-            registry.require_owned('abcd1234')
+            registry.require_owned('claude:abcd1234')
 
     def test_failed_teardown_keeps_ownership_so_it_can_be_retried(self):
         registry = SessionRegistry()
-        registry.mint('abcd1234')
+        registry.mint('claude:abcd1234')
         driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(1, stderr='rm failed'), cwd='/scratch')
         with self.assertRaises(RuntimeError):
             driver.teardown('abcd1234')
-        registry.require_owned('abcd1234')  # still ours: the live session can still be removed
+        registry.require_owned('claude:abcd1234')  # still ours: the live session can still be removed
 
 
 class CodexDriverTests(unittest.TestCase):
@@ -691,7 +691,7 @@ class CodexDriverTests(unittest.TestCase):
             paths[tid] = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z',
                                        'type': 'session_meta'})
             driver.register_existing(tid)
-        self.assertEqual(registry.created, {'thread-1', 'thread-2', 'thread-3'})
+        self.assertEqual(registry.created, {'codex:thread-1', 'codex:thread-2', 'codex:thread-3'})
 
     def test_a_neighbour_that_cannot_be_dated_is_ambiguity_not_absence(self):
         registry = SessionRegistry()
@@ -773,7 +773,7 @@ class CodexDriverTests(unittest.TestCase):
         # A rollout is created lazily, so an early poll can precede the file: an unreadable
         # channel is unobservable, exactly as a failed `claude logs` read is.
         registry = SessionRegistry()
-        registry.mint('thread-1')
+        registry.mint('codex:thread-1')
         missing = os.path.join(self.tmp_missing(), 'never-written.jsonl')
         self.assertEqual(self.driver(registry, missing).observe('thread-1', marker=MARKER, submitted_at=0.0),
                           Observation(outcomes={}, observable=False))
@@ -789,7 +789,7 @@ class CodexDriverTests(unittest.TestCase):
 
     def test_observe_reads_the_rollout_file(self):
         registry = SessionRegistry()
-        registry.mint('thread-1')
+        registry.mint('codex:thread-1')
         path = self.rollout(
             {'timestamp': '2026-09-11T00:00:00.500Z', 'type': 'event_msg',
              'payload': {'type': 'task_started'}},
@@ -806,7 +806,7 @@ class CodexDriverTests(unittest.TestCase):
         # Opening the file proved nothing about reading it: a truncated or corrupt rollout
         # would otherwise yield an empty, observable read and classify as not_observed.
         registry = SessionRegistry()
-        registry.mint('thread-1')
+        registry.mint('codex:thread-1')
         with tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False) as handle:
             handle.write('{"timestamp": "2026-09-11T00:00:0\n')
             path = handle.name
@@ -817,7 +817,7 @@ class CodexDriverTests(unittest.TestCase):
 
     def test_observe_is_unobservable_when_the_rollout_holds_an_undated_message(self):
         registry = SessionRegistry()
-        registry.mint('thread-1')
+        registry.mint('codex:thread-1')
         path = self.rollout({'type': 'response_item',
                              'payload': {'type': 'message', 'role': 'assistant',
                                           'content': [{'type': 'output_text', 'text': f'ack {MARKER}'}]}})
@@ -827,7 +827,7 @@ class CodexDriverTests(unittest.TestCase):
 
     def test_observe_is_unobservable_without_a_rollout_path(self):
         registry = SessionRegistry()
-        registry.mint('thread-1')
+        registry.mint('codex:thread-1')
         self.assertEqual(self.driver(registry, None).observe('thread-1', marker=MARKER, submitted_at=0.0),
                           Observation(outcomes={}, observable=False))
 
@@ -836,14 +836,53 @@ class CodexDriverTests(unittest.TestCase):
         # runner believe a live, authenticated host session had been cleaned up when it had
         # not.
         registry = SessionRegistry()
-        registry.mint('thread-1')
+        registry.mint('codex:thread-1')
         with self.assertRaises(TeardownUnsupported):
             self.driver(registry, None).teardown('thread-1')
-        registry.require_owned('thread-1')  # still ours: nothing was actually torn down
+        registry.require_owned('codex:thread-1')  # still ours: nothing was actually torn down
 
     def test_teardown_refuses_a_foreign_thread(self):
         with self.assertRaises(ForeignSessionError):
             self.driver(SessionRegistry(), None).teardown('not-mine')
+
+
+class CrossDriverNamespaceTests(unittest.TestCase):
+    """A bare session id minted by one driver must not satisfy another's ownership check.
+
+    `claude agents` and `codex queue --thread` both accept caller-chosen names, so nothing stops
+    the two hosts from coincidentally sharing one -- a run that adopts a Codex thread named
+    `abcd1234` right after a Claude driver mints a session with the same id must not let either
+    driver operate on the other's session.
+    """
+
+    RUN_STARTED = datetime.datetime(2026, 9, 11, 12, 0, 0, tzinfo=datetime.UTC).timestamp()
+
+    def codex_driver(self, registry):
+        return CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
+                           rollout_path_for=lambda _id: None, started_at=self.RUN_STARTED,
+                           sessions_root=None)
+
+    def test_a_claude_minted_id_does_not_satisfy_a_codex_driver_with_the_same_bare_id(self):
+        registry = SessionRegistry()
+        registry.mint('claude:collide')
+        codex = self.codex_driver(registry)
+        with self.assertRaises(ForeignSessionError):
+            codex.submit('collide', 'hi')
+        with self.assertRaises(ForeignSessionError):
+            codex.observe('collide', marker=MARKER, submitted_at=0.0)
+        with self.assertRaises(ForeignSessionError):
+            codex.teardown('collide')
+
+    def test_a_codex_minted_id_does_not_satisfy_a_claude_driver_with_the_same_bare_id(self):
+        registry = SessionRegistry()
+        registry.mint('codex:collide')
+        claude = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
+        with self.assertRaises(ForeignSessionError):
+            claude.submit('collide', 'hi')
+        with self.assertRaises(ForeignSessionError):
+            claude.observe('collide', marker=MARKER, submitted_at=0.0)
+        with self.assertRaises(ForeignSessionError):
+            claude.teardown('collide')
 
 
 class OpenCodeDriverTests(unittest.TestCase):

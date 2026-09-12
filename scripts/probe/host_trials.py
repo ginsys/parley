@@ -338,7 +338,19 @@ def parse_claude_transcript(raw):
 
 class ClaudeDriver:
     """Drives Claude Code background sessions. `run` defaults to subprocess.run; tests inject a
-    fake to avoid launching an installed `claude` binary (AGENTS.md, Test isolation)."""
+    fake to avoid launching an installed `claude` binary (AGENTS.md, Test isolation).
+
+    Registry ownership is namespaced by `NAMESPACE` (`_key()`): a bare session id in a
+    `SessionRegistry` shared across host drivers would let one driver's minted id satisfy
+    another's `require_owned()` check purely by string collision -- Claude's `claude agents`
+    surface and Codex's `codex queue --thread` both accept caller-chosen ids/names
+    (docs/host-probe-preflight.md), so a coincidentally identical id is not a hypothetical.
+    Without the namespace, a Codex thread named the same as a Claude session Claude owns could
+    be queued to via `CodexDriver.submit` without ever going through `register_existing`, or the
+    reverse could let `teardown()` run `claude rm` against an unrelated Codex-named session.
+    """
+
+    NAMESPACE = 'claude'
 
     def __init__(self, registry, *, run=subprocess.run, cwd, model=None, max_budget_usd=None):
         self.registry = registry
@@ -346,6 +358,9 @@ class ClaudeDriver:
         self.cwd = cwd
         self.model = model
         self.max_budget_usd = max_budget_usd
+
+    def _key(self, session_id):
+        return f'{self.NAMESPACE}:{session_id}'
 
     def _background_session_ids(self):
         """`claude agents --json --all` background session ids under this driver's cwd.
@@ -433,7 +448,9 @@ class ClaudeDriver:
                 f'background session(s) under {self.cwd} (expected exactly one): '
                 f'{sorted(new)!r} -- none minted as owned; this runner cannot verify which, if '
                 'any, it created', candidates=sorted(new))
-        return self.registry.mint(new.pop())
+        session_id = new.pop()
+        self.registry.mint(self._key(session_id))
+        return session_id
 
     def submit(self, session_id, message):
         """Refuse to report acceptance: no captured mechanism delivers `message` here.
@@ -454,7 +471,7 @@ class ClaudeDriver:
         nothing and every owned session would fail the membership check below. A nonzero
         listing is reported as such rather than reaching `json.loads` as a decode error.
         """
-        self.registry.require_owned(session_id)
+        self.registry.require_owned(self._key(session_id))
         if session_id not in self._background_session_ids():
             raise ValueError(f'session not listed under {self.cwd}: {session_id}')
         raise SubmissionUncaptured(
@@ -473,7 +490,7 @@ class ClaudeDriver:
         polling loop does not catch exceptions from `observe`, so an uncaught timeout here would
         abort the whole trial and lose every poll's evidence gathered so far, not just this read.
         """
-        self.registry.require_owned(session_id)
+        self.registry.require_owned(self._key(session_id))
         try:
             result = self.run(['claude', 'logs', session_id], capture_output=True, text=True, timeout=15)
         except subprocess.TimeoutExpired:
@@ -492,11 +509,11 @@ class ClaudeDriver:
         every later teardown attempt fail `require_owned`, so the session could never be
         reclaimed and would keep consuming the developer's real host environment.
         """
-        self.registry.require_owned(session_id)
+        self.registry.require_owned(self._key(session_id))
         result = self.run(['claude', 'rm', session_id], capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             raise RuntimeError(f'claude rm exited {result.returncode} for {session_id}: {result.stderr}')
-        self.registry.release(session_id)
+        self.registry.release(self._key(session_id))
 
 
 # --- Codex: `codex queue --thread <id> --message <text>` and the rollout JSONL -----------------
@@ -684,7 +701,15 @@ def codex_rollout_events(lines):
 
 class CodexDriver:
     """Drives Codex CLI sessions via `codex queue`. Requires an existing thread id — creating one
-    needs an interactive/exec session first; `create()` documents this as the caller's job."""
+    needs an interactive/exec session first; `create()` documents this as the caller's job.
+
+    Registry ownership is namespaced by `NAMESPACE` (`_key()`, see `ClaudeDriver`'s docstring for
+    why a shared registry needs it): `codex queue --thread` accepts a caller-chosen name just as
+    freely as `claude agents` does, so a name coincidentally shared with a Claude session must not
+    satisfy this driver's ownership check.
+    """
+
+    NAMESPACE = 'codex'
 
     def __init__(self, registry, *, run=subprocess.run, rollout_path_for, started_at,
                  sessions_root=None):
@@ -698,6 +723,20 @@ class CodexDriver:
         # Directory holding every rollout this host writes ($CODEX_HOME/sessions). Adoption
         # needs it to see rival threads; without it there is nothing to compare against.
         self.sessions_root = sessions_root
+
+    def _key(self, thread_id):
+        return f'{self.NAMESPACE}:{thread_id}'
+
+    def _owned_thread_ids(self):
+        """This driver's own owned thread ids, unprefixed -- never the raw registry keys.
+
+        A shared registry's `created` set can hold another driver's namespaced keys too;
+        treating those as Codex thread ids would pass a foreign id straight into
+        `rollout_path_for`, which is exactly the cross-namespace confusion the namespace exists
+        to prevent.
+        """
+        prefix = self._key('')
+        return {key[len(prefix):] for key in self.registry.created if key.startswith(prefix)}
 
     def create(self, prompt):
         """Refuse: no non-interactive codex thread-creation path has been captured.
@@ -739,7 +778,7 @@ class CodexDriver:
         """
         adopted = os.path.realpath(adopted)
         already_owned = {os.path.realpath(self.rollout_path_for(thread_id))
-                         for thread_id in self.registry.created}
+                         for thread_id in self._owned_thread_ids()}
         rivals = []
 
         def _cannot_list(error):
@@ -810,17 +849,18 @@ class CodexDriver:
             raise ForeignSessionError(
                 f'{len(rivals)} concurrent thread(s) under {self.sessions_root} cannot be told '
                 f'apart from this run\'s; refusing to adopt {thread_id}')
-        return self.registry.mint(thread_id)
+        self.registry.mint(self._key(thread_id))
+        return thread_id
 
     def submit(self, thread_id, message):
-        self.registry.require_owned(thread_id)
+        self.registry.require_owned(self._key(thread_id))
         result = self.run(['codex', 'queue', '--thread', thread_id, '--message', message],
                            capture_output=True, text=True, timeout=15)
         return result.returncode == 0
 
     def observe(self, thread_id, *, marker, submitted_at):
         """Read the thread's rollout; an unreadable or undatable rollout is unobservable."""
-        self.registry.require_owned(thread_id)
+        self.registry.require_owned(self._key(thread_id))
         path = self.rollout_path_for(thread_id)
         if path is None:
             return Observation(observable=False)  # no rollout to read is a dead channel
@@ -850,7 +890,7 @@ class CodexDriver:
         cleanup (AGENTS.md, Test isolation). Ownership is retained rather than released, so the
         thread stays inspectable and a caller cannot mistake this for a successful teardown.
         """
-        self.registry.require_owned(thread_id)
+        self.registry.require_owned(self._key(thread_id))
         raise TeardownUnsupported(
             f'codex has no captured teardown mechanism; thread {thread_id} remains registered '
             'and its host session is still live')
