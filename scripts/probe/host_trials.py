@@ -1253,7 +1253,7 @@ class TrialRun:
     submission_diagnostic: str | None = None
 
 
-def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda session_id: None,
+def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
               existing_session=None,
               poll_interval=5.0, clock=time.time, monotonic=time.monotonic, sleep=time.sleep):
     """Create, submit and observe one trial through its windows; returns a `TrialRun`.
@@ -1274,11 +1274,12 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda sessio
     no-op is only correct for `idle`. It receives `session_id` so it can actually target the
     session just created (send it a long-running prompt, detach the client, kill the host
     process) rather than needing the caller to close over an id it cannot yet have when
-    `settle` is defined. `state` is validated here and carried into the result so
-    the cell cannot be recorded under a state the trial never exercised; a caller passing
-    `state='busy'` with a no-op `settle` is still exercising an idle host, which no code can
-    detect for it. Teardown stays the caller's responsibility so a failed trial's session
-    remains inspectable.
+    `settle` is defined. `state` is validated here and carried into the result so the cell
+    cannot be recorded under a state the trial never exercised; omitting `settle` for any
+    non-`idle` state raises `ValueError` immediately, before any session exists, rather than
+    silently exercising an idle host under a `busy`/`approval`/`disconnected`/`restarted` label
+    no code could otherwise detect. Teardown stays the caller's responsibility so a failed
+    trial's session remains inspectable.
 
     Observation polls until every transcript outcome is seen or the longest window (120s) has
     elapsed. A single immediate snapshot reported `not_observed` for events that arrived well
@@ -1353,6 +1354,17 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda sessio
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
+    if settle is None:
+        if state != 'idle':
+            # A no-op default would submit to an ordinary idle session while returning a
+            # TrialRun labeled with the requested state -- silently publishing a result for a
+            # condition (busy/approval/disconnected/restarted) the experiment never established,
+            # and for `busy` specifically changing the polling deadline to the 900s cap for
+            # nothing. Fail closed instead of documenting the caveat and trusting every caller.
+            raise ValueError(
+                f'state={state!r} requires an explicit settle callback to establish it; the '
+                f'default no-op only ever exercises idle')
+        settle = lambda session_id: None  # noqa: E731 -- trivial, and named callers pass real ones
     if marker is None:
         # The default path: a fresh marker per call, so an ordinary caller running several
         # trials against the same thread/session can never reuse one by omission and count a

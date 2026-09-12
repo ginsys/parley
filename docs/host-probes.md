@@ -285,8 +285,8 @@ It returns a named `TrialRun` (`submitted_at`, `accepted_at`, `outcomes`, `state
 stamped when `submit` *returns*, since a submission that blocks for seconds would otherwise be
 backdated into its 10s window. The requested `state` is validated and carried into the result,
 but establishing a busy/approval/disconnected/restarted precondition is the caller's `settle`
-callable — passing `state='busy'` with a no-op `settle` still exercises an idle host, and no
-code here can detect that for the caller.
+callable — omitting `settle` for any non-`idle` state raises `ValueError` immediately rather than
+silently exercising an idle host under that label.
 
 `signals`, keyed the same as `outcomes`, names what established each positive result — a
 user-role transcript match, an assistant-role match, the host's own turn-boundary event, or the
