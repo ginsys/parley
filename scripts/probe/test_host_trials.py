@@ -691,6 +691,15 @@ class CodexDriverTests(unittest.TestCase):
         with self.assertRaises(SessionCreationUncaptured):
             self.driver(SessionRegistry(), None).create('hi')
 
+    def test_a_non_finite_started_at_is_rejected_at_construction(self):
+        # A NaN boundary makes both `started < self.started_at` (register_existing) and
+        # `started >= self.started_at` (the rival scan) evaluate False, so an arbitrarily old
+        # rollout could adopt as owned while every concurrent candidate is silently ruled out.
+        for bad in (float('nan'), float('inf'), float('-inf')):
+            with self.assertRaises(ValueError):
+                CodexDriver(SessionRegistry(), rollout_path_for=lambda _id: None, started_at=bad,
+                           sessions_root=self.sessions_root)
+
     def test_register_existing_refuses_without_a_sessions_root(self):
         # Without sessions_root there is no way to rule out a concurrent human thread at all --
         # this fixture's own driver() helper always supplies one, so the refusal path needs its
