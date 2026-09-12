@@ -33,6 +33,7 @@ from host_trials import (
     background_sessions,
     classify_trial,
     codex_rollout_events,
+    codex_session_version,
     detect_outcomes,
     marker_message,
     marker_token,
@@ -443,6 +444,30 @@ class CodexParsingTests(unittest.TestCase):
         lines = [json.dumps(None), json.dumps({'timestamp': '2026-09-11T00:00:01.000Z'})]
         self.assertIsNone(rollout_started_at(lines))
 
+    def test_codex_session_version_reads_the_confirmed_payload_shape(self):
+        # Shape confirmed from a real rollout on this workstation
+        # (~/.codex/sessions/2026/09/08/rollout-2026-09-08T16-42-57-*.jsonl).
+        lines = [json.dumps({'timestamp': '2026-09-08T14:44:05.650Z', 'type': 'session_meta',
+                             'payload': {'cli_version': '0.153.4'}})]
+        self.assertEqual(codex_session_version(lines), '0.153.4')
+
+    def test_codex_session_version_is_none_without_a_session_meta_record(self):
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item'})]
+        self.assertIsNone(codex_session_version(lines))
+
+    def test_codex_session_version_is_none_when_the_payload_carries_no_cli_version(self):
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'session_meta',
+                             'payload': {}})]
+        self.assertIsNone(codex_session_version(lines))
+
+    def test_codex_session_version_skips_an_unparseable_line_rather_than_failing_closed(self):
+        # Unlike rollout_started_at, this is best-effort evidence enrichment with a client
+        # fallback available -- an unreadable line does not need to poison the whole read.
+        lines = ['not json', json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                                        'type': 'session_meta',
+                                        'payload': {'cli_version': '0.153.4'}})]
+        self.assertEqual(codex_session_version(lines), '0.153.4')
+
 
 class ClaudeDriverTests(unittest.TestCase):
     def test_create_mints_the_new_session_id_from_a_listing_diff(self):
@@ -766,19 +791,19 @@ class ClaudeDriverTests(unittest.TestCase):
     def test_version_reports_stripped_stdout(self):
         driver = ClaudeDriver(SessionRegistry(),
                                run=lambda *a, **k: FakeResult(0, stdout='2.1.268\n'), cwd='/scratch')
-        self.assertEqual(driver.version(), '2.1.268')
+        self.assertEqual(driver.version('abcd1234'), '2.1.268')
 
     def test_version_is_none_when_the_command_fails(self):
         driver = ClaudeDriver(SessionRegistry(),
                                run=lambda *a, **k: FakeResult(1, stderr='not found'), cwd='/scratch')
-        self.assertIsNone(driver.version())
+        self.assertIsNone(driver.version('abcd1234'))
 
     def test_version_is_none_when_the_run_call_itself_raises(self):
         def raising_run(*_args, **_kwargs):
             raise subprocess.TimeoutExpired(cmd=['claude', '--version'], timeout=15)
 
         driver = ClaudeDriver(SessionRegistry(), run=raising_run, cwd='/scratch')
-        self.assertIsNone(driver.version())
+        self.assertIsNone(driver.version('abcd1234'))
 
 
 class CodexDriverTests(unittest.TestCase):
@@ -1072,15 +1097,31 @@ class CodexDriverTests(unittest.TestCase):
         with self.assertRaises(ForeignSessionError):
             self.driver(SessionRegistry(), None).teardown('not-mine')
 
-    def test_version_reports_stripped_stdout(self):
+    def test_version_prefers_the_adopted_rollouts_own_recorded_version(self):
+        # A rollout's session_meta.cli_version can disagree with the currently installed
+        # client's (docs/host-probe-preflight.md, 2026-09-11: 0.154.0 vs 0.153.4 same day); the
+        # adopted thread's own record is the one that actually describes its transcript.
+        path = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta',
+                             'payload': {'cli_version': '0.154.0'}})
+        driver = self.driver(SessionRegistry(), path,
+                              run=lambda *a, **k: FakeResult(0, stdout='codex-cli 0.153.4\n'))
+        self.assertEqual(driver.version('thread-1'), '0.154.0')
+
+    def test_version_falls_back_to_the_client_when_the_rollout_has_no_cli_version(self):
+        path = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
+        driver = self.driver(SessionRegistry(), path,
+                              run=lambda *a, **k: FakeResult(0, stdout='codex-cli 0.153.4\n'))
+        self.assertEqual(driver.version('thread-1'), 'codex-cli 0.153.4')
+
+    def test_version_falls_back_to_the_client_when_there_is_no_rollout_path(self):
         driver = self.driver(SessionRegistry(), None,
                               run=lambda *a, **k: FakeResult(0, stdout='codex-cli 0.153.4\n'))
-        self.assertEqual(driver.version(), 'codex-cli 0.153.4')
+        self.assertEqual(driver.version('thread-1'), 'codex-cli 0.153.4')
 
-    def test_version_is_none_when_the_command_fails(self):
+    def test_version_is_none_when_neither_rollout_nor_client_can_be_read(self):
         driver = self.driver(SessionRegistry(), None,
                               run=lambda *a, **k: FakeResult(1, stderr='not found'))
-        self.assertIsNone(driver.version())
+        self.assertIsNone(driver.version('thread-1'))
 
 
 class CrossDriverNamespaceTests(unittest.TestCase):
@@ -1165,7 +1206,8 @@ class FakeDriver:
         self.order.append('create')
         return 'sid'
 
-    def version(self):
+    def version(self, session_id):
+        assert session_id == 'sid'
         self.order.append('version')
         if self.version_error is not None:
             raise self.version_error
