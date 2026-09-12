@@ -920,8 +920,12 @@ class CodexDriver:
         # turn that was already running cannot be miscounted as the start of a new one.
         observation = detect_outcomes(events, marker, submitted_at=submitted_at, turn_stream=True)
         if unusable:
-            return Observation(outcomes=observation.outcomes, observable=False,
-                               turn_end=observation.turn_end, turn_stream=True)
+            # `signals` must travel with `outcomes` here too: run_trial's polling loop merges
+            # outcomes across polls with setdefault(), so an unusable poll that dropped `signals`
+            # would let a later clean poll's outcome value in while permanently losing what
+            # established it -- setdefault() never overwrites the None already recorded.
+            return Observation(outcomes=observation.outcomes, signals=observation.signals,
+                               observable=False, turn_end=observation.turn_end, turn_stream=True)
         return observation
 
     def teardown(self, thread_id):

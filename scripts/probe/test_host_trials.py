@@ -863,6 +863,25 @@ class CodexDriverTests(unittest.TestCase):
         self.assertEqual(observation.outcomes, {})
         self.assertFalse(observation.observable)
 
+    def test_observe_preserves_signals_alongside_outcomes_when_the_poll_is_unusable(self):
+        # run_trial's polling loop merges outcomes across polls with setdefault(); an unusable
+        # poll that dropped `signals` while keeping `outcomes` would let the outcome's timestamp
+        # in but permanently lose what established it, since setdefault() never overwrites the
+        # None already recorded by an earlier poll.
+        registry = SessionRegistry()
+        registry.mint('codex:thread-1')
+        path = self.rollout(
+            {'timestamp': '2026-09-11T00:00:01.000Z', 'type': 'response_item',
+             'payload': {'type': 'message', 'role': 'assistant',
+                         'content': [{'type': 'output_text', 'text': f'ack {MARKER}'}]}},
+            {'type': 'response_item', 'payload': {'type': 'message', 'role': 'assistant',
+                                                   'content': [{'type': 'output_text', 'text': 'undated'}]}},
+        )
+        observation = self.driver(registry, path).observe('thread-1', marker=MARKER, submitted_at=0.0)
+        self.assertFalse(observation.observable)
+        self.assertIn('ack', observation.outcomes)
+        self.assertEqual(observation.signals.get('ack'), SIGNAL_ASSISTANT_MESSAGE)
+
     def test_observe_is_unobservable_without_a_rollout_path(self):
         registry = SessionRegistry()
         registry.mint('codex:thread-1')
