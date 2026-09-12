@@ -133,9 +133,15 @@ func TestBudgetRaceAcrossIndependentConnections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := a.OpenReaders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	defer a.Close()
 	b, err := store.Open(ctx, path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer b.Close()
@@ -181,9 +187,15 @@ func TestRevokeWhileIndependentDispatchIsInFlight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := a.OpenReaders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	defer a.Close()
 	b, err := store.Open(ctx, path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer b.Close()

@@ -69,10 +69,11 @@ type Transport interface {
 type Bridge struct {
 	db        *store.DB
 	transport Transport
+	queries   store.Queries
 }
 
 func New(db *store.DB, t Transport) *Bridge {
-	return &Bridge{db: db, transport: t}
+	return &Bridge{db: db, transport: t, queries: db.Queries()}
 }
 
 var ErrNotPermitted = errors.New("grant does not permit this peer pair or direction")
@@ -396,12 +397,7 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 }
 
 func (b *Bridge) currentOutcome(ctx context.Context, envelopeID string) (Outcome, error) {
-	tx, err := b.db.Begin(ctx)
-	if err != nil {
-		return Outcome{ID: envelopeID}, err
-	}
-	defer tx.Rollback()
-	e, err := store.GetByID(ctx, tx, envelopeID)
+	e, err := b.queries.Outcome(ctx, envelopeID)
 	if err != nil {
 		return Outcome{ID: envelopeID}, err
 	}

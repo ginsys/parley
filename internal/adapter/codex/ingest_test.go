@@ -21,6 +21,9 @@ func openTestDB(t *testing.T) *store.DB {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	if err := db.OpenReaders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { db.Close() })
 	return db
 }

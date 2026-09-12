@@ -26,6 +26,9 @@ func setupSettlement(t *testing.T) (*store.DB, *Bridge, *store.Envelope, string)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.OpenReaders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { db.Close() })
 	if _, err := controller.New(db).Grant(ctx, controller.GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 5}); err != nil {
 		t.Fatal(err)
@@ -203,6 +206,9 @@ func TestCrashHandoffHelper(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, path)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	b := New(db, testTransport{})

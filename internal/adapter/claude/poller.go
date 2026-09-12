@@ -15,7 +15,7 @@ import (
 type Poller struct {
 	tickMu       sync.Mutex
 	after        *store.QueueCursor
-	db           *store.DB
+	queries      store.Queries
 	bridge       *dispatch.Bridge
 	handshake    *Handshake
 	conversation string
@@ -23,7 +23,7 @@ type Poller struct {
 }
 
 func NewPoller(db *store.DB, bridge *dispatch.Bridge, handshake *Handshake, conversation, toPeer string) *Poller {
-	return &Poller{db: db, bridge: bridge, handshake: handshake, conversation: conversation, toPeer: toPeer}
+	return &Poller{queries: db.Queries(), bridge: bridge, handshake: handshake, conversation: conversation, toPeer: toPeer}
 }
 
 // Tick attempts a bounded page of currently queued envelopes addressed to
@@ -99,15 +99,9 @@ func (p *Poller) dispatchOne(ctx, genCtx context.Context, id string) (dispatch.O
 }
 
 func (p *Poller) queuedForMe(ctx context.Context) ([]store.QueueCursor, error) {
-	tx, err := p.db.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	rows, err := store.ListQueuedIDs(ctx, tx, p.conversation, p.toPeer, store.MaxQueueBatch, p.after)
-	if err == nil && len(rows) == 0 && p.after != nil {
+	batch, wrapped, err := p.queries.QueueBatch(ctx, p.conversation, p.toPeer, store.MaxQueueBatch, p.after)
+	if err == nil && wrapped {
 		p.after = nil
-		return store.ListQueuedIDs(ctx, tx, p.conversation, p.toPeer, store.MaxQueueBatch, nil)
 	}
-	return rows, err
+	return batch, err
 }
