@@ -1169,31 +1169,27 @@ class CodexDriver:
             'and its host session is still live')
 
     def version(self, thread_id):
-        """The adopted thread's own recorded version, falling back to the installed client's.
+        """The adopted thread's own recorded version, or None if it cannot be read.
 
         `codex --version` and a rollout's own `session_meta.cli_version` can disagree
         (docs/host-probe-preflight.md, 2026-09-11: 0.154.0 vs 0.153.4 the same day). Every real
         Codex trial adopts an existing thread (`create()` refuses), so the installed client's
         version would misattribute the matrix cell to a binary that may not be the one that
-        actually produced the transcript being measured; the rollout's own record is preferred
-        whenever it can be read. Falls back to the client version only when the rollout is
-        missing, unreadable, or carries no `cli_version`, so a trial still learns something
-        rather than nothing.
+        actually produced the transcript being measured -- deliberately not returned here as a
+        fallback, even though the rollout's own record being missing, unreadable, or carrying no
+        `cli_version` means the trial then learns nothing about its version rather than a value
+        that risks being wrong. `TrialRun.version` has exactly one meaning: this session's own
+        reported version; a `None` here is that guarantee, not a gap to paper over with the
+        client's.
         """
         path = self.rollout_path_for(thread_id)
-        if path is not None:
-            try:
-                with open(path, encoding='utf-8') as handle:
-                    version = codex_session_version(handle)
-            except (OSError, UnicodeDecodeError):
-                version = None
-            if version is not None:
-                return version
-        try:
-            result = self.run(['codex', '--version'], capture_output=True, text=True, timeout=15)
-        except (OSError, subprocess.TimeoutExpired):
+        if path is None:
             return None
-        return result.stdout.strip() if result.returncode == 0 else None
+        try:
+            with open(path, encoding='utf-8') as handle:
+                return codex_session_version(handle)
+        except (OSError, UnicodeDecodeError):
+            return None
 
 
 class OpenCodeDriver:
