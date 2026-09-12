@@ -211,7 +211,7 @@ still retarget existing keys, so any future normalization needs a separate migra
 ## Connection registry foundation
 
 Schema version 5 and the store-owned coordinator introduce the internal binding/credential registry
-and permanent operation-result/audit ledger. They have synthetic callers only at this stage, no
+and permanent operation-result/audit ledger. Internal provisioning consumes them; there is no
 human CLI/RPC or live authentication surface. Never treat CommandPrincipal fields as authenticated
 input. Trusted handlers must recheck current authority through the coordinator before replay and
 validate host evidence/legacy eligibility before registration. Every writer owns one coordinator;
@@ -219,3 +219,12 @@ callbacks perform no external I/O, reentrant coordinator calls or nested writer 
 Terminal rejection discards business effects before auditing; result/audit failure rolls all effects
 back. Unknown commit outcome disables that coordinator pending runtime recovery. Replay evidence
 has no TTL eviction. Preserve immutable migration history and frozen legacy adoption schemas.
+
+Internal credential provisioning requires explicit trusted authority, recovery, host evidence,
+legacy eligibility, target resolution and invalidation providers. An authorized replay precedes
+mutation preconditions and never republishes a secret. Enrollment/verifier commit precedes file
+publication; separate evidence recording survives request cancellation. Pending/unknown publication
+is not proof that no file exists and requires a fresh human recovery operation. The Linux publisher
+uses private descriptor-relative paths and atomic no-replace publication followed by directory sync;
+it never changes account ownership/permissions or replaces another credential version. Controlled
+crash fixtures use only the test binary and synthetic credential files, never a real host CLI.
