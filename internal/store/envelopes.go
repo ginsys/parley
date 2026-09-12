@@ -163,13 +163,22 @@ func cancelQueuedWhere(ctx context.Context, tx *sql.Tx, where, updatedAt string,
 func TransitionToDispatching(ctx context.Context, tx *sql.Tx, id, updatedAt string) (bool, error) {
 	res, err := tx.ExecContext(ctx, `
 		UPDATE envelopes SET state = 'dispatching', dispatch_attempt=dispatch_attempt+1, error_code='', error_detail='', updated_at = ?
-		WHERE id = ? AND state = 'queued'`, updatedAt, id)
+		WHERE id = ? AND state = 'queued' AND typeof(dispatch_attempt)='integer' AND dispatch_attempt<9223372036854775807`, updatedAt, id)
 	if err != nil {
 		return false, fmt.Errorf("transition to dispatching: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("transition to dispatching: rows affected: %w", err)
+	}
+	if n == 0 {
+		var queued bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM envelopes WHERE id=? AND state='queued')", id).Scan(&queued); err != nil {
+			return false, err
+		}
+		if queued {
+			return false, InvalidRequest
+		}
 	}
 	return n == 1, nil
 }
