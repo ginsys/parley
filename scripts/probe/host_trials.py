@@ -273,14 +273,17 @@ def background_sessions(raw):
     iteration, keeps this failure in the same reportable class as a nonzero exit instead of
     crashing the trial with an unrelated-looking exception.
 
-    A malformed individual entry (non-dict, or a `background` entry with no usable `id`) is
-    likewise rejected rather than silently dropped: `create()` diffs two calls to this function
-    to identify the session it just made, and a malformed entry that is simply missing from one
-    snapshot's *filtered* output is indistinguishable from a session that never existed there.
-    If that entry happened to be a real, unrelated background session becoming well-formed only
-    in the later snapshot -- a listing race, not a probe session -- silently dropping it from the
-    earlier snapshot would make the diff mint it as this trial's own. Rejecting the whole read
-    instead keeps a listing race from ever reaching the diff at all.
+    A malformed individual entry (non-dict, an unrecognized `kind`, or a `background` entry with
+    no usable `id`) is likewise rejected rather than silently dropped: `create()` diffs two calls
+    to this function to identify the session it just made, and a malformed entry that is simply
+    missing from one snapshot's *filtered* output is indistinguishable from a session that never
+    existed there. If that entry happened to be a real, unrelated background session becoming
+    well-formed only in the later snapshot -- a listing race, not a probe session -- silently
+    dropping it from the earlier snapshot would make the diff mint it as this trial's own.
+    Rejecting the whole read instead keeps a listing race from ever reaching the diff at all.
+    Only the known, intentionally-ignored `interactive` kind is skipped; a missing or
+    schema-drifted kind is rejected the same way, since an entry that is merely malformed in one
+    snapshot and a well-formed `background` entry in the other is exactly the same listing race.
     """
     try:
         entries = json.loads(raw)
@@ -293,8 +296,11 @@ def background_sessions(raw):
     for entry in entries:
         if not isinstance(entry, dict):
             raise RuntimeError(f'claude agents --json listed a non-object entry: {entry!r}')
-        if entry.get('kind') != 'background':
+        kind = entry.get('kind')
+        if kind == 'interactive':
             continue
+        if kind != 'background':
+            raise RuntimeError(f'claude agents --json listed an entry with an unrecognized kind: {entry!r}')
         if not isinstance(entry.get('id'), str) or not entry['id']:
             raise RuntimeError(
                 f'claude agents --json listed a background session with an invalid id: {entry!r}')

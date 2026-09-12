@@ -169,6 +169,16 @@ class ClaudeParsingTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             background_sessions(json.dumps([{'id': '', 'kind': 'background'}]))
 
+    def test_background_sessions_raises_on_an_unrecognized_kind(self):
+        # A missing or schema-drifted kind was previously dropped by the same `!= 'background'`
+        # check used to skip the known `interactive` entries. If that entry is a real background
+        # session that is merely malformed in this snapshot -- and well-formed in the other --
+        # silently dropping it here would let create()'s diff mint it as this trial's own.
+        with self.assertRaises(RuntimeError):
+            background_sessions(json.dumps([{'id': 'a'}]))
+        with self.assertRaises(RuntimeError):
+            background_sessions(json.dumps([{'id': 'a', 'kind': 'zombie'}]))
+
     def test_transcript_parses_role_prefixed_multiline_blocks(self):
         raw = f'User: hello {MARKER}\ncontinued\nAssistant: got it\nstill talking\n'
         events = parse_claude_transcript(raw)
