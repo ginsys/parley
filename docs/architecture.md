@@ -50,7 +50,8 @@ Wire decoding and unknown-field/tag rejection remain the endpoint's responsibili
 kind and the canonical digest are retained, not request payloads. Receipts/audit retain fixed codes
 and affected identity/version metadata, never message bodies or secrets. Replay reauthorizes current
 access, creates no second audit or effect, and has no TTL or automatic eviction. Disk capacity
-failure rejects new mutations with capacity_exceeded rather than deleting evidence.
+failure rejects new mutations with capacity_exceeded rather than deleting evidence. Registration
+preserves that original error even when SQLite automatically rolls back and removes its savepoint.
 
 These are internal storage primitives with synthetic test callers, not authentication or a human
 administration endpoint. CommandPrincipal is trusted server input; passing identity fields does

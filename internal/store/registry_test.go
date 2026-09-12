@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -190,5 +191,31 @@ func TestPublicationEvidenceIsSeparateAndTerminal(t *testing.T) {
 	var count int
 	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM credentials WHERE status='current'").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("publication changed credential eligibility: %d %v", count, err)
+	}
+}
+
+func TestRegistrationCapacityFailurePreservesOriginalError(t *testing.T) {
+	db := commandDB(t)
+	var pages int64
+	if err := db.sql.QueryRow("PRAGMA page_count").Scan(&pages); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.sql.Exec(fmt.Sprintf("PRAGMA max_page_count=%d", pages)); err != nil {
+		t.Fatal(err)
+	}
+	actor := CommandPrincipal{testPrincipal, 1000}
+	b := BindingRecord{ID: "30000000-0000-4000-8000-000000000001", PeerID: "peer", HostKind: "codex_cli", NamespaceID: strings.Repeat("n", 4096), SessionID: strings.Repeat("s", 4096), ConnectorUID: 1000, Status: "enabled", Version: 1}
+	c := CredentialRecord{BindingID: b.ID, ID: "40000000-0000-4000-8000-000000000001", Version: 1, Status: "current", ExpiresAtNS: 1}
+	_, err := db.Coordinator().Execute(context.Background(), actor, testRequest(t, testOperation), allowed, func(ctx context.Context, tx *sql.Tx) (CommandResult, error) {
+		return CommandResult{}, InsertBindingCredential(ctx, tx, b, c)
+	}, nil)
+	if err != CapacityExceeded {
+		t.Fatalf("capacity error lost during rollback: %v", err)
+	}
+	for _, table := range []string{"bindings", "credentials", "operation_results", "command_audit"} {
+		var n int
+		if err := db.sql.QueryRow("SELECT count(*) FROM " + table).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("%s=%d err=%v", table, n, err)
+		}
 	}
 }

@@ -63,10 +63,19 @@ func InsertBindingCredential(ctx context.Context, tx *sql.Tx, b BindingRecord, c
 		return storageCode(err)
 	}
 	failure := func(err error) error {
+		// SQLITE_FULL can automatically roll back the whole transaction, removing
+		// this savepoint. Cleanup failure must not hide the original capacity error.
+		original := storageCode(err)
 		if _, rollbackErr := tx.ExecContext(ctx, "ROLLBACK TO binding_registration"); rollbackErr != nil {
+			if original == CapacityExceeded {
+				return original
+			}
 			return storageCode(rollbackErr)
 		}
 		if _, releaseErr := tx.ExecContext(ctx, "RELEASE binding_registration"); releaseErr != nil {
+			if original == CapacityExceeded {
+				return original
+			}
 			return storageCode(releaseErr)
 		}
 		var se *sqlite.Error
