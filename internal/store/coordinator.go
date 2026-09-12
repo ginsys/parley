@@ -48,14 +48,15 @@ type CommandReceipt struct {
 // transaction, or reenter the coordinator. Publication is process-local and
 // infallible; socket writes and credential publication happen after Execute.
 type Coordinator struct {
-	db       *DB
-	gate     chan struct{}
-	once     sync.Once
-	epoch    string
-	initErr  error
-	revision int64
-	failed   bool
-	now      func() time.Time
+	db                 *DB
+	gate               chan struct{}
+	once               sync.Once
+	epoch              string
+	initErr            error
+	revision           int64
+	failed             bool
+	connectionsClaimed bool
+	now                func() time.Time
 }
 
 func (d *DB) Coordinator() *Coordinator { return d.coordinator }
@@ -123,6 +124,7 @@ func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r Command
 	}
 	nextRevision, err := NextVersion(c.revision)
 	if err != nil {
+		c.failed = true
 		return CommandReceipt{}, err
 	}
 	now, err := InstantNanos(c.now())
