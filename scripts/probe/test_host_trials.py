@@ -1496,8 +1496,8 @@ class RunTrialTests(unittest.TestCase):
         second_run = run_trial(second_driver, prompt='hi', clock=clock.time,
                                monotonic=clock.monotonic, sleep=clock.sleep)
         self.assertNotEqual(first_run.marker, second_run.marker)
-        self.assertRegex(first_run.marker, MARKER_PATTERN)
-        self.assertRegex(second_run.marker, MARKER_PATTERN)
+        self.assertIsNotNone(MARKER_PATTERN.fullmatch(first_run.marker))
+        self.assertIsNotNone(MARKER_PATTERN.fullmatch(second_run.marker))
         prefix = 'Automated probe: reply with exactly this token to confirm receipt: '
         self.assertEqual(first_driver.submitted_message.removeprefix(prefix), first_run.marker)
         self.assertEqual(second_driver.submitted_message.removeprefix(prefix), second_run.marker)
@@ -1533,7 +1533,10 @@ class MarkerTokenTests(unittest.TestCase):
         self.assertTrue(first.startswith('PARLEY-PROBE-'))
 
     def test_generated_tokens_satisfy_run_trials_own_validation(self):
-        self.assertRegex(marker_token(), MARKER_PATTERN)
+        # assertRegex is re.search semantics: `$` matches before a trailing newline, so it would
+        # not catch a generated token run_trial's own `.fullmatch()` check rejects (the same gap
+        # test_marker_is_validated_before_any_session_exists_or_is_sent documents).
+        self.assertIsNotNone(MARKER_PATTERN.fullmatch(marker_token()))
 
 
 if __name__ == '__main__':
