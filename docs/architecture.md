@@ -35,6 +35,7 @@ under the current account; production isolation is not claimed from those tests.
 names alone cannot distinguish a human from an agent under the same account. The production
 validation issue owns explicit privilege-route evidence; it does not block ordinary development.
 
+The store now provides the explicit reader foundation described in [Runtime foundation](runtime.md).
 The server will serialize writes through one immediate-transaction connection and use at most
 four separate read-only deferred connections for pure queries. Authorization reads stay with the
 mutation in a writer transaction. Bounded reads have a five-second deadline including connection

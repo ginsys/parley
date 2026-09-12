@@ -74,6 +74,9 @@ func TestRollbackSurvivesCallerCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	if err := db.OpenReaders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { db.Close() })
 
 	callerCtx, cancel := context.WithCancel(ctx)
