@@ -1073,6 +1073,14 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     (polling continues, in case a delivered marker still produces transcript evidence) with
     `accepted` alone marked unobservable, rather than propagating the exception and losing the
     trial's evidence entirely.
+
+    A `KeyboardInterrupt` during the polling loop — a real risk given a busy trial's up-to-900s
+    wait — is caught and finalizes a `TrialRun` from whatever was accumulated so far, rather than
+    propagating and losing it. An outcome already seen keeps standing on its own evidence; a
+    still-missing transcript outcome is marked unobservable rather than the usual
+    "readable channel, genuinely absent", since an interrupted poll never reached its deadline
+    and a channel staying readable up to that point is not proof the outcome would never have
+    appeared.
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
@@ -1143,38 +1151,49 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     turn_end = None
     channel_readable = False
     turn_stream_capable = False
-    while True:
-        observation = driver.observe(session_id, marker=marker, submitted_at=submitted_at)
-        # The *final* read decides observability, not whether any read ever worked. A transcript
-        # is cumulative, so one successful read late in the window covers the earlier gaps; but
-        # if the last read failed — a finished Claude session's daemon socket disappearing is
-        # exactly this — the tail of the window was never seen, and an outcome missing from a
-        # transcript nobody could read at the end is not negative evidence.
-        channel_readable = observation.observable
-        turn_stream_capable = turn_stream_capable or observation.turn_stream
-        for name, when in observation.outcomes.items():
-            outcomes.setdefault(name, when)
-            signals.setdefault(name, observation.signals.get(name))
-        if state == 'busy' and turn_end is None and observation.turn_end is not None:
-            # Only a busy trial has a turn "already running at submission" for this field to
-            # mean (Observation's docstring). For every other state, the first turn boundary
-            # after submission is the completion of the turn *this trial's own marker* started,
-            # not a pre-existing one — adopting it here would mislabel that turn as something
-            # left running before the trial began.
-            turn_end = observation.turn_end
-            # The dependent windows run from the turn's end: adjust the deadline to match,
-            # shortening it when they close early rather than sitting out the rest of the cap,
-            # but also extending it when the end lands close to the cap — `min()` against the
-            # cap-based deadline could only ever shorten, silently truncating a turn that ended
-            # at e.g. 890s to the 900s cap instead of the 1010s its own window earns it. A turn
-            # ending *past* the cap gets no such extension: `Trial.result` classifies that
-            # `inconclusive` no matter how much longer polling would wait.
-            if turn_end - submitted_at <= BUSY_CAP:
-                deadline = monotonic() + max(0.0, LAST_WINDOW - (clock() - turn_end))
-        remaining = deadline - monotonic()
-        if remaining <= 0 or all(name in outcomes for name in TRANSCRIPT_OUTCOMES):
-            break
-        sleep(min(poll_interval, remaining))
+    interrupted = False
+    try:
+        while True:
+            observation = driver.observe(session_id, marker=marker, submitted_at=submitted_at)
+            # The *final* read decides observability, not whether any read ever worked. A transcript
+            # is cumulative, so one successful read late in the window covers the earlier gaps; but
+            # if the last read failed — a finished Claude session's daemon socket disappearing is
+            # exactly this — the tail of the window was never seen, and an outcome missing from a
+            # transcript nobody could read at the end is not negative evidence.
+            channel_readable = observation.observable
+            turn_stream_capable = turn_stream_capable or observation.turn_stream
+            for name, when in observation.outcomes.items():
+                outcomes.setdefault(name, when)
+                signals.setdefault(name, observation.signals.get(name))
+            if state == 'busy' and turn_end is None and observation.turn_end is not None:
+                # Only a busy trial has a turn "already running at submission" for this field to
+                # mean (Observation's docstring). For every other state, the first turn boundary
+                # after submission is the completion of the turn *this trial's own marker* started,
+                # not a pre-existing one — adopting it here would mislabel that turn as something
+                # left running before the trial began.
+                turn_end = observation.turn_end
+                # The dependent windows run from the turn's end: adjust the deadline to match,
+                # shortening it when they close early rather than sitting out the rest of the cap,
+                # but also extending it when the end lands close to the cap — `min()` against the
+                # cap-based deadline could only ever shorten, silently truncating a turn that ended
+                # at e.g. 890s to the 900s cap instead of the 1010s its own window earns it. A turn
+                # ending *past* the cap gets no such extension: `Trial.result` classifies that
+                # `inconclusive` no matter how much longer polling would wait.
+                if turn_end - submitted_at <= BUSY_CAP:
+                    deadline = monotonic() + max(0.0, LAST_WINDOW - (clock() - turn_end))
+            remaining = deadline - monotonic()
+            if remaining <= 0 or all(name in outcomes for name in TRANSCRIPT_OUTCOMES):
+                break
+            sleep(min(poll_interval, remaining))
+    except KeyboardInterrupt:
+        # Losing the local outcomes/signals/turn_end accumulated so far to a propagated
+        # interrupt would discard real evidence a busy trial's up-to-900s wait may have spent
+        # minutes gathering. Finalize instead: an outcome already in `outcomes` keeps standing on
+        # its own evidence exactly as a completed trial would, but a still-missing transcript
+        # outcome is marked unobservable rather than the usual "readable channel, genuinely
+        # absent" -- an interrupted poll never reached its deadline, so the channel staying
+        # readable up to this point is not proof the outcome would never have appeared.
+        interrupted = True
     if accepted_at is not None:
         outcomes['accepted'] = accepted_at
         signals['accepted'] = SIGNAL_SUBMIT_EXIT_STATUS
@@ -1183,7 +1202,12 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     # unobservable only when the submission call itself timed out without confirming either way.
     observable = {'accepted': not accepted_unobservable}
     for name in TRANSCRIPT_OUTCOMES:
-        observable[name] = True if name in outcomes else channel_readable
+        if name in outcomes:
+            observable[name] = True
+        elif interrupted:
+            observable[name] = False
+        else:
+            observable[name] = channel_readable
     if state == 'busy' and turn_end is None and not turn_stream_capable:
         # No turn-boundary stream at all: this runner cannot tell a still-running prior turn's
         # tail from a genuinely new one (`detect_outcomes`' docstring), so a captured value is
@@ -1193,11 +1217,14 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         # itself `Trial.result`'s own `inconclusive` case via `turn_end_observable`, not this one.
         for name in ('turn_start', 'ack'):
             observable[name] = False
+    # Same reasoning as the transcript outcomes above: an interrupted poll never reached its
+    # deadline, so a still-missing turn_end is not proof one would never have appeared, even
+    # though the channel itself stayed readable up to the point of interruption.
+    turn_end_observable = turn_end is not None or (channel_readable and not interrupted)
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
                     outcomes=outcomes, state=state,
                     supported={name: True for name in OUTCOME_NAMES}, observable=observable,
-                    signals=signals,
-                    turn_end=turn_end, turn_end_observable=turn_end is not None or channel_readable)
+                    signals=signals, turn_end=turn_end, turn_end_observable=turn_end_observable)
 
 
 def classify_trial(trial, now, *, supported=None, observable=None):
