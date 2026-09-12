@@ -1168,6 +1168,18 @@ class RunTrialTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_one(FakeDriver(clock=clock), clock, state='asleep')
 
+    def test_poll_interval_is_validated_before_any_session_exists_or_marker_is_sent(self):
+        # A negative or NaN interval previously stayed unnoticed until the first sleep() call
+        # after submission -- by which point the real host may already have received the
+        # marker with no returned evidence. Zero would pass that same later check (sleep(0)
+        # never raises) and spin the polling loop CPU-bound for up to 900s instead.
+        for bad in (-1.0, 0.0, float('nan')):
+            clock = FakeClock()
+            driver = FakeDriver(clock=clock)
+            with self.assertRaises(ValueError):
+                self.run_one(driver, clock, poll_interval=bad)
+            self.assertEqual(driver.order, [])
+
 
 class ClassifyTrialTests(unittest.TestCase):
     def test_open_window_raises_rather_than_defaulting(self):

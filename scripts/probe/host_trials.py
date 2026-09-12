@@ -36,6 +36,7 @@ export from at investigation time) and is deliberately left unimplemented rather
 
 import datetime
 import json
+import math
 import os
 import re
 import subprocess
@@ -960,6 +961,13 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
+    if not math.isfinite(poll_interval) or poll_interval <= 0:
+        # Caught here, before any session exists or the marker is sent: a negative or NaN
+        # interval previously stayed unnoticed until the first `sleep()` call *after*
+        # submission, by which point the real host may already have received the marker with no
+        # returned evidence at all. Zero would pass that same later check (`sleep(0)` never
+        # raises) and instead spin the polling loop CPU-bound for up to 900s.
+        raise ValueError(f'poll_interval must be a positive, finite number of seconds: {poll_interval!r}')
     session_id = (driver.register_existing(existing_session) if existing_session is not None
                   else driver.create(prompt))
     settle()
