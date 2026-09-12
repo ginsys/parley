@@ -353,6 +353,20 @@ partial changes. Timestamp backfill reads bounded ID/timestamp pages, preserves 
 and validates round-trip range before writing numeric values. Messages and metadata are plaintext;
 filesystem isolation and SQLite-consistent backups remain the operator's responsibility.
 
+## Host-probe matrix isolation
+
+Host-probe matrix trials (`scripts/probe/host_trials.py`) are not ordinary tests: an owner
+decision of 2026-09-11 has them run against an installed host CLI under the operator's real HOME
+(`wake_probe.py --home inherit`), because a disposable HOME holds no host credentials and would
+measure an unauthenticated session rather than a wake. The alternative considered — disposable at
+the HOME level, matching every ordinary test — was rejected for exactly that reason: it cannot
+authenticate against a real host, so it cannot measure what the matrix exists to measure.
+Isolation is instead at the *session* level: each trial creates a throwaway host session, tracked
+in a `SessionRegistry` that refuses to touch any id it did not itself mint, and tears it down
+after the trial. Every matrix cell this produces therefore carries the developer's real
+credentials and configuration and must be sanitized before publication — see
+[host probes](host-probes.md#matrix-runner) for the driver contract and outcome detectors.
+
 ## Evidence and limits
 
 The normal verification gate is `mise run verify`; its contents are described in
