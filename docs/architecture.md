@@ -30,14 +30,17 @@ Each store writer owns one coordinator. Its trusted internal Execute API acquire
 gate and an immediate transaction, rechecks command/result access, and returns an existing receipt
 before reevaluating mutation-specific versions. New commands reserve checked audit/view counters,
 apply effects and insert their receipt/audit atomically. A terminal domain rejection rolls back its
-business-effect savepoint before recording its fixed result; infrastructure failure rolls back
-all writes. Successful commit publishes process-local state before releasing the gate. Callbacks
+business-effect savepoint before recording its fixed result. An explicit terminal-code allowlist
+excludes transient/infrastructure and pre-principal failures: those roll back all writes and leave
+the operation ID retryable. Successful commit publishes process-local state before releasing the gate. Callbacks
 must not reenter the coordinator, open another writer transaction or perform external I/O.
 Credential publication starts as pending evidence at enrollment. Publisher integration must record
 published or unknown in a separate audited transaction after file I/O; terminal observations cannot
 be overwritten, and pending after interruption is not proof that no file was published.
 Credential-file and response I/O belong after gate release. Unknown commit outcome disables further
-commands on that coordinator with recovery_required; the eventual runtime integration must stop
+commands on that coordinator with recovery_required. Proven database/sql pre-commit cancellation
+rolls back without disabling the coordinator; a late cancellation alone cannot prove rollback of
+a driver failure. The eventual runtime integration must stop
 admission and apply its recovery inspection, never infer that the mutation failed.
 
 Requests use typed logical fields after operation-specific schema validation, with explicit sets

@@ -143,6 +143,9 @@ func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r Command
 	if !result.Code.valid() {
 		return CommandReceipt{}, InvalidRequest
 	}
+	if !result.Code.terminalResult() {
+		return CommandReceipt{}, result.Code
+	}
 	if result.Code != "" {
 		// Even a buggy rejecting callback cannot commit a partial state transition.
 		if _, err := tx.ExecContext(ctx, "ROLLBACK TO command_effect"); err != nil {
@@ -173,9 +176,8 @@ func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r Command
 	if _, err := tx.ExecContext(ctx, "UPDATE installation SET audit_sequence=? WHERE singleton=1", nextSequence); err != nil {
 		return CommandReceipt{}, storageCode(err)
 	}
-	if err := tx.Commit(); err != nil {
-		c.failed = true
-		return CommandReceipt{}, OutcomeUnknown
+	if err := c.commit(tx); err != nil {
+		return CommandReceipt{}, err
 	}
 	c.revision = nextRevision
 	view := CommitView{c.epoch, nextRevision}
@@ -199,4 +201,19 @@ func lookupReceipt(ctx context.Context, tx *sql.Tx, principal string, r CommandR
 		return CommandReceipt{}, TemporarilyUnavailable
 	}
 	return result, nil
+}
+
+func (c *Coordinator) commit(tx *sql.Tx) error {
+	if err := tx.Commit(); err != nil {
+		// With the pinned driver, Commit executes under context.Background. These
+		// sentinels therefore come from database/sql's pre-commit cancellation/done
+		// checks: the driver commit was not invoked. Do not infer this merely from
+		// ctx.Err(), which could become non-nil after an ambiguous driver failure.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, sql.ErrTxDone) {
+			return TemporarilyUnavailable
+		}
+		c.failed = true
+		return OutcomeUnknown
+	}
+	return nil
 }

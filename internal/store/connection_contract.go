@@ -56,6 +56,17 @@ func (c Code) valid() bool {
 	}
 	return false
 }
+
+// Only terminal domain rejections are permanent operation results. Transient,
+// infrastructure and pre-principal failures must roll back the entire command.
+func (c Code) terminalResult() bool {
+	switch c {
+	case "", InvalidRequest, NotFound, Forbidden, IdentityConflict, BindingUnavailable, HostUnverified, NotReady, AlreadyConnected, GenerationConflict, VersionConflict, RequestExpired, RequestTerminal, OperationConflict, EventConflict, SecurityHold:
+		return true
+	}
+	return false
+}
+
 func validUUID(s string) bool {
 	id, err := uuid.Parse(s)
 	return err == nil && id != uuid.Nil && id.String() == s

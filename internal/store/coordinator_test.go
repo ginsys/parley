@@ -257,3 +257,56 @@ func TestCommandCapacityFailureAndVersionLimits(t *testing.T) {
 		t.Fatalf("unrepresentable timestamp: %v", err)
 	}
 }
+
+func TestTransientCommandResultsDoNotBecomePermanentReceipts(t *testing.T) {
+	for _, code := range []Code{TemporarilyUnavailable, CapacityExceeded, RecoveryRequired, OutcomeUnknown, AuthenticationFailed} {
+		t.Run(string(code), func(t *testing.T) {
+			db := commandDB(t)
+			req := testRequest(t, testOperation)
+			actor := CommandPrincipal{testPrincipal, 1000}
+			_, err := db.Coordinator().Execute(context.Background(), actor, req, allowed, func(ctx context.Context, tx *sql.Tx) (CommandResult, error) {
+				if _, err := insertSynthetic(ctx, tx); err != nil {
+					return CommandResult{}, err
+				}
+				return CommandResult{Code: code}, nil
+			}, nil)
+			if err != code {
+				t.Fatalf("transient result committed: err=%v want=%s", err, code)
+			}
+			for _, table := range []string{"conversations", "operation_results", "command_audit"} {
+				var n int
+				if err := db.sql.QueryRow("SELECT count(*) FROM " + table).Scan(&n); err != nil || n != 0 {
+					t.Fatalf("%s=%d err=%v", table, n, err)
+				}
+			}
+			receipt, err := db.Coordinator().Execute(context.Background(), actor, req, allowed, insertSynthetic, nil)
+			if err != nil || receipt.Replayed || receipt.Result.Code != "" {
+				t.Fatalf("same-ID retry failed: %+v %v", receipt, err)
+			}
+		})
+	}
+}
+func TestCancelledCommitDoesNotPoisonCoordinator(t *testing.T) {
+	db := commandDB(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := insertSynthetic(ctx, tx); err != nil {
+		t.Fatal(err)
+	}
+	// Cancel precisely before database/sql.Commit's context/done check, after SQL
+	// completed. The pinned SQLite driver commits with context.Background.
+	cancel()
+	if err := db.Coordinator().commit(tx); err != TemporarilyUnavailable {
+		t.Fatalf("cancelled commit: %v", err)
+	}
+	tx.Rollback()
+	receipt, err := db.Coordinator().Execute(context.Background(), CommandPrincipal{testPrincipal, 1000}, testRequest(t, testOperation), allowed, insertSynthetic, nil)
+	if err != nil || receipt.Result.Code != "" {
+		t.Fatalf("coordinator poisoned by cancellation: %v", err)
+	}
+}
