@@ -81,6 +81,23 @@ class SubmissionUncaptured(NotImplementedError):
     """
 
 
+class SubmissionRejected(RuntimeError):
+    """Raised by `submit()` to report a definitive rejection with its diagnostic.
+
+    A clean nonzero exit is real, observed negative evidence -- `run_trial` still treats it as
+    "genuinely rejected", not an error -- but a bare `False` return discards the exact status and
+    stderr behind it, leaving no way to tell a mechanism rejection (a full queue, an expired
+    thread) from a prerequisite or invocation failure (a missing binary, a bad flag), or to
+    reproduce the cell. `run_trial` catches this and folds it into the same `TrialRun` shape a
+    plain `False` return produces, with the diagnostic attached via `submission_diagnostic`.
+    """
+
+    def __init__(self, returncode, stderr):
+        super().__init__(f'submission rejected: exit {returncode}: {stderr}')
+        self.returncode = returncode
+        self.stderr = stderr
+
+
 class SessionCreationUncaptured(NotImplementedError):
     """Raised when this runner has captured no session-creation path for a host.
 
@@ -1087,7 +1104,9 @@ class CodexDriver:
         self.registry.require_owned(self._key(thread_id))
         result = self.run(['codex', 'queue', '--thread', thread_id, '--message', message],
                            capture_output=True, text=True, timeout=15)
-        return result.returncode == 0
+        if result.returncode != 0:
+            raise SubmissionRejected(result.returncode, result.stderr)
+        return True
 
     def observe(self, thread_id, *, marker, submitted_at):
         """Read the thread's rollout; an unreadable or undatable rollout is unobservable."""
@@ -1208,6 +1227,11 @@ class TrialRun:
     # this a cell built from a drifted binary is indistinguishable from one built at the recorded
     # preflight pin.
     version: str | None = None
+    # The diagnostic behind a definitive submission rejection (`SubmissionRejected`), or None for
+    # every other outcome including a rejection this runner has no diagnostic for. Without this,
+    # a rejected cell records only that `accepted` was False, with no way to tell a mechanism
+    # rejection apart from a prerequisite or invocation failure, or to reproduce it.
+    submission_diagnostic: str | None = None
 
 
 def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
@@ -1355,8 +1379,16 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
     deadline = monotonic() + (BUSY_CAP if state == 'busy' else LAST_WINDOW)
     accepted_unobservable = False
     submit_interrupted = False
+    submission_diagnostic = None
     try:
         accepted = driver.submit(session_id, marker_message(marker))
+    except SubmissionRejected as error:
+        # A definitive rejection with a diagnostic -- exactly the `not accepted` case below,
+        # except with the returncode/stderr behind it retained rather than discarded, so a
+        # rejected cell can tell a mechanism rejection apart from a prerequisite or invocation
+        # failure, or be reproduced.
+        accepted = False
+        submission_diagnostic = str(error)
     except SubmissionUnsupported:
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
                         outcomes={}, state=state, marker=marker, version=version,
@@ -1414,7 +1446,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
                         outcomes={}, state=state, marker=marker, version=version,
                         supported={name: True for name in OUTCOME_NAMES}, observable=observable,
-                        turn_end_observable=False)
+                        turn_end_observable=False, submission_diagnostic=submission_diagnostic)
     accepted_at = None if accepted_unobservable else clock()
     outcomes = {}
     signals = {}

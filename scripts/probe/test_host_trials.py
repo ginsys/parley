@@ -27,6 +27,7 @@ from host_trials import (
     SessionRegistry,
     SettleFailed,
     SubmissionFailed,
+    SubmissionRejected,
     SubmissionUncaptured,
     SubmissionUnsupported,
     TeardownUnsupported,
@@ -1041,6 +1042,16 @@ class CodexDriverTests(unittest.TestCase):
         with self.assertRaises(ForeignSessionError):
             self.driver(SessionRegistry(), None).submit('not-mine', MARKER)
 
+    def test_submit_raises_rejection_with_the_exit_status_and_stderr_on_a_nonzero_exit(self):
+        registry = SessionRegistry()
+        registry.mint('codex:thread-1')
+        driver = self.driver(registry, None,
+                             run=lambda *a, **k: FakeResult(1, stderr='thread expired'))
+        with self.assertRaises(SubmissionRejected) as ctx:
+            driver.submit('thread-1', MARKER)
+        self.assertEqual(ctx.exception.returncode, 1)
+        self.assertEqual(ctx.exception.stderr, 'thread expired')
+
     def test_observe_reads_the_rollout_file(self):
         registry = SessionRegistry()
         registry.mint('codex:thread-1')
@@ -1431,6 +1442,19 @@ class RunTrialTests(unittest.TestCase):
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['accepted'], 'not_observed')
         self.assertEqual(classified['visible'], 'unobservable')
+
+    def test_submission_rejected_carries_its_diagnostic_rather_than_a_bare_false(self):
+        # A `SubmissionRejected` (e.g. from `CodexDriver.submit`) folds into the identical
+        # not-accepted shape a plain `False` return produces, except with the returncode/stderr
+        # behind it retained via `submission_diagnostic` instead of discarded.
+        clock = FakeClock()
+        driver = FakeDriver(submit_error=SubmissionRejected(3, 'thread expired'), clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertNotIn('accepted', run.outcomes)
+        self.assertIsNone(run.accepted_at)
+        self.assertIn('thread expired', run.submission_diagnostic)
+        self.assertIn('3', run.submission_diagnostic)
+        self.assertNotIn('observe', driver.order)
 
     def test_observation_continues_through_the_windows_instead_of_one_snapshot(self):
         # The outcome lands on a later poll: a single immediate snapshot reported it
