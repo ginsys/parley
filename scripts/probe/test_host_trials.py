@@ -325,6 +325,16 @@ class CodexParsingTests(unittest.TestCase):
                                          'content': [{'type': 'text'}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
+    def test_a_part_type_mismatched_with_its_records_role_is_unusable(self):
+        # input_text belongs to a user record, output_text to an assistant one
+        # (docs/host-probe-preflight.md) -- accepting any string-valued `text` regardless of
+        # `type` would also accept an output_text part inside a user record (or the reverse), a
+        # shape this runner has never captured.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
+                             'payload': {'type': 'message', 'role': 'user',
+                                         'content': [{'type': 'output_text', 'text': MARKER}]}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
     def test_a_non_object_record_is_unusable_rather_than_an_attributeerror(self):
         # Valid JSON is not necessarily an object -- a damaged or schema-drifted line can decode
         # to `null`, a number or a list -- and `record.get(...)` on any of those raises instead
@@ -332,7 +342,7 @@ class CodexParsingTests(unittest.TestCase):
         lines = [json.dumps(None), json.dumps([1, 2]), json.dumps(3),
                 json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                             'payload': {'type': 'message', 'role': 'user',
-                                        'content': [{'text': 'hi'}]}})]
+                                        'content': [{'type': 'input_text', 'text': 'hi'}]}})]
         events, unusable = codex_rollout_events(lines)
         self.assertEqual(unusable, 3)
         self.assertEqual(len(events), 1)

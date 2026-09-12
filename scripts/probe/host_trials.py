@@ -590,6 +590,13 @@ CODEX_MESSAGE_RECORD_TYPE = 'response_item'
 CODEX_EVENT_RECORD_TYPE = 'event_msg'
 
 
+# A message's content parts carry a role-appropriate `type` (docs/host-probe-preflight.md,
+# 2026-09-11): `input_text` for what the user sent, `output_text` for what the assistant said.
+# A part whose `type` doesn't match its record's role is a shape this runner has not captured,
+# not a same-meaning synonym worth accepting on the `text` field alone.
+ROLE_CONTENT_PART_TYPE = {'user': 'input_text', 'assistant': 'output_text'}
+
+
 def codex_rollout_events(lines):
     """Extract message and turn-boundary Events from rollout JSONL; returns `(events, unusable)`.
 
@@ -692,6 +699,13 @@ def codex_rollout_events(lines):
                 # evidence rather than the unusable read it actually is, and could even produce a
                 # false `turn_start` from an assistant record. Fail the whole record closed
                 # instead of guessing at a partial join.
+                texts = None
+                break
+            if part.get('type') != ROLE_CONTENT_PART_TYPE[role]:
+                # A part's text is only trustworthy alongside the role-appropriate `type` --
+                # accepting any string-valued `text` regardless of `type` would also accept an
+                # `input_text` part inside an `assistant` record (or the reverse), a shape this
+                # runner has never captured and has no evidence reads the same way.
                 texts = None
                 break
             texts.append(part_text)
