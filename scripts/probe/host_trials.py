@@ -645,6 +645,20 @@ class ClaudeDriver:
             raise RuntimeError(f'claude rm exited {result.returncode} for {session_id}: {result.stderr}')
         self.registry.release(self._key(session_id))
 
+    def version(self):
+        """Best-effort `claude --version` output, or None if it cannot be read.
+
+        A matrix cell is version-scoped (docs/host-wake-matrix.md); a trial run against a
+        binary that has drifted from the recorded preflight must say so rather than silently
+        inherit a stale pin. A failed or missing read is this call's own problem, not the
+        trial's -- the same best-effort contract as `_recoverable_candidates`.
+        """
+        try:
+            result = self.run(['claude', '--version'], capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
 
 # --- Codex: `codex queue --thread <id> --message <text>` and the rollout JSONL -----------------
 
@@ -1082,6 +1096,14 @@ class CodexDriver:
             f'codex has no captured teardown mechanism; thread {thread_id} remains registered '
             'and its host session is still live')
 
+    def version(self):
+        """Best-effort `codex --version` output, or None if it cannot be read. See ClaudeDriver."""
+        try:
+            result = self.run(['codex', '--version'], capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
 
 class OpenCodeDriver:
     """Placeholder pending stage 3's real `export <sessionID>` sample.
@@ -1128,6 +1150,11 @@ class TrialRun:
     # "no turn was running", which is the one thing a busy trial is defined not to be.
     turn_end: float | None = None
     turn_end_observable: bool = True
+    # The driver's own version string at trial time (e.g. `claude --version` output), or None if
+    # it could not be read. Matrix cells are version-scoped (docs/host-wake-matrix.md); without
+    # this a cell built from a drifted binary is indistinguishable from one built at the recorded
+    # preflight pin.
+    version: str | None = None
 
 
 def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
@@ -1252,6 +1279,12 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
     session_id = (driver.register_existing(existing_session) if existing_session is not None
                   else driver.create(prompt))
     try:
+        # Best-effort: a driver with no version() (e.g. a test double) or one whose read fails
+        # records None rather than losing the trial over an evidence field, not the trial itself.
+        version = driver.version()
+    except Exception:
+        version = None
+    try:
         settle()
     except (Exception, KeyboardInterrupt) as error:
         # settle() runs after create() has already produced a live, owned session; letting its
@@ -1267,12 +1300,12 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
         accepted = driver.submit(session_id, marker_message(marker))
     except SubmissionUnsupported:
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
-                        outcomes={}, state=state, marker=marker,
+                        outcomes={}, state=state, marker=marker, version=version,
                         supported={name: False for name in OUTCOME_NAMES},
                         observable={name: True for name in OUTCOME_NAMES})
     except SubmissionUncaptured:
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
-                        outcomes={}, state=state, marker=marker,
+                        outcomes={}, state=state, marker=marker, version=version,
                         supported={name: True for name in OUTCOME_NAMES},
                         observable={name: False for name in OUTCOME_NAMES},
                         turn_end_observable=False)
@@ -1320,7 +1353,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
         observable = {'accepted': True}
         observable.update({name: False for name in TRANSCRIPT_OUTCOMES})
         return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=None,
-                        outcomes={}, state=state, marker=marker,
+                        outcomes={}, state=state, marker=marker, version=version,
                         supported={name: True for name in OUTCOME_NAMES}, observable=observable,
                         turn_end_observable=False)
     accepted_at = None if accepted_unobservable else clock()
@@ -1414,7 +1447,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
     # though the channel itself stayed readable up to the point of interruption.
     turn_end_observable = turn_end is not None or (channel_readable and not interrupted)
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
-                    outcomes=outcomes, state=state, marker=marker,
+                    outcomes=outcomes, state=state, marker=marker, version=version,
                     supported={name: True for name in OUTCOME_NAMES}, observable=observable,
                     signals=signals, turn_end=turn_end, turn_end_observable=turn_end_observable)
 
