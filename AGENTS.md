@@ -228,3 +228,25 @@ is not proof that no file exists and requires a fresh human recovery operation. 
 uses private descriptor-relative paths and atomic no-replace publication followed by directory sync;
 it never changes account ownership/permissions or replaces another credential version. Controlled
 crash fixtures use only the test binary and synthetic credential files, never a real host CLI.
+
+## Connection attachment boundaries
+
+The internal Linux Manager is exclusive per writer and consumes the shared coordinator. Session
+capabilities are created only by authenticated attachment; Token fields supplied by a caller confer
+no authority. Capacity/deadline accounting starts before coordinator admission. Inspection remains
+restricted and nonattached; credential failure closes the socket before another credential attempt
+can proceed. Kernel UID, exact native tuple, credential lifecycle and durable generation are all
+required. Same-account stolen credentials remain within the accepted cooperative-policy limit.
+
+Use connection Transition for connection-specific state and Execute for durable administrative
+operation receipts. Publish slot/readiness state after commit under the gate; keep host/file/socket
+I/O outside callbacks. Cancellation may fail closed immediately when a transaction cannot publish
+cleanup. Subsequent housekeeping removes cancelled records. View-revision overflow stops ordinary
+service. Deadline-crossing authorization cannot return a usable expired attachment.
+
+Host verification is a mandatory trusted capability and runs with the exact native tuple/token,
+outside the gate and cancelled by socket lifetime. Readiness requires a fresh nonce per explicit
+thirty-second attempt. Heartbeats only extend liveness; adapters send every ten seconds, close after
+thirty seconds without one. Stale timers, ACKs, disconnects and retained command results cannot
+alter a successor slot. Internal callbacks and synthetic Unix socket tests do not establish a
+human endpoint, real host compatibility, authenticated ordinary dispatch or a live bridge.
