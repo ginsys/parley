@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -252,5 +253,63 @@ func TestDispatchOutcomeDoesNotReportRolledBackSettlement(t *testing.T) {
 	saved, err := store.GetByID(ctx, tx, e.ID)
 	if err != nil || saved.State != store.Dispatching {
 		t.Fatalf("stored outcome: %+v %v", saved, err)
+	}
+}
+
+// A process upgrading validation must still settle attempts made under the old rule.
+func TestSettlementOfHistoricalIncompatibleAttempt(t *testing.T) {
+	for _, result := range []error{nil, ErrNoAttempt, ErrAmbiguous} {
+		t.Run(fmt.Sprint(result), func(t *testing.T) {
+			db, b, e, _ := setupSettlement(t)
+			ctx := context.Background()
+			claimed, ok, err := b.claim(ctx, e.ID)
+			if err != nil || !ok {
+				t.Fatalf("claim: %v", err)
+			}
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(ctx, "UPDATE grants SET peer_a_id=?", "a\xff"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(ctx, "UPDATE envelopes SET from_peer=?", "a\xff"); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			claimed.FromPeer = "a\xff"
+			if _, err := b.settle(ctx, claimed, result); err != nil {
+				t.Fatal(err)
+			}
+			// Duplicate settlement must not refund twice, including the compatibility case.
+			if _, err := b.settle(ctx, claimed, result); err != nil {
+				t.Fatal(err)
+			}
+			tx, err = db.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			g, err := store.CurrentGrant(ctx, tx, "c")
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := store.GetByID(ctx, tx, e.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantState, wantUsed := store.HandedOff, int64(1)
+			if result == ErrNoAttempt {
+				wantState, wantUsed = store.Queued, 0
+			}
+			if result == ErrAmbiguous {
+				wantState = store.Uncertain
+			}
+			if g.ExchangesUsed != wantUsed || stored.State != wantState || stored.DispatchAttempt != claimed.DispatchAttempt || stored.FromPeer != "a\xff" || g.PeerAID != "a\xff" {
+				t.Fatalf("historical settlement: %+v %+v", g, stored)
+			}
+		})
 	}
 }

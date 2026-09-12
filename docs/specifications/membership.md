@@ -78,9 +78,10 @@ UTF-8 as well as valid non-ASCII names such as `José` and U+FFFD. Preserve perm
 trailing spaces and punctuation exactly. Message bodies are unaffected by this identifier rule.
 
 This simple restriction replaces the proposed Unicode identifier policy and encoded-ID recovery
-API. The current validator can accept distinct malformed byte strings (`61FF`, `61FE`) that Go
-JSON encodes identically. ASCII validation rejects both, including replacement characters produced
-by a JSON decoder; no custom Unicode decoder or encoded public identity representation is needed.
+API. The previous validator accepted distinct malformed byte strings (`61FF`, `61FE`) that Go
+JSON encodes identically. The shared byte validator now rejects both, including replacement
+characters produced by a JSON decoder; no custom Unicode decoder or encoded public identity
+representation is needed.
 Validate identifiers before storage, authorization, wrapping or public serialization.
 
 For an existing database, first check stored conversation names and peer IDs as raw bytes against

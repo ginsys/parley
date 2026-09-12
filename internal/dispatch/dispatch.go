@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -85,6 +86,12 @@ var ErrStaleGrantVersion = errors.New("envelope grant version is no longer curre
 // calls the transport itself — that's Dispatch's job — so a crash between
 // accept and delivery leaves the message safely queued, not lost.
 func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, inReplyTo *string) (*store.Envelope, error) {
+	for _, id := range []string{conversation, from, to} {
+		if err := bridgetext.ValidateMetadata(id); err != nil {
+			return nil, err
+		}
+	}
+
 	tx, err := b.db.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -162,6 +169,16 @@ func (b *Bridge) DispatchOutcome(ctx context.Context, envelopeID string) (Outcom
 func (b *Bridge) dispatch(ctx context.Context, envelopeID string, outcome *Outcome) (store.EnvelopeState, error) {
 	claimedEnvelope, claimed, err := b.claim(ctx, envelopeID)
 	if err != nil {
+		if errors.Is(err, bridgetext.ErrInvalidMetadata) {
+			current, stateErr := b.currentOutcome(ctx, envelopeID)
+			if stateErr != nil {
+				return "", stateErr
+			}
+			*outcome = current
+			outcome.ErrorCode = "incompatible_identifier"
+			outcome.ErrorDetail = "Stored identifiers require human compatibility review before delivery."
+			return current.State, err
+		}
 		if errors.Is(err, ErrBudgetExhausted) {
 			outcome.ErrorCode = "budget_exhausted"
 			outcome.ErrorDetail = "Grant budget is exhausted; delivery awaits human renewal."
@@ -336,7 +353,20 @@ func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope,
 		return nil, false, nil
 	}
 
+	// Compatibility rejection is observational: leave historical state and budget intact.
+	for _, id := range []string{e.Conversation, e.FromPeer, e.ToPeer} {
+		if err := bridgetext.ValidateMetadata(id); err != nil {
+			return nil, false, err
+		}
+	}
 	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
+	if err == nil {
+		for _, id := range []string{g.Conversation, g.PeerAID, g.PeerBID} {
+			if err := bridgetext.ValidateMetadata(id); err != nil {
+				return nil, false, err
+			}
+		}
+	}
 	authErr := err
 	if err == nil {
 		authErr = authorizeEnvelope(g, e, time.Now())

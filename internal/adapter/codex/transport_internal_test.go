@@ -162,7 +162,7 @@ func TestTransportDeliverClassifiesWrapFailureAsNoAttempt(t *testing.T) {
 	}
 
 	tr := NewTransport(&fakeQueueSender{}, "thread-123", "claude-session-a", "codex-thread-b")
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{Conversation: "c", ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
 	if !errors.Is(err, dispatch.ErrNoAttempt) {
 		t.Fatalf("want dispatch.ErrNoAttempt (refundable, requeueable), got %v", err)
 	}

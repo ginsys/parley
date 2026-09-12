@@ -168,6 +168,11 @@ func (t *Transport) Deliver(ctx context.Context, e store.Envelope) error {
 	if e.FromPeer != t.fromLabel {
 		return fmt.Errorf("%w: %w: envelope from %q, transport bound to %q", dispatch.ErrPermanentlyRejected, ErrRecipientMismatch, e.FromPeer, t.fromLabel)
 	}
+	for _, id := range []string{e.Conversation, e.FromPeer, e.ToPeer} {
+		if err := bridgetext.ValidateMetadata(id); err != nil {
+			return fmt.Errorf("%w: %w", dispatch.ErrPermanentlyRejected, err)
+		}
+	}
 	wrapped, err := wrapMessage(e.ID, t.fromLabel, e.Text)
 	if err != nil {
 		if errors.Is(err, bridgetext.ErrInvalidMetadata) {

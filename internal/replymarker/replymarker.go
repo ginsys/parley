@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/store"
 	"github.com/yuin/goldmark"
 	"github.com/yuin/goldmark/ast"
@@ -244,6 +245,12 @@ func decodeMarker(raw []byte) (*Marker, error) {
 // transient condition the caller should retry, not a permanent rejection.
 // Returns the envelope the reply resolves against.
 func Validate(ctx context.Context, tx *sql.Tx, conversation, replyingPeer, expectedTo string, m *Marker) (*store.Envelope, error) {
+	for _, id := range []string{conversation, replyingPeer, expectedTo, m.To} {
+		if err := bridgetext.ValidateMetadata(id); err != nil {
+			return nil, err
+		}
+	}
+
 	if m.To != expectedTo {
 		return nil, fmt.Errorf("%w: marker to=%q, expected %q", ErrWrongRecipient, m.To, expectedTo)
 	}
@@ -254,6 +261,11 @@ func Validate(ctx context.Context, tx *sql.Tx, conversation, replyingPeer, expec
 	}
 	if err != nil {
 		return nil, err
+	}
+	for _, id := range []string{e.Conversation, e.FromPeer, e.ToPeer} {
+		if err := bridgetext.ValidateMetadata(id); err != nil {
+			return nil, err
+		}
 	}
 	if e.Conversation != conversation {
 		return nil, fmt.Errorf("%w: envelope %s belongs to conversation %s, not %s",

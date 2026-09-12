@@ -17,11 +17,13 @@ func TestUnsafePeerIdentifiersNeverCreateGrants(t *testing.T) {
 	}
 	defer db.Close()
 	ctrl := New(db)
-	for _, id := range []string{"peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
-		for _, side := range []string{"a", "b"} {
+	for _, id := range []string{"a\xff", "a\xfe", "café", "a\ufffd", "peer\x7f", "peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
+		for _, side := range []string{"conversation", "a", "b"} {
 			t.Run(fmt.Sprintf("%s/%q", side, id), func(t *testing.T) {
-				p := GrantParams{Conversation: t.Name(), PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2}
-				if side == "a" {
+				p := GrantParams{Conversation: "fresh", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2}
+				if side == "conversation" {
+					p.Conversation = id
+				} else if side == "a" {
 					p.PeerAID = id
 				} else {
 					p.PeerBID = id

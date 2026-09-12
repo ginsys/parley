@@ -188,20 +188,22 @@ starving later queued messages. It is process-local and resets when the poller i
 
 ## Exact identifiers
 
-Conversation names and peer IDs are opaque exact keys. Whitespace-only values are invalid;
-permitted leading/trailing whitespace is preserved, and administrator output quotes identifiers
-so it is visible. Peer IDs must also satisfy the wrapper's shared metadata validation: no control
-or Unicode format characters, U+2028 or U+2029. Check both peers before grant storage and CLI
-storage access, and before renewing historical grants. Historical IDs are never rewritten and
-unusable historical grants remain revocable. This rejects unusable enrollment at its source
-instead of accepting grants whose messages will always fail wrapping. Do not silently trim keys
-during grant/revoke/renew: existing spaced and unspaced names
-can coexist, and normalization could retarget an operation or strand a historical grant. Any
-future canonicalization requires an identity policy and migration design, not CLI-only cleanup.
+Conversation names and peer IDs are opaque exact keys restricted to printable ASCII bytes
+`0x20` through `0x7E`, with at least one non-space byte. The shared metadata validator checks
+bytes, rejecting malformed UTF-8, valid non-ASCII and U+FFFD without replacement decoding.
+Permitted leading/trailing spaces and punctuation are preserved; administrator output quotes
+identifiers so whitespace is visible. Message bodies retain their existing encoding rules.
 
-Owner-approved target rule (2026-09-11): both conversation names and peer IDs use printable ASCII
-bytes `0x20`–`0x7E`, excluding empty/space-only values; preserve all permitted bytes exactly.
-This supersedes Unicode-capable enrollment when implemented, not message-body encoding. First
-inventory existing identifiers without modifying them; retain exact-key revocation and do not
-invent a recovery API without affected data. See the [accepted identifier rule](docs/specifications/membership.md#accepted-ascii-identifier-rule).
-The shipped validator does not yet enforce this restriction.
+Enrollment and renewal validate conversation and peers before durable mutation; CLI input
+validation happens before storage access. Acceptance, queued claims, reply validation and direct
+Codex transport delivery reject incompatible identities. A queued historical compatibility
+rejection leaves its state, budget and attempt token unchanged and reports an explicit diagnostic;
+it does not call the transport. Already claimed attempts retain normal settlement and refunds.
+Historical IDs are never rewritten; exact-key human revocation remains available. Do not apply
+new-enrollment validation to that revocation path.
+
+Before moving an existing database behind a text-only administration interface, follow the
+[identifier inventory](docs/identifier-inventory.md) on a stopped, checkpointed copy and record
+any incompatible history's disposition. No automatic repair, encoded aliases or recovery API is
+introduced. This byte rule replaces the rejected Unicode compatibility machinery; trimming would
+still retarget existing keys, so any future normalization needs a separate migration decision.

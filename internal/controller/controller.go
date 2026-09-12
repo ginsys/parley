@@ -9,7 +9,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/ginsys/parley/internal/bridgetext"
@@ -159,7 +158,10 @@ type RenewParams struct {
 // proven replies carry by default because their originals were acknowledged.
 // CancelPendingReplies explicitly opts out, including late unattempted rescue.
 func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, error) {
-	if strings.TrimSpace(p.Conversation) == "" || p.MaxExchanges < 0 {
+	if err := bridgetext.ValidateMetadata(p.Conversation); err != nil {
+		return nil, fmt.Errorf("conversation identifier: %w", err)
+	}
+	if p.MaxExchanges < 0 {
 		return nil, fmt.Errorf("renew requires conversation and nonnegative budget")
 	}
 	if p.ExpiresAt != nil && !p.ExpiresAt.After(time.Now()) {
@@ -256,7 +258,10 @@ func formatOptionalTime(t *time.Time) *string {
 }
 
 func validateGrant(p GrantParams) error {
-	if strings.TrimSpace(p.Conversation) == "" || strings.TrimSpace(p.PeerAID) == "" || strings.TrimSpace(p.PeerBID) == "" || p.PeerAID == p.PeerBID || p.MaxExchanges <= 0 {
+	if err := bridgetext.ValidateMetadata(p.Conversation); err != nil {
+		return fmt.Errorf("conversation identifier: %w", err)
+	}
+	if p.PeerAID == p.PeerBID || p.MaxExchanges <= 0 {
 		return fmt.Errorf("grant requires conversation, distinct peers and positive budget")
 	}
 	if err := validatePeerIDs(p.PeerAID, p.PeerBID); err != nil {
