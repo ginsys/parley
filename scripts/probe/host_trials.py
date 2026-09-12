@@ -499,9 +499,23 @@ class ClaudeDriver:
         (docs/host-probe-preflight.md, 2026-09-11), so `background_sessions()` would return
         nothing and every owned session would fail the membership check below. A nonzero
         listing is reported as such rather than reaching `json.loads` as a decode error.
+
+        A `subprocess.TimeoutExpired` from that listing call is translated to
+        `SubmissionUncaptured` rather than left to propagate: this listing is only a presence
+        check, run entirely before the unconditional raise below, so its timing out means the
+        marker was *definitely* never sent — unlike `run_trial`'s generic
+        `subprocess.TimeoutExpired` handling for a driver whose submit call itself performs the
+        delivery, where a timeout leaves genuine doubt about whether the host received it first.
         """
         self.registry.require_owned(self._key(session_id))
-        if session_id not in self._background_session_ids():
+        try:
+            listed = self._background_session_ids()
+        except subprocess.TimeoutExpired as error:
+            raise SubmissionUncaptured(
+                'claude has no captured message-submission path to an existing --bg session; '
+                'the presence check itself timed out, so no delivery could have been '
+                'attempted either') from error
+        if session_id not in listed:
             raise ValueError(f'session not listed under {self.cwd}: {session_id}')
         raise SubmissionUncaptured(
             'claude has no captured message-submission path to an existing --bg session; '
