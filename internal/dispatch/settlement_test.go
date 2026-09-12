@@ -313,3 +313,37 @@ func TestSettlementOfHistoricalIncompatibleAttempt(t *testing.T) {
 		})
 	}
 }
+
+func TestDispatchAttemptOverflowLeavesStateAndBudgetUnchanged(t *testing.T) {
+	db, b, e, _ := setupSettlement(t)
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE envelopes SET dispatch_attempt=9223372036854775807 WHERE id=?", e.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := b.claim(ctx, e.ID); err != store.InvalidRequest || claimed {
+		t.Fatalf("overflow claim=%v %v", claimed, err)
+	}
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	current, err := store.GetByID(ctx, tx, e.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != store.Queued || current.DispatchAttempt != 9223372036854775807 || g.ExchangesUsed != 0 {
+		t.Fatalf("overflow mutated evidence: %+v %+v", current, g)
+	}
+}

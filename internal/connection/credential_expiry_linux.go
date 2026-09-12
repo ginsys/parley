@@ -17,7 +17,7 @@ func (m *Manager) observeCredentialExpiry(c store.CredentialRecord, now time.Tim
 }
 
 func (m *Manager) expireCredential(ctx context.Context, tx *sql.Tx, c store.CredentialRecord) (bool, error) {
-	if !m.observeCredentialExpiry(c, m.now()) {
+	if !m.observeCredentialExpiry(c, store.AuthorityTime(ctx, m.now)) {
 		return false, nil
 	}
 	_, err := tx.ExecContext(ctx, "UPDATE credentials SET status='expired' WHERE credential_id=? AND status='current'", c.ID)

@@ -34,6 +34,9 @@ var ErrDirectionNotPermitted = errors.New("grant does not permit this message di
 // (the Claude-side identity) — a marker addressed elsewhere is rejected,
 // never forwarded on the strength of syntax alone.
 func IngestTurn(ctx context.Context, db *store.DB, conversation, fromPeer, expectedTo, turnText string) (*store.Envelope, error) {
+	if db.RecoveryControlled() {
+		return nil, store.RecoveryRequired
+	}
 	marker, err := replymarker.Extract(turnText)
 	if err != nil {
 		return nil, err

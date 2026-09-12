@@ -10,7 +10,7 @@ import (
 
 // Inspect serializes a materialized read with command publication. It always
 // rolls back, so even an accidentally mutating read callback cannot commit.
-func (c *Coordinator) Inspect(ctx context.Context, read func(context.Context, *sql.Tx) error) error {
+func (c *Coordinator) inspect(ctx context.Context, read func(context.Context, *sql.Tx) error) error {
 	if read == nil {
 		return InvalidRequest
 	}
@@ -26,6 +26,10 @@ func (c *Coordinator) Inspect(ctx context.Context, read func(context.Context, *s
 		return storageCode(err)
 	}
 	defer tx.Rollback()
+	ctx, err = c.transactionContext(ctx, tx, "human_inspection")
+	if err != nil {
+		return err
+	}
 	if err := read(ctx, tx); err != nil {
 		return storageCode(err)
 	}

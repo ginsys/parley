@@ -23,7 +23,7 @@ type TransitionResult struct {
 // publication after rollback instead, retaining the current revision. Neither
 // callback may perform external I/O. Unchanged transitions roll back even
 // accidental SQL writes.
-func (c *Coordinator) Transition(ctx context.Context,
+func (c *Coordinator) transition(ctx context.Context,
 	change func(context.Context, *sql.Tx, CommitView) (TransitionResult, error),
 	publish func(CommitView),
 ) (Code, error) {
@@ -42,6 +42,10 @@ func (c *Coordinator) Transition(ctx context.Context,
 		return "", storageCode(err)
 	}
 	defer tx.Rollback()
+	ctx, err = c.transactionContext(ctx, tx, "connection")
+	if err != nil {
+		return "", err
+	}
 	result, err := change(ctx, tx, CommitView{c.epoch, c.revision})
 	if err != nil {
 		return "", storageCode(err)
