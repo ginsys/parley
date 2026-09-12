@@ -44,7 +44,10 @@ real HOME/environment instead, for driving an authenticated host session; the re
 it. `--cwd` overrides the child's working directory, and the record's `cwd` field carries the
 resolved directory the child actually ran in — host behaviour varies with repository-level
 configuration and instructions, so without it two captures of the same command in different
-directories are indistinguishable and cannot satisfy the reproduction requirement below.
+directories are indistinguishable and cannot satisfy the reproduction requirement below. Inherit
+mode copies the parent's whole environment, so the child's `PWD` is overwritten with the same
+resolved `cwd` rather than left at the parent's own — otherwise a `--cwd` differing from the
+parent's would start the child believing it is somewhere it is not.
 Before exec, the child closes all non-stdio descriptors, including handles
 made inheritable by its launcher. This Linux harness requires `/proc/self/fd` to enumerate the
 actual descriptor range; enumeration failure aborts startup instead of launching with unknown

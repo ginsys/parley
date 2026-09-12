@@ -255,6 +255,20 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
         printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
         self.assertIn(os.environ['HOME'].encode(), printed)
 
+    def test_home_inherit_with_explicit_cwd_sets_pwd_to_match_not_the_parents(self):
+        # inherit mode copies the whole parent environment, PWD included; a --cwd that differs
+        # from the parent's own cwd must not leave the child believing it is somewhere else.
+        output = Path(self.tmp.name, 'inherit-cwd.json')
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--home', 'inherit',
+                '--cwd', self.tmp.name, '--', sys.executable, '-u', '-c',
+                "import os; print(os.environ.get('PWD'), flush=True)"]
+        with patch.object(sys, 'argv', args), patch.dict(os.environ, {'PWD': '/nonexistent-stale'}):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
+        self.assertIn(os.path.realpath(self.tmp.name).encode(), printed)
+        self.assertNotIn(b'/nonexistent-stale', printed)
+
     def test_home_missing_for_inherit_mode_is_a_usage_error(self):
         output = Path(self.tmp.name, 'no-home.json')
         args = ['wake_probe', '--output', str(output), '--home', 'inherit', '--', 'fixture']

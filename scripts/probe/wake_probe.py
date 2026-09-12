@@ -333,6 +333,11 @@ def main():
             # chdir actually reaches. The child keeps the caller's own string either way — the
             # record describes where it ran, it does not redirect it.
             record['cwd'] = os.path.realpath(child_cwd)
+            # `--home inherit` copies the parent's whole environment, PWD included; a `--cwd`
+            # that differs from the parent's own cwd would otherwise start the child believing
+            # it is somewhere it is not, corrupting anything in the transcript that reads $PWD
+            # rather than calling getcwd().
+            env['PWD'] = record['cwd']
             # The generation names the session this transcript belongs to and is what `send`
             # checks for staleness; hardcoding 'disposable' labelled an inherit-mode capture
             # as the credential-free one and let a stale disposable-era token pass.
