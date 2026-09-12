@@ -221,7 +221,7 @@ func TestShutdownOrderAndCancelledWait(t *testing.T) {
 	service := func(name string) fixtureService {
 		var workerCtx context.Context
 		return fixtureService{start: func(ctx context.Context, r Resources) error {
-			workerCtx = ctx
+			workerCtx = r.WorkerContext
 			db = r.Writer
 			add("start-" + name)
 			return nil
@@ -377,19 +377,39 @@ func TestCancelledPartialStartupCleansEveryService(t *testing.T) {
 	path := initializedRuntimeDB(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	entered := make(chan struct{})
+	entered, interrupted, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	var events []string
+	var firstWorker context.Context
 	service := func(name string, block bool) fixtureService {
+		var workers context.Context
 		return fixtureService{
-			start: func(ctx context.Context, _ Resources) error {
+			start: func(ctx context.Context, r Resources) error {
+				workers = r.WorkerContext
+				if !block {
+					firstWorker = workers
+				}
 				events = append(events, "start-"+name)
 				if block {
 					close(entered)
 					<-ctx.Done()
+					close(interrupted)
+					<-release
 					return ctx.Err()
 				}
 				return nil
-			}, stop: func() error { events = append(events, "stop-"+name); return nil }, wait: func() error { events = append(events, "wait-"+name); return nil },
+			}, stop: func() error {
+				if workers.Err() != nil {
+					t.Error("workers cancelled while admission was still open")
+				}
+				events = append(events, "stop-"+name)
+				return nil
+			}, wait: func() error {
+				if workers.Err() == nil {
+					t.Error("workers not cancelled after stopping admission")
+				}
+				events = append(events, "wait-"+name)
+				return nil
+			},
 		}
 	}
 	result := make(chan error, 1)
@@ -399,6 +419,16 @@ func TestCancelledPartialStartupCleansEveryService(t *testing.T) {
 	}()
 	<-entered
 	cancel()
+	<-interrupted
+	// The later Start has observed cancellation but has not yet returned. The
+	// earlier service still admits work, so its workers must remain alive.
+	if firstWorker.Err() != nil {
+		t.Error("startup cancellation stranded admitted work")
+	}
+	if _, err := Acquire(path); !errors.Is(err, ErrAlreadyRunning) {
+		t.Error("startup cancellation released ownership", err)
+	}
+	close(release)
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
@@ -409,6 +439,74 @@ func TestCancelledPartialStartupCleansEveryService(t *testing.T) {
 	o, err := Acquire(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	o.Close()
+}
+
+func TestSuccessfulStartupEndsInitializationButKeepsWorkers(t *testing.T) {
+	var initialization, workers context.Context
+	service := fixtureService{start: func(ctx context.Context, r Resources) error {
+		initialization, workers = ctx, r.WorkerContext
+		return nil
+	}, stop: func() error {
+		if workers.Err() != nil {
+			t.Error("workers stopped before admission")
+		}
+		return nil
+	}, wait: func() error {
+		if workers.Err() == nil {
+			t.Error("workers still running after stop")
+		}
+		return nil
+	}}
+	r, err := Start(context.Background(), Config{DatabasePath: initializedRuntimeDB(t), InspectRecovery: normal, Services: []Registration{{Service: service}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(initialization.Err(), context.Canceled) {
+		t.Error("initialization context leaked beyond startup")
+	}
+	if workers.Err() != nil {
+		t.Error("startup completion cancelled workers")
+	}
+	if err := r.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEmptyVersionedCatalogNeverAdmitsRecoveryService(t *testing.T) {
+	path := initializedRuntimeDB(t)
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"envelopes", "grants", "conversations"} {
+		if _, err := raw.Exec("DROP TABLE " + table); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	// Keep the initialized user_version while removing all application tables.
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	admitted := false
+	service := fixtureService{start: func(context.Context, Resources) error { admitted = true; return nil }}
+	r, err := Start(context.Background(), Config{
+		DatabasePath:    path,
+		InspectRecovery: func(context.Context, *store.DB) (RecoveryMode, error) { return Held, nil },
+		Services:        []Registration{{Service: service, RecoveryOnly: true}},
+	})
+	if err == nil {
+		r.Stop(context.Background())
+		t.Fatal("runtime accepted empty versioned catalog")
+	}
+	if admitted {
+		t.Fatal("recovery service admitted before rejecting missing schema")
+	}
+	o, err := Acquire(path)
+	if err != nil {
+		t.Fatal("failed startup retained ownership", err)
 	}
 	o.Close()
 }

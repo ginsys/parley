@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -424,5 +425,40 @@ func TestNamedMemoryURIRetainsIdentityAcrossWorkingDirectories(t *testing.T) {
 	var count int
 	if err := tx.QueryRow("SELECT count(*) FROM conversations WHERE id='shared'").Scan(&count); err != nil || count != 1 {
 		t.Fatalf("memory identity changed: %d %v", count, err)
+	}
+}
+
+func TestRuntimeWriterRejectsEmptyCatalogAtEveryVersion(t *testing.T) {
+	for version := 0; version <= len(migrations); version++ {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "empty.db")
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer raw.Close()
+			// SQLite-owned statistics are not application schema.
+			if _, err := raw.Exec("ANALYZE"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := raw.Exec(fmt.Sprintf("PRAGMA user_version=%d", version)); err != nil {
+				t.Fatal(err)
+			}
+			db, err := OpenExisting(context.Background(), path)
+			if err == nil {
+				db.Close()
+				t.Fatal("runtime accepted empty application catalog")
+			}
+			if !strings.Contains(err.Error(), "initialization required") {
+				t.Fatalf("empty catalog misclassified: %v", err)
+			}
+			var got, objects int
+			if err := raw.QueryRow("PRAGMA user_version").Scan(&got); err != nil || got != version {
+				t.Fatalf("version changed: %d %v", got, err)
+			}
+			if err := raw.QueryRow("SELECT count(*) FROM sqlite_master WHERE tbl_name NOT GLOB 'sqlite_*'").Scan(&objects); err != nil || objects != 0 {
+				t.Fatalf("catalog changed: %d %v", objects, err)
+			}
+		})
 	}
 }
