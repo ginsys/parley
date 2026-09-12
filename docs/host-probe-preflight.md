@@ -48,6 +48,8 @@ a preflight run on a different day.
 | Official plugin marketplace cache, `external_plugins/` | Contains `asana context7 discord fakechat firebase github gitlab imessage laravel-boost linear playwright serena telegram terraform`; no channels plugin |
 | `claude agents --json --all` | Background sessions report `{id, kind: "background", state, cwd, sessionId, name, startedAt}`; `state` values seen: `"done"` |
 | `claude agents --json` (no `--all`) | Interactive sessions report a *different* schema: `{pid, kind: "interactive", status, cwd, sessionId, name, startedAt}` — `status`, not `state` |
+| `claude agents --help` (re-read at `2.1.269`, 2026-09-12) | `--json`: "Print active sessions (interactive and background)"; `--all`: "With --json: also include completed background sessions"; `--cwd <path>`: "Show only background sessions started under <path>". The no-`--all` listing above showed only interactive entries because no background daemon was live, not because `--all` selects a kind |
+| `claude --cwd /tmp agents --json --all` (`2.1.269`) | Exit 1: `error: unknown option '--cwd'` — the root `claude` command has no `--cwd`; a background session's directory is the process cwd it is started from |
 | `claude logs e9f3bf35` (a `state: "done"` background session) | Exit nonzero: `Couldn't read logs for e9f3bf35 — connect ENOENT /tmp/cc-daemon-1000/9a97f840/control.sock`; the session's daemon has already exited |
 | `ls /tmp/cc-daemon-1000/` | Empty except the directory itself — no background session's daemon was live at observation time |
 | Codex rollout sample (`$CODEX_HOME/sessions/2026/09/11/rollout-*.jsonl`) | Confirmed real shape: one JSON object per line, a chat turn is `{"type": "response_item", "payload": {"type": "message", "role": "developer"\|"user"\|"assistant", "content": [{"type": "input_text"\|"output_text", "text": ...}]}}`, record-level ISO-8601 `timestamp`. The same file carries `{"type": "event_msg", "payload": {"type": "task_started"\|"task_complete"\|"turn_aborted", ...}}` records, each with its own record-level `timestamp` — the host's own turn boundaries |
@@ -61,6 +63,10 @@ matrix cell and are not wake/delivery results.
 Confirmed CLI surface beyond what #18 originally named, none of it yet exercised:
 - Claude 2.1.268: `--bg`/`--background` paired with `claude attach|agents|logs|stop|rm`,
   `--remote-control [name]`, `--mcp-config` (plain MCP), `--print --input-format=stream-json`.
+  `--cwd` exists only on `claude agents` as a listing filter (table above); the runner therefore
+  starts its session from the probe directory as the subprocess cwd. Still unexercised: `--cwd`
+  on `agents`, `--print`/`--model`/`--max-budget-usd` combined with `--bg`, and `claude --bg`
+  itself under captured stdout.
 - Codex 0.153.4: `codex queue --thread <uuid|name> --message <text>` (confirmed), also accepts
   `--remote unix://PATH` (unexercised).
 - OpenCode 1.18.30: `serve` (headless), `attach <url>`, `session list|delete`, `export
