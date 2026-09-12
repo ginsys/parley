@@ -362,6 +362,17 @@ class CodexParsingTests(unittest.TestCase):
                                          'content': [{'type': 'output_text', 'text': MARKER}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
+    def test_a_payload_missing_its_type_key_is_unusable_not_silently_skipped(self):
+        # `payload.get('type')` returning `None` for a missing key must not fall through the
+        # same path as a recognized-but-irrelevant string kind -- both `response_item` and
+        # `event_msg` always carry `payload.type` in every captured shape, so its absence here
+        # is a corrupted or drifted record, not evidence of a successful read.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
+                             'payload': {'role': 'assistant',
+                                         'content': [{'type': 'output_text', 'text': MARKER}]}}),
+                json.dumps({'type': 'event_msg', 'payload': {'role': 'assistant'}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 2))
+
     def test_a_non_object_record_is_unusable_rather_than_an_attributeerror(self):
         # Valid JSON is not necessarily an object -- a damaged or schema-drifted line can decode
         # to `null`, a number or a list -- and `record.get(...)` on any of those raises instead
