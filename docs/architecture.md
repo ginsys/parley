@@ -16,6 +16,43 @@ identity, database credential or proven protection against a peer with the same 
 permissions. Session identifiers are not yet bound to authenticated live sessions. Optional host
 policy tools can supplement these boundaries but are neither implemented nor required here.
 
+## Connection registry and command foundation
+
+Schema version 5 adds a stable installation UUID, immutable native binding tuples and peer keys,
+versioned credential verifiers, permanent operation results and append-only command audit. It
+creates no bindings or credentials from legacy grants, grants no membership and does not yet
+quarantine legacy delivery. Historical adoption schemas remain frozen; migration failure rolls
+back every DDL/data change and the schema version together. Runtime epochs are process-local,
+fresh per store lifetime; SQLite user_version remains the schema-version authority.
+
+Each store writer owns one coordinator. Its trusted internal Execute API acquires a cancellable
+gate and an immediate transaction, rechecks command/result access, and returns an existing receipt
+before reevaluating mutation-specific versions. New commands reserve checked audit/view counters,
+apply effects and insert their receipt/audit atomically. A terminal domain rejection rolls back its
+business-effect savepoint before recording its fixed result; infrastructure failure rolls back
+all writes. Successful commit publishes process-local state before releasing the gate. Callbacks
+must not reenter the coordinator, open another writer transaction or perform external I/O.
+Credential-file and response I/O belong after gate release. Unknown commit outcome disables further
+commands on that coordinator with recovery_required; the eventual runtime integration must stop
+admission and apply its recovery inspection, never infer that the mutation failed.
+
+Requests use typed logical fields after operation-specific schema validation, with explicit sets
+for contract-defined unordered arrays. Canonicalization sorts object fields and sets, rejects
+duplicates and unsupported values, preserves exact strings and distinguishes absent from null.
+Wire decoding and unknown-field/tag rejection remain the endpoint's responsibility. Only operation
+kind and the canonical digest are retained, not request payloads. Receipts/audit retain fixed codes
+and affected identity/version metadata, never message bodies or secrets. Replay reauthorizes current
+access, creates no second audit or effect, and has no TTL or automatic eviction. Disk capacity
+failure rejects new mutations with capacity_exceeded rather than deleting evidence.
+
+These are internal storage primitives with synthetic test callers, not authentication or a human
+administration endpoint. CommandPrincipal is trusted server input; passing identity fields does
+not authenticate a socket. Registration handlers must supply verified native evidence, legacy
+eligibility and trusted provisioning before using the binding/credential insertion primitive.
+Existing controller, dispatch and ingestion callers are unchanged at this foundation stage.
+The [connection specification](specifications/connections.md) remains authoritative for attachment,
+readiness, holds, ingestion barriers and clock/restore recovery that subsequent slices implement.
+
 ## Accepted runtime direction
 
 The owner-approved roadmap changes the target deployment, not the current behavior above.
