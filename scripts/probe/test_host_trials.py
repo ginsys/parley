@@ -24,6 +24,7 @@ from host_trials import (
     OpenCodeDriver,
     SessionCreationUncaptured,
     SessionRegistry,
+    SettleFailed,
     SubmissionUncaptured,
     SubmissionUnsupported,
     TeardownUnsupported,
@@ -1120,6 +1121,34 @@ class RunTrialTests(unittest.TestCase):
         driver = FakeDriver(clock=clock)
         self.run_one(driver, clock, settle=lambda: driver.order.append('settle'))
         self.assertEqual(driver.order[:3], ['create', 'settle', 'submit'])
+
+    def test_a_settle_failure_carries_the_session_id_rather_than_discarding_it(self):
+        # settle() runs after create() already produced a live, owned session; letting its
+        # failure propagate bare would discard the only place that session_id is ever surfaced,
+        # leaving an authenticated real-HOME session running with no way to find it.
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock)
+
+        def failing_settle():
+            raise RuntimeError('could not confirm busy state')
+
+        with self.assertRaises(SettleFailed) as caught:
+            self.run_one(driver, clock, settle=failing_settle)
+        self.assertEqual(caught.exception.session_id, 'sid')
+        self.assertIsInstance(caught.exception.original, RuntimeError)
+        self.assertNotIn('submit', driver.order)
+
+    def test_a_settle_interrupt_also_carries_the_session_id(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock)
+
+        def interrupting_settle():
+            raise KeyboardInterrupt
+
+        with self.assertRaises(SettleFailed) as caught:
+            self.run_one(driver, clock, settle=interrupting_settle)
+        self.assertEqual(caught.exception.session_id, 'sid')
+        self.assertIsInstance(caught.exception.original, KeyboardInterrupt)
 
     def test_rejected_submission_does_not_add_accepted(self):
         clock = FakeClock()

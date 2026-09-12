@@ -115,6 +115,22 @@ class TeardownUnsupported(NotImplementedError):
     """
 
 
+class SettleFailed(RuntimeError):
+    """Raised when `run_trial`'s state-establishing `settle()` callback fails or is interrupted.
+
+    `settle()` runs after `driver.create()` has already produced a live, owned session --
+    letting its failure propagate raw would discard the only place that session id is ever
+    surfaced, leaving an authenticated real-HOME session running with no documented way for the
+    caller to find and tear it down. `session_id` carries it so a caller can still call
+    `driver.teardown(session_id)` even though the trial itself never completed.
+    """
+
+    def __init__(self, session_id, original):
+        super().__init__(f'settle() failed for session {session_id!r}: {original!r}')
+        self.session_id = session_id
+        self.original = original
+
+
 @dataclass
 class SessionRegistry:
     """Tracks session ids created by *this run*; refuses to touch anything else.
@@ -1095,6 +1111,12 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     transcript outcome is marked unobservable rather than the usual "readable channel, genuinely
     absent", since an interrupted poll never reached its deadline and a channel staying readable
     up to that point is not proof the outcome would never have appeared.
+
+    A `settle()` failure or interrupt raises `SettleFailed(session_id, original)` rather than
+    propagating `original` bare: `settle()` runs after `create()` has already produced a live,
+    owned session, and the raw exception would discard the only place that id is ever surfaced,
+    leaving an authenticated real-HOME session running with no way for the caller to find and
+    tear it down.
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
@@ -1114,7 +1136,14 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         raise ValueError(f'poll_interval must be a positive, finite number of seconds: {poll_interval!r}')
     session_id = (driver.register_existing(existing_session) if existing_session is not None
                   else driver.create(prompt))
-    settle()
+    try:
+        settle()
+    except (Exception, KeyboardInterrupt) as error:
+        # settle() runs after create() has already produced a live, owned session; letting its
+        # failure or an interrupt during it propagate raw would discard the only place that
+        # session_id is ever surfaced, leaving an authenticated real-HOME session running with
+        # no way for the caller to find it.
+        raise SettleFailed(session_id, error) from error
     submitted_at = clock()
     deadline = monotonic() + (BUSY_CAP if state == 'busy' else LAST_WINDOW)
     accepted_unobservable = False
