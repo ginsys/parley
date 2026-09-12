@@ -505,7 +505,7 @@ class ClaudeDriver:
         """
         try:
             return self._background_session_ids() - before
-        except (RuntimeError, subprocess.TimeoutExpired, KeyboardInterrupt):
+        except (RuntimeError, OSError, subprocess.TimeoutExpired, KeyboardInterrupt):
             return set()
 
     def create(self, prompt):
@@ -582,9 +582,10 @@ class ClaudeDriver:
             raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')
         try:
             after = self._background_session_ids()
-        except (RuntimeError, subprocess.TimeoutExpired) as error:
-            # A transient listing failure here (timeout, nonzero exit, malformed JSON) is no
-            # different from the interrupt case just below it -- claude --bg already exited 0,
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+            # A transient listing failure here (timeout, nonzero exit, malformed JSON, or the
+            # executable vanishing between the two calls) is no different from the interrupt
+            # case just below it -- claude --bg already exited 0,
             # so a background session definitely exists, this read just failed to find its id.
             # The same bounded, best-effort recovery listing applies.
             raise AmbiguousSessionCreation(
