@@ -373,6 +373,20 @@ class CodexParsingTests(unittest.TestCase):
                 json.dumps({'type': 'event_msg', 'payload': {'role': 'assistant'}})]
         self.assertEqual(codex_rollout_events(lines), ([], 2))
 
+    def test_a_record_missing_its_outer_type_key_is_unusable_not_silently_skipped(self):
+        # record.get('type') returning None (or a non-string) for a missing/malformed outer
+        # discriminator must not fall through the same path as a recognized-but-irrelevant
+        # string kind like token_usage_record/world_state/turn_context/session_meta -- those
+        # are always a recognized string in every captured shape, so a missing or non-string
+        # outer type here is a corrupted or drifted record, not evidence of a successful read.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
+                             'payload': {'type': 'message', 'role': 'assistant',
+                                         'content': [{'type': 'output_text', 'text': MARKER}]}}),
+                json.dumps({'type': ['response_item'],
+                            'payload': {'type': 'message', 'role': 'assistant',
+                                        'content': [{'type': 'output_text', 'text': MARKER}]}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 2))
+
     def test_a_non_object_record_is_unusable_rather_than_an_attributeerror(self):
         # Valid JSON is not necessarily an object -- a damaged or schema-drifted line can decode
         # to `null`, a number or a list -- and `record.get(...)` on any of those raises instead

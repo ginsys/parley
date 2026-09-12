@@ -648,13 +648,14 @@ def codex_rollout_events(lines):
     boundary name must not be accepted as transcript evidence just because of that coincidence.
 
     `unusable` counts content that *should* have been readable and was not — a line that is not
-    valid JSON (a corrupt or half-written rollout), a `response_item`/`event_msg` record whose
-    `payload` is missing or not an object, a payload whose `type` is missing or not a string, a
-    message record whose `timestamp` is missing or malformed, or a message record whose `content`
-    is not the list of parts every captured shape carries (missing, explicit `null`, or a single
-    object rather than a list — a structured/tool-call payload this runner has not captured a
-    shape for). Neither can be ordered against submission, and opening a file successfully does
-    not establish that its transcript was read successfully. The caller reports such a read
+    valid JSON (a corrupt or half-written rollout), a record whose outer `type` is missing or not
+    a string, a `response_item`/`event_msg` record whose `payload` is missing or not an object, a
+    payload whose `type` is missing or not a string, a message record whose `timestamp` is
+    missing or malformed, or a message record whose `content` is not the list of parts every
+    captured shape carries (missing, explicit `null`, or a single object rather than a list — a
+    structured/tool-call payload this runner has not captured a shape for). Neither can be
+    ordered against submission, and opening a file successfully does not establish that its
+    transcript was read successfully. The caller reports such a read
     unobservable rather than letting absent outcomes become negative evidence.
     """
     events = []
@@ -675,6 +676,16 @@ def codex_rollout_events(lines):
             unusable += 1
             continue
         outer_kind = record.get('type')
+        if not isinstance(outer_kind, str):
+            # Same reasoning as payload.type below: a missing or non-string outer discriminator
+            # is a corrupted or schema-drifted record, not one of the known irrelevant record
+            # kinds this runner has no use for (token_usage_record, world_state, turn_context,
+            # session_meta, ...) -- those are always a recognized string. Treating a malformed
+            # discriminator the same as a known-irrelevant one let a record whose payload
+            # happened to carry the marker or a turn boundary skip silently with unusable == 0,
+            # so observe() could report a readable channel and publish a false not_observed.
+            unusable += 1
+            continue
         if outer_kind not in (CODEX_MESSAGE_RECORD_TYPE, CODEX_EVENT_RECORD_TYPE):
             continue
         payload = record.get('payload')
