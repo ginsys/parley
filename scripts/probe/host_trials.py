@@ -143,6 +143,9 @@ class SessionRegistry:
         self.created.discard(session_id)
 
 
+MARKER_PATTERN = re.compile(r'^PARLEY-PROBE-[0-9a-f]{32}$')
+
+
 def marker_token():
     """A fresh high-entropy marker per trial so an ack cannot be chance or terminal echo."""
     return f'PARLEY-PROBE-{uuid.uuid4().hex}'
@@ -1001,6 +1004,13 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
+    if not MARKER_PATTERN.match(marker):
+        # An empty, guessable or hand-typed marker can appear in a transcript for reasons that
+        # have nothing to do with this trial -- a short or low-entropy value risks colliding
+        # with real conversation text, silently promoting an unrelated message to `ack`. Only
+        # `marker_token()`'s own high-entropy shape is accepted; callers needing a marker call
+        # it rather than construct one by hand.
+        raise ValueError(f'marker does not look like a fresh marker_token() value: {marker!r}')
     if not math.isfinite(poll_interval) or poll_interval <= 0:
         # Caught here, before any session exists or the marker is sent: a negative or NaN
         # interval previously stayed unnoticed until the first `sleep()` call *after*
