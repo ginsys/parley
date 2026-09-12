@@ -1085,13 +1085,16 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     `accepted` alone marked unobservable, rather than propagating the exception and losing the
     trial's evidence entirely.
 
-    A `KeyboardInterrupt` during the polling loop — a real risk given a busy trial's up-to-900s
-    wait — is caught and finalizes a `TrialRun` from whatever was accumulated so far, rather than
-    propagating and losing it. An outcome already seen keeps standing on its own evidence; a
-    still-missing transcript outcome is marked unobservable rather than the usual
-    "readable channel, genuinely absent", since an interrupted poll never reached its deadline
-    and a channel staying readable up to that point is not proof the outcome would never have
-    appeared.
+    A `KeyboardInterrupt` while `submit()` itself is blocked is treated exactly like a
+    `subprocess.TimeoutExpired` from it: acceptance is recorded unobservable and observation
+    proceeds as though submission had returned True, since the host may already have received
+    the marker before the interrupt reached this call. A `KeyboardInterrupt` during the polling
+    loop that follows — a real risk given a busy trial's up-to-900s wait — is caught and
+    finalizes a `TrialRun` from whatever was accumulated so far, rather than propagating and
+    losing it. An outcome already seen keeps standing on its own evidence; a still-missing
+    transcript outcome is marked unobservable rather than the usual "readable channel, genuinely
+    absent", since an interrupted poll never reached its deadline and a channel staying readable
+    up to that point is not proof the outcome would never have appeared.
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
@@ -1134,6 +1137,16 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         # this would lose the trial (and any transcript evidence a delivered marker produced)
         # entirely, so acceptance itself is recorded unobservable rather than assumed either
         # way, and observation continues exactly as if submission had returned True.
+        accepted = True
+        accepted_unobservable = True
+    except KeyboardInterrupt:
+        # Mirrors the TimeoutExpired case immediately above: an operator's Ctrl-C while
+        # `submit()` is blocked leaves the same ambiguity -- the host may already have received
+        # the marker before the interrupt reached this call. The polling-loop interrupt handler
+        # below only covers interrupts *after* submission returns; without this, one that lands
+        # here would still escape uncaught and lose the trial (and any created session) with no
+        # TrialRun at all. A second interrupt during the polling loop that follows is what
+        # actually stops the trial, finalizing whatever partial evidence it gathered.
         accepted = True
         accepted_unobservable = True
     if not accepted:
