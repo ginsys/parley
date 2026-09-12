@@ -434,6 +434,43 @@ class ClaudeDriverTests(unittest.TestCase):
             driver.create('probe prompt')
         self.assertEqual(ctx.exception.candidates, ())
 
+    def test_create_recovers_candidates_when_claude_bg_itself_times_out(self):
+        # claude --bg can exceed its own 30s timeout after already detaching the background
+        # session -- the subprocess call raises before returning, but the session it forked is
+        # not thereby undone. A best-effort post-timeout listing should still surface it.
+        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
+        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'new1', 'kind': 'background'}])
+        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=after)])
+
+        def fake_run(argv, **kwargs):
+            if '--bg' in argv:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 30))
+            return next(responses)
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaises(AmbiguousSessionCreation) as ctx:
+            driver.create('probe prompt')
+        self.assertEqual(ctx.exception.candidates, ('new1',))
+
+    def test_create_reports_no_candidates_when_bg_timeout_recovery_listing_also_fails(self):
+        # The recovery attempt's own failure must not escalate to a second, unrelated exception
+        # -- it swallows to an empty candidate set since the caller is already reporting the
+        # original timeout.
+        before = json.dumps([])
+
+        def fake_run(argv, **kwargs):
+            if '--bg' in argv:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 30))
+            if not hasattr(fake_run, 'called'):
+                fake_run.called = True
+                return FakeResult(0, stdout=before)
+            return FakeResult(1, stderr='daemon unavailable')
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaises(AmbiguousSessionCreation) as ctx:
+            driver.create('probe prompt')
+        self.assertEqual(ctx.exception.candidates, ())
+
     def test_submit_refuses_a_foreign_session(self):
         driver = ClaudeDriver(SessionRegistry(), run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
         with self.assertRaises(ForeignSessionError):
