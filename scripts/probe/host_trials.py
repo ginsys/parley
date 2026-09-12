@@ -556,7 +556,10 @@ class ClaudeDriver:
         a fresh best-effort listing can still surface its id even though this specific read was
         interrupted.
         """
-        argv = ['claude', '--bg', '--cwd', self.cwd, '--print']
+        # The root `claude` command has no `--cwd` (only `claude agents` does, as a listing
+        # filter -- docs/host-probe-preflight.md); the session's directory is the subprocess cwd,
+        # which is what the `--cwd`-filtered before/after listings below match against.
+        argv = ['claude', '--bg', '--print']
         if self.model:
             argv += ['--model', self.model]
         if self.max_budget_usd is not None:
@@ -564,7 +567,7 @@ class ClaudeDriver:
         argv.append(prompt)
         before = self._background_session_ids()
         try:
-            result = self.run(argv, capture_output=True, text=True, timeout=30)
+            result = self.run(argv, capture_output=True, text=True, timeout=30, cwd=self.cwd)
         except subprocess.TimeoutExpired as error:
             raise AmbiguousSessionCreation(
                 f'claude --bg under {self.cwd} did not exit within its 30s timeout; it may have '

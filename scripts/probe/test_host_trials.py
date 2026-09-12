@@ -494,14 +494,18 @@ class ClaudeDriverTests(unittest.TestCase):
                           FakeResult(0, stdout=after)])
 
         def fake_run(argv, **kwargs):
-            calls.append(argv)
+            calls.append((argv, kwargs))
             return next(responses)
 
         driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
         session_id = driver.create('probe prompt')
         self.assertEqual(session_id, 'abcd1234')
         self.assertIn('claude:abcd1234', registry.created)
-        self.assertEqual(calls[1][:3], ['claude', '--bg', '--cwd'])
+        # The root command has no --cwd flag (docs/host-probe-preflight.md); the session's
+        # directory is the subprocess cwd, the same directory the listings filter on.
+        self.assertEqual(calls[1][0][:3], ['claude', '--bg', '--print'])
+        self.assertNotIn('--cwd', calls[1][0])
+        self.assertEqual(calls[1][1].get('cwd'), '/scratch')
 
     def test_create_raises_on_nonzero_exit(self):
         def fake_run(argv, **kwargs):
