@@ -1149,20 +1149,24 @@ class CodexDriverTests(unittest.TestCase):
                               run=lambda *a, **k: FakeResult(0, stdout='codex-cli 0.153.4\n'))
         self.assertEqual(driver.version('thread-1'), '0.154.0')
 
-    def test_version_falls_back_to_the_client_when_the_rollout_has_no_cli_version(self):
+    def test_version_is_none_rather_than_the_client_when_the_rollout_has_no_cli_version(self):
+        # The installed client's version can disagree with the adopted thread's own (see the
+        # test above) -- falling back to it here would misattribute the matrix cell to a binary
+        # that may not be the one that produced the transcript, so this reports unknown instead
+        # of ever calling `codex --version` for this field.
         path = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
-        driver = self.driver(SessionRegistry(), path,
-                              run=lambda *a, **k: FakeResult(0, stdout='codex-cli 0.153.4\n'))
-        self.assertEqual(driver.version('thread-1'), 'codex-cli 0.153.4')
+        driver = self.driver(SessionRegistry(), path)
+        self.assertIsNone(driver.version('thread-1'))
 
-    def test_version_falls_back_to_the_client_when_there_is_no_rollout_path(self):
-        driver = self.driver(SessionRegistry(), None,
-                              run=lambda *a, **k: FakeResult(0, stdout='codex-cli 0.153.4\n'))
-        self.assertEqual(driver.version('thread-1'), 'codex-cli 0.153.4')
+    def test_version_is_none_rather_than_the_client_when_there_is_no_rollout_path(self):
+        driver = self.driver(SessionRegistry(), None)
+        self.assertIsNone(driver.version('thread-1'))
 
-    def test_version_is_none_when_neither_rollout_nor_client_can_be_read(self):
-        driver = self.driver(SessionRegistry(), None,
-                              run=lambda *a, **k: FakeResult(1, stderr='not found'))
+    def test_version_is_none_when_the_rollout_cannot_be_read(self):
+        path = self.rollout(lines=['not json\n'])
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o644)
+        driver = self.driver(SessionRegistry(), path)
         self.assertIsNone(driver.version('thread-1'))
 
 
