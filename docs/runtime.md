@@ -62,7 +62,8 @@ paths while service runs. Simultaneous restored copies are not made safe by sepa
 ## Startup and shutdown
 
 `runtime.Start` requires an explicit recovery inspector. After ownership it opens the existing
-writer (rejecting missing files, empty placeholders and empty application catalogs), performs ordered
+writer (rejecting missing files, empty placeholders and empty application catalogs at every schema
+version), performs ordered
 migrations, asks the inspector for `Normal` or `Held`, establishes permitted
 recovery, opens readers, and starts registered services. Missing/unknown/failed inspection rejects
 startup. Normal mode applies `RecoverUncertain`: interrupted `dispatching` rows become `uncertain`
@@ -76,8 +77,13 @@ Concrete durable clock/restore markers and authenticated human disposition are n
 this slice. Tests inject controlled inspection results; a future executable must implement the
 accepted recovery contract before exposing ordinary operations.
 
-Each service receives initialized writer/query resources and a worker context. `Start` must honor
-cancellation and return after initialization. `StopAdmission` promptly closes acceptance of new
+Each service receives initialized writer/query resources and `Resources.WorkerContext` for admitted
+work. `Start` receives a separate initialization context: it must honor cancellation and return
+after initialization, including partial failure. That context is cancelled when startup ends;
+workers must use `Resources.WorkerContext`, which remains alive until admission has stopped.
+If cancellation interrupts a later service's initialization, earlier services retain live workers
+while it unwinds; then the same ordered cleanup stops admission before cancelling any workers.
+`StopAdmission` promptly closes acceptance of new
 work, while `Wait` joins workers and their independent settlement. Both cleanup methods must be safe
 after partial `Start` failure; errors report a completed cleanup, not permission to abandon workers.
 A failed service start is included in reverse cleanup.

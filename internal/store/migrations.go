@@ -29,15 +29,18 @@ func migrate(ctx context.Context, db *sql.DB, allowCreate bool) error {
 	if version < 0 || version > len(migrations) {
 		return fmt.Errorf("unsupported schema version %d", version)
 	}
-	if version == 0 && !allowCreate {
-		catalog, err := readSchemaCatalog(ctx, tx)
-		if err != nil {
+	if !allowCreate {
+		// Presence only, not DDL inference: later versions still use numbered
+		// migrations. An empty catalog cannot be legitimized by user_version.
+		var present bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE tbl_name NOT GLOB 'sqlite_*')").Scan(&present); err != nil {
 			return err
 		}
-		if len(catalog) == 0 {
+		if !present {
 			return fmt.Errorf("database initialization required")
 		}
 	}
+
 	for version < len(migrations) {
 		if err := migrations[version](ctx, tx); err != nil {
 			return fmt.Errorf("migration %d: %w", version+1, err)

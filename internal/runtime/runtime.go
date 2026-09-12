@@ -20,16 +20,21 @@ const (
 )
 
 type Resources struct {
-	Writer  *store.DB
-	Queries store.Queries
-	Mode    RecoveryMode
+	// WorkerContext owns admitted work, independently of startup cancellation.
+	// Services must use this context for workers, not Start's initialization context.
+	WorkerContext context.Context
+	Writer        *store.DB
+	Queries       store.Queries
+	Mode          RecoveryMode
 }
 
 // Service is trusted wiring, not an agent-selected capability. Start may publish
 // admission only after runtime initializes resources. StopAdmission must stop new
 // work promptly, without waiting for workers. Wait joins all workers and their
 // independent outcome settlement. Both must work after a partially failed Start.
-// The Start context lives until shutdown; Start must honor startup cancellation.
+// Start's context is for initialization only and is cancelled when startup ends.
+// Admitted work uses Resources.WorkerContext. Start must honor cancellation and
+// return before cleanup calls StopAdmission, including on partial initialization.
 type Service interface {
 	Start(context.Context, Resources) error
 	StopAdmission() error
@@ -85,11 +90,11 @@ func start(ctx context.Context, cfg Config, open func(context.Context, string) (
 	}
 	workers, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	r := &Runtime{ownership: ownership, cancel: cancel, done: make(chan struct{})}
-	// A cancelled startup interrupts an initializing service. After success, the
-	// watcher below instead stops admission before cancelling established workers.
-	interruptStartup := context.AfterFunc(ctx, cancel)
-	defer interruptStartup()
+	// Initialization may be interrupted without killing workers of services
+	// that already admit work. Cleanup always stops admission before workers.
+	startup, cancelStartup := context.WithCancel(ctx)
 	defer func() {
+		cancelStartup()
 		if err != nil {
 			r.beginStop()
 			<-r.done
@@ -116,7 +121,7 @@ func start(ctx context.Context, cfg Config, open func(context.Context, string) (
 	if err := r.db.OpenReaders(ctx); err != nil {
 		return nil, fmt.Errorf("open readers: %w", err)
 	}
-	resources := Resources{Writer: r.db, Queries: r.db.Queries(), Mode: mode}
+	resources := Resources{WorkerContext: workers, Writer: r.db, Queries: r.db.Queries(), Mode: mode}
 	for _, registration := range cfg.Services {
 		if mode == Held && !registration.RecoveryOnly {
 			continue
@@ -126,14 +131,13 @@ func start(ctx context.Context, cfg Config, open func(context.Context, string) (
 		}
 		// Register before Start so partial initialization is included in cleanup.
 		r.services = append(r.services, registration.Service)
-		if err := registration.Service.Start(workers, resources); err != nil {
+		if err := registration.Service.Start(startup, resources); err != nil {
 			return nil, fmt.Errorf("start service: %w", err)
 		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	interruptStartup()
 	go func() {
 		select {
 		case <-ctx.Done():
