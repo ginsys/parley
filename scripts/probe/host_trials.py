@@ -488,6 +488,12 @@ class ClaudeDriver:
         the timeout above -- the same bounded, best-effort recovery -- while still honoring the
         actual cancellation: the recovery listing carries its own 15s timeout, and nothing here
         retries `claude --bg` or waits further, so the call still aborts immediately.
+
+        A Ctrl-C can also arrive while the *post-create* listing (`after = ...`) is running,
+        after `claude --bg` has already exited 0. This is stronger than the two cases above --
+        a background session definitely exists, not just "may" -- but the same recovery applies:
+        a fresh best-effort listing can still surface its id even though this specific read was
+        interrupted.
         """
         argv = ['claude', '--bg', '--cwd', self.cwd, '--print']
         if self.model:
@@ -517,6 +523,15 @@ class ClaudeDriver:
                 f'claude --bg exited 0 but the post-create listing under {self.cwd} could not '
                 f'be read ({error!r}); a background session may now be running with an id this '
                 'runner never learned', candidates=()) from error
+        except KeyboardInterrupt as error:
+            # Unlike the two Ctrl-C cases above, `claude --bg` has already exited 0 here: a
+            # background session definitely exists, this call just doesn't know its id yet. The
+            # same bounded, best-effort recovery listing can still find it.
+            raise AmbiguousSessionCreation(
+                f'claude --bg exited 0 but was interrupted while reading the post-create '
+                f'listing under {self.cwd}; a background session may now be running with an id '
+                'this runner never learned',
+                candidates=sorted(self._recoverable_candidates(before))) from error
         new = after - before
         if len(new) != 1:
             raise AmbiguousSessionCreation(

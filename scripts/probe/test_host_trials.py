@@ -570,6 +570,29 @@ class ClaudeDriverTests(unittest.TestCase):
             driver.create('probe prompt')
         self.assertEqual(ctx.exception.candidates, ())
 
+    def test_create_recovers_candidates_when_interrupted_during_the_post_create_listing(self):
+        # claude --bg can exit 0 -- a background session definitely exists -- and then a Ctrl-C
+        # lands while the post-create listing itself is being read. That listing's own except
+        # clause caught only RuntimeError/TimeoutExpired, so KeyboardInterrupt escaped without a
+        # minted id or recovered candidates even though a fresh listing could still find one.
+        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
+        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'new1', 'kind': 'background'}])
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            if '--bg' in argv:
+                return FakeResult(0)
+            if len(calls) == 3:
+                raise KeyboardInterrupt()
+            return FakeResult(0, stdout=before if len(calls) == 1 else after)
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaises(AmbiguousSessionCreation) as ctx:
+            driver.create('probe prompt')
+        self.assertEqual(ctx.exception.candidates, ('new1',))
+        self.assertIsInstance(ctx.exception.__cause__, KeyboardInterrupt)
+
     def test_create_recovers_candidates_when_interrupted_while_claude_bg_is_blocked(self):
         # A Ctrl-C while claude --bg is running shares the timeout case's ambiguity: the
         # background session may already have detached before the interrupt landed. This must
