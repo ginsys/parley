@@ -104,6 +104,62 @@ and a directory-sync failure after rename. Controlled test subprocesses exit bef
 after publication and after evidence recording; restart replays the receipt without publishing again.
 These cover provisioning portions of C01/C02/C14/C17 and do not satisfy the live-connection gate.
 
+## Internal connection attachment
+
+The Linux connection Manager owns one registry per writer, reserved through the shared
+coordinator. It accepts connected Unix streams from the future control endpoint and derives the
+connector UID with [SO_PEERCRED](https://man7.org/linux/man-pages/man7/unix.7.html). The client
+DialTrustedServer checks a protected pathname and the configured server UID before returning a
+socket on which credential material may be sent. Descriptor-relative lookup rejects symlinks,
+abstract addresses and directories replaceable by untrusted accounts. Kernel identity identifies
+an account; possession of a stolen credential within that account remains an accepted limitation.
+
+A positive nonattached-socket bound and five-second authentication deadline include coordinator
+wait time. Each socket serializes credential operations through rejection cleanup. Failed initial
+authentication cancels that socket with authentication_failed. Successful inspection retains only
+a restricted identity and returns epoch, committed generation and active status; it reserves no
+attachment or readiness. Inspected sockets remain within the nonattached bound. Every lookup and
+attachment rechecks credential hash, native tuple, kernel UID, lifecycle and server-time expiry.
+Observed credential expiry commits terminal state before it can be revived by an earlier clock.
+The required trusted guard supplies global clock/recovery policy in the later recovery slice.
+
+Attachment compares and increments the durable generation in an immediate transaction. Its
+server-created Session capability is installed after commit under the same coordinator gate.
+A concurrent socket cannot evict the winner. Repeating attachment on that winning socket rechecks
+its identity and returns the same capability. Public Token metadata exists only for trusted host
+evidence and cannot construct a Session. Generation overflow rolls back without installation;
+view-revision overflow additionally stops ordinary service. A deadline crossing during authorization
+or publication cannot install a usable expired socket. Connection transitions have their own
+transaction rules, separate from ordinary operation-result receipts. An uncertain commit disables
+further coordinator operations and publishes no slot.
+
+Host verification runs outside the coordinator and is cancelled with the socket lifetime. Each
+explicit readiness attempt starts unready with a fresh random nonce and a thirty-second deadline.
+The trusted adapter ACK must match the verified native tuple, exact token and current nonce.
+Heartbeats update liveness alone: adapters must send them every ten seconds, and thirty seconds
+without one expires the slot. Delayed callbacks check current socket ownership; due slots cannot
+block a replacement while their timer is waiting. Cancellation takes effect immediately even if
+writer cleanup fails; subsequent coordinated housekeeping removes cancelled records. Reconnect
+inspects before each compare-and-swap attempt, allows at most three retries spaced at least one
+second apart, and returns control on exhaustion. A reopened writer creates a new epoch and retains
+the committed generation while discarding readiness.
+
+Internal administrative disconnect requires a separately authenticated principal and exact
+binding/epoch/generation. Its receipt and audit commit before cancellation; replay or a stale target
+cannot disconnect a successor. Rotation/revocation providers use the infallible Invalidate
+publication callback, cancelling the old transport and readiness under the shared gate.
+
+Controlled fixtures cover C03 authentication forgery and one-attempt closure; C04 concurrent
+attachment, lost readiness across restart and bounded reconnect; C05 stale callbacks and exact
+disconnect; C06 synthetic verifier matching/failure; C17 deadline equality, terminal expiry and
+counter bounds; and C18 wrong-UID rejection and accepted same-account credential possession.
+These internal APIs currently have test-only callers. Human endpoints/admission remain owned by
+[#28](https://github.com/ginsys/parley/issues/28), real host evidence by
+[#30](https://github.com/ginsys/parley/issues/30) and [#31](https://github.com/ginsys/parley/issues/31).
+There is no runnable listener, wire parser, human credential CLI or live-session validation in
+this slice. Grants continue through the existing protected controller; authenticated ordinary
+acceptance, dispatch and ingestion follow in the storage/recovery and caller-migration slices.
+
 ## Accepted runtime direction
 
 The owner-approved roadmap changes the target deployment, not the current behavior above.
@@ -489,6 +545,7 @@ All migration steps and `PRAGMA user_version` changes run within one immediate t
 | 2 | Persist renewal cancellation policy on grants |
 | 3 | Add dispatch attempt and fixed diagnostic fields |
 | 4 | Backfill numeric envelope timestamps and add the recipient queue index |
+| 5 | Add installation, bindings, credentials, publication evidence and permanent command results/audit |
 
 `schema.sql` remains the frozen version-1 schema used for legacy adoption. Only version-zero
 bootstrap inspects column layouts; subsequent steps follow version numbers. Unknown legacy
