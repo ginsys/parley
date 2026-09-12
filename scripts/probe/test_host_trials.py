@@ -763,6 +763,23 @@ class ClaudeDriverTests(unittest.TestCase):
             driver.teardown('abcd1234')
         registry.require_owned('claude:abcd1234')  # still ours: the live session can still be removed
 
+    def test_version_reports_stripped_stdout(self):
+        driver = ClaudeDriver(SessionRegistry(),
+                               run=lambda *a, **k: FakeResult(0, stdout='2.1.268\n'), cwd='/scratch')
+        self.assertEqual(driver.version(), '2.1.268')
+
+    def test_version_is_none_when_the_command_fails(self):
+        driver = ClaudeDriver(SessionRegistry(),
+                               run=lambda *a, **k: FakeResult(1, stderr='not found'), cwd='/scratch')
+        self.assertIsNone(driver.version())
+
+    def test_version_is_none_when_the_run_call_itself_raises(self):
+        def raising_run(*_args, **_kwargs):
+            raise subprocess.TimeoutExpired(cmd=['claude', '--version'], timeout=15)
+
+        driver = ClaudeDriver(SessionRegistry(), run=raising_run, cwd='/scratch')
+        self.assertIsNone(driver.version())
+
 
 class CodexDriverTests(unittest.TestCase):
     RUN_STARTED = datetime.datetime(2026, 9, 11, 12, 0, 0, tzinfo=datetime.UTC).timestamp()
@@ -1055,6 +1072,16 @@ class CodexDriverTests(unittest.TestCase):
         with self.assertRaises(ForeignSessionError):
             self.driver(SessionRegistry(), None).teardown('not-mine')
 
+    def test_version_reports_stripped_stdout(self):
+        driver = self.driver(SessionRegistry(), None,
+                              run=lambda *a, **k: FakeResult(0, stdout='codex-cli 0.153.4\n'))
+        self.assertEqual(driver.version(), 'codex-cli 0.153.4')
+
+    def test_version_is_none_when_the_command_fails(self):
+        driver = self.driver(SessionRegistry(), None,
+                              run=lambda *a, **k: FakeResult(1, stderr='not found'))
+        self.assertIsNone(driver.version())
+
 
 class CrossDriverNamespaceTests(unittest.TestCase):
     """A bare session id minted by one driver must not satisfy another's ownership check.
@@ -1124,17 +1151,25 @@ class FakeDriver:
     """Scripted host: `observations` is consumed one entry per observe() call, last repeating."""
 
     def __init__(self, *, observations=None, accepted=True, submit_error=None,
-                 observe_error=None, clock=None):
+                 observe_error=None, version_value=None, version_error=None, clock=None):
         self.observations = list(observations or [Observation()])
         self.accepted = accepted
         self.submit_error = submit_error
         self.observe_error = observe_error
+        self.version_value = version_value
+        self.version_error = version_error
         self.clock = clock
         self.order = []
 
     def create(self, prompt):
         self.order.append('create')
         return 'sid'
+
+    def version(self):
+        self.order.append('version')
+        if self.version_error is not None:
+            raise self.version_error
+        return self.version_value
 
     def register_existing(self, session_id):
         self.order.append('register_existing')
@@ -1222,11 +1257,26 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(run.observable['turn_start'])
         self.assertFalse(run.observable['ack'])
 
+    def test_the_result_carries_the_driver_version_captured_at_trial_time(self):
+        # A matrix cell is version-scoped (docs/host-wake-matrix.md); without this, a cell built
+        # against a drifted binary is indistinguishable from one built at the recorded preflight.
+        clock = FakeClock()
+        driver = FakeDriver(version_value='2.1.268', clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertEqual(run.version, '2.1.268')
+
+    def test_a_version_read_failure_records_none_rather_than_losing_the_trial(self):
+        clock = FakeClock()
+        driver = FakeDriver(version_error=RuntimeError('claude --version exited 1'), clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertIsNone(run.version)
+        self.assertEqual(run.session_id, 'sid')  # the rest of the trial still completed normally
+
     def test_settle_runs_between_create_and_submit(self):
         clock = FakeClock()
         driver = FakeDriver(clock=clock)
         self.run_one(driver, clock, settle=lambda: driver.order.append('settle'))
-        self.assertEqual(driver.order[:3], ['create', 'settle', 'submit'])
+        self.assertEqual(driver.order[:4], ['create', 'version', 'settle', 'submit'])
 
     def test_a_settle_failure_carries_the_session_id_rather_than_discarding_it(self):
         # settle() runs after create() already produced a live, owned session; letting its
@@ -1431,7 +1481,7 @@ class RunTrialTests(unittest.TestCase):
         clock = FakeClock()
         driver = FakeDriver(clock=clock)
         run = self.run_one(driver, clock, existing_session='sid')
-        self.assertEqual(driver.order[:2], ['register_existing', 'submit'])
+        self.assertEqual(driver.order[:3], ['register_existing', 'version', 'submit'])
         self.assertNotIn('create', driver.order)
         self.assertEqual(run.session_id, 'sid')
 
