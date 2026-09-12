@@ -568,6 +568,13 @@ def codex_rollout_events(lines):
         if not isinstance(payload, dict):
             continue
         kind = payload.get('type')
+        if kind is not None and not isinstance(kind, str):
+            # A non-string type (e.g. a schema-drifted list or object) crashes the membership
+            # test below with an unhashable-type TypeError; it is also not one of the known
+            # record shapes this runner has no use for (token_usage_record, world_state, ...),
+            # so it is a corrupted or drifted record, not evidence of a successful read.
+            unusable += 1
+            continue
         if kind in TURN_BOUNDARY_ROLES:
             when = record_time(record)
             if when is None:

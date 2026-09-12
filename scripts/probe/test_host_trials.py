@@ -212,6 +212,12 @@ class CodexParsingTests(unittest.TestCase):
                                          'content': [{'text': MARKER}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
+    def test_a_non_string_payload_type_is_unusable_rather_than_a_typeerror(self):
+        # A schema-drifted, unhashable payload.type (e.g. a list) crashed the
+        # `kind in TURN_BOUNDARY_ROLES` membership test with a TypeError.
+        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'payload': {'type': []}})]
+        self.assertEqual(codex_rollout_events(lines), ([], 1))
+
     def test_unparseable_lines_count_as_unusable_while_other_record_types_do_not(self):
         # A record this runner has no use for is not a failed read; a line that is not JSON is.
         lines = ['not json', json.dumps({'payload': {'type': 'world_state'}}), '']
