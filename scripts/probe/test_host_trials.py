@@ -589,6 +589,22 @@ class ClaudeDriverTests(unittest.TestCase):
             driver.submit('abcd1234', 'msg')
         self.assertIn('--all', seen[0])
 
+    def test_submit_translates_a_listing_timeout_into_uncaptured_not_a_raw_timeout(self):
+        # The listing is a presence check, run entirely before submit()'s unconditional
+        # SubmissionUncaptured raise -- its timing out means the marker was definitely never
+        # sent. Left as a raw TimeoutExpired, run_trial's generic handler would treat it as
+        # "maybe delivered before the timeout fired", which is not true for a driver with no
+        # delivery mechanism at all.
+        registry = SessionRegistry()
+        registry.mint('claude:abcd1234')
+
+        def fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 15))
+
+        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('abcd1234', 'msg')
+
     def test_submit_rejects_a_session_absent_from_the_listing_before_anything_else(self):
         registry = SessionRegistry()
         registry.mint('claude:abcd1234')
