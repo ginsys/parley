@@ -10,7 +10,10 @@ Early, incremental build. Present: sqlite schema, the state machine (`internal/s
 protected controller (`internal/controller`), ordinary send/dispatch (`internal/dispatch`), the
 Claude-side readiness handshake and gated poller (`internal/adapter/claude`), reply-marker
 parsing/validation (`internal/replymarker`), and the Codex-side transport/ingest adapter
-(`internal/adapter/codex`) over `codex queue`. Not yet present: identity binding and a runnable bridge. Do not treat anything below `internal/` as wired to a live session yet —
+(`internal/adapter/codex`) over `codex queue`. Also present: the internal Linux ownership/startup
+lifecycle (`internal/runtime`) and explicit
+read-only SQLite query pool. These have controlled fixtures, not executable/endpoint wiring.
+Not yet present: identity binding and a runnable bridge. Do not treat anything below `internal/` as wired to a live session yet —
 `dispatch.Transport` is an interface with no real Channels implementation in this repo so far,
 `Handshake.sendProbe`/`Ack` are not wired to an actual Channels connection or the `reply` tool, and
 `codex.ExecSender`/`IngestTurn` are untested against an actual `codex` CLI or rollout file.
@@ -118,6 +121,11 @@ The store uses `database/sql.Tx` with the SQLite driver's `_txlock=immediate`: t
 acquired before authorization reads, and the standard library/driver own cancellation and failed
 commit cleanup. Outcome recording after a host attempt keeps its independent context so caller
 cancellation does not erase delivery evidence. Connection pragmas are supplied through the DSN.
+
+Pure queue/status queries use the explicit four-connection reader pool with deferred read-only
+transactions and a five-second total query deadline. Open readers only after migrations and recovery;
+there is no writer fallback. Runtime ownership and lifecycle contracts are documented in
+[Runtime foundation](docs/runtime.md). Mutation authorization stays inside the immediate writer.
 
 Schema upgrades use ordered `PRAGMA user_version` steps in an immediate transaction. Version-zero
 adoption compares the complete application catalog against the shipped schemas: initial `a024019`,

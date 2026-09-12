@@ -40,6 +40,13 @@ func OpenExisting(ctx context.Context, path string) (*DB, error) {
 }
 
 func open(ctx context.Context, path string, existing bool) (*DB, error) {
+	normalized, err := normalizedDatabaseURL(path)
+	if err != nil {
+		return nil, err
+	}
+	// Pin relative paths at writer initialization; reader initialization must not
+	// follow a later process working-directory change to a different database.
+	path = normalized.String()
 	dsn, err := databaseDSN(path)
 	if err != nil {
 		return nil, err

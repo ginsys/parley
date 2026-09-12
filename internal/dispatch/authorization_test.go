@@ -289,3 +289,48 @@ func TestPermittedDirectionsAndClaimAuthorization(t *testing.T) {
 		})
 	}
 }
+
+func TestReaderCandidateDoesNotAuthorizeAfterAdministration(t *testing.T) {
+	for _, action := range []string{"revoke", "renew"} {
+		t.Run(action, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestDB(t)
+			ctrl := controller.New(db)
+			grantOne(t, ctrl, "c", 5)
+			tr := newFakeTransport()
+			bridge := dispatch.New(db, tr)
+			e, err := bridge.Send(ctx, "c", "claude-session-a", "codex-thread-b", "synthetic", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids, _, err := db.Queries().QueueBatch(ctx, "c", "codex-thread-b", 100, nil)
+			if err != nil || len(ids) != 1 || ids[0].ID != e.ID {
+				t.Fatalf("selection: %v %v", ids, err)
+			}
+			if action == "revoke" {
+				_, err = ctrl.Revoke(ctx, "c")
+			} else {
+				_, err = ctrl.Renew(ctx, controller.RenewParams{Conversation: "c", MaxExchanges: 5})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := bridge.DispatchOutcome(ctx, ids[0].ID)
+			if err != nil || out.Attempted || out.State != store.Cancelled {
+				t.Fatalf("stale selection delivered: %+v %v", out, err)
+			}
+			if len(tr.delivered) != 0 {
+				t.Fatal("host called after authority changed")
+			}
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			var used int64
+			if err := tx.QueryRowContext(ctx, "SELECT sum(exchanges_used) FROM grants WHERE conversation='c'").Scan(&used); err != nil || used != 0 {
+				t.Fatalf("budget changed: %d %v", used, err)
+			}
+		})
+	}
+}
