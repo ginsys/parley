@@ -1,11 +1,11 @@
 # Connection principals and session lifecycle specification
 
-Specification under review for [#22](https://github.com/ginsys/parley/issues/22), grounded in the
+Accepted specification for [#22](https://github.com/ginsys/parley/issues/22), grounded in the
 accepted [identity decision](../identity-proposal.md) and [membership contract](membership.md).
-PR #44 supplies the prior landed baseline; the current legacy-quarantine and clock-recovery
-corrections require review and landing before completion is reassessed. GitHub owns acceptance.
-These proposed contracts add no runtime or schema implementation. The [control specification](control.md)
-maps the logical operations to proposed wire contracts.
+GitHub owns acceptance and implementation completion. This document defines the target contracts;
+it does not claim they are all implemented. The [control specification](control.md) maps the
+logical operations to accepted wire contracts. See [Architecture](../architecture.md) for the
+implemented foundation and its limitations.
 
 ## Scope and boundaries
 

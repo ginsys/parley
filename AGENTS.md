@@ -207,3 +207,15 @@ Before moving an existing database behind a text-only administration interface, 
 any incompatible history's disposition. No automatic repair, encoded aliases or recovery API is
 introduced. This byte rule replaces the rejected Unicode compatibility machinery; trimming would
 still retarget existing keys, so any future normalization needs a separate migration decision.
+
+## Connection registry foundation
+
+Schema version 5 and the store-owned coordinator introduce the internal binding/credential registry
+and permanent operation-result/audit ledger. They have synthetic callers only at this stage, no
+human CLI/RPC or live authentication surface. Never treat CommandPrincipal fields as authenticated
+input. Trusted handlers must recheck current authority through the coordinator before replay and
+validate host evidence/legacy eligibility before registration. Every writer owns one coordinator;
+callbacks perform no external I/O, reentrant coordinator calls or nested writer transactions.
+Terminal rejection discards business effects before auditing; result/audit failure rolls all effects
+back. Unknown commit outcome disables that coordinator pending runtime recovery. Replay evidence
+has no TTL eviction. Preserve immutable migration history and frozen legacy adoption schemas.

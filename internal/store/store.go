@@ -24,12 +24,13 @@ var schema string
 
 // DB owns one immediate writer and, after explicit initialization, deferred readers.
 type DB struct {
-	sql       *sql.DB
-	path      string
-	readers   atomic.Pointer[sql.DB]
-	lifecycle sync.Mutex
-	closed    bool
-	closeErr  error
+	coordinator *Coordinator
+	sql         *sql.DB
+	path        string
+	readers     atomic.Pointer[sql.DB]
+	lifecycle   sync.Mutex
+	closed      bool
+	closeErr    error
 }
 
 func Open(ctx context.Context, path string) (*DB, error) {
@@ -89,7 +90,9 @@ func open(ctx context.Context, path string, existing bool) (*DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate schema: %w", err)
 	}
-	return &DB{sql: db, path: path}, nil
+	result := &DB{sql: db, path: path}
+	result.coordinator = &Coordinator{db: result, gate: make(chan struct{}, 1), now: time.Now}
+	return result, nil
 }
 
 // Only memory/cache URI options are caller-selectable. Locking and foreign-key
