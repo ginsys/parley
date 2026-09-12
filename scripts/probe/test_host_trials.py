@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from unittest.mock import patch
 
 from host_trials import (
+    MARKER_PATTERN,
     AmbiguousSessionCreation,
     ClaudeDriver,
     CodexDriver,
@@ -1219,6 +1220,18 @@ class RunTrialTests(unittest.TestCase):
                 self.run_one(driver, clock, poll_interval=bad)
             self.assertEqual(driver.order, [])
 
+    def test_marker_is_validated_before_any_session_exists_or_is_sent(self):
+        # An empty or hand-typed marker can appear in a transcript for reasons unrelated to this
+        # trial, silently promoting an unrelated message to `ack`; only marker_token()'s own
+        # high-entropy shape is accepted.
+        for bad in ('', 'hello', MARKER.upper(), 'PARLEY-PROBE-tooshort'):
+            clock = FakeClock()
+            driver = FakeDriver(clock=clock)
+            with self.assertRaises(ValueError):
+                run_trial(driver, prompt='hi', marker=bad, clock=clock.time,
+                          monotonic=clock.monotonic, sleep=clock.sleep)
+            self.assertEqual(driver.order, [])
+
 
 class ClassifyTrialTests(unittest.TestCase):
     def test_open_window_raises_rather_than_defaulting(self):
@@ -1248,6 +1261,9 @@ class MarkerTokenTests(unittest.TestCase):
         first, second = marker_token(), marker_token()
         self.assertNotEqual(first, second)
         self.assertTrue(first.startswith('PARLEY-PROBE-'))
+
+    def test_generated_tokens_satisfy_run_trials_own_validation(self):
+        self.assertRegex(marker_token(), MARKER_PATTERN)
 
 
 if __name__ == '__main__':
