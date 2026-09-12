@@ -1074,7 +1074,7 @@ class TrialRun:
     turn_end_observable: bool = True
 
 
-def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
+def run_trial(driver, *, prompt, marker=None, state='idle', settle=lambda: None,
               existing_session=None,
               poll_interval=5.0, clock=time.time, monotonic=time.monotonic, sleep=time.sleep):
     """Create, submit and observe one trial through its windows; returns a `TrialRun`.
@@ -1082,6 +1082,13 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     `existing_session` adopts a session the caller already created (`driver.register_existing`)
     instead of calling `driver.create`. A host with no captured creation path — Codex today —
     can be driven no other way, and unconditional creation left it undriveable.
+
+    `marker` defaults to a fresh `marker_token()` generated here, so an ordinary run of several
+    trials against the same thread/session can never reuse one by omission: a caller-supplied
+    marker only had its *shape* checked, and a fixed or reused literal that happened to match it
+    let a later trial's delayed echo of an earlier trial's marker count as its own
+    acknowledgement. A caller may still pass an explicit value (tests asserting against a known
+    token); it is still validated against `marker_token()`'s shape, just not for uniqueness.
 
     `settle` is what establishes the requested `state` (busy/approval/disconnected/restarted)
     before submission — this function cannot create those conditions itself, and the default
@@ -1164,7 +1171,15 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
-    if not MARKER_PATTERN.fullmatch(marker):
+    if marker is None:
+        # The default path: a fresh marker per call, so an ordinary caller running several
+        # trials against the same thread/session can never reuse one by omission and count a
+        # delayed echo from an earlier trial as this one's acknowledgement. A caller that
+        # supplies its own value (tests needing a known, assertable token) still goes through
+        # the shape check below, which catches shape but not reuse -- generating here is what
+        # actually enforces uniqueness for real trials.
+        marker = marker_token()
+    elif not MARKER_PATTERN.fullmatch(marker):
         # An empty, guessable or hand-typed marker can appear in a transcript for reasons that
         # have nothing to do with this trial -- a short or low-entropy value risks colliding
         # with real conversation text, silently promoting an unrelated message to `ack`. Only

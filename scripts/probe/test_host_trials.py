@@ -1479,6 +1479,26 @@ class RunTrialTests(unittest.TestCase):
                           monotonic=clock.monotonic, sleep=clock.sleep)
             self.assertEqual(driver.order, [])
 
+    def test_omitting_the_marker_generates_a_fresh_one_each_call(self):
+        # A caller-supplied marker was only ever checked for shape, so a fixed or reused literal
+        # passed the check and let a later trial's delayed echo of an earlier trial's marker
+        # count as its own acknowledgement. Omitting the argument is the path that actually
+        # guarantees a fresh, unique token per trial.
+        clock = FakeClock()
+        first_driver = FakeDriver(clock=clock)
+        run_trial(first_driver, prompt='hi', clock=clock.time, monotonic=clock.monotonic,
+                  sleep=clock.sleep)
+        clock = FakeClock()
+        second_driver = FakeDriver(clock=clock)
+        run_trial(second_driver, prompt='hi', clock=clock.time, monotonic=clock.monotonic,
+                  sleep=clock.sleep)
+        prefix = 'Automated probe: reply with exactly this token to confirm receipt: '
+        first_marker = first_driver.submitted_message.removeprefix(prefix)
+        second_marker = second_driver.submitted_message.removeprefix(prefix)
+        self.assertNotEqual(first_marker, second_marker)
+        self.assertRegex(first_marker, MARKER_PATTERN)
+        self.assertRegex(second_marker, MARKER_PATTERN)
+
 
 class ClassifyTrialTests(unittest.TestCase):
     def test_open_window_raises_rather_than_defaulting(self):
