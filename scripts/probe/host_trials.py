@@ -889,8 +889,15 @@ class CodexDriver:
         turns "definitely too old to matter" into a skip, never a rival into a non-rival.
         """
         adopted = os.path.realpath(adopted)
-        already_owned = {os.path.realpath(self.rollout_path_for(thread_id))
-                         for thread_id in self._owned_thread_ids()}
+        # rollout_path_for is a live lookup, not a snapshot of what it returned at adoption
+        # time: an owned thread whose rollout has since become unresolvable returns None here
+        # just as it does for a thread never seen at all. Skipping it (rather than passing None
+        # into realpath) can only widen the rival scan below, never narrow it -- consistent with
+        # this method's fail-closed contract.
+        already_owned = {os.path.realpath(path)
+                         for path in (self.rollout_path_for(thread_id)
+                                      for thread_id in self._owned_thread_ids())
+                         if path is not None}
         rivals = []
 
         def _cannot_list(error):

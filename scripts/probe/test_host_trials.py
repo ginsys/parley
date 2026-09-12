@@ -783,6 +783,26 @@ class CodexDriverTests(unittest.TestCase):
             driver.register_existing(tid)
         self.assertEqual(registry.created, {'codex:thread-1', 'codex:thread-2', 'codex:thread-3'})
 
+    def test_an_owned_threads_rollout_path_going_missing_does_not_crash_adoption(self):
+        # rollout_path_for is a live lookup, not a snapshot: if an owned thread's rollout later
+        # becomes unresolvable (rotated away, cache evicted), the None it returns must not reach
+        # os.path.realpath() -- the same fail-closed handling register_existing/observe give a
+        # missing path elsewhere in this class.
+        registry = SessionRegistry()
+        paths = {}
+        driver = CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
+                             rollout_path_for=paths.get, started_at=self.RUN_STARTED,
+                             sessions_root=self.sessions_root)
+        paths['thread-1'] = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z',
+                                          'type': 'session_meta'})
+        driver.register_existing('thread-1')
+        os.remove(paths['thread-1'])  # rotated away: rollout_path_for('thread-1') now finds nothing
+        del paths['thread-1']
+        paths['thread-2'] = self.rollout({'timestamp': '2026-09-11T12:00:31.000Z',
+                                          'type': 'session_meta'})
+        driver.register_existing('thread-2')
+        self.assertEqual(registry.created, {'codex:thread-1', 'codex:thread-2'})
+
     def test_a_neighbour_that_cannot_be_dated_is_ambiguity_not_absence(self):
         registry = SessionRegistry()
         mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
