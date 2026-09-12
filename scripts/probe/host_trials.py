@@ -756,6 +756,13 @@ class CodexDriver:
 
     def __init__(self, registry, *, run=subprocess.run, rollout_path_for, started_at,
                  sessions_root=None):
+        if not math.isfinite(started_at):
+            # register_existing()'s `started < self.started_at` and _unruled_out_threads()'s
+            # `started >= self.started_at` both evaluate False against a NaN boundary -- an
+            # arbitrarily old rollout would then adopt as owned while every concurrent candidate
+            # is silently ruled out as "not a rival", and a later submit() could queue into a
+            # human's thread under the real HOME.
+            raise ValueError(f'started_at must be a finite epoch-seconds timestamp: {started_at!r}')
         self.registry = registry
         self.run = run
         # Injectable lookup from thread id to its rollout file path, so tests never touch
