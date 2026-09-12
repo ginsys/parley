@@ -1274,11 +1274,12 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.outcomes['visible'], 1000.0)
         self.assertEqual(run.outcomes['ack'], 1002.0)
 
-    def test_a_keyboardinterrupt_during_submit_is_unobservable_acceptance_but_still_polls(self):
+    def test_a_keyboardinterrupt_during_submit_stops_immediately_without_polling(self):
         # An operator's Ctrl-C while submit() is blocked leaves the same ambiguity as a
-        # subprocess.TimeoutExpired from it: the host may already have received the marker.
-        # Left uncaught here, the interrupt would escape before the polling-loop handler exists
-        # to catch it, losing the trial (and the created session) entirely.
+        # subprocess.TimeoutExpired from it (the host may already have received the marker), but
+        # must honor the explicit cancellation rather than entering the up-to-900s polling loop
+        # regardless -- that would need a second Ctrl-C to actually stop the trial. No observe()
+        # call should happen at all.
         clock = FakeClock()
         driver = FakeDriver(
             observations=[Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0,
@@ -1288,9 +1289,11 @@ class RunTrialTests(unittest.TestCase):
         self.assertIsNone(run.accepted_at)
         self.assertNotIn('accepted', run.outcomes)
         self.assertFalse(run.observable['accepted'])
-        self.assertTrue(run.observable['visible'])
-        self.assertEqual(run.outcomes['visible'], 1000.0)
-        self.assertEqual(run.outcomes['ack'], 1002.0)
+        self.assertFalse(run.observable['visible'])
+        self.assertFalse(run.observable['turn_start'])
+        self.assertFalse(run.observable['ack'])
+        self.assertEqual(run.outcomes, {})
+        self.assertNotIn('observe', driver.order)
 
     def test_an_existing_session_is_adopted_instead_of_created(self):
         clock = FakeClock()
