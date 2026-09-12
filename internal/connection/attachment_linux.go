@@ -66,6 +66,9 @@ type Manager struct {
 	slots   map[string]*Session
 }
 type Socket struct {
+	// Timer expiry and deadline publication serialize independently of the writer.
+	deadlineMu              sync.Mutex
+	deadline                time.Time
 	authGate                chan struct{}
 	authenticated           atomic.Bool
 	releaseOnce             sync.Once
@@ -216,6 +219,13 @@ func (m *Manager) prune() {
 }
 func (s *Socket) Context() context.Context { return s.ctx }
 func (s *Socket) arm(after time.Duration) {
+	s.deadlineMu.Lock()
+	if s.authenticated.Load() {
+		s.deadline = s.lastHeartbeat.Add(store.LivenessDeadline)
+	} else {
+		s.deadline = s.accepted.Add(store.AuthenticationDeadline)
+	}
+	s.deadlineMu.Unlock()
 	if s.timer != nil {
 		s.timer()
 	}
@@ -283,17 +293,19 @@ func (m *Manager) expired(s *Socket, now time.Time) bool {
 	return !now.Before(s.lastHeartbeat.Add(store.LivenessDeadline))
 }
 func (m *Manager) expire(s *Socket) {
-	ctx, cancel := context.WithTimeout(context.Background(), store.AuthenticationDeadline)
-	defer cancel()
-	closeIt := false
-	_, err := m.store.Coordinator().Transition(ctx, func(context.Context, *sql.Tx, store.CommitView) (store.TransitionResult, error) {
-		_, present := m.sockets[s]
-		closeIt = present && (s.ctx.Err() != nil || m.expired(s, m.now()))
-		return store.TransitionResult{Changed: closeIt}, nil
-	}, func(store.CommitView) { m.remove(s) })
-	if err != nil {
+	if s == nil || s.manager != m {
+		return
+	}
+	s.deadlineMu.Lock()
+	closeIt := s.ctx.Err() != nil || (!s.deadline.IsZero() && !m.now().Before(s.deadline))
+	if closeIt {
+		// Cancel while holding the deadline lock so a concurrent heartbeat cannot
+		// revive a socket whose published deadline already expired.
 		s.cancel()
-		s.conn.Close()
+	}
+	s.deadlineMu.Unlock()
+	if closeIt {
+		s.Close()
 	}
 }
 
@@ -303,10 +315,22 @@ func (m *Manager) authenticate(ctx context.Context, tx *sql.Tx, s *Socket, a Aut
 	}
 	c, err := store.ReadCredential(ctx, tx, a.credentialID)
 	if err != nil {
+		if err == store.BindingUnavailable {
+			err = store.AuthenticationFailed
+		}
+		return store.BindingRecord{}, c, false, err
+	}
+	if !c.Matches(a.secret) {
 		return store.BindingRecord{}, c, false, store.AuthenticationFailed
 	}
 	b, err := store.ReadBinding(ctx, tx, c.BindingID)
-	if err != nil || !c.Matches(a.secret) || b.ConnectorUID != s.uid || a.native != (NativeTuple{b.HostKind, b.NamespaceID, b.SessionID}) || b.Status != "enabled" || c.Status != "current" {
+	if err != nil {
+		if err == store.BindingUnavailable {
+			err = store.AuthenticationFailed
+		}
+		return b, c, false, err
+	}
+	if b.ConnectorUID != s.uid || a.native != (NativeTuple{b.HostKind, b.NamespaceID, b.SessionID}) || b.Status != "enabled" || c.Status != "current" {
 		return b, c, false, store.AuthenticationFailed
 	}
 	if s.credentialID != "" && (s.credentialID != a.credentialID || s.bindingID != b.ID || s.native != a.native) {
