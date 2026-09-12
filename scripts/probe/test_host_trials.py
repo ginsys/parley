@@ -714,8 +714,8 @@ class ClaudeDriverTests(unittest.TestCase):
         self.assertNotIsInstance(SubmissionUncaptured(''), SubmissionUnsupported)
 
     def test_submit_lists_background_sessions_and_reports_a_failed_listing(self):
-        # Without --all the listing carries interactive entries only, so every owned session
-        # would fail the membership check; a nonzero exit is reported, not parsed as JSON.
+        # Without --all a completed background session drops out of the listing, so an owned
+        # session could fail the membership check; a nonzero exit is reported, not parsed as JSON.
         registry = SessionRegistry()
         registry.mint('claude:abcd1234')
         seen = []

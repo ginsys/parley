@@ -333,7 +333,8 @@ def main():
             # chdir actually reaches. The child keeps the caller's own string either way — the
             # record describes where it ran, it does not redirect it.
             record['cwd'] = os.path.realpath(child_cwd)
-            # `--home inherit` copies the parent's whole environment, PWD included; a `--cwd`
+            # Both modes set PWD to the resolved cwd. The case that needs it is `--home inherit`,
+            # which copies the parent's whole environment, PWD included; a `--cwd`
             # that differs from the parent's own cwd would otherwise start the child believing
             # it is somewhere it is not, corrupting anything in the transcript that reads $PWD
             # rather than calling getcwd().

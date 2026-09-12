@@ -22,7 +22,8 @@ Two host-specific schemas are grounded in real, captured output rather than assu
   creation; `attach` is an interactive PTY, `--remote-control` and `--input-format=stream-json`
   are unexercised — docs/host-probe-preflight.md, 2026-09-11). `ClaudeDriver.submit()` therefore
   raises `SubmissionUncaptured` rather than report acceptance for a marker the host never
-  received; the cell classifies `unobservable` until stage 3 captures a real submission path.
+  received; the cell classifies `unobservable` until stage 2 (the change that runs the Claude
+  row; docs/host-probes.md, Matrix runner) captures a real submission path.
 - Codex's rollout JSONL (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`) is one JSON object per
   line; a chat turn is `{"type": "response_item", "payload": {"type": "message", "role": ...,
   "content": [{"type": "input_text"|"output_text", "text": ...}]}}` with a record-level ISO-8601
@@ -481,8 +482,10 @@ class ClaudeDriver:
     def _background_session_ids(self):
         """`claude agents --json --all` background session ids under this driver's cwd.
 
-        `--all` is required: without it the listing carries only `kind: "interactive"` entries
-        (docs/host-probe-preflight.md, 2026-09-11).
+        `--all` is required: `--json` alone prints active sessions, and only `--all` also
+        includes completed background sessions (`claude agents --help`,
+        docs/host-probe-preflight.md), so without it an owned session that has finished its turn
+        drops out of the listing.
         """
         result = self.run(['claude', 'agents', '--json', '--all', '--cwd', self.cwd],
                           capture_output=True, text=True, timeout=15)
@@ -627,9 +630,10 @@ class ClaudeDriver:
         `unobservable`. The listing check runs first, so an absent or foreign session still
         fails as such rather than as a missing mechanism.
 
-        `--all` is required: without it the listing carries only `kind: "interactive"` entries
-        (docs/host-probe-preflight.md, 2026-09-11), so `background_sessions()` would return
-        nothing and every owned session would fail the membership check below. A nonzero
+        `--all` is required: `--json` alone prints active sessions and only `--all` also
+        includes completed background sessions (`claude agents --help`,
+        docs/host-probe-preflight.md), so without it an owned session whose turn has finished
+        would drop out of `background_sessions()` and fail the membership check below. A nonzero
         listing is reported as such rather than reaching `json.loads` as a decode error.
 
         A `subprocess.TimeoutExpired` from that listing call is translated to
