@@ -187,11 +187,14 @@ func (s *Socket) releaseCapacity() { s.releaseOnce.Do(func() { <-s.manager.pendi
 // Authentication calls are serialized per socket through their failure cleanup.
 // No coordinator callback takes this gate, so the lock order cannot be reversed.
 func (s *Socket) lockAuthentication(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return store.TemporarilyUnavailable
+	}
 	select {
 	case s.authGate <- struct{}{}:
 		return nil
 	case <-ctx.Done():
-		return store.AuthenticationFailed
+		return store.TemporarilyUnavailable
 	case <-s.ctx.Done():
 		return store.AuthenticationFailed
 	}
@@ -383,7 +386,7 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 		err = store.AuthenticationFailed
 	}
 	if err != nil {
-		if s != nil && s.manager == m {
+		if (rejected || err == store.AuthenticationFailed) && s != nil && s.manager == m {
 			s.Close()
 		}
 		return Snapshot{}, err

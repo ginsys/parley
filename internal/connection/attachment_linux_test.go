@@ -378,3 +378,32 @@ func TestOnlyUnixStreamSocketsAreAccepted(t *testing.T) {
 		t.Fatalf("non-stream socket accepted: %v", err)
 	}
 }
+
+func TestInspectionFailurePreservesAuthenticatedSocket(t *testing.T) {
+	for _, kind := range []string{"guard", "cancelled_wait"} {
+		t.Run(kind, func(t *testing.T) {
+			m, auth, _ := attachmentFixture(t)
+			ctx := context.Background()
+			socket := acceptSocket(t, m)
+			session, err := m.Attach(ctx, socket, auth, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := m.guard
+			if kind == "guard" {
+				m.guard = func(context.Context, *sql.Tx, string) error { return store.TemporarilyUnavailable }
+			} else {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			if _, err := m.Inspect(ctx, socket, auth); err == nil {
+				t.Fatal("failed inspection succeeded")
+			}
+			m.guard = original
+			if err := m.Heartbeat(context.Background(), session); err != nil {
+				t.Fatalf("observation failure disconnected current slot: %v", err)
+			}
+		})
+	}
+}
