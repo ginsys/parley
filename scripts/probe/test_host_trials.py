@@ -522,7 +522,10 @@ class ClaudeDriverTests(unittest.TestCase):
         # claude --bg can succeed and still leave a real, live session with an unknown id if the
         # follow-up listing call times out, exits nonzero, or returns malformed JSON -- that
         # failure must not propagate as an unrelated exception from _background_session_ids().
+        # The recovery attempt itself also fails here, so candidates still comes back empty --
+        # a real recovery is covered by the next test.
         responses = iter([FakeResult(0, stdout=json.dumps([])), FakeResult(0, stdout=''),
+                          FakeResult(1, stderr='daemon unavailable'),
                           FakeResult(1, stderr='daemon unavailable')])
 
         def fake_run(argv, **kwargs):
@@ -532,6 +535,23 @@ class ClaudeDriverTests(unittest.TestCase):
         with self.assertRaises(AmbiguousSessionCreation) as ctx:
             driver.create('probe prompt')
         self.assertEqual(ctx.exception.candidates, ())
+
+    def test_create_recovers_candidates_when_the_post_create_listing_itself_fails(self):
+        # Unlike the case above, a fresh recovery listing here succeeds -- the transient failure
+        # must not be treated as reason to give up with an empty candidate set when a retry can
+        # still find the id.
+        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
+        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'new1', 'kind': 'background'}])
+        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=''),
+                          FakeResult(1, stderr='daemon unavailable'), FakeResult(0, stdout=after)])
+
+        def fake_run(argv, **kwargs):
+            return next(responses)
+
+        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
+        with self.assertRaises(AmbiguousSessionCreation) as ctx:
+            driver.create('probe prompt')
+        self.assertEqual(ctx.exception.candidates, ('new1',))
 
     def test_create_recovers_candidates_when_claude_bg_itself_times_out(self):
         # claude --bg can exceed its own 30s timeout after already detaching the background
