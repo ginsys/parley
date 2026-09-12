@@ -472,7 +472,10 @@ class ClaudeDriver:
         a human to investigate and clean up out of band instead. The post-create listing call can
         itself fail (timeout, nonzero exit, malformed JSON) after `claude --bg` already
         succeeded; that failure is caught the same way, since it leaves an equally real,
-        equally-unidentified session behind and must not propagate as an unrelated exception.
+        equally-unidentified session behind and must not propagate as an unrelated exception. It
+        also attempts the same bounded, best-effort recovery listing as the interrupt cases
+        below rather than giving up with an empty candidate set: the failure is transient exactly
+        as often as the timeout/interrupt cases are, and a fresh listing can still succeed.
 
         `claude --bg` itself can also exceed its own 30s timeout after it has already detached
         the background session -- the subprocess call raises before returning, but the session
@@ -519,10 +522,15 @@ class ClaudeDriver:
         try:
             after = self._background_session_ids()
         except (RuntimeError, subprocess.TimeoutExpired) as error:
+            # A transient listing failure here (timeout, nonzero exit, malformed JSON) is no
+            # different from the interrupt case just below it -- claude --bg already exited 0,
+            # so a background session definitely exists, this read just failed to find its id.
+            # The same bounded, best-effort recovery listing applies.
             raise AmbiguousSessionCreation(
                 f'claude --bg exited 0 but the post-create listing under {self.cwd} could not '
                 f'be read ({error!r}); a background session may now be running with an id this '
-                'runner never learned', candidates=()) from error
+                'runner never learned',
+                candidates=sorted(self._recoverable_candidates(before))) from error
         except KeyboardInterrupt as error:
             # Unlike the two Ctrl-C cases above, `claude --bg` has already exited 0 here: a
             # background session definitely exists, this call just doesn't know its id yet. The
