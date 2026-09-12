@@ -154,3 +154,41 @@ func TestRegistryIdentityConstraintsAndBounds(t *testing.T) {
 		t.Fatalf("unexpected grants=%d err=%v", count, err)
 	}
 }
+
+func TestPublicationEvidenceIsSeparateAndTerminal(t *testing.T) {
+	db := commandDB(t)
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	b := BindingRecord{ID: "30000000-0000-4000-8000-000000000001", PeerID: "peer", HostKind: "codex_cli", NamespaceID: "test", SessionID: "synthetic", ConnectorUID: 1000, Status: "enabled", Version: 1}
+	c := CredentialRecord{BindingID: b.ID, ID: "40000000-0000-4000-8000-000000000001", Version: 1, Status: "current", ExpiresAtNS: 1}
+	if err := InsertBindingCredential(ctx, tx, b, c); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var observed sql.NullInt64
+	if err := tx.QueryRowContext(ctx, "SELECT status,observed_at_ns FROM credential_publications WHERE credential_id=?", c.ID).Scan(&status, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || observed.Valid {
+		t.Fatalf("enrollment claims publication: %s %+v", status, observed)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE credential_publications SET status='unknown',observed_at_ns=2 WHERE credential_id=?", c.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{
+		"UPDATE credential_publications SET status='published',observed_at_ns=3",
+		"UPDATE credential_publications SET observed_at_ns=3", "DELETE FROM credential_publications",
+	} {
+		if _, err := tx.ExecContext(ctx, query); err == nil {
+			t.Fatalf("rewrote publication evidence: %s", query)
+		}
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM credentials WHERE status='current'").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("publication changed credential eligibility: %d %v", count, err)
+	}
+}

@@ -46,6 +46,23 @@ CREATE TRIGGER credential_terminal BEFORE UPDATE OF status ON credentials WHEN O
 CREATE TRIGGER credential_retained BEFORE DELETE ON credentials
  BEGIN SELECT RAISE(ABORT,'credential retained'); END;
 
+-- Enrollment commits pending evidence. The trusted publisher records a terminal
+-- observation in a separate audited transaction after file I/O; replay never
+-- republishes a credential, and unknown requires a new human rotation/revocation.
+CREATE TABLE credential_publications (
+ credential_id TEXT PRIMARY KEY NOT NULL REFERENCES credentials(credential_id),
+ status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','published','unknown')),
+ observed_at_ns INTEGER,
+ CHECK((status='pending' AND observed_at_ns IS NULL) OR
+       (status!='pending' AND typeof(observed_at_ns)='integer'))
+);
+CREATE TRIGGER publication_identity_immutable BEFORE UPDATE OF credential_id ON credential_publications
+ BEGIN SELECT RAISE(ABORT,'immutable publication identity'); END;
+CREATE TRIGGER publication_terminal BEFORE UPDATE ON credential_publications WHEN OLD.status!='pending'
+ BEGIN SELECT RAISE(ABORT,'terminal publication evidence'); END;
+CREATE TRIGGER publication_retained BEFORE DELETE ON credential_publications
+ BEGIN SELECT RAISE(ABORT,'publication evidence retained'); END;
+
 CREATE TABLE operation_results (
  principal_id TEXT NOT NULL CHECK(length(principal_id)=36),
  operation_id TEXT NOT NULL CHECK(length(operation_id)=36),

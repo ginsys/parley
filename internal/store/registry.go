@@ -81,6 +81,9 @@ func InsertBindingCredential(ctx context.Context, tx *sql.Tx, b BindingRecord, c
 	if _, err := tx.ExecContext(ctx, `INSERT INTO credentials(binding_id,credential_version,credential_id,verifier,expires_at_ns,status) VALUES(?,?,?,?,?,?)`, c.BindingID, c.Version, c.ID, c.Verifier[:], c.ExpiresAtNS, c.Status); err != nil {
 		return failure(err)
 	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO credential_publications(credential_id) VALUES(?)", c.ID); err != nil {
+		return failure(err)
+	}
 	_, err := tx.ExecContext(ctx, "RELEASE binding_registration")
 	if err != nil {
 		return storageCode(err)

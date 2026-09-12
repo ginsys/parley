@@ -19,8 +19,9 @@ policy tools can supplement these boundaries but are neither implemented nor req
 ## Connection registry and command foundation
 
 Schema version 5 adds a stable installation UUID, immutable native binding tuples and peer keys,
-versioned credential verifiers, permanent operation results and append-only command audit. It
-creates no bindings or credentials from legacy grants, grants no membership and does not yet
+versioned credential verifiers, publication evidence, permanent operation results and append-only
+command audit. It creates no bindings or credentials from legacy grants, grants no membership and
+does not yet
 quarantine legacy delivery. Historical adoption schemas remain frozen; migration failure rolls
 back every DDL/data change and the schema version together. Runtime epochs are process-local,
 fresh per store lifetime; SQLite user_version remains the schema-version authority.
@@ -32,6 +33,9 @@ apply effects and insert their receipt/audit atomically. A terminal domain rejec
 business-effect savepoint before recording its fixed result; infrastructure failure rolls back
 all writes. Successful commit publishes process-local state before releasing the gate. Callbacks
 must not reenter the coordinator, open another writer transaction or perform external I/O.
+Credential publication starts as pending evidence at enrollment. Publisher integration must record
+published or unknown in a separate audited transaction after file I/O; terminal observations cannot
+be overwritten, and pending after interruption is not proof that no file was published.
 Credential-file and response I/O belong after gate release. Unknown commit outcome disables further
 commands on that coordinator with recovery_required; the eventual runtime integration must stop
 admission and apply its recovery inspection, never infer that the mutation failed.
