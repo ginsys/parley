@@ -196,6 +196,12 @@ class Observation:
     """
 
     outcomes: dict = field(default_factory=dict)
+    # Which record/event established each entry in `outcomes`, keyed the same
+    # (docs/host-probes.md, Trial protocol: "Record which signal established each positive
+    # result, not just a timestamp"). Kept separate from `outcomes` itself rather than folded
+    # into it, since `outcomes`' float values feed `wake_probe.Trial`'s classification
+    # unmodified and must stay exactly that shape.
+    signals: dict = field(default_factory=dict)
     observable: bool = True
     turn_end: float | None = None
     # True when this read came from a host that emits its own turn-boundary events
@@ -204,6 +210,14 @@ class Observation:
     # at all, and any assistant text after submission is indistinguishable from the tail of a
     # turn that was already running -- `run_trial` must not trust it either.
     turn_stream: bool = False
+
+
+# Names for what established a positive outcome, carried in `Observation.signals`/
+# `TrialRun.signals` alongside each outcome's timestamp (docs/host-probes.md, Trial protocol).
+SIGNAL_USER_MESSAGE = 'user_message'
+SIGNAL_ASSISTANT_MESSAGE = 'assistant_message'
+SIGNAL_TURN_BOUNDARY_EVENT = 'turn_boundary_event'
+SIGNAL_SUBMIT_EXIT_STATUS = 'submit_exit_status'
 
 
 def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
@@ -226,8 +240,14 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
     first assistant message, and the first `turn_end` is reported separately as the completion
     of whatever turn was already running. Without that stream the caller cannot tell a host that
     stayed silent from one that was still finishing an earlier turn.
+
+    The returned `Observation.signals` names what established each entry in `outcomes`, keyed
+    the same -- a user-role match is `SIGNAL_USER_MESSAGE`, an assistant-role match is
+    `SIGNAL_ASSISTANT_MESSAGE`, and a `turn_stream` host's own boundary event is
+    `SIGNAL_TURN_BOUNDARY_EVENT` (docs/host-probes.md, Trial protocol).
     """
     outcomes = {}
+    signals = {}
     undated = False
     turn_end = None
     started = None
@@ -248,17 +268,23 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
         if event.role == 'user':
             if marker in event.text:
                 outcomes.setdefault('visible', event.time)
+                signals.setdefault('visible', SIGNAL_USER_MESSAGE)
             continue
         if event.role != 'assistant':
             continue
         outcomes.setdefault('turn_start', event.time)
+        signals.setdefault('turn_start', SIGNAL_ASSISTANT_MESSAGE)
         if marker in event.text:
             outcomes.setdefault('ack', event.time)
+            signals.setdefault('ack', SIGNAL_ASSISTANT_MESSAGE)
     if turn_stream:
         outcomes.pop('turn_start', None)
         if started is not None:
             outcomes['turn_start'] = started
-    return Observation(outcomes=outcomes, observable=not undated, turn_end=turn_end,
+            signals['turn_start'] = SIGNAL_TURN_BOUNDARY_EVENT
+        else:
+            signals.pop('turn_start', None)
+    return Observation(outcomes=outcomes, signals=signals, observable=not undated, turn_end=turn_end,
                        turn_stream=turn_stream)
 
 
@@ -944,6 +970,10 @@ class TrialRun:
     state: str
     supported: dict
     observable: dict
+    # What established each entry in `outcomes`, keyed the same (docs/host-probes.md, Trial
+    # protocol) -- see `Observation.signals`. An outcome absent here was never positively
+    # observed, regardless of what `observable` says about the channel.
+    signals: dict = field(default_factory=dict)
     # The turn already running at submission, and whether its end could be observed at all.
     # `Trial` needs both to classify a busy cell; omitting them defaulted every busy trial to
     # "no turn was running", which is the one thing a busy trial is defined not to be.
@@ -1081,6 +1111,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
                         turn_end_observable=False)
     accepted_at = None if accepted_unobservable else clock()
     outcomes = {}
+    signals = {}
     turn_end = None
     channel_readable = False
     turn_stream_capable = False
@@ -1095,6 +1126,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         turn_stream_capable = turn_stream_capable or observation.turn_stream
         for name, when in observation.outcomes.items():
             outcomes.setdefault(name, when)
+            signals.setdefault(name, observation.signals.get(name))
         if state == 'busy' and turn_end is None and observation.turn_end is not None:
             # Only a busy trial has a turn "already running at submission" for this field to
             # mean (Observation's docstring). For every other state, the first turn boundary
@@ -1117,6 +1149,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
         sleep(min(poll_interval, remaining))
     if accepted_at is not None:
         outcomes['accepted'] = accepted_at
+        signals['accepted'] = SIGNAL_SUBMIT_EXIT_STATUS
     # A positively observed outcome stands on its own evidence; only the ones still missing at
     # the deadline depend on whether the transcript could be read at all. `accepted` itself is
     # unobservable only when the submission call itself timed out without confirming either way.
@@ -1135,6 +1168,7 @@ def run_trial(driver, *, prompt, marker, state='idle', settle=lambda: None,
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
                     outcomes=outcomes, state=state,
                     supported={name: True for name in OUTCOME_NAMES}, observable=observable,
+                    signals=signals,
                     turn_end=turn_end, turn_end_observable=turn_end is not None or channel_readable)
 
 
