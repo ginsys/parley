@@ -79,8 +79,8 @@ func TestHelpAndInvalidArgumentsNeverOpenDatabase(t *testing.T) {
 }
 
 func TestUnsafePeerIdentifiersRejectedBeforeStorage(t *testing.T) {
-	for _, id := range []string{"peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
-		for _, flag := range []string{"-peer-a", "-peer-b"} {
+	for _, id := range []string{"a\xff", "a\xfe", "café", "a\ufffd", "peer\x7f", "peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
+		for _, flag := range []string{"-conversation", "-peer-a", "-peer-b"} {
 			t.Run(flag+id, func(t *testing.T) {
 				args := []string{"grant", "-conversation", "fixture", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2", flag, id}
 				var out, errOut bytes.Buffer
@@ -201,5 +201,27 @@ func TestCLIIdentifiersRemainExactAndVisible(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCLIRenewRejectsIncompatibleNamesButRevokeKeepsExactKey(t *testing.T) {
+	for _, name := range []string{"café", "a\xff", "a\xfe", "a\ufffd"} {
+		for _, operation := range []string{"renew", "revoke"} {
+			fake := &fakeController{}
+			opened := false
+			factory := func(context.Context, string) (controllerAPI, io.Closer, error) {
+				opened = true
+				return fake, fake, nil
+			}
+			var out, errOut bytes.Buffer
+			code := run([]string{operation, "-conversation", name}, "unused", &out, &errOut, factory)
+			if operation == "renew" {
+				if code != 2 || opened {
+					t.Fatalf("renew opened storage for %x: exit=%d", name, code)
+				}
+			} else if code != 0 || !opened || fake.revoke != name {
+				t.Fatalf("revoke changed key %x: %+v, exit=%d", name, fake, code)
+			}
+		}
 	}
 }

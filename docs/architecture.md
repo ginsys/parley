@@ -254,7 +254,12 @@ no identifier migration or recovery feature is needed. Preserve incompatible his
 current exact-key human revocation; determine any necessary disposition from actual findings
 before replacing the administration interface. No encoded-ID recovery API is approved.
 The [membership specification](specifications/membership.md#accepted-ascii-identifier-rule) records
-this target contract; current runtime validation has not yet been changed.
+the contract. The shared byte predicate now enforces it at enrollment/renewal, acceptance,
+queued claims, reply validation and wrapping/direct Codex delivery. Incompatible queued work
+returns `incompatible_identifier` without changing historical state, spending budget or calling
+the transport. Already claimed attempts retain their settlement rules. The
+[read-only inventory](identifier-inventory.md) reports exact bytes from stopped database copies;
+no operator database has been inventoried by these synthetic fixtures.
 
 ## Components
 
@@ -281,11 +286,11 @@ A conversation has at most one active grant, enforced by a partial unique index.
 increase across renewals and re-enrollment after revoke; history is retained. Peers must be
 nonempty and distinct, direction must be valid, the grant budget must be positive and an explicit
 expiry must be in the future. Names and peer IDs are opaque exact keys: permitted leading/trailing
-whitespace is preserved, while whitespace-only values are rejected. Peer enrollment and renewal
-share the wrapper's metadata check: control/format characters and U+2028/U+2029 are rejected before
-grant writes; CLI enrollment rejects them before opening storage. Legacy IDs are never rewritten,
-and a historical grant with unusable peer IDs remains revocable. There is no session identity
-canonicalization policy yet. Silently trimming existing keys could target a different conversation
+spaces are preserved. Both conversation and peer identifiers require printable ASCII bytes
+with at least one non-space byte. Enrollment/renewal share the wrapper's byte validator and reject
+incompatible keys before grant writes; CLI input rejects them before opening storage. Legacy IDs
+are never rewritten, and a historical grant with unusable names or peers remains revocable.
+Silently trimming existing keys could target a different conversation
 or make historical grants inaccessible; administrator output quotes keys to expose whitespace.
 Renewal rejects negative budget/TTL inputs; zero budget or omitted
 expiry preserves the current setting, while `exchanges_used` starts at zero on the successor.

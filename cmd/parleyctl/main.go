@@ -74,6 +74,11 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	if strings.TrimSpace(c.conversation) == "" {
 		return c, fmt.Errorf("%s requires -conversation", c.name)
 	}
+	if c.name != "revoke" {
+		if err := bridgetext.ValidateMetadata(c.conversation); err != nil {
+			return c, fmt.Errorf("conversation identifier: %w", err)
+		}
+	}
 	if c.budget < 0 || c.expiresIn < 0 {
 		return c, fmt.Errorf("budget and expiry must not be negative")
 	}

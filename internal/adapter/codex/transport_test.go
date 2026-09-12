@@ -32,7 +32,7 @@ func TestTransportDeliverWrapsAndSends(t *testing.T) {
 	sender := &fakeSender{}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "hello there"})
+	err := tr.Deliver(context.Background(), store.Envelope{Conversation: "c", ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "hello there"})
 	if err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestTransportDeliverFailure(t *testing.T) {
 	sender := &fakeSender{err: errors.New("boom")}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{Conversation: "c", ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
 	if err == nil || errors.Is(err, dispatch.ErrAmbiguous) {
 		t.Fatalf("want a plain failure, got %v", err)
 	}
@@ -59,7 +59,7 @@ func TestTransportDeliverAmbiguous(t *testing.T) {
 	sender := &fakeSender{err: codex.ErrQueueAmbiguous}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{Conversation: "c", ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
 	if !errors.Is(err, dispatch.ErrAmbiguous) {
 		t.Fatalf("want dispatch.ErrAmbiguous, got %v", err)
 	}
@@ -69,7 +69,7 @@ func TestTransportDeliverPermanentlyRejected(t *testing.T) {
 	sender := &fakeSender{err: codex.ErrQueuePermanentlyRejected}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{Conversation: "c", ID: "e1", FromPeer: "claude-session-a", ToPeer: "codex-thread-b", Text: "x"})
 	if !errors.Is(err, dispatch.ErrPermanentlyRejected) {
 		t.Fatalf("want dispatch.ErrPermanentlyRejected, got %v", err)
 	}
@@ -87,7 +87,7 @@ func TestTransportDeliverRejectsWrongRecipient(t *testing.T) {
 	sender := &fakeSender{}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "claude-session-a", ToPeer: "claude-session-a", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{Conversation: "c", ID: "e1", FromPeer: "claude-session-a", ToPeer: "claude-session-a", Text: "x"})
 	if !errors.Is(err, codex.ErrRecipientMismatch) {
 		t.Fatalf("want ErrRecipientMismatch, got %v", err)
 	}
@@ -115,7 +115,7 @@ func TestTransportDeliverRejectsWrongSender(t *testing.T) {
 	sender := &fakeSender{}
 	tr := codex.NewTransport(sender, "thread-123", "claude-session-a", "codex-thread-b")
 
-	err := tr.Deliver(context.Background(), store.Envelope{ID: "e1", FromPeer: "some-other-peer", ToPeer: "codex-thread-b", Text: "x"})
+	err := tr.Deliver(context.Background(), store.Envelope{Conversation: "c", ID: "e1", FromPeer: "some-other-peer", ToPeer: "codex-thread-b", Text: "x"})
 	if !errors.Is(err, codex.ErrRecipientMismatch) {
 		t.Fatalf("want ErrRecipientMismatch, got %v", err)
 	}
@@ -124,5 +124,20 @@ func TestTransportDeliverRejectsWrongSender(t *testing.T) {
 	}
 	if len(sender.sent) != 0 {
 		t.Fatalf("want no message queued for a mismatched sender, got %v", sender.sent)
+	}
+}
+
+func TestTransportRejectsIncompatibleBoundIdentifiers(t *testing.T) {
+	for _, bad := range []string{"a\xff", "café", " ", "a\ufffd"} {
+		for field := 0; field < 3; field++ {
+			ids := []string{"c", "a", "b"}
+			ids[field] = bad
+			sender := &fakeSender{}
+			tr := codex.NewTransport(sender, "synthetic-thread", ids[1], ids[2])
+			err := tr.Deliver(context.Background(), store.Envelope{ID: "e", Conversation: ids[0], FromPeer: ids[1], ToPeer: ids[2], Text: "body"})
+			if !errors.Is(err, dispatch.ErrPermanentlyRejected) || sender.lastThread != "" {
+				t.Fatalf("field %d %x: error=%v sender=%+v", field, bad, err, sender)
+			}
+		}
 	}
 }
