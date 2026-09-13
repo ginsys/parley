@@ -368,6 +368,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   store is global, so a stranger's server would look identical). Any HTTP response, including
   4xx/5xx, proves a listener exists and prevents spawning. Our child is ready only once
   `GET /session` returns the captured 200 while it is still alive; other statuses fail startup.
+  Read timeouts after spawning retry within the startup deadline. A preflight read timeout
+  remains a refusal: it cannot prove that the port is free of another listener.
   The password variable is uncaptured, so the server is
   the captured unsecured loopback listener for the trial's duration. The child is spawned and
   held in one statement inside the handler that closes it, so any failure or Ctrl-C during that

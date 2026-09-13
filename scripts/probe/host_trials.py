@@ -1848,7 +1848,7 @@ class OpenCodeDriver(Driver):
                         raise RuntimeError(f'opencode serve returned HTTP {status}; '
                                            'the captured readiness response is 200')
                     break
-                except urllib.error.URLError:
+                except (urllib.error.URLError, TimeoutError):
                     if time.monotonic() >= deadline:
                         raise RuntimeError(f'opencode serve did not answer on {url} within {timeout}s') from None
                     self.sleep(0.25)

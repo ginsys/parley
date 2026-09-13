@@ -1788,6 +1788,31 @@ class OpenCodeDriverTests(DriverTestCase):
         self.assertEqual(killed, [(4321, 15)])
         self.assertIsNone(driver.server)
 
+    def test_serve_retries_a_read_timeout_only_after_starting_its_own_child(self):
+        self.patch_killpg()
+        getter = unittest.mock.Mock(side_effect=[urllib.error.URLError('refused'),
+                                                 TimeoutError('slow response'), 200])
+        driver = self.driver(FakeRun([]), port=4096, http_get=getter)
+        server = driver.serve()
+        self.assertIs(server.process, self.servers[0])
+        self.assertEqual(getter.call_count, 3)
+
+    def test_a_preflight_read_timeout_does_not_authorize_spawning(self):
+        driver = self.driver(FakeRun([]), port=4096,
+                             http_get=unittest.mock.Mock(side_effect=TimeoutError('ambiguous listener')))
+        with self.assertRaises(TimeoutError):
+            driver.serve()
+        self.assertEqual(self.servers, [])
+
+    def test_serve_read_timeouts_stop_at_the_startup_deadline(self):
+        killed = self.patch_killpg()
+        getter = unittest.mock.Mock(side_effect=[urllib.error.URLError('refused'), TimeoutError('slow')])
+        driver = self.driver(FakeRun([]), port=4096, http_get=getter)
+        with self.assertRaisesRegex(RuntimeError, 'within 0'):
+            driver.serve(timeout=0)
+        self.assertEqual(killed, [(4321, 15)])
+        self.assertIsNone(driver.server)
+
     def test_serve_holds_the_child_before_it_waits_for_readiness(self):
         # Ownership is taken with the spawn, not after the wait: anything running while `serve()`
         # is still probing -- a sweep, a second exit path -- has to find the child, not None.
@@ -1807,7 +1832,7 @@ class OpenCodeDriverTests(DriverTestCase):
     def test_serve_closes_the_child_when_the_readiness_wait_is_interrupted(self):
         # A Ctrl-C (or any failing probe) after the spawn used to leave the child running with no
         # handle to it: `close_servers()` had nothing to close.
-        for error in (KeyboardInterrupt(), TimeoutError('probe hung')):
+        for error in (KeyboardInterrupt(), ValueError('invalid probe')):
             with self.subTest(error=type(error).__name__):
                 self.servers = []
                 killed = self.patch_killpg()
