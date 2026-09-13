@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"github.com/ginsys/parley/internal/bridgetext"
 	"time"
 	"unicode/utf8"
@@ -61,8 +62,15 @@ func (f PublisherFunc) Publish(ctx context.Context, c CredentialFile) error { re
 // All capabilities are supplied by trusted runtime configuration. Missing host,
 // authority, legacy or recovery providers fail closed, including in development.
 // Target resolves a configured UUID reference, never a request-supplied path.
+// Target returns a terminal domain code for an invalid/unauthorized target and
+// a transient error for unavailable infrastructure; a nil publisher is forbidden.
+// Verify returns nil for matching evidence, HostUnverified for mismatch or an
+// unsupported mechanism, and an error such as TemporarilyUnavailable for an
+// unavailable source. Only HostUnverified is a retained verification rejection.
 type ProvisioningConfig struct {
 	// ReenrollEvidence resolves a trusted immutable host-evidence reference.
+	// Only HostUnverified (mismatch or unsupported evidence) is retained as a
+	// rejection; unavailable evidence and other provider errors remain retryable.
 	// Absence disables reenrollment, while registration and rotation remain usable.
 	ReenrollEvidence  func(context.Context, string, NativeTuple) error
 	Store             *store.DB
@@ -142,9 +150,15 @@ func (p *Provisioner) Register(ctx context.Context, actor store.CommandPrincipal
 			return domainRejection(err)
 		}
 		if evidenceErr != nil {
-			return rejection(store.HostUnverified)
+			if errors.Is(evidenceErr, store.HostUnverified) {
+				return rejection(store.HostUnverified)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
-		if targetErr != nil || publisher == nil {
+		if targetErr != nil {
+			return domainRejection(targetErr)
+		}
+		if publisher == nil {
 			return rejection(store.Forbidden)
 		}
 		if !store.AuthorityTime(ctx, p.config.Now).Before(r.ExpiresAt) {
@@ -193,18 +207,27 @@ func (p *Provisioner) Rotate(ctx context.Context, actor store.CommandPrincipal, 
 	// Resolve the enrolled UID under a serialized, currently authorized read. Do
 	// not let an arbitrary request choose ownership for the publication target.
 	var binding store.BindingRecord
+	var bindingErr error
 	err = p.config.Store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		if err := p.config.Authorize(ctx, tx, actor); err != nil {
 			return err
 		}
-		var err error
-		binding, err = store.ReadBinding(ctx, tx, r.BindingID)
-		return err
+		binding, bindingErr = store.ReadBinding(ctx, tx, r.BindingID)
+		// Missing state is a terminal mutation precondition, not an authority
+		// failure. Retain it through Execute without consulting the target.
+		if errors.Is(bindingErr, store.BindingUnavailable) {
+			return nil
+		}
+		return bindingErr
 	})
 	if err != nil {
 		return ProvisioningResult{}, err
 	}
-	publisher, targetErr := p.config.Target(r.TargetRef, binding.ConnectorUID)
+	var publisher Publisher
+	var targetErr error
+	if bindingErr == nil {
+		publisher, targetErr = p.config.Target(r.TargetRef, binding.ConnectorUID)
+	}
 	var file CredentialFile
 	rotated := false
 	defer clear(file.secret[:])
@@ -212,7 +235,13 @@ func (p *Provisioner) Rotate(ctx context.Context, actor store.CommandPrincipal, 
 		if err := p.config.Guard(ctx, tx, "binding.rotate"); err != nil {
 			return domainRejection(err)
 		}
-		if targetErr != nil || publisher == nil {
+		if bindingErr != nil {
+			return domainRejection(bindingErr)
+		}
+		if targetErr != nil {
+			return domainRejection(targetErr)
+		}
+		if publisher == nil {
 			return rejection(store.Forbidden)
 		}
 		if !store.AuthorityTime(ctx, p.config.Now).Before(r.ExpiresAt) {
@@ -338,7 +367,8 @@ func (p *Provisioner) finish(ctx context.Context, actor store.CommandPrincipal, 
 }
 
 func domainRejection(err error) (store.CommandResult, error) {
-	if code, ok := err.(store.Code); ok {
+	var code store.Code
+	if errors.As(err, &code) && code != "" {
 		return rejection(code)
 	}
 	return store.CommandResult{}, err

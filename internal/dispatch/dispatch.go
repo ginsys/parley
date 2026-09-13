@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/ginsys/parley/internal/store"
@@ -114,46 +113,41 @@ func (b *settlementStore) settle(ctx context.Context, claimed *store.Envelope, d
 		outcome.ErrorCode = "failed"
 		outcome.ErrorDetail = "Transport reported a delivery failure."
 	}
-	tx, err := b.db.Begin(ctx)
-	if err != nil {
-		return outcome, fmt.Errorf("record dispatch outcome: %w", err)
-	}
-	defer tx.Rollback()
-	version := claimed.GrantVersion
-	if noAttempt {
-		target, ok, err := resolveRequeueVersion(ctx, tx, claimed)
+	_, err = b.db.Coordinator().Settle(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		version := claimed.GrantVersion
+		if noAttempt {
+			target, ok, err := resolveRequeueVersion(ctx, tx, claimed)
+			if err != nil {
+				return store.TransitionResult{}, err
+			}
+			if ok {
+				version = target
+			} else {
+				outcome.State = store.Cancelled
+			}
+		}
+		changed, err := store.SettleDispatch(ctx, tx, claimed, outcome.State, version, outcome.ErrorCode, outcome.ErrorDetail, store.AuthorityTime(ctx, time.Now).UTC().Format(time.RFC3339Nano))
 		if err != nil {
-			return outcome, err
+			return store.TransitionResult{}, err
 		}
-		if ok {
-			version = target
-		} else {
-			outcome.State = store.Cancelled
+		if !changed {
+			current, err := store.GetByID(ctx, tx, claimed.ID)
+			if err != nil {
+				return store.TransitionResult{}, err
+			}
+			outcome.State = current.State
+			outcome.ErrorCode = current.ErrorCode
+			outcome.ErrorDetail = current.ErrorDetail
+			return store.TransitionResult{}, nil
 		}
-	}
-	changed, err := store.SettleDispatch(ctx, tx, claimed, outcome.State, version, outcome.ErrorCode, outcome.ErrorDetail, time.Now().UTC().Format(time.RFC3339Nano))
-	if err != nil {
-		return outcome, err
-	}
-	if !changed {
-		current, err := store.GetByID(ctx, tx, claimed.ID)
-		if err != nil {
-			return outcome, err
+		if noAttempt || permanent {
+			if err := store.RefundExchange(ctx, tx, claimed.Conversation, claimed.GrantVersion); err != nil {
+				return store.TransitionResult{}, err
+			}
 		}
-		outcome.State = current.State
-		outcome.ErrorCode = current.ErrorCode
-		outcome.ErrorDetail = current.ErrorDetail
-		return outcome, nil
-	}
-	if noAttempt || permanent {
-		if err := store.RefundExchange(ctx, tx, claimed.Conversation, claimed.GrantVersion); err != nil {
-			return outcome, err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return outcome, err
-	}
-	return outcome, nil
+		return store.TransitionResult{Changed: true}, nil
+	})
+	return outcome, err
 }
 
 // resolveRequeueVersion decides whether an unattempted envelope can go back

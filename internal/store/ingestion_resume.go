@@ -63,7 +63,8 @@ func ResumeIngestion(ctx context.Context, tx *sql.Tx, r ResumeIngestionRequest) 
 	}
 	var source, cursor string
 	err = tx.QueryRowContext(ctx, "SELECT source_id,cursor FROM ingestion_cursors WHERE binding_id=?", b.ID).Scan(&source, &cursor)
-	if errors.Is(err, sql.ErrNoRows) {
+	initializing := errors.Is(err, sql.ErrNoRows)
+	if initializing {
 		if paused.Valid {
 			return ResourceChange{}, RecoveryRequired
 		}
@@ -95,6 +96,9 @@ func ResumeIngestion(ctx context.Context, tx *sql.Tx, r ResumeIngestionRequest) 
 	if cursor != r.Interval.After {
 		return ResourceChange{}, InvalidRequest
 	}
+	if err := pendingAfterResume(ctx, tx, b.ID, source, cursor); err != nil {
+		return ResourceChange{}, err
+	}
 	// Pending events at the resume boundary may be retried afterwards; events in
 	// the reviewed interval have permanent held results and cannot be accepted.
 	id, err := uuid.NewRandom()
@@ -110,4 +114,61 @@ func ResumeIngestion(ctx context.Context, tx *sql.Tx, r ResumeIngestionRequest) 
 		return ResourceChange{}, storageCode(err)
 	}
 	return ResourceChange{Kind: "ingestion_barrier", ID: b.ID, Before: barrier, After: next}, nil
+}
+
+// Opaque cursors cannot be sorted. After a reviewed advance, every remaining
+// pending edge must be reachable from the new boundary; otherwise the interval
+// may have jumped over retained evidence. Disconnected evidence needs a fuller
+// reviewed interval. Even an empty resume must leave processable evidence.
+func pendingAfterResume(ctx context.Context, tx *sql.Tx, binding, source, cursor string) error {
+	var otherSource bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM ingestion_evidence WHERE binding_id=? AND classification='pending' AND source_id!=?)", binding, source).Scan(&otherSource); err != nil {
+		return storageCode(err)
+	}
+	if otherSource {
+		return EventConflict
+	}
+
+	rows, err := tx.QueryContext(ctx, "SELECT cursor_before,cursor_after FROM ingestion_evidence WHERE binding_id=? AND source_id=? AND classification='pending' LIMIT 1001", binding, source)
+	if err != nil {
+		return storageCode(err)
+	}
+	defer rows.Close()
+	edges := make(map[string][]string)
+	count := 0
+	for rows.Next() {
+		var before, after string
+		if err := rows.Scan(&before, &after); err != nil {
+			return storageCode(err)
+		}
+		count++
+		if count > 1000 {
+			return CapacityExceeded
+		}
+		if len(edges[before]) != 0 {
+			return EventConflict
+		}
+		edges[before] = append(edges[before], after)
+	}
+	if err := rows.Err(); err != nil {
+		return storageCode(err)
+	}
+	reached := 0
+	queue := []string{cursor}
+	seen := map[string]bool{cursor: true}
+	for len(queue) > 0 {
+		at := queue[0]
+		queue = queue[1:]
+		for _, after := range edges[at] {
+			reached++
+			if !seen[after] {
+				seen[after] = true
+				queue = append(queue, after)
+			}
+		}
+	}
+	if reached != count {
+		return EventConflict
+	}
+	return nil
 }

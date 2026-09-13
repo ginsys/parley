@@ -36,6 +36,8 @@ func (m Marker) record() store.RecoveryRecord {
 	r := store.RecoveryRecord{ID: m.IncidentID, ServerID: m.ServerID, Kind: m.Kind, Version: 1, Status: "held"}
 	if m.Floor != nil {
 		r.Floor = sql.NullInt64{Int64: *m.Floor, Valid: true}
+	}
+	if m.Observed != nil {
 		r.Observed = sql.NullInt64{Int64: *m.Observed, Valid: true}
 	}
 	return r
@@ -47,7 +49,10 @@ func sameMarker(a, b Marker) bool {
 	if (a.Floor == nil) != (b.Floor == nil) || (a.Observed == nil) != (b.Observed == nil) {
 		return false
 	}
-	return a.Floor == nil || (*a.Floor == *b.Floor && *a.Observed == *b.Observed)
+	if a.Floor != nil && *a.Floor != *b.Floor {
+		return false
+	}
+	return a.Observed == nil || *a.Observed == *b.Observed
 }
 
 // Markers is trusted external storage, independent of the restored database.
@@ -58,3 +63,10 @@ type Markers interface {
 	Put(context.Context, Marker) error
 	Remove(context.Context, Marker) error
 }
+
+// markerPublicationFailure preserves the fixed public code while telling the
+// owning service that interrupted-publication recovery requires fail-stop.
+type markerPublicationFailure struct{}
+
+func (markerPublicationFailure) Error() string { return string(store.TemporarilyUnavailable) }
+func (markerPublicationFailure) Unwrap() error { return store.TemporarilyUnavailable }

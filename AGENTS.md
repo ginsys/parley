@@ -14,8 +14,9 @@ parsing/validation (`internal/replymarker`), and the Codex-side transport/ingest
 lifecycle (`internal/runtime`) and explicit
 read-only SQLite query pool. These have controlled fixtures, not executable/endpoint wiring.
 Also present: internal binding provisioning, authenticated attachment/readiness and audited binding
-lifecycle/holds. Their callers are controlled fixtures; authenticated ordinary-work integration and
-a runnable bridge remain pending. Do not treat anything below `internal/` as wired to a live session yet —
+lifecycle/holds, authenticated ordinary-work APIs and the migrated poller. Human operations still
+have controlled fixture callers; a runnable bridge remains pending. Do not treat anything below
+`internal/` as wired to a live session yet —
 `dispatch.Transport` is an interface with no real Channels implementation in this repo so far,
 `Handshake.sendProbe`/`Ack` are not wired to an actual Channels connection or the `reply` tool, and
 `codex.ExecSender` and the native-source ingestion providers are untested against an actual `codex` CLI or rollout file.
@@ -116,6 +117,22 @@ Ordinary tests use synthetic databases and controlled subprocesses. Process crea
 sender is injectable so size-boundary tests cannot launch an installed host CLI or pass merely
 because a real thread is missing. Cancellation tests synchronize with child startup rather than
 assuming a timeout is longer than process creation. Live compatibility needs separate evidence.
+
+Host-probe matrix trials are not ordinary tests and carry an owner decision of 2026-09-11: they
+run against an installed host CLI under the operator's **real HOME**
+(`scripts/probe/wake_probe.py --home inherit`), because a disposable HOME holds no host
+credentials and would measure an unauthenticated session rather than a wake. Isolation is at the
+*session* level, never at the HOME level: a throwaway host session, torn down after the trial
+where a teardown mechanism is captured (Claude, `claude rm`). Where none is (Codex: `create()`
+and `teardown()` both refuse, and the caller adopts a thread it just made via
+`existing_session=`), the runner retains registry ownership, raises `TeardownUnsupported`, and
+disposing of that thread is the caller's job, symmetric with its creation. The runner's drivers
+inherit the environment through `subprocess.run`; `--home inherit` is the PTY recorder's
+equivalent. Every matrix cell is therefore produced with real credentials and configuration and
+must be sanitized before it is published. The PTY fixtures keep `--home disposable`, except the coverage for
+`--home inherit` itself, which exercises that mode's real environment-passing behavior against a
+controlled synthetic child process, never an installed host CLI. No ordinary test may launch an
+installed host CLI, regardless of HOME mode. See [host probes](docs/host-probes.md#matrix-runner).
 
 ## Transactions and schema upgrades
 
@@ -237,7 +254,9 @@ The internal Linux Manager is exclusive per writer and consumes the shared coord
 capabilities are created only by authenticated attachment; Token fields supplied by a caller confer
 no authority. Capacity/deadline accounting starts before coordinator admission. Inspection remains
 restricted and nonattached; credential failure closes the socket before another credential attempt
-can proceed. Kernel UID, exact native tuple, credential lifecycle and durable generation are all
+can proceed. A fresh socket's serialized authentication attempt also closes on transient guard/store
+failure; transient rechecks of authenticated sockets preserve the existing attachment. Kernel UID,
+exact native tuple, credential lifecycle and durable generation are all
 required. Same-account stolen credentials remain within the accepted cooperative-policy limit.
 
 Use connection Transition for connection-specific state and Execute for durable administrative
@@ -245,9 +264,24 @@ operation receipts. Publish slot/readiness state after commit under the gate; ke
 I/O outside callbacks. Cancellation may fail closed immediately when a transaction cannot publish
 cleanup. Subsequent housekeeping removes cancelled records. View-revision overflow stops ordinary
 service. Deadline-crossing authorization cannot return a usable expired attachment.
+Recheck credential/liveness deadlines after guards and after commit before installing process state.
+Successful no-op connection calls must opt into the same final fence after rollback under the
+coordinator gate. Roll back accidental SQL first; neither advance revision nor publish an unchanged
+rejection. Read-only success must not skip the credential/liveness fence.
+Carry that validated publication instant through pruning and initial liveness; do not substitute
+later unchecked clock samples. Admission must also reject post-commit expiry/cancellation, including
+cancellation during timer installation, releasing the socket registry entry and capacity.
+Observed expiry is denial evidence, not a successful publication: remember the exact credential
+before a fallible expiry write, and persist it independently of caller cancellation. Failed storage
+must retain that denial through clock rollback; a rotated successor has a different identity.
 
 Host verification is a mandatory trusted capability and runs with the exact native tuple/token,
-outside the gate and cancelled by socket lifetime. Readiness requires a fresh nonce per explicit
+outside the gate and cancelled by socket lifetime. Failed verification must still revalidate the
+session and persist observed credential expiry using a bounded context independent of caller
+cancellation; expiry takes precedence over the verifier outcome. Retain the attempt's authenticated
+immutable credential evidence so socket cancellation/removal cannot skip that expiry observation.
+A failed coordinator rejects connection-manager ownership without consuming the claim.
+Readiness requires a fresh nonce per explicit
 thirty-second attempt. Heartbeats only extend liveness; adapters send every ten seconds, close after
 thirty seconds without one. Stale timers, ACKs, disconnects and retained command results cannot
 alter a successor slot. Internal callbacks and synthetic Unix socket tests do not establish a

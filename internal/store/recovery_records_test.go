@@ -53,3 +53,41 @@ func TestRecoveryRecordReplayPreservesActiveHoldAndRejectsClearedReuse(t *testin
 	}
 	checkReplay("cleared", 3, false, RecoveryRequired)
 }
+
+func TestNamespaceRetirementRejectsDifferentIncident(t *testing.T) {
+	db := commandDB(t)
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var server string
+	if err := tx.QueryRowContext(ctx, "SELECT server_id FROM installation").Scan(&server); err != nil {
+		t.Fatal(err)
+	}
+	first, second := "60000000-0000-4000-8000-000000000001", "60000000-0000-4000-8000-000000000002"
+	for _, id := range []string{first, second} {
+		if _, err := RecordRecovery(ctx, tx, RecoveryRecord{ID: id, ServerID: server, Kind: "restore", Status: "held", Version: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retirement := NamespaceRetirement{PrincipalID: "80000000-0000-4000-8000-000000000001"}
+	if err := RetireRecoveryNamespace(ctx, tx, first, retirement, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := RetireRecoveryNamespace(ctx, tx, first, retirement, 2); err != nil {
+		t.Fatalf("exact incident replay=%v", err)
+	}
+	if err := RetireRecoveryNamespace(ctx, tx, second, retirement, 3); err != VersionConflict {
+		t.Errorf("different incident retirement=%v", err)
+	}
+	var incident string
+	var retiredAt int64
+	if err := tx.QueryRowContext(ctx, "SELECT incident_id,retired_at_ns FROM retired_namespaces WHERE principal_id=?", retirement.PrincipalID).Scan(&incident, &retiredAt); err != nil {
+		t.Fatal(err)
+	}
+	if incident != first || retiredAt != 1 {
+		t.Errorf("original evidence changed: %s %d", incident, retiredAt)
+	}
+}

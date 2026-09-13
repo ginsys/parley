@@ -187,6 +187,12 @@ func TestCommandCommitFailurePoisonsCoordinator(t *testing.T) {
 	if err != RecoveryRequired {
 		t.Fatalf("continued after unknown commit: %v", err)
 	}
+	if err := db.Coordinator().ClaimConnections(context.Background()); err != RecoveryRequired {
+		t.Errorf("connection claim after unknown commit=%v", err)
+	}
+	if db.Coordinator().connectionsClaimed {
+		t.Error("failed coordinator consumed connection ownership")
+	}
 	var count int
 	if err := db.sql.QueryRow("SELECT count(*) FROM operation_results").Scan(&count); err != nil || count != 0 {
 		t.Fatalf("receipts=%d err=%v", count, err)

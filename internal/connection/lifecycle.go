@@ -3,6 +3,8 @@ package connection
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
+	"errors"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -19,7 +21,9 @@ type LifecycleConfig struct {
 	Invalidate         func(string)
 	PendingWork        func(context.Context, *sql.Tx, string) ([]store.WorkRef, error)
 	PendingDisposition func(context.Context, *sql.Tx, store.WorkRef, string) error
-	LegacyEvidence     func(context.Context, LegacyDispositionRequest) error
+	// LegacyEvidence returns Forbidden for rejected evidence; unavailable sources
+	// and other provider failures remain uncommitted and retryable.
+	LegacyEvidence func(context.Context, LegacyDispositionRequest) error
 }
 type Lifecycle struct{ config LifecycleConfig }
 
@@ -85,6 +89,7 @@ func (l *Lifecycle) disable(ctx context.Context, p store.CommandPrincipal, r Bin
 			{Kind: "binding", ID: r.BindingID, Before: r.ExpectedBindingVersion, After: change.BindingVersion},
 			{Kind: "revocation_incident", ID: change.IncidentID, After: 1},
 			{Kind: "ingestion_barrier", ID: r.BindingID, Before: change.BarrierVersion - 1, After: change.BarrierVersion},
+			{Kind: "credential", ID: change.CredentialID, Before: change.CredentialVersion, After: change.CredentialVersion},
 		}}, nil
 	}, func(store.CommitView) {
 		if changed {
@@ -131,10 +136,10 @@ func (l *Lifecycle) HoldDisposition(ctx context.Context, p store.CommandPrincipa
 	if err != nil {
 		return store.CommandReceipt{}, err
 	}
-	if !canonicalID(r.IncidentID) || r.ExpectedHoldVersion < 1 || (r.Action != "release" && r.Action != "cancel") {
+	if r.Work.ID == "" || (r.Work.Kind != "envelope" && r.Work.Kind != "pending" && r.Work.Kind != "join") || !canonicalID(r.IncidentID) || r.ExpectedHoldVersion < 1 || (r.Action != "release" && r.Action != "cancel") {
 		return store.CommandReceipt{}, store.InvalidRequest
 	}
-	request, err := store.NewCommandRequest("hold.disposition", r.OperationID, store.Field{Name: "work", Value: store.Fields{{Name: "kind", Value: r.Work.Kind}, {Name: "id", Value: r.Work.ID}}}, store.Field{Name: "incident_id", Value: r.IncidentID}, store.Field{Name: "expected_hold_version", Value: r.ExpectedHoldVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "reason", Value: reason})
+	request, err := store.NewCommandRequest("hold.disposition", r.OperationID, store.Field{Name: "work", Value: store.Fields{{Name: "kind", Value: r.Work.Kind}, {Name: "id", Value: retainedWorkID(r.Work.ID)}}}, store.Field{Name: "incident_id", Value: r.IncidentID}, store.Field{Name: "expected_hold_version", Value: r.ExpectedHoldVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "reason", Value: reason})
 	if err != nil {
 		return store.CommandReceipt{}, err
 	}
@@ -151,7 +156,7 @@ func (l *Lifecycle) LegacyDisposition(ctx context.Context, p store.CommandPrinci
 	if !canonicalID(r.MigrationIncidentID) || !canonicalID(r.DispositionRef) || r.WorkID == "" || r.ExpectedQuarantineVersion < 1 || (r.Action != "release" && r.Action != "cancel") {
 		return store.CommandReceipt{}, store.InvalidRequest
 	}
-	request, err := store.NewCommandRequest("legacy.disposition", r.OperationID, store.Field{Name: "migration_incident_id", Value: r.MigrationIncidentID}, store.Field{Name: "work_id", Value: r.WorkID}, store.Field{Name: "expected_quarantine_version", Value: r.ExpectedQuarantineVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "disposition_ref", Value: r.DispositionRef})
+	request, err := store.NewCommandRequest("legacy.disposition", r.OperationID, store.Field{Name: "migration_incident_id", Value: r.MigrationIncidentID}, store.Field{Name: "work_id", Value: retainedWorkID(r.WorkID)}, store.Field{Name: "expected_quarantine_version", Value: r.ExpectedQuarantineVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "disposition_ref", Value: r.DispositionRef})
 	if err != nil {
 		return store.CommandReceipt{}, err
 	}
@@ -177,7 +182,10 @@ func (l *Lifecycle) disposition(ctx context.Context, p store.CommandPrincipal, r
 			return domainRejection(err)
 		}
 		if evidenceErr != nil {
-			return rejection(store.Forbidden)
+			if errors.Is(evidenceErr, store.Forbidden) {
+				return rejection(store.Forbidden)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
 		now, err := store.InstantNanos(store.AuthorityTime(ctx, l.config.Now))
 		if err != nil {
@@ -190,4 +198,14 @@ func (l *Lifecycle) disposition(ctx context.Context, p store.CommandPrincipal, r
 		}
 		return store.CommandResult{Resources: []store.ResourceChange{change}}, nil
 	}, nil)
+}
+
+// retainedWorkID preserves existing valid-text digests while distinguishing every
+// byte sequence in incompatible historical IDs. The tagged object cannot alias a
+// valid string; storage and evidence resolution still receive the original bytes.
+func retainedWorkID(id string) any {
+	if utf8.ValidString(id) {
+		return id
+	}
+	return store.Fields{{Name: "base64", Value: base64.StdEncoding.EncodeToString([]byte(id))}}
 }

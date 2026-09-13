@@ -77,6 +77,14 @@ that authenticated attachment must supply. Rotation compares both expected versi
 the old credential, increments binding/credential versions and invalidates runtime state after
 commit under the coordinator gate. Rejected or replayed rotation cannot invalidate a connection.
 Legacy enrollment requires the trusted eligibility provider; it is never inferred from a peer key.
+The host verifier explicitly returns `host_unverified` for mismatched or unsupported evidence;
+only that verification failure becomes a retained rejection. Unavailable evidence, cancellation
+and other provider errors leave no enrollment, receipt or audit entry, so the same operation ID
+can retry after recovery. Provider errors pass through the coordinator's fixed-code sanitization.
+Target resolution also preserves transient errors; invalid/unauthorized targets and missing
+publishers remain terminal. Wrapping a guard, eligibility or target domain code does not change
+its terminal/transient classification. Rotation of a missing binding records a terminal rejection
+without target lookup, and every replay still checks current administrator authority.
 
 Authorized retries consult retained receipts before host/target checks or mutation preconditions.
 They return committed metadata and current publication evidence, never a secret or a second file.
@@ -97,6 +105,10 @@ Unsupported no-replace rename fails closed. There is no mutable active-file poin
 permission repair or cross-account ownership change; cross-account publication needs the trusted
 setup capability. Credential material is confined to the publisher's private file serialization,
 excluded from ordinary JSON results and redacted from standard diagnostic formatting.
+During target construction, directory resource/I/O failures return `temporarily_unavailable`;
+missing/inaccessible paths, symlinks and unsafe ownership/permissions remain terminal refusals.
+Controlled child processes exhaust descriptors at root/component lookup and prove that recovery
+permits the same registration operation ID to succeed without a poisoned receipt.
 
 Controlled fixtures cover authorization before host/file work, duplicate replay, expiry equality,
 legacy denial, rotation/version conflicts, missing providers, unsafe publication paths, no overwrite
@@ -116,11 +128,24 @@ an account; possession of a stolen credential within that account remains an acc
 
 A positive nonattached-socket bound and five-second authentication deadline include coordinator
 wait time. Each socket serializes credential operations through rejection cleanup. Failed initial
-authentication cancels that socket with authentication_failed. Successful inspection retains only
+authentication, including a transient guard/store failure after entering the serialized attempt,
+cancels that socket with authentication_failed; retry requires a new socket. Transient failures
+while rechecking an already-authenticated socket preserve its attachment. Successful inspection retains only
 a restricted identity and returns epoch, committed generation and active status; it reserves no
 attachment or readiness. Inspected sockets remain within the nonattached bound. Every lookup and
 attachment rechecks credential hash, native tuple, kernel UID, lifecycle and server-time expiry.
-Observed credential expiry commits terminal state before it can be revived by an earlier clock.
+Credential expiry is checked again after guards and at post-commit publication. An expiry first
+observed after commit prevents installation and is persisted with an independent bounded context.
+Publication uses one validated instant for credential checks, socket pruning and initial liveness;
+housekeeping cannot substitute a later, unchecked time when installing the attachment. Admission
+also rechecks its deadline and socket cancellation after commit, and cancellation during timer
+installation releases the registry entry and capacity instead of returning a dead socket.
+An inspection that publishes pruning recomputes its active flag from the remaining slot at the
+same validated instant, so the returned snapshot cannot still name a pruned winner as active.
+An exact-credential denial remains in the store coordinator if persistence fails, so an earlier
+clock cannot revive that identity. Persistence compares the immutable identity/deadline and cannot
+expire a rotated successor. This shared denial primitive is introduced with attachment and is also
+consumed by the later recovery/ordinary-work expiry collector.
 The required trusted guard supplies global clock/recovery policy in the later recovery slice.
 
 Attachment compares and increments the durable generation in an immediate transaction. Its
@@ -132,10 +157,27 @@ view-revision overflow additionally stops ordinary service. A deadline crossing 
 or publication cannot install a usable expired socket. Connection transitions have their own
 transaction rules, separate from ordinary operation-result receipts. An uncertain commit disables
 further coordinator operations and publishes no slot.
+Successful no-op inspection, repeat attachment, readiness checks and duplicate ACKs explicitly
+request a final process-state fence after transaction rollback under the same coordinator gate.
+That fence advances no revision and commits no accidental SQL. Unchanged rejections still suppress
+publication; credential/liveness expiry observed by a successful read's fence follows the same
+independent expiry-persistence path as a deadline crossing after a write commit.
 
 Host verification runs outside the coordinator and is cancelled with the socket lifetime. Each
 explicit readiness attempt starts unready with a fresh random nonce and a thirty-second deadline.
+Only explicit `host_unverified` errors mean mismatched/unsupported evidence; other verifier errors
+return a sanitized `temporarily_unavailable`. Socket cancellation returns `authentication_failed`.
+Failed verification still revalidates the session with a bounded context independent of caller
+cancellation. Observed credential expiry takes precedence and is persisted even when socket
+liveness also elapsed; a verifier failure cannot leave that credential current for clock rollback.
+The attempt retains its authenticated immutable credential record and checks that expiry before
+handling socket cancellation, since disconnect may already have removed its slot. Persistence
+matches that exact identity and cannot expire or disconnect a rotated successor. A failed
+coordinator also rejects a new connection-manager ownership claim without consuming it.
 The trusted adapter ACK must match the verified native tuple, exact token and current nonce.
+Verifier completion and ACK publication recheck the attempt deadline after commit. Heartbeats
+recheck socket and credential deadlines there too, using the validated instant for deadline renewal;
+a timer that has not fired yet cannot let a late heartbeat revive an expired slot.
 Heartbeats update liveness alone: adapters must send them every ten seconds, and thirty seconds
 without one expires the slot. Delayed callbacks check current socket ownership; due slots cannot
 block a replacement while their timer is waiting. Cancellation takes effect immediately even if
@@ -174,11 +216,21 @@ Authenticated work records the accepting binding and credential version using re
 Renewal may carry the envelope's effective grant forward without rewriting this provenance.
 Revocation and retirement disable the binding, terminalize its current credential, append an
 incident, hold outstanding authored work across all credential versions and pause ingestion in
-one audited transaction. Exact legacy sender matches receive independent security holds too.
+one audited transaction. Each hold retains the trusted creation instant in immutable signed
+nanoseconds. Revoke and retire receipts retain the credential ID and unchanged historical version
+alongside binding, incident and barrier metadata; replay returns the same metadata without secrets.
+Exact legacy sender matches receive independent security holds too.
 Work merely addressed to that binding is not treated as authored by it. Admission supplies its
 pending-work extension through trusted callbacks; no pending-request implementation ships here.
 Re-enrollment requires new reviewed host evidence and a fresh credential for the same tuple;
 it does not clear holds, quarantine, the earliest paused cursor or barrier incident history.
+Unavailable evidence and other provider errors leave reenrollment uncommitted, allowing the same
+operation ID to retry after recovery without altering the revoked binding, credential or barrier.
+Target resolution preserves terminal versus transient errors just as registration and rotation do;
+a missing publisher remains forbidden. A missing binding is retained as an authorized terminal
+rejection without consulting host evidence or a publication target, and replay reauthorizes it.
+Only an explicit `host_unverified` mismatch/unsupported result, or a missing evidence provider,
+is retained as a terminal host-verification rejection. Replays never reverify or republish.
 
 The internal Lifecycle service exposes revoke, retire, hold disposition and legacy disposition;
 Provisioner adds re-enrollment. Current administrator authorization precedes private replay;
@@ -186,6 +238,15 @@ evidence I/O occurs outside the writer and mutation guards recheck under the coo
 and effects commit before socket invalidation. Missing capabilities fail closed. These APIs have
 test-only human-operation callers; they add no human endpoint or credential
 CLI, and grants still come from the protected controller.
+
+Legacy evidence resolution retains only explicit `forbidden` rejections. Unavailable manifests
+and other resolver failures commit no disposition or receipt; the same operation ID can retry
+after recovery while quarantine and delivery evidence remain unchanged. Disposition request
+digests encode malformed UTF-8 work IDs as a tagged base64 object; valid text keeps its existing
+canonical representation. Evidence lookup and storage use the original bytes, so incompatible
+historical IDs remain addressable without replacement-character aliases. This also applies to
+security-hold dispositions for legacy work. Empty IDs and unknown work kinds fail request
+validation before retaining an operation result, allowing correction under the same operation ID.
 
 Release changes only the selected hold or quarantine version. A second incident remains effective.
 Cancellation is terminal; only queued work changes to cancelled, while dispatched/uncertain and
@@ -606,6 +667,23 @@ partial changes. Timestamp backfill reads bounded ID/timestamp pages, preserves 
 and validates round-trip range before writing numeric values. Messages and metadata are plaintext;
 filesystem isolation and SQLite-consistent backups remain the operator's responsibility.
 
+## Host-probe matrix isolation
+
+Host-probe matrix trials (`scripts/probe/host_trials.py`) are not ordinary tests: an owner
+decision of 2026-09-11 has them run against an installed host CLI under the operator's real HOME
+(`wake_probe.py --home inherit`), because a disposable HOME holds no host credentials and would
+measure an unauthenticated session rather than a wake. The alternative considered — disposable at
+the HOME level, matching every ordinary test — was rejected for exactly that reason: it cannot
+authenticate against a real host, so it cannot measure what the matrix exists to measure.
+Isolation is instead at the *session* level: each trial runs against a throwaway host session
+tracked in a `SessionRegistry` that refuses to touch any id it did not itself mint or adopt,
+torn down after the trial where a teardown mechanism is captured (Claude). Codex has no captured
+create or teardown path: the caller creates the thread, `run_trial(existing_session=...)` adopts
+it, `teardown()` raises `TeardownUnsupported` and keeps ownership so the id stays reportable, and
+the caller disposes of the thread it created. Every matrix cell this produces therefore carries the developer's real
+credentials and configuration and must be sanitized before publication — see
+[host probes](host-probes.md#matrix-runner) for the driver contract and outcome detectors.
+
 ## Evidence and limits
 
 The normal verification gate is `mise run verify`; its contents are described in
@@ -648,13 +726,19 @@ barrier closed. Native event production and large-interval tooling remain separa
 
 ## Durable recovery implementation
 
-`internal/recovery.Service` supplies `runtime.Config.InspectRecovery` and installs store hooks before
-service admission. Preparation and marker flush run outside the coordinator. Time sampling,
+`runtime.Config.InspectRecovery` constructs `internal/recovery.Service` inside its callback with
+the writer supplied by `runtime.Start`, then calls that service's `InspectRecovery` with the same
+writer. Retain that service for trusted administrative wiring after construction. Binding the method
+of a service constructed on a separate DB is invalid; runtime owns opening and closing its writer.
+This installs recovery hooks before readers, interrupted-dispatch recovery and service admission. Preparation and marker flush run outside the coordinator. Time sampling,
 checkpoint comparison and advancement share a writer acquisition; business transactions receive one
 validated authorization instant. A durable preceding checkpoint remains even when later business
 work rejects. A rollback detected in the writer immediately holds ordinary operations and is flushed
 after the gate is released. The old direct acceptance/claim/ingestion paths refuse a recovery-owned
 store, while exact settlement remains available to retain an already attempted delivery's outcome.
+Authenticated dispatch reports incompatible historical identifiers with the explicit compatibility
+diagnostic, without rewriting the envelope, consuming budget or contacting a transport. Exhausted
+grants similarly return the fixed budget-wait diagnostic with Attempted false and queued work intact.
 
 The Linux marker repository uses a pre-existing private directory and descriptor-relative,
 no-follow operations. Marker creation is non-replacing and syncs the file and parent directory.
@@ -663,8 +747,12 @@ already absent file. Malformed entries, unsafe paths and reused cleared incident
 External publication failure invokes a mandatory nonblocking supervisor fail-stop callback; its
 actual process/supervisor integration remains required before live use. No persistence guarantee is
 claimed when every persistence path fails, or for a rollback never recorded before a crash and
-subsequent clock correction. Once a marker or held database incident exists, corrected wall time and
-restart cannot clear it. Restore detection requires the operator to establish a fresh external marker.
+subsequent clock correction. Distinct detected floor/observed pairs retain independent incidents
+even while another clock incident is held or awaiting cleanup; repeated identical writer
+observations reuse that evidence only while its incident is held. Independent reconciliation
+samples may retain fresh incidents for identical pairs; pending observations still deduplicate. Reconciled incidents are being cleared, so
+a repeated detection needs fresh evidence. A failed deduplication read retains the detection.
+Once a marker or held database incident exists, corrected wall time and restart cannot clear it. Restore detection requires the operator to establish a fresh external marker.
 
 Internal human `clock.reconcile` verifies reviewed source evidence and nondecreasing samples at
 least one monotonic second apart outside the writer, then rechecks the current floor/version. The
@@ -673,12 +761,122 @@ Recording an existing reconciled incident is idempotent because its global hold 
 the storage primitive rejects reuse of a cleared incident without changing its terminal evidence.
 Retries reauthorize before looking up the receipt and may finish only that committed cleanup. Other
 incidents keep the global gate closed. `recovery.complete` follows the same two-phase protocol.
+After a reviewed ingestion advance, remaining pending events must form reachable edges from the
+new cursor boundary. Disconnected evidence rejects the interval rather than guessing the order of
+opaque cursors; up to 1000 remaining pending events are inspected, with capacity failure above it.
+An empty interval advances nothing and can leave a single reachable pending chain for ordinary retry.
+For both operations and `ingestion.resume`, only an explicit host-verification mismatch retains
+a terminal evidence rejection. Provider failures, cancellation and evidence deadlines leave no
+receipt or business effect, so the same operation ID can retry after evidence becomes available.
 Its implemented restore policy is conservative: every restored binding must be permanently retired,
-and every outstanding envelope receives an independent restore hold. Surviving-history import is
+and every outstanding envelope receives an independent restore hold with the same trusted creation
+instant as the retirement transaction. Surviving-history import is
 not implemented. Grant budgets, ACKs, states and attempt tokens remain snapshot evidence; retired
 identities cannot use them to authorize new work. A reviewed bad-floor disposition additionally
 retires affected authority, matches the exact checkpoint version and all held clock incidents, and
 records the floor change against the same audit. Ordinary reconciliation never lowers the floor.
 Recovery does not clear individual security holds, ingestion barriers or persisted expiry.
+Expiry persistence snapshots observations before acquiring the writer, preserving retry evidence
+without reversing the collection lock order. Malformed marker fields reach validation errors
+instead of pointer dereferences.
 Trusted writer authorization helpers enforce remembered exact-credential expiry denials even
 when their caller has not installed an expiry observation collector.
+
+The legacy protected `controller.Grant`, `Revoke` and `Renew` writers reject a store
+whose runtime installed recovery policy, even while healthy: their direct transactions cannot
+honor its writer-time contract. Grants used by these internal fixtures are established before
+recovery ownership; coordinated human grant commands remain the admission/control work item's
+responsibility. This slice exposes no new human CLI path.
+Restore retirement has no 1000-binding cap: the trusted resolver must enumerate every affected
+binding and retirement remains one atomic transaction. A new rollback latched at writer time
+aborts a reviewed floor reset before any disposition or retirement commits; the independent
+after-hook persists the new incident for another review of the complete set.
+Expiry persistence also snapshots the coordinator's remembered observations, so replay of a
+committed rejection retries a failed expiry write and invalidates the affected binding after
+persistence. It does not require an unrelated request to rediscover the expired recipient.
+
+Source initialization also preserves retained pending evidence: a different pending source or
+edges unreachable from the proposed initial cursor return `event_conflict`. The same bounded
+edge check used for resume applies; initializing at the retained first edge permits its retry.
+Reviewed floor reset has no 99-clock-incident cap. Its trusted complete incident list is retained
+in the receipt for exact cleanup replay, including after marker-removal failure. Only this
+internal recovery command is exempt from the ordinary 100-resource result limit; identity,
+version and result validation still apply. No schema migration is added.
+
+Successful no-op expiry persistence publishes after rollback, forgetting already terminal
+credential observations without incrementing the coordinator revision or invalidating a newer
+session. Repeated source initialization reports whether it actually inserted the cursor, so
+its existing successful no-op session fence also preserves the revision.
+Startup settlement of interrupted dispatch now uses the coordinator: it rechecks recovery after
+the initial runtime inspection and again at writer time, and records the trusted timestamp.
+A newly detected rollback or restore hold leaves the dispatching rows and attempt evidence intact.
+
+Every audited resume, including an empty interval at an existing cursor, validates pending
+source identity and edge reachability. Branching pending edges fail closed because ordinary
+ingestion cannot choose between events with the same predecessor.
+Clock rollback observations enter the held pending queue before incident-ID generation. If that
+generation fails, fail-stop still applies and the original floor/observed pair remains available
+for supervised retry; corrected wall time cannot erase the pending observation.
+
+Legacy controller transactions also inspect durable recovery ownership: an initialized clock
+checkpoint or any recorded recovery incident rejects direct grant/revoke/renew writes from a
+freshly opened handle. A process-local hook check alone cannot protect the human's separate
+controller process. Healthy legacy fixtures establish grants before recovery ownership.
+Late dispatch settlement runs recovery detection under the coordinator while remaining available
+for exact already-claimed outcomes during a hold. Rollback retains its observed marker/incident;
+the settlement timestamp uses the trusted floor when the observed clock is below it. Exact attempt
+matching and single refunds remain unchanged, and this path cannot authorize a new claim.
+Ingestion and source-origin verification retain the authenticated immutable credential before
+host I/O and revalidate on every outcome. Expiry is independently persisted before reporting the
+verifier result, including after socket removal or caller cancellation; expiry takes precedence.
+
+Repeated verified events that remain pending do not advance the coordinator revision when their
+reference already exists; the successful no-op session fence still runs. New pending references
+and terminal event classifications remain durable changes. Origin/ingestion verifier outages,
+unknown provider failures and cancellation return `temporarily_unavailable`; only an explicit
+host-verification mismatch returns `host_unverified`, after the independent expiry/session check.
+
+Marker listing can recover a fully encoded pending publication after a crash: it validates the
+private file and canonical marker contents, syncs the file, and promotes it without replacement.
+Each promotion syncs its directory before inspecting another entry; later validation/cancellation
+cannot leave a renamed marker unsynced, and a failed sync invokes the supervisor fail-stop.
+An existing destination must match exactly; incomplete, unsafe or conflicting files remain held.
+The directory is synced before successful listing, including retries after a failed promotion
+sync. No evidence is discarded and promotion alone never clears a recovery incident. Failure to make
+a promotion durable invokes the same supervisor fail-stop contract as ordinary marker publication.
+Missing incidents in `clock.reconcile` and `recovery.complete` retain audited terminal `not_found`
+results. Creating the incident later cannot change the same operation ID's result. An incident
+appearing between clock preflight and the mutation writer instead requires a fresh verification
+attempt without committing a receipt.
+
+Initialization checks the ingestion barrier before trusted origin I/O and again before storing
+the cursor. A verified new edge that forks at the current cursor remains pending with
+`event_conflict`; it cannot disappear through rollback or permit a later resume to overlook it.
+Marker listing finishes bounded enumeration before promotion mutates the directory. Canonical
+and pending names each have the configured capacity bound; unique incident materialization has
+the same bound. Partial timestamp shapes compare safely even before marker validation.
+
+Recovery hooks stay fail closed until their constructor finishes installation identity loading
+and preparation. A failed constructor retains this denial; the trusted owner must reopen the
+store for a fresh supervised initialization instead of falling back to unguarded services.
+
+Origin verification receives only canonical nonzero source UUIDs and UTF-8 cursor locators within
+4096 bytes. Malformed initialization coordinates return `invalid_request` before provider I/O.
+Historical dispatch compatibility checks include the 256-byte limit for conversation and both
+peer identifiers; oversized rows remain untouched with `incompatible_identifier` diagnostics.
+
+Namespace retirement is idempotent only within its original incident. A later incident naming
+that already-retired namespace receives `version_conflict`; immutable retirement evidence is
+never relinked or reported as a new retirement. Reviewed later recovery can omit prior retirements.
+
+Authenticated terminal event replay and retained identity conflicts precede ingestion barriers;
+fresh or pending work still checks the barrier before provider I/O and mutation. Re-enrollment
+therefore preserves access to old terminal results without reopening ingestion.
+Dispatch revalidates the exact captured recipient through the coordinator after claim commit and
+transport resolution. Crossed credential/liveness deadlines settle as never attempted and refund
+the exact claim; delayed timers cannot authorize host delivery to an expired capability.
+Reconciliation captures the applicable clock floor inside a short transaction, closes it, then
+takes and publishes each sample under the same coordinator gate. Verification and the monotonic
+one-second wait hold neither gate nor transaction. Valid samples raise the remembered floor;
+rollback samples latch exact evidence, flushed independently of caller cancellation. Later normal
+checkpoint advancement cannot retrospectively invalidate an earlier legitimate sample.

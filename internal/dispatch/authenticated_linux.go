@@ -70,7 +70,7 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 	defer stop()
 	transport := b.transportFor(recipient)
 	var deliveryErr error
-	if transport == nil || recipient.Context().Err() != nil {
+	if transport == nil || b.manager.RequireReady(ctx, recipient) != nil || recipient.Context().Err() != nil {
 		deliveryErr = ErrNoAttempt
 	} else {
 		deliveryErr = transport.Deliver(attempt, *claimed)
@@ -98,7 +98,7 @@ func (b *AuthenticatedBridge) claim(ctx context.Context, id string) (*store.Enve
 			return store.TransitionResult{}, nil
 		}
 		for _, key := range []string{e.Conversation, e.FromPeer, e.ToPeer} {
-			if bridgetext.ValidateMetadata(key) != nil {
+			if len(key) > store.MaxIdentityBytes || bridgetext.ValidateMetadata(key) != nil {
 				claimErr = store.InvalidRequest
 				return store.TransitionResult{}, nil
 			}
@@ -106,7 +106,7 @@ func (b *AuthenticatedBridge) claim(ctx context.Context, id string) (*store.Enve
 		g, err := store.CurrentGrant(ctx, tx, e.Conversation)
 		if err == nil {
 			for _, key := range []string{g.Conversation, g.PeerAID, g.PeerBID} {
-				if bridgetext.ValidateMetadata(key) != nil {
+				if len(key) > store.MaxIdentityBytes || bridgetext.ValidateMetadata(key) != nil {
 					claimErr = store.InvalidRequest
 					return store.TransitionResult{}, nil
 				}

@@ -8,11 +8,14 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ginsys/parley/internal/connection"
 	"github.com/ginsys/parley/internal/controller"
+	"github.com/ginsys/parley/internal/recovery"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -25,6 +28,9 @@ type authenticatedFixture struct {
 }
 
 func authenticatedSetup(t *testing.T) *authenticatedFixture {
+	return authenticatedSetupBeforeManager(t, nil)
+}
+func authenticatedSetupBeforeManager(t *testing.T, setup func(*store.DB), configure ...func(*connection.ManagerConfig)) *authenticatedFixture {
 	t.Helper()
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "auth.db"))
@@ -59,7 +65,17 @@ func authenticatedSetup(t *testing.T) *authenticatedFixture {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := connection.NewManager(connection.ManagerConfig{Store: db, MaxNonattached: 4, Now: func() time.Time { return time.Unix(110, 0) }, AfterFunc: func(time.Duration, func()) func() { return func() {} }, Guard: func(context.Context, *sql.Tx, string) error { return nil }, Verify: func(context.Context, connection.NativeTuple, connection.Token) error { return nil }})
+	if _, err := controller.New(db).Grant(ctx, controller.GrantParams{Conversation: "work", PeerAID: "author", PeerBID: "recipient", Direction: store.Bidirectional, MaxExchanges: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if setup != nil {
+		setup(db)
+	}
+	config := connection.ManagerConfig{Store: db, MaxNonattached: 4, Now: func() time.Time { return time.Unix(110, 0) }, AfterFunc: func(time.Duration, func()) func() { return func() {} }, Guard: func(context.Context, *sql.Tx, string) error { return nil }, Verify: func(context.Context, connection.NativeTuple, connection.Token) error { return nil }}
+	for _, apply := range configure {
+		apply(&config)
+	}
+	m, err := connection.NewManager(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,9 +83,6 @@ func authenticatedSetup(t *testing.T) *authenticatedFixture {
 	f.author, _ = f.attach(t, auths[0], 0, true)
 	f.recipient, f.recipientSocket = f.attach(t, auths[1], 0, false)
 	f.auth = auths[1]
-	if _, err := controller.New(db).Grant(ctx, controller.GrantParams{Conversation: "work", PeerAID: "author", PeerBID: "recipient", Direction: store.Bidirectional, MaxExchanges: 5}); err != nil {
-		t.Fatal(err)
-	}
 	return f
 }
 func (f *authenticatedFixture) attach(t *testing.T, auth connection.Authentication, generation int64, ready bool) (*connection.Session, *connection.Socket) {
@@ -211,6 +224,215 @@ func TestAuthenticatedClaimHonorsAuthoredRevocationHold(t *testing.T) {
 		t.Fatalf("held claim=%+v %v", out, err)
 	}
 	f.assertBudget(t, 0)
+}
+
+func TestAuthenticatedCompatibilityDiagnosticPreservesHistory(t *testing.T) {
+	for _, bad := range []string{"caf\u00e9", "a\xff", "a\x7f", strings.Repeat("x", store.MaxIdentityBytes+1)} {
+		for _, field := range []string{"conversation", "from_peer", "to_peer"} {
+			t.Run(fmt.Sprintf("%s/%x", field, bad), func(t *testing.T) {
+				f := authenticatedSetup(t)
+				id := f.send(t)
+				ctx := context.Background()
+				_, err := f.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+					if field == "conversation" {
+						if err := store.EnsureConversation(ctx, tx, bad, bad, "1970-01-01T00:00:00Z"); err != nil {
+							return store.TransitionResult{}, err
+						}
+						grant, err := store.CurrentGrant(ctx, tx, "work")
+						if err != nil {
+							return store.TransitionResult{}, err
+						}
+						grant.Conversation = bad
+						if err := store.InsertGrant(ctx, tx, *grant); err != nil {
+							return store.TransitionResult{}, err
+						}
+					}
+					_, err := tx.ExecContext(ctx, "UPDATE envelopes SET "+field+"=? WHERE id=?", bad, id)
+					return store.TransitionResult{Changed: true}, err
+				}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var before *store.Envelope
+				if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+					var err error
+					before, err = store.GetByID(ctx, tx, id)
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				b, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport { t.Fatal("incompatible work reached transport"); return nil }, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				out, err := b.DispatchOutcome(ctx, id)
+				if err != store.InvalidRequest || out.Attempted || out.State != store.Queued || out.ErrorCode != "incompatible_identifier" || out.ErrorDetail == "" {
+					t.Fatalf("compatibility=%+v %v", out, err)
+				}
+				if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+					after, err := store.GetByID(ctx, tx, id)
+					if err == nil && !reflect.DeepEqual(before, after) {
+						t.Error("compatibility rejection changed row")
+					}
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				f.assertBudget(t, 0)
+			})
+		}
+	}
+}
+
+func TestAuthenticatedBudgetExhaustionHasUnattemptedDiagnostic(t *testing.T) {
+	f := authenticatedSetup(t)
+	makeReady(t, f.manager, f.recipient)
+	id := f.send(t)
+	ctx := context.Background()
+	var budget int64
+	var before *store.Envelope
+	_, err := f.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		if err := tx.QueryRowContext(ctx, "SELECT max_exchanges FROM grants WHERE conversation='work'").Scan(&budget); err != nil {
+			return store.TransitionResult{}, err
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE grants SET exchanges_used=max_exchanges WHERE conversation='work'"); err != nil {
+			return store.TransitionResult{}, err
+		}
+		var err error
+		before, err = store.GetByID(ctx, tx, id)
+		return store.TransitionResult{Changed: true}, err
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport { t.Fatal("exhausted grant reached transport"); return nil }, func() time.Time { return time.Unix(110, 0) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		out, err := b.DispatchOutcome(ctx, id)
+		if err != ErrBudgetExhausted || out.State != store.Queued || out.Attempted || out.ErrorCode != "budget_exhausted" || out.ErrorDetail == "" {
+			t.Fatalf("budget wait=%+v %v", out, err)
+		}
+	}
+	f.assertBudget(t, budget)
+	if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		after, err := store.GetByID(ctx, tx, id)
+		if err == nil && !reflect.DeepEqual(before, after) {
+			t.Error("budget wait changed queued work")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLateSettlementRecordsRollbackAndRefundsOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(110, 0)
+	var markers *recovery.Directory
+	f := authenticatedSetupBeforeManager(t, func(db *store.DB) {
+		path, tempErr := os.MkdirTemp("/tmp", "parley-settlement-")
+		if tempErr != nil {
+			t.Fatal(tempErr)
+		}
+		t.Cleanup(func() { os.RemoveAll(path) })
+		var err error
+		markers, err = recovery.NewDirectory(path, uint32(os.Geteuid()), 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = recovery.New(ctx, recovery.Config{Store: db, Markers: markers, Now: func() time.Time { return now }, FailStop: func() { t.Error("unexpected fail-stop") }})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	makeReady(t, f.manager, f.recipient)
+	id := f.send(t)
+	var claim store.Envelope
+	bridge, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport {
+		return authenticatedTransport(func(_ context.Context, e store.Envelope) error {
+			claim = e
+			now = time.Unix(100, 0)
+			return ErrNoAttempt
+		})
+	}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := bridge.DispatchOutcome(ctx, id)
+	if err != nil || out.State != store.Queued || out.Attempted {
+		t.Fatalf("late settlement=%+v %v", out, err)
+	}
+	saved, err := markers.List(ctx)
+	if err != nil || len(saved) != 1 {
+		t.Fatalf("settlement missed rollback marker=%+v %v", saved, err)
+	}
+	f.assertBudget(t, 0)
+	if _, err := bridge.bridge.settle(ctx, &claim, ErrNoAttempt); err != nil {
+		t.Fatal(err)
+	}
+	f.assertBudget(t, 0)
+	if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		e, err := store.GetByID(ctx, tx, id)
+		if err == nil && (e.UpdatedAt != time.Unix(110, 0).UTC().Format(time.RFC3339Nano) || e.DispatchAttempt != 1) {
+			t.Errorf("untrusted settlement=%+v", e)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuthenticatedHandoffRechecksElapsedRecipientDeadline(t *testing.T) {
+	for _, kind := range []string{"credential", "liveness"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Unix(110, 0)
+			f := authenticatedSetupBeforeManager(t, nil, func(c *connection.ManagerConfig) { c.Now = func() time.Time { return now } })
+			makeReady(t, f.manager, f.recipient)
+			id := f.send(t)
+			deadline := time.Unix(141, 0)
+			if kind == "credential" {
+				// Keep liveness valid beyond the immutable credential expiry at 200.
+				for sec := int64(130); sec <= 190; sec += 20 {
+					now = time.Unix(sec, 0)
+					if err := f.manager.Heartbeat(ctx, f.recipient); err != nil {
+						t.Fatal(err)
+					}
+				}
+				deadline = time.Unix(201, 0)
+			}
+			deliveries := 0
+			bridge, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport {
+				// Claim committed, but no timer callback has run before handoff.
+				now = deadline
+				return authenticatedTransport(func(context.Context, store.Envelope) error { deliveries++; return nil })
+			}, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := bridge.DispatchOutcome(ctx, id)
+			if err != nil || out.Attempted || out.State != store.Queued || deliveries != 0 {
+				t.Fatalf("expired handoff=%+v %v deliveries=%d", out, err, deliveries)
+			}
+			f.assertBudget(t, 0)
+			if f.recipient.Context().Err() == nil {
+				t.Error("expired recipient remained live")
+			}
+			if kind == "credential" {
+				if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+					credential, err := store.ReadCredential(ctx, tx, "40000000-0000-4000-8000-000000000002")
+					if err == nil && credential.Status != "expired" {
+						t.Errorf("lost expiry evidence=%s", credential.Status)
+					}
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
 }
 
 func TestAuthenticatedBudgetDiagnosticOverridesPriorAttemptWithoutRewritingIt(t *testing.T) {

@@ -37,8 +37,18 @@ output or an echoed marker cannot establish acceptance, a new turn or acknowledg
 [pty.fork](https://docs.python.org/3/library/pty.html) and selectors. It owns a disposable child
 process group, bounds captured input/output to 1 MiB, closes the PTY and kills/reaps its child on
 exit. Terminal bytes are hex-encoded with monotonic timestamps rather than rendered as terminal
-control sequences. The CLI creates a fresh HOME and working directory, passes only HOME/PATH/TERM,
-and never writes input. Before exec, the child closes all non-stdio descriptors, including handles
+control sequences. By default (`--home disposable`) the CLI creates a fresh HOME and working
+directory, passes only HOME/PATH/TERM/PWD, and never writes input. `--home inherit` opts into the
+real HOME/environment instead, for driving an authenticated host session; the record's
+`home_mode` field makes that choice visible rather than implicit, and no HOME cleanup runs for
+it. `--cwd` overrides the child's working directory, and the record's `cwd` field carries the
+resolved directory the child actually ran in — host behaviour varies with repository-level
+configuration and instructions, so without it two captures of the same command in different
+directories are indistinguishable and cannot satisfy the reproduction requirement below. In both
+modes the child's `PWD` is set to that same resolved `cwd`. Inherit mode copies the parent's
+whole environment, so without that override a `--cwd` differing from the parent's would start
+the child believing it is somewhere it is not.
+Before exec, the child closes all non-stdio descriptors, including handles
 made inheritable by its launcher. This Linux harness requires `/proc/self/fd` to enumerate the
 actual descriptor range; enumeration failure aborts startup instead of launching with unknown
 handles. The parent's descriptors remain unchanged. SIGINT is blocked across fork until the parent
@@ -108,8 +118,9 @@ not that a trial completed or a host delivered anything. Failed/interrupted reco
 supply negative wake findings. Even a
 `complete` passive recording is not host-readiness evidence, and early EOF does not complete an
 outcome observation window. Neither EOF nor a captured marker is
-promoted to host acceptance. The command runs under a fresh HOME with no copied host credentials.
-The Python `PtyProcess` API allows explicit writes only with a matching observer-supplied generation
+promoted to host acceptance. In disposable mode (the default) the command runs under a fresh HOME
+with no copied host credentials; `--home inherit` trades that away deliberately, and its records
+say so via `home_mode`. The Python `PtyProcess` API allows explicit writes only with a matching observer-supplied generation
 and observed idle-agent state. It records partial writes as ambiguous and refuses other states.
 It does not authenticate the observer, discover a current host identity or make PTY injection
 safe by itself. Descendants which deliberately escape the child process group are outside this
@@ -144,6 +155,197 @@ Result codes: `observed`, `not_observed` (not observed within the window), `unob
 `unsupported`, `inconclusive`. No negative classification proves nondelivery. Record which signal
 established each positive result, not just a timestamp.
 
+## Matrix runner
+
+[`host_trials.py`](../scripts/probe/host_trials.py) drives a real host through one trial —
+create a session, submit a synthetic marker message, observe the four outcomes — and feeds the
+result into `wake_probe.py`'s own `Trial`/`aggregate` classification unmodified. It is tooling
+only: filling the matrix (running it against installed hosts three times per mechanism/state)
+is separate evidence, landed in a later change once trials actually run. Filling it is staged in
+three changes: stage 1 is this tooling; stage 2 runs the Claude and Codex rows and lands
+`docs/host-wake-matrix.md`; stage 3 runs the OpenCode row and writes the synthesis #18 asks for.
+"Stage N" elsewhere in this document and in `host_trials.py` refers to that list.
+
+Every session it creates is tracked in a `SessionRegistry`; `submit`/`observe`/`teardown` refuse
+an id the registry did not itself mint (`ForeignSessionError`). This matters concretely: `claude
+agents --json --all` lists every background session on the workstation, including ordinary human
+work, so a driver bug here could otherwise stop or message someone else's session. Trials run
+under the real HOME so the host session is actually authenticated, per the owner's 2026-09-11
+decision — disposable at the *session* level, not the HOME level. The runner has no disposable
+mode at all: its drivers call `subprocess.run` without an `env=` argument, so every host command
+inherits the operator's environment; `wake_probe.py --home inherit` is the PTY recorder's
+equivalent of that and applies only to PTY captures. Every
+matrix cell this produces therefore carries the developer's real credentials and config; it is
+not the clean-room isolation `--home disposable` gives the PTY fixtures above.
+
+Outcome detection is grounded in captured real output, not assumed formats:
+- `claude agents --json [--all] [--cwd <dir>]` uses different field names by session `kind`: a
+  `background` session (created by `claude --bg`, what this runner uses) reports `state`
+  (e.g. `"done"`); an `interactive` session reports `status` instead. `background_sessions()`
+  filters to the former; nothing here ever touches the latter. `--cwd` exists only on
+  `claude agents`, as that listing filter; the root command has none (`2.1.269`,
+  docs/host-probe-preflight.md), so `ClaudeDriver.create()` starts `claude --bg` with the probe
+  directory as the subprocess cwd.
+- `ClaudeDriver.create()` learns the id of the session it started from a listing diff — the one
+  `background` id under the probe directory present after `claude --bg` that was absent before —
+  never from the command's stdout: the help text says `--bg` prints the id, but its exact
+  format has not been captured against a real session. Zero or several new ids
+  raise `AmbiguousSessionCreation` with the candidates, and nothing is minted. That diff is only
+  as good as its precondition: the probe directory must be a fresh, private cwd per run, since
+  `--cwd` matches sessions started *under* that path and any other session started there in the
+  same interval — a human's, or a second runner's — is an extra candidate at best and, if it is
+  the only new id, a foreign session minted as owned at worst. Correlating the session with a
+  `--session-id` this runner chose (`sessionId` in the listing) would close that gap, and is the
+  first thing stage 2 captures before any Claude cell is run; `--print`, `--model` and
+  `--max-budget-usd` alongside `--bg`, and `claude --bg` under captured stdout, are likewise
+  unexercised.
+- `claude logs <id>` fails once a background session's daemon has exited — observed as
+  `connect ENOENT /tmp/cc-daemon-*/*/control.sock` against a session already `state: "done"`.
+  Observation must happen *before* teardown; a failed read returns an `Observation` marked
+  `observable=False`, which classifies `unobservable`. An empty outcome map is not enough: with
+  observability defaulting to true, "nothing read" would become `not_observed`, i.e. negative
+  evidence from a channel that was never available.
+- `claude logs` output is **assumed** to carry no per-entry timestamp — a hypothesis to
+  reproduce, since the one read attempted here failed against an already-exited daemon
+  (docs/host-probe-preflight.md, 2026-09-11) — so a reachable Claude transcript is treated as
+  `unobservable` today: an undated entry cannot be ordered against submission, and
+  counting it would let the assistant turn produced by the session-creation prompt stand in as
+  this trial's `turn_start` before the marker existed. The same fail-closed rule applies to a
+  Codex rollout record whose `timestamp` is missing or malformed, and to a line that is not
+  valid JSON at all (a truncated or corrupt rollout): opening a file successfully does not
+  establish that its transcript was read successfully, so the read is reported unobservable
+  rather than yielding an empty outcome map that would classify as `not_observed`. A record
+  type this runner has no use for (`token_usage_record`, `world_state`, ...) is not a failed
+  read and is skipped silently; `event_msg` records are read for turn boundaries (below), not
+  skipped. Provenance is stricter still: `rollout_started_at` returns nothing at
+  all on an unparseable line, since the line it could not read may be the earliest one.
+- No captured mechanism at `2.1.268` submits a message to an *existing* background session:
+  `claude --bg` takes its prompt at creation, `attach` is an interactive PTY, and
+  `--remote-control` / `--print --input-format=stream-json` are unexercised. `ClaudeDriver.submit()`
+  raises `SubmissionUncaptured`, rather than confirming the session is listed and reporting
+  acceptance for a marker the host never received. Guessing an unconfirmed submission flag is the
+  same evidence violation as guessing OpenCode's export shape; capturing a real path is stage 2
+  work (the change that runs the Claude row). The two refusals are distinct types and classify
+  differently. `SubmissionUnsupported`
+  says the *host* has no such mechanism — Claude's `--channels`, absent from both the help text
+  and the plugin cache — and yields `supported=False`. `SubmissionUncaptured` says *this runner*
+  has captured no path, and yields `observable=False`, so the cell classifies `unobservable`:
+  "no trial was performed", never "the host cannot do this". The listing `submit` checks first
+  is `claude agents --json --all`, the same call `background_sessions()` makes, and a nonzero
+  exit from that listing is a failed read rather than evidence the session is gone.
+- A Codex thread is adopted only when its rollout's earliest record timestamp is at or after the
+  run's own start (`CodexDriver(started_at=...)`). Minting whatever id a caller passed defeated
+  the registry guarantee, since `submit` then queues a message to it — a mistyped id could reach
+  an ordinary human thread. This orders a thread against the run; it does not authenticate it.
+  "Started at or after this run" is equally true of a human thread opened in the same minute, so
+  adoption additionally requires that no *other* rollout under `sessions_root` shares that
+  property: `register_existing` walks the tree and raises `ForeignSessionError` when any
+  neighbour is an unruled-out rival, counting a neighbour it cannot read or cannot date as a
+  rival rather than as an absence. A driver constructed without `sessions_root` cannot run that
+  check and is refused outright instead of adopting on the weaker test.
+  **Residual risk, not closed by the above:** recency and uniqueness order and isolate a thread,
+  they do not prove *this run* created it. If a human opens the only other thread after
+  `started_at` and its id is the one passed to `register_existing`, no rival exists and it is
+  minted as owned before `submit` ever messages it. Binding adoption to the runner's own creation
+  action is out of scope for this stage — `CodexDriver.create()` already refuses rather than
+  guess (above) — so the caller passing `existing_session=` is trusted to have just created that
+  exact thread itself.
+- No captured mechanism *creates* a Codex thread non-interactively either: `codex queue` targets
+  a thread that already exists, and no creation output shape has been captured to parse an id
+  out of. `CodexDriver.create()` raises `SessionCreationUncaptured`, so a Codex cell is run as
+  `run_trial(..., existing_session=<thread id>)` against a thread the caller made themselves.
+  Teardown is equally uncaptured: `codex queue` has no `--stop`/`--delete`/equivalent, so
+  `CodexDriver.teardown()` raises `TeardownUnsupported` and retains registry ownership rather
+  than silently releasing it — releasing on a no-op would read as a live, authenticated host
+  session having been cleaned up when it had not. Disposal of an adopted thread is the caller's
+  job, symmetric with its creation; ownership is retained only so the id stays reportable.
+- Codex's rollout JSONL (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`) is one JSON object
+  per line; a chat turn is `{"type": "response_item", "payload": {"type": "message", "role":
+  "user"|"assistant"|"developer", "content": [{"type": "input_text"|"output_text", "text":
+  ...}]}}` with a record-level ISO-8601 `timestamp`. Only `user`/`assistant` roles count as
+  transcript turns; `developer` carries fixed instructions, not conversation. Turn boundaries
+  are taken from the host rather than inferred: `{"type": "event_msg", "payload": {"type":
+  "task_started"|"task_complete"|"turn_aborted"}}` records become `turn_start`/`turn_end`
+  pseudo-role events, so on Codex `turn_start` means the host's own task start rather than
+  whichever assistant message happened to be read first.
+- OpenCode's `export <sessionID>` shape has **no captured sample yet** — no local session existed
+  to export from at investigation time (`opencode --pure session list` printed nothing).
+  `OpenCodeDriver` raises `NotImplementedError` rather than guess at an unconfirmed format; this
+  is the scope gap the owner-recorded third-host requirement still has open.
+
+The marker each trial submits is a fresh high-entropy token (`marker_token()`), so an
+acknowledgement can never be satisfied by chance text or a terminal echoing the input back —
+`detect_outcomes()` only counts an assistant event as `ack` when the marker itself appears in it,
+distinct from `turn_start`, which any assistant activity satisfies.
+
+`run_trial()` keeps observing until every transcript outcome is seen or the longest window
+(120s) has elapsed, merging each poll's evidence and keeping the first timestamp per outcome. A
+single immediate snapshot would report `not_observed` for events that arrive comfortably inside
+their window, which is precisely the delay the windows exist to measure. Observability is decided by the *final* poll, not by whether any poll ever succeeded:
+a transcript is cumulative, so a late successful read covers earlier gaps, but if the last read
+failed then the tail of the window was never seen and a missing outcome is `unobservable`
+rather than negative. An outcome already observed keeps its own evidence either way.
+
+A Ctrl-C during `submit()` or the polling loop does not propagate out of `run_trial()`: the
+trial finalizes with whatever it had gathered, every still-missing outcome marked unobservable,
+and `TrialRun.interrupted` set. Swallowing it is deliberate — a busy trial can spend minutes
+collecting evidence that a propagated exception would discard along with the session id — but
+it means the interrupt reaches nothing above the trial. A caller looping over trials must stop
+on `interrupted` and never pass such a run to `aggregate()`, since apart from that flag its
+fields are identical to an uncaptured or unreadable run's.
+
+A `busy` trial is the exception to that 120s ceiling. `wake_probe.py` refuses to rule on
+`turn_start` or `ack` for a busy host until the turn already running has ended or 900s have
+passed, so observing only to 120s would leave those two cells unclassifiable by construction;
+a busy trial therefore polls to the 900s cap. When the transcript reports its own `turn_end`
+the deadline collapses back to the last window measured from that boundary, which is what
+lets the cell classify without waiting the cap out. If the window closes with no `turn_end`
+seen, what happens next depends on whether the host demonstrated a turn-boundary stream at all
+during the cap. Without one — Claude today, no turn-boundary events captured — `turn_start` and
+`ack` are marked `observable=False` unconditionally, even when one was captured: with no
+independent boundary this runner cannot tell a still-running prior turn's tail from a genuinely
+new one, so a bare capture is exactly that ambiguity rather than trustworthy evidence either
+way, and publishing it as `observed` would claim more than the classifier can support. With
+one — a Codex-style host whose channel stayed readable through the whole cap but never emitted
+the boundary — `Trial.result()`'s own `turn_end_observable` branch classifies the cell
+`inconclusive` instead: the channel was readable the whole time and simply never resolved,
+which is a different, positive fact from an unavailable channel and must not collapse into the
+same `unobservable` result.
+
+It returns a named `TrialRun` carrying what `Trial`/`classify_trial` need plus the evidence a
+matrix cell must cite alongside them — `session_id`, `marker`, `version`,
+`submission_diagnostic`, `interrupted` (the full field list is the dataclass in
+`host_trials.py`); acceptance is
+stamped when `submit` *returns*, since a submission that blocks for seconds would otherwise be
+backdated into its 10s window. The requested `state` is validated and carried into the result,
+but establishing a busy/approval/disconnected/restarted precondition is the caller's `settle`
+callable — omitting `settle` for any non-`idle` state raises `ValueError` immediately rather than
+silently exercising an idle host under that label.
+
+`signals`, keyed the same as `outcomes`, names what established each positive result — a
+user-role transcript match, an assistant-role match, the host's own turn-boundary event, or the
+submit command's exit status — per the Trial protocol's requirement above to record the
+establishing signal, not just a timestamp. It travels alongside `outcomes` rather than replacing
+any of its values, since those floats feed `Trial`'s classification unmodified.
+
+`version` is read per trial from the session under test, never assumed from the preflight pin:
+Claude's driver runs `claude --version`; Codex's reads the adopted thread's own rollout
+`session_meta.cli_version` and deliberately never falls back to the installed `codex --version`,
+because the two have been observed to disagree on the same day (0.154.0 in a rollout against
+0.153.4 from the binary, docs/host-probe-preflight.md). An unreadable version is `None`, not a
+guess.
+
+One documented deviation from `Trial`'s "same monotonic clock" contract: `wake_probe.py`'s own
+PTY capture stays in one process and can use `time.monotonic()`, but a real host's transcript
+carries only wall-clock/ISO-8601 timestamps from another process, and no monotonic-to-wall
+calibration exists to convert them. Every *compared* value therefore comes from `time.time()`;
+`Trial.result()` only requires one consistent clock across `submitted`/`outcomes`/`now`, not
+monotonicity, so this is safe as long as every value on a given `Trial` uses the same clock.
+The local polling deadline is the exception and uses `time.monotonic()`, because an elapsed
+interval measured inside this process must not move when NTP steps the clock. A wall-clock step
+mid-trial still distorts the recorded timestamps themselves; that is a known limitation of
+cross-process evidence, not something the runner can correct.
+
 ## Real-host evidence still required
 
 Probe Claude Channels and plain MCP separately, Codex queue and reachable IPC separately, and
@@ -153,6 +355,12 @@ Missing prerequisites must be recorded and resolved or explicitly scoped out by 
 No herdr installation is assumed. Publish sanitized manifests and observations here or in durable
 issue-linked artifacts; never copy real credentials, administrator sessions or ordinary work
 messages into fixtures. The recorder does not provision host authentication.
+
+Claude's `--channels` mechanism does not exist at the installed version (`claude --version`
+`2.1.268`): absent from `claude --help`, and no channels plugin is present in the official
+marketplace cache. The two upstream reports motivating this investigation describe a mechanism
+this installation does not have; that is a legitimate `unsupported` classification for that
+mechanism at this version, not evidence about Channels generally or about other versions.
 
 Direct-host investigation does not connect live sessions through Parley. That connection still
 requires the complete fixture gate in [AGENTS.md](../AGENTS.md#record-evidence-and-decisions),

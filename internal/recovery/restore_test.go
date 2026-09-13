@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ginsys/parley/internal/controller"
 	runtimeowner "github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
 )
@@ -66,7 +67,7 @@ func seedRestoredWork(t *testing.T, s *Service) {
 	}
 }
 func TestRestoreRetiresNamespaceWithoutReplayingSnapshotEffects(t *testing.T) {
-	a, s, _, r := restoreAdministration(t)
+	a, s, now, r := restoreAdministration(t)
 	seedRestoredWork(t, s)
 	ctx := context.Background()
 	// Missing the affected binding cannot release restored grant budgets.
@@ -100,6 +101,13 @@ func TestRestoreRetiresNamespaceWithoutReplayingSnapshotEffects(t *testing.T) {
 		b, err := store.ReadBinding(ctx, tx, restoredBinding)
 		if err != nil {
 			return err
+		}
+		var missing int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM security_holds WHERE created_at_ns != ?", now.UnixNano()).Scan(&missing); err != nil {
+			return err
+		}
+		if missing != 0 {
+			t.Errorf("holds missing trusted creation instant: %d", missing)
 		}
 		if b.Status != "retired" {
 			t.Errorf("revival=%+v", b)
@@ -203,5 +211,270 @@ func TestReviewedBadFloorRequiresExactClockSetAndCannotBeRaisedByOldPublication(
 	r.OperationID = "80000000-0000-4000-8000-000000000005"
 	if _, err := a.Complete(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, r); err != store.RecoveryRequired {
 		t.Fatalf("retired principal new mutation=%v", err)
+	}
+}
+
+func TestLegacyControllerCannotBypassRecoveryOwner(t *testing.T) {
+	for _, operation := range []string{"grant", "revoke", "renew"} {
+		t.Run(operation, func(t *testing.T) {
+			_, s, _, _ := restoreAdministration(t)
+			seedRestoredWork(t, s)
+			c := controller.New(s.config.Store)
+			ctx := context.Background()
+			var err error
+			switch operation {
+			case "grant":
+				_, err = c.Grant(ctx, controller.GrantParams{Conversation: "new", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 1})
+			case "revoke":
+				_, err = c.Revoke(ctx, "restore")
+			case "renew":
+				_, err = c.Renew(ctx, controller.RenewParams{Conversation: "restore", MaxExchanges: 20})
+			}
+			if err != store.RecoveryRequired {
+				t.Fatalf("legacy %s bypass=%v", operation, err)
+			}
+			if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+				var grants, conversations int
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM grants").Scan(&grants); err != nil {
+					return err
+				}
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM conversations").Scan(&conversations); err != nil {
+					return err
+				}
+				g, err := store.CurrentGrant(ctx, tx, "restore")
+				if err != nil {
+					return err
+				}
+				if grants != 1 || conversations != 1 || g.GrantVersion != 1 || g.MaxExchanges != 10 {
+					t.Errorf("mutated grants=%d conversations=%d grant=%+v", grants, conversations, g)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRestoreCanRetireMoreThanThousandBindings(t *testing.T) {
+	a, s, _, r := restoreAdministration(t)
+	ctx := context.Background()
+	var retire []store.NamespaceRetirement
+	_, err := s.maintenance.Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		for i := 1; i <= 1001; i++ {
+			b := store.BindingRecord{ID: fmt.Sprintf("30000000-0000-4000-8000-%012d", i), PeerID: fmt.Sprintf("peer-%d", i), HostKind: "codex_cli", NamespaceID: "synthetic", SessionID: fmt.Sprintf("session-%d", i), ConnectorUID: 1000, Status: "enabled", Version: 1}
+			c := store.CredentialRecord{BindingID: b.ID, ID: fmt.Sprintf("40000000-0000-4000-8000-%012d", i), Version: 1, Status: "current", ExpiresAtNS: 300000000000}
+			if err := store.InsertBindingCredential(ctx, tx, b, c); err != nil {
+				return store.TransitionResult{}, err
+			}
+			retire = append(retire, store.NamespaceRetirement{PrincipalID: b.ID, BindingVersion: 1, CredentialVersion: 1})
+		}
+		return store.TransitionResult{Changed: true}, nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.resolve = func(context.Context, RecoveryCompleteRequest) (RestoreDisposition, error) {
+		return RestoreDisposition{Retire: retire}, nil
+	}
+	receipt, err := a.Complete(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, r)
+	if err != nil || receipt.Result.Code != "" {
+		t.Fatalf("large restore=%+v %v", receipt, err)
+	}
+	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM retired_namespaces WHERE binding_id IS NOT NULL").Scan(&count); err != nil {
+			return err
+		}
+		if count != 1001 {
+			t.Errorf("retired=%d", count)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if mode, err := s.InspectRecovery(ctx, s.config.Store); err != nil || mode != runtimeowner.Normal {
+		t.Fatalf("large restore held=%v %v", mode, err)
+	}
+}
+
+func TestFloorResetRejectsRollbackLatchedAtWriterTime(t *testing.T) {
+	a, s, now, r := restoreAdministration(t)
+	ctx := context.Background()
+	*now = time.Unix(100, 0)
+	if err := rejectOrdinary(t, s); err != store.RecoveryRequired {
+		t.Fatal(err)
+	}
+	var floor store.ClockCheckpoint
+	var clocks []ReviewedIncident
+	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		floor, err = store.ReadClockCheckpoint(ctx, tx)
+		if err != nil {
+			return err
+		}
+		rows, err := tx.QueryContext(ctx, "SELECT incident_id,recovery_version FROM recovery_incidents WHERE kind='clock' AND status='held'")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c ReviewedIncident
+			if err := rows.Scan(&c.ID, &c.Version); err != nil {
+				return err
+			}
+			clocks = append(clocks, c)
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a.resolve = func(context.Context, RecoveryCompleteRequest) (RestoreDisposition, error) {
+		samples := 0
+		s.config.Now = func() time.Time {
+			samples++
+			if samples == 1 {
+				return time.Unix(100, 0)
+			}
+			return time.Unix(101, 0)
+		}
+		return RestoreDisposition{Retire: []store.NamespaceRetirement{{PrincipalID: recoveryPrincipal}}, ClockFloor: &store.ReviewedClockFloor{CheckpointVersion: floor.Version, Previous: floor.Instant.Int64, Reviewed: time.Unix(100, 0).UnixNano()}, ClockIncidents: clocks}, nil
+	}
+	receipt, err := a.Complete(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, r)
+	if err != store.RecoveryRequired {
+		t.Fatalf("unreviewed writer evidence reset floor: receipt=%+v err=%v", receipt, err)
+	}
+	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		got, err := store.ReadClockCheckpoint(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if got != floor {
+			t.Errorf("floor changed: %+v want %+v", got, floor)
+		}
+		var clocks, retired, receipts int
+		for query, target := range map[string]*int{"SELECT count(*) FROM recovery_incidents WHERE kind='clock' AND status='held'": &clocks, "SELECT count(*) FROM retired_namespaces": &retired, "SELECT count(*) FROM operation_results": &receipts} {
+			if err := tx.QueryRowContext(ctx, query).Scan(target); err != nil {
+				return err
+			}
+		}
+		if clocks != 2 || retired != 0 || receipts != 0 {
+			t.Errorf("clock/retirement/receipt=%d/%d/%d", clocks, retired, receipts)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFloorResetCanCoverMoreThanNinetyNineClockIncidents(t *testing.T) {
+	a, s, now, r := restoreAdministration(t)
+	s.config.Markers.(*Directory).capacity = 200
+	ctx := context.Background()
+	var clocks []ReviewedIncident
+	floor := time.Unix(110, 0).UnixNano()
+	for i := 1; i <= 100; i++ {
+		observed := time.Unix(100, 0).UnixNano() + int64(i)
+		marker := Marker{IncidentID: fmt.Sprintf("61000000-0000-4000-8000-%012d", i), ServerID: s.serverID, Kind: "clock", Floor: &floor, Observed: &observed}
+		if err := s.config.Markers.Put(ctx, marker); err != nil {
+			t.Fatal(err)
+		}
+		clocks = append(clocks, ReviewedIncident{ID: marker.IncidentID, Version: 1})
+	}
+	*now = time.Unix(100, 100)
+	if err := s.prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint store.ClockCheckpoint
+	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		checkpoint, err = store.ReadClockCheckpoint(ctx, tx)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a.resolve = func(context.Context, RecoveryCompleteRequest) (RestoreDisposition, error) {
+		return RestoreDisposition{Retire: []store.NamespaceRetirement{{PrincipalID: recoveryPrincipal}}, ClockFloor: &store.ReviewedClockFloor{CheckpointVersion: checkpoint.Version, Previous: floor, Reviewed: now.UnixNano()}, ClockIncidents: clocks}, nil
+	}
+	markers := &removalFailure{Markers: s.config.Markers, fail: true}
+	s.config.Markers = markers
+	receipt, err := a.Complete(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, r)
+	if err != store.TemporarilyUnavailable || receipt.Result.Code != "" || len(receipt.Result.Resources) != 101 {
+		t.Fatalf("large floor reset=%+v %v", receipt, err)
+	}
+	markers.fail = false
+	a.resolve = func(context.Context, RecoveryCompleteRequest) (RestoreDisposition, error) {
+		t.Fatal("replay re-resolved evidence")
+		return RestoreDisposition{}, nil
+	}
+	replay, err := a.Complete(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, r)
+	if err != nil || !replay.Replayed || replay.AuditID != receipt.AuditID {
+		t.Fatalf("large reset cleanup replay=%+v %v", replay, err)
+	}
+	if mode, err := s.InspectRecovery(ctx, s.config.Store); err != nil || mode != runtimeowner.Normal {
+		t.Fatalf("large floor reset held=%v %v", mode, err)
+	}
+	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM recovery_incidents WHERE status='cleared'").Scan(&count); err != nil {
+			return err
+		}
+		if count != 101 {
+			t.Errorf("cleared=%d", count)
+		}
+		got, err := store.ReadClockCheckpoint(ctx, tx)
+		if got.Instant.Int64 != now.UnixNano() {
+			t.Errorf("reset floor=%+v", got)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFreshControllerHandleCannotBypassRecoveryOwner(t *testing.T) {
+	for _, operation := range []string{"grant", "revoke", "renew"} {
+		t.Run(operation, func(t *testing.T) {
+			s, _, path := recoveryFixture(t)
+			seedRestoredWork(t, s)
+			other, openErr := store.Open(context.Background(), path)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			defer other.Close()
+			c := controller.New(other)
+			ctx := context.Background()
+			var err error
+			switch operation {
+			case "grant":
+				_, err = c.Grant(ctx, controller.GrantParams{Conversation: "new", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 1})
+			case "revoke":
+				_, err = c.Revoke(ctx, "restore")
+			case "renew":
+				_, err = c.Renew(ctx, controller.RenewParams{Conversation: "restore", MaxExchanges: 20})
+			}
+			if err != store.RecoveryRequired {
+				t.Fatalf("legacy %s bypass=%v", operation, err)
+			}
+			if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+				var grants, conversations int
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM grants").Scan(&grants); err != nil {
+					return err
+				}
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM conversations").Scan(&conversations); err != nil {
+					return err
+				}
+				g, err := store.CurrentGrant(ctx, tx, "restore")
+				if err != nil {
+					return err
+				}
+				if grants != 1 || conversations != 1 || g.GrantVersion != 1 || g.MaxExchanges != 10 {
+					t.Errorf("mutated grants=%d conversations=%d grant=%+v", grants, conversations, g)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

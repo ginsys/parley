@@ -131,3 +131,100 @@ func TestClockCleanupCannotClearAnotherIncidentOrReusedMarker(t *testing.T) {
 		t.Fatalf("reused cleared marker removed=%v", err)
 	}
 }
+
+func TestReconciliationRetainsEverySampleRollback(t *testing.T) {
+	cases := []struct {
+		name                 string
+		first, second, later int64
+		cancelFirst          bool
+		floor, observed      int64
+	}{
+		{"below-new-floor", 150, 160, 210, false, 200, 150},
+		{"second-regresses", 210, 209, 211, false, 210, 209},
+		{"writer-regresses", 210, 211, 205, false, 211, 205},
+		{"cancel-after-first", 150, 160, 210, true, 200, 150},
+		{"later-normal-advance", 201, 202, 203, false, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, s, _, request := clockAdministration(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			next, later := int64(200), int64(200)
+			pending := false
+			s.config.Now = func() time.Time {
+				if pending {
+					pending = false
+					value := next
+					if tc.cancelFirst && value == tc.first {
+						cancel()
+					}
+					return time.Unix(value, 0)
+				}
+				return time.Unix(later, 0)
+			}
+			mono := time.Unix(0, 0)
+			a.config.MonotonicNow = func() time.Time { return mono }
+			a.config.VerifyTime = func(context.Context, ClockReconcileRequest, store.RecoveryRecord) error {
+				next, later, pending = tc.first, tc.later, true
+				return nil
+			}
+			a.config.Wait = func(context.Context, time.Duration) error {
+				mono = mono.Add(time.Second)
+				next, pending = tc.second, true
+				return nil
+			}
+			receipt, err := a.ClockReconcile(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, request)
+			if tc.floor == 0 {
+				if err != nil || receipt.Result.Code != "" {
+					t.Fatalf("normal advancing samples rejected=%+v %v", receipt, err)
+				}
+			} else if err == nil && receipt.Result.Code == "" {
+				t.Errorf("rollback cleared recovery=%+v", receipt)
+			}
+			if err := s.maintenance.Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+				var count int
+				if tc.floor == 0 {
+					if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM recovery_incidents WHERE status='held'").Scan(&count); err != nil {
+						return err
+					}
+					if count != 0 {
+						t.Errorf("invented rollback incidents=%d", count)
+					}
+				} else {
+					if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM recovery_incidents WHERE status='held' AND last_trusted_ns=? AND observed_ns=?", time.Unix(tc.floor, 0).UnixNano(), time.Unix(tc.observed, 0).UnixNano()).Scan(&count); err != nil {
+						return err
+					}
+					if count == 0 {
+						t.Errorf("lost exact sample rollback=(%d,%d)", tc.floor, tc.observed)
+					}
+					current, err := store.ReadRecovery(ctx, tx, request.IncidentID)
+					if err != nil {
+						return err
+					}
+					if current.Status != "held" {
+						t.Errorf("original incident cleared=%+v", current)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			markers, err := s.config.Markers.List(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.floor != 0 {
+				found := false
+				for _, m := range markers {
+					if m.Floor != nil && *m.Floor == time.Unix(tc.floor, 0).UnixNano() && m.Observed != nil && *m.Observed == time.Unix(tc.observed, 0).UnixNano() {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("missing external sample marker: %+v", markers)
+				}
+			}
+		})
+	}
+}

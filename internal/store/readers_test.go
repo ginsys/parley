@@ -462,3 +462,19 @@ func TestRuntimeWriterRejectsEmptyCatalogAtEveryVersion(t *testing.T) {
 		})
 	}
 }
+
+func TestReaderEnablesRecursiveTriggers(t *testing.T) {
+	d := readerTestDB(t)
+	if err := d.Queries().snapshot(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+		var enabled int
+		if err := tx.QueryRowContext(ctx, "PRAGMA recursive_triggers").Scan(&enabled); err != nil {
+			return err
+		}
+		if enabled != 1 {
+			t.Errorf("recursive_triggers=%d", enabled)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

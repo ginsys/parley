@@ -60,6 +60,21 @@ func TestBindingRevocationIsAuditedAndCancelsExactConnection(t *testing.T) {
 	if err != nil || retired.Result.Code != "" {
 		t.Fatalf("retire=%+v %v", retired, err)
 	}
+	retireReplay, err := service.Retire(ctx, actor, request)
+	if err != nil || !retireReplay.Replayed {
+		t.Fatalf("retire replay=%+v %v", retireReplay, err)
+	}
+	for _, receipt := range []store.CommandReceipt{result, replay, retired, retireReplay} {
+		found := false
+		for _, resource := range receipt.Result.Resources {
+			if resource.Kind == "credential" && resource.ID == auth.credentialID && resource.Before == 1 && resource.After == 1 {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("receipt omitted immutable credential metadata: %+v", receipt.Result.Resources)
+		}
+	}
 	if err := m.store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		b, err := store.ReadBinding(ctx, tx, request.BindingID)
 		if err != nil {
@@ -187,6 +202,13 @@ func TestHoldDispositionRetainsReasonAndReplayIdentity(t *testing.T) {
 				t.Fatalf("revoke=%+v %v", revoke, err)
 			}
 			request := HoldDispositionRequest{OperationID: "80000000-0000-4000-8000-000000000001", Work: store.WorkRef{Kind: "envelope", ID: work}, IncidentID: revoke.Result.Resources[1].ID, ExpectedHoldVersion: 1, Action: "release", Reason: DispositionReason{Code: "owner_reviewed", Note: value}}
+			for _, work := range []store.WorkRef{{}, {Kind: "envelope"}, {Kind: "unknown", ID: request.Work.ID}} {
+				invalid := request
+				invalid.Work = work
+				if receipt, err := service.HoldDisposition(ctx, actor, invalid); err != store.InvalidRequest || receipt.AuditID != "" {
+					t.Errorf("invalid work retained a receipt: %+v %v", receipt, err)
+				}
+			}
 			receipt, err := service.HoldDisposition(ctx, actor, request)
 			if err != nil || receipt.Result.Code != "" {
 				t.Fatalf("disposition=%+v %v", receipt, err)

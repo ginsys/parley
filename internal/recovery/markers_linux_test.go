@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -120,6 +121,214 @@ func TestMalformedAndUnfinishedMarkersFailClosed(t *testing.T) {
 			}
 			if _, err := d.List(context.Background()); err != store.RecoveryRequired {
 				t.Fatalf("malformed marker=%v", err)
+			}
+		})
+	}
+}
+
+func TestCompletePendingMarkerIsRecoveredWithoutLosingEvidence(t *testing.T) {
+	for _, kind := range []string{"complete", "conflict", "truncated", "sync-failure"} {
+		t.Run(kind, func(t *testing.T) {
+			d := markerDirectory(t)
+			m := testMarker()
+			ctx := context.Background()
+			if kind == "conflict" {
+				other := m
+				other.ServerID = "70000000-0000-4000-8000-000000000002"
+				if err := d.Put(ctx, other); err != nil {
+					t.Fatal(err)
+				}
+			}
+			data, err := m.encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "truncated" {
+				data = data[:len(data)/2]
+			}
+			pending := filepath.Join(d.path, ".pending-90000000-0000-4000-8000-000000000001")
+			file, err := os.OpenFile(pending, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.Write(data); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			d, err = NewDirectory(d.path, d.uid, 4)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == "sync-failure" {
+				d.syncDirectory = func(int) error { return errors.New("synthetic sync failure") }
+			}
+			markers, err := d.List(ctx)
+			if kind == "conflict" || kind == "truncated" {
+				if err != store.RecoveryRequired {
+					t.Fatalf("unsafe pending accepted=%+v %v", markers, err)
+				}
+				if _, err := os.Stat(pending); err != nil {
+					t.Fatalf("unsafe evidence removed=%v", err)
+				}
+				return
+			}
+			if kind == "sync-failure" {
+				if !errors.Is(err, store.TemporarilyUnavailable) {
+					t.Fatalf("unsynced publication=%v", err)
+				}
+				d.syncDirectory = unix.Fsync
+				markers, err = d.List(ctx)
+			}
+			if err != nil || len(markers) != 1 || !sameMarker(markers[0], m) {
+				t.Fatalf("pending not recovered=%+v %v", markers, err)
+			}
+			if _, err := os.Stat(pending); !os.IsNotExist(err) {
+				t.Fatalf("pending retained after promotion=%v", err)
+			}
+			again, err := d.List(ctx)
+			if err != nil || len(again) != 1 || !sameMarker(again[0], m) {
+				t.Fatalf("repeat listing=%+v %v", again, err)
+			}
+		})
+	}
+}
+
+func TestPendingPromotionFailureInvokesSupervisorFailStop(t *testing.T) {
+	s, _, _ := recoveryFixture(t)
+	d := s.config.Markers.(*Directory)
+	marker := testMarker()
+	marker.ServerID = s.serverID
+	data, err := marker.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(d.path, ".pending-90000000-0000-4000-8000-000000000002")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	stopped := 0
+	s.config.FailStop = func() { stopped++ }
+	d.syncDirectory = func(int) error { return errors.New("synthetic promotion sync failure") }
+	if _, err := s.InspectRecovery(context.Background(), s.config.Store); err != store.RecoveryRequired {
+		t.Fatalf("failed publication=%v", err)
+	}
+	if stopped == 0 {
+		t.Fatal("promotion publication failure did not fail-stop")
+	}
+}
+
+func TestSameMarkerPartialTimes(t *testing.T) {
+	for _, field := range []string{"floor", "observed"} {
+		t.Run(field, func(t *testing.T) {
+			a, b := testMarker(), testMarker()
+			x, y := int64(1), int64(1)
+			if field == "floor" {
+				a.Floor, b.Floor = &x, &y
+			} else {
+				a.Observed, b.Observed = &x, &y
+			}
+			if !sameMarker(a, b) {
+				t.Fatal("equal partial times differ")
+			}
+			y = 2
+			if sameMarker(a, b) {
+				t.Fatal("unequal partial times compare equal")
+			}
+		})
+	}
+}
+
+func TestListEnumeratesBeforePromoting(t *testing.T) {
+	d := markerDirectory(t)
+	a, b := testMarker(), testMarker()
+	b.IncidentID = "60000000-0000-4000-8000-000000000002"
+	pending := ".pending-80000000-0000-4000-8000-000000000001"
+	data, err := a.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d.path, pending), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	d.readNames = func(*os.File, int) ([]string, error) {
+		calls++
+		if calls == 1 {
+			return []string{pending}, nil
+		}
+		if calls == 2 {
+			// A directory mutation during enumeration may make readdir skip B.
+			if _, err := os.Stat(filepath.Join(d.path, pending)); errors.Is(err, os.ErrNotExist) {
+				return nil, io.EOF
+			}
+			return []string{b.IncidentID}, nil
+		}
+		return nil, io.EOF
+	}
+	markers, err := d.List(context.Background())
+	if err != nil || len(markers) != 2 {
+		t.Fatalf("lost marker during promotion: %+v %v", markers, err)
+	}
+}
+
+func TestPromotionSyncPrecedesLaterEntryFailure(t *testing.T) {
+	for _, failSync := range []bool{false, true} {
+		t.Run(map[bool]string{false: "later-invalid", true: "sync-fails"}[failSync], func(t *testing.T) {
+			s, _, _ := recoveryFixture(t)
+			d := s.config.Markers.(*Directory)
+			marker := testMarker()
+			marker.ServerID = s.serverID
+			data, err := marker.encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending := ".pending-90000000-0000-4000-8000-000000000001"
+			invalid := "60000000-0000-4000-8000-000000000002"
+			if err := os.WriteFile(filepath.Join(d.path, pending), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(d.path, invalid), []byte("incomplete"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			listed := false
+			d.readNames = func(*os.File, int) ([]string, error) {
+				if listed {
+					return nil, io.EOF
+				}
+				listed = true
+				return []string{pending, invalid}, nil
+			}
+			syncs, stops := 0, 0
+			d.syncDirectory = func(fd int) error {
+				syncs++
+				if failSync {
+					return errors.New("synthetic sync failure")
+				}
+				return unix.Fsync(fd)
+			}
+			s.config.FailStop = func() { stops++ }
+			_, err = s.listMarkers(context.Background())
+			if syncs != 1 {
+				t.Errorf("promoted file not synced before later failure: calls=%d", syncs)
+			}
+			if failSync {
+				var publication markerPublicationFailure
+				if !errors.As(err, &publication) || stops != 1 {
+					t.Errorf("unknown promotion durability did not fail-stop: %v stops=%d", err, stops)
+				}
+			} else if err != store.RecoveryRequired || stops != 0 {
+				t.Errorf("later invalid entry=%v stops=%d", err, stops)
+			}
+			if _, err := os.Stat(filepath.Join(d.path, marker.IncidentID)); err != nil {
+				t.Errorf("promoted evidence lost=%v", err)
 			}
 		})
 	}

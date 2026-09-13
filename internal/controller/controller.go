@@ -41,6 +41,10 @@ type GrantParams struct {
 // Grant creates the next historical version for a conversation. It fails if
 // the conversation already has an active grant — use Renew for that.
 func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, error) {
+	// This legacy writer has no coordinated recovery/clock contract.
+	if c.db.RecoveryControlled() {
+		return nil, store.RecoveryRequired
+	}
 	if err := validateGrant(p); err != nil {
 		return nil, err
 	}
@@ -54,6 +58,9 @@ func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, er
 			tx.Rollback()
 		}
 	}()
+	if err := rejectRecoveryOwner(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	now := nowRFC3339()
 	if err := store.EnsureConversation(ctx, tx, p.Conversation, p.Conversation, now); err != nil {
@@ -105,6 +112,10 @@ type RevokeResult struct {
 // dispatch or already handed off are reported, not touched — Revoke cannot
 // undo a send that already committed to leaving this process.
 func (c *Controller) Revoke(ctx context.Context, conversation string) (*RevokeResult, error) {
+	// This legacy writer has no coordinated recovery/clock contract.
+	if c.db.RecoveryControlled() {
+		return nil, store.RecoveryRequired
+	}
 	tx, err := c.db.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -115,6 +126,9 @@ func (c *Controller) Revoke(ctx context.Context, conversation string) (*RevokeRe
 			tx.Rollback()
 		}
 	}()
+	if err := rejectRecoveryOwner(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	g, err := store.CurrentGrant(ctx, tx, conversation)
 	if err != nil {
@@ -158,6 +172,10 @@ type RenewParams struct {
 // proven replies carry by default because their originals were acknowledged.
 // CancelPendingReplies explicitly opts out, including late unattempted rescue.
 func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, error) {
+	// This legacy writer has no coordinated recovery/clock contract.
+	if c.db.RecoveryControlled() {
+		return nil, store.RecoveryRequired
+	}
 	if err := bridgetext.ValidateMetadata(p.Conversation); err != nil {
 		return nil, fmt.Errorf("conversation identifier: %w", err)
 	}
@@ -177,6 +195,9 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 			tx.Rollback()
 		}
 	}()
+	if err := rejectRecoveryOwner(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	current, err := store.CurrentGrant(ctx, tx, p.Conversation)
 	if err != nil {
@@ -281,6 +302,23 @@ func validatePeerIDs(ids ...string) error {
 		if err := bridgetext.ValidateMetadata(id); err != nil {
 			return fmt.Errorf("peer identifier: %w", err)
 		}
+	}
+	return nil
+}
+
+// A separately opened legacy handle has no process-local recovery hooks. The
+// durable checkpoint/incident evidence still establishes runtime ownership.
+func rejectRecoveryOwner(ctx context.Context, tx *sql.Tx) error {
+	checkpoint, err := store.ReadClockCheckpoint(ctx, tx)
+	if err != nil {
+		return err
+	}
+	var incident bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents)").Scan(&incident); err != nil {
+		return err
+	}
+	if checkpoint.Instant.Valid || incident {
+		return store.RecoveryRequired
 	}
 	return nil
 }

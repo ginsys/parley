@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/ginsys/parley/internal/store"
@@ -68,19 +69,23 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 		return a.finish(prior, r.IncidentID, r.ExpectedClockVersion, r.TimeEvidenceRef)
 	}
 	var record store.RecoveryRecord
-	if err := coordinator.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	recordErr := coordinator.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		if err := a.config.Authorize(ctx, tx, p); err != nil {
 			return err
 		}
 		var err error
 		record, err = store.ReadRecovery(ctx, tx, r.IncidentID)
 		return err
-	}); err != nil {
-		return store.CommandReceipt{}, err
+	})
+	if recordErr != nil && !errors.Is(recordErr, store.NotFound) {
+		return store.CommandReceipt{}, recordErr
 	}
+	missing := errors.Is(recordErr, store.NotFound)
 	var evidenceErr error
 	var first, second int64
-	if record.Kind != "clock" {
+	if missing {
+		evidenceErr = store.NotFound
+	} else if record.Kind != "clock" {
 		evidenceErr = store.InvalidRequest
 	} else if record.Version != r.ExpectedClockVersion || record.Status != "held" {
 		evidenceErr = store.VersionConflict
@@ -88,7 +93,7 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 		evidenceCtx, cancel := context.WithTimeout(ctx, store.ReadinessDeadline)
 		evidenceErr = a.config.VerifyTime(evidenceCtx, r, record)
 		if evidenceErr == nil {
-			first, evidenceErr = store.InstantNanos(a.config.Service.config.Now())
+			first, evidenceErr = a.config.Service.sampleReconciliationClock(evidenceCtx, record.Floor.Int64)
 			monotonicStart := a.config.MonotonicNow()
 			if evidenceErr == nil {
 				evidenceErr = a.config.Wait(evidenceCtx, time.Second)
@@ -97,14 +102,14 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 				evidenceErr = store.HostUnverified
 			}
 			if evidenceErr == nil {
-				second, evidenceErr = store.InstantNanos(a.config.Service.config.Now())
+				second, evidenceErr = a.config.Service.sampleReconciliationClock(evidenceCtx, record.Floor.Int64)
 			}
 			if evidenceErr == nil && (second < first || first < record.Floor.Int64) {
 				evidenceErr = store.HostUnverified
 			}
 		}
 		if evidenceCtx.Err() != nil {
-			evidenceErr = store.HostUnverified
+			evidenceErr = evidenceCtx.Err()
 		}
 		cancel()
 	}
@@ -113,8 +118,16 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 			return store.CommandResult{}, err
 		}
 		current, err := store.ReadRecovery(ctx, tx, r.IncidentID)
+		if errors.Is(err, store.NotFound) {
+			return rejection(store.NotFound)
+		}
 		if err != nil {
 			return store.CommandResult{}, err
+		}
+		// A concurrently appearing incident needs a fresh verification attempt;
+		// absence is terminal only when confirmed under the mutation writer.
+		if missing {
+			return store.CommandResult{}, store.TemporarilyUnavailable
 		}
 		if current.Version != r.ExpectedClockVersion {
 			return rejection(store.VersionConflict)
@@ -126,7 +139,10 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 			return rejection(store.RequestTerminal)
 		}
 		if evidenceErr != nil {
-			return rejection(store.HostUnverified)
+			if errors.Is(evidenceErr, store.HostUnverified) {
+				return rejection(store.HostUnverified)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
 		now, err := store.InstantNanos(store.AuthorityTime(ctx, a.config.Service.config.Now))
 		if err != nil {
@@ -190,7 +206,7 @@ func (a *Administration) finish(receipt store.CommandReceipt, id string, origina
 	if !record.Evidence.Valid || record.Evidence.String != evidence || !((record.Status == "reconciled" && record.Version == reconciled) || (record.Status == "cleared" && record.Version == cleared)) {
 		return receipt, store.RecoveryRequired
 	}
-	markers, err := s.config.Markers.List(ctx)
+	markers, err := s.listMarkers(ctx)
 	if err != nil {
 		return receipt, store.RecoveryRequired
 	}
@@ -210,7 +226,7 @@ func (a *Administration) finish(receipt store.CommandReceipt, id string, origina
 	}, nil); err != nil {
 		return receipt, err
 	}
-	markers, err = s.config.Markers.List(ctx)
+	markers, err = s.listMarkers(ctx)
 	if err != nil {
 		return receipt, store.RecoveryRequired
 	}
@@ -226,4 +242,48 @@ func (a *Administration) finish(receipt store.CommandReceipt, id string, origina
 	s.held = held || len(markers) > 0 || len(s.pending) > 0
 	s.stateMu.Unlock()
 	return receipt, nil
+}
+
+// sampleReconciliationClock reads the applicable floor, closes its transaction,
+// then samples and records the observation while retaining the coordinator gate.
+// No writer can advance or reset the floor between comparison and publication.
+func (s *Service) sampleReconciliationClock(ctx context.Context, incidentFloor int64) (sample int64, err error) {
+	defer func() {
+		if flushErr := s.after(); flushErr != nil {
+			err = flushErr
+		}
+	}()
+	floor := incidentFloor
+	var sampleErr error
+	_, err = s.maintenance.Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		checkpoint, err := s.authorizationFloor(ctx, tx)
+		if err != nil {
+			return store.TransitionResult{}, err
+		}
+		if checkpoint.Instant.Valid && checkpoint.Instant.Int64 > floor {
+			floor = checkpoint.Instant.Int64
+		}
+		return store.TransitionResult{PublishUnchanged: true}, nil
+	}, func(store.CommitView) {
+		sample, sampleErr = store.InstantNanos(s.config.Now())
+		if sampleErr != nil {
+			return
+		}
+		if sample < floor {
+			if sampleErr = s.latch(floor, sample); sampleErr == nil {
+				sampleErr = store.RecoveryRequired
+			}
+			return
+		}
+		s.stateMu.Lock()
+		if s.trusted == nil || sample > *s.trusted {
+			value := sample
+			s.trusted = &value
+		}
+		s.stateMu.Unlock()
+	})
+	if err == nil {
+		err = sampleErr
+	}
+	return sample, err
 }

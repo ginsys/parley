@@ -54,6 +54,7 @@ CREATE TABLE security_holds (
  incident_id TEXT NOT NULL CHECK(length(incident_id)=36),
  revocation_incident_id TEXT REFERENCES revocation_incidents(incident_id),
  recovery_incident_id TEXT REFERENCES recovery_incidents(incident_id),
+ created_at_ns INTEGER NOT NULL CHECK(typeof(created_at_ns)='integer'),
  hold_version INTEGER NOT NULL DEFAULT 1 CHECK(typeof(hold_version)='integer' AND hold_version>0),
  status TEXT NOT NULL DEFAULT 'held' CHECK(status IN ('held','released','cancelled')),
  CHECK((revocation_incident_id IS NOT NULL AND revocation_incident_id=incident_id AND recovery_incident_id IS NULL) OR

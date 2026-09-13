@@ -33,12 +33,28 @@ func recordExpiry(ctx context.Context, c CredentialRecord) {
 	}
 }
 func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if db != e.owner {
 		return InvalidRequest
 	}
-	if len(e.observed) == 0 {
+	// Never hold the evidence mutex while waiting on the writer: collection
+	// takes this mutex from inside a writer transaction. Preserve observations
+	// for retry if persistence fails, and leave concurrently added ones intact.
+	e.mu.Lock()
+	observations := make(map[string]CredentialExpiry, len(e.observed))
+	for id, observed := range e.observed {
+		observations[id] = observed
+	}
+	e.mu.Unlock()
+	// A replay bypasses the business callback, so its collector may be empty.
+	// Retry all exact-credential observations retained by previous failed writes.
+	db.coordinator.credentialExpiries.Range(func(key, value any) bool {
+		id, deadline := key.(string), value.(int64)
+		if _, exists := observations[id]; !exists {
+			observations[id] = CredentialExpiry{Deadline: deadline}
+		}
+		return true
+	})
+	if len(observations) == 0 {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), AuthenticationDeadline)
@@ -46,7 +62,7 @@ func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
 	var bindings []string
 	_, err := db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ CommitView) (TransitionResult, error) {
 		changed := false
-		for id, observed := range e.observed {
+		for id, observed := range observations {
 			result, err := tx.ExecContext(ctx, "UPDATE credentials SET status='expired' WHERE credential_id=? AND expires_at_ns=? AND status='current'", id, observed.Deadline)
 			if err != nil {
 				return TransitionResult{}, err
@@ -57,13 +73,30 @@ func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
 			}
 			changed = changed || n > 0
 			if n > 0 {
-				bindings = append(bindings, observed.BindingID)
+				binding := observed.BindingID
+				if binding == "" {
+					credential, err := ReadCredential(ctx, tx, id)
+					if err != nil {
+						return TransitionResult{}, err
+					}
+					binding = credential.BindingID
+				}
+				bindings = append(bindings, binding)
 			}
 		}
-		return TransitionResult{Changed: changed}, nil
+		return TransitionResult{Changed: changed, PublishUnchanged: true}, nil
 	}, func(CommitView) {
-		for id := range e.observed {
-			db.coordinator.credentialExpiries.Delete(id)
+		// Retain failed and concurrently added observations, but a successful
+		// collector must not retry evidence already made terminal.
+		e.mu.Lock()
+		for id, observed := range observations {
+			if current, ok := e.observed[id]; ok && current.Deadline == observed.Deadline {
+				delete(e.observed, id)
+			}
+		}
+		e.mu.Unlock()
+		for id, observed := range observations {
+			db.coordinator.credentialExpiries.CompareAndDelete(id, observed.Deadline)
 		}
 		if invalidate != nil {
 			for _, binding := range bindings {
@@ -74,23 +107,7 @@ func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
 	return err
 }
 
-// CredentialExpiryObserved denies only the exact immutable credential identity.
-// A failed persistence attempt cannot poison an unrelated or rotated credential.
-func (d *DB) CredentialExpiryObserved(id string) bool {
-	_, denied := d.coordinator.credentialExpiries.Load(id)
-	return denied
-}
 func observedExpiry(ctx context.Context, id string) bool {
 	evidence, ok := ctx.Value(expiryContextKey{}).(*ExpiryEvidence)
 	return ok && evidence.owner.CredentialExpiryObserved(id)
 }
-
-// RememberCredentialExpiry is used before a terminal-expiry write so failure
-// cannot erase that observation. Credential identities/deadlines are immutable.
-func (d *DB) RememberCredentialExpiry(c CredentialRecord) {
-	d.coordinator.credentialExpiries.Store(c.ID, c.ExpiresAtNS)
-}
-
-// ForgetCredentialExpiry is only a post-commit publication callback after the
-// exact credential became terminal. It never changes durable lifecycle state.
-func (d *DB) ForgetCredentialExpiry(id string) { d.coordinator.credentialExpiries.Delete(id) }

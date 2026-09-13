@@ -62,7 +62,7 @@ type RevocationRequest struct {
 }
 type RevocationChange struct {
 	BindingVersion, CredentialVersion, BarrierVersion int64
-	IncidentID                                        string
+	IncidentID, CredentialID                          string
 }
 
 // RevokeBinding is used inside an audited human command. pending contains only
@@ -159,7 +159,7 @@ func RevokeBinding(ctx context.Context, tx *sql.Tx, r RevocationRequest, pending
 			break
 		}
 		for _, id := range ids {
-			if err := insertRevocationHold(ctx, tx, WorkRef{"envelope", id}, r.IncidentID); err != nil {
+			if err := insertRevocationHold(ctx, tx, WorkRef{"envelope", id}, r.IncidentID, r.NowNS); err != nil {
 				return RevocationChange{}, err
 			}
 		}
@@ -170,18 +170,18 @@ func RevokeBinding(ctx context.Context, tx *sql.Tx, r RevocationRequest, pending
 		if !work.valid() || work.Kind == "envelope" {
 			return RevocationChange{}, InvalidRequest
 		}
-		if err := insertRevocationHold(ctx, tx, work, r.IncidentID); err != nil {
+		if err := insertRevocationHold(ctx, tx, work, r.IncidentID, r.NowNS); err != nil {
 			return RevocationChange{}, err
 		}
 	}
-	return RevocationChange{version, credential.Version, nextBarrier, r.IncidentID}, nil
+	return RevocationChange{BindingVersion: version, CredentialVersion: credential.Version, BarrierVersion: nextBarrier, IncidentID: r.IncidentID, CredentialID: credential.ID}, nil
 }
-func insertRevocationHold(ctx context.Context, tx *sql.Tx, w WorkRef, incident string) error {
+func insertRevocationHold(ctx context.Context, tx *sql.Tx, w WorkRef, incident string, nowNS int64) error {
 	id, err := uuid.NewRandom()
 	if err != nil {
 		return TemporarilyUnavailable
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO security_holds(hold_id,work_kind,work_id,incident_id,revocation_incident_id) VALUES(?,?,?,?,?)", id.String(), w.Kind, w.ID, incident, incident)
+	_, err = tx.ExecContext(ctx, "INSERT INTO security_holds(hold_id,work_kind,work_id,incident_id,revocation_incident_id,created_at_ns) VALUES(?,?,?,?,?,?)", id.String(), w.Kind, w.ID, incident, incident, nowNS)
 	if err != nil {
 		return storageCode(err)
 	}

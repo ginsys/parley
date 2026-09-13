@@ -3,7 +3,9 @@ package recovery
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	runtimeowner "github.com/ginsys/parley/internal/runtime"
@@ -21,16 +23,18 @@ type Config struct {
 	FailStop func()
 }
 type Service struct {
+	initialized atomic.Bool
 	config      Config
 	maintenance *store.RecoveryMaintenance
 	// Lock order: I/O serialization -> maintenance coordinator -> short state.
 	// Writer Time/Guard take state only and never acquire ioMu.
-	ioMu     sync.Mutex
-	stateMu  sync.Mutex
-	held     bool
-	pending  []Marker
-	trusted  *int64
-	serverID string
+	ioMu          sync.Mutex
+	stateMu       sync.Mutex
+	held          bool
+	pending       []Marker
+	trusted       *int64
+	serverID      string
+	newIncidentID func() (uuid.UUID, error)
 }
 
 func New(ctx context.Context, c Config) (*Service, error) {
@@ -40,7 +44,7 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	if c.Now == nil {
 		c.Now = time.Now
 	}
-	s := &Service{config: c}
+	s := &Service{config: c, newIncidentID: uuid.NewRandom}
 	maintenance, err := c.Store.Coordinator().InstallRecovery(store.RecoveryHooks{Before: s.before, Time: s.transactionTime, After: s.after})
 	if err != nil {
 		return nil, err
@@ -54,39 +58,60 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	if err := s.prepare(ctx); err != nil {
 		return nil, err
 	}
+	s.initialized.Store(true)
 	return s, nil
 }
 func humanRecovery(kind string) bool {
 	return kind == "human_inspection" || kind == "clock.reconcile" || kind == "recovery.complete"
 }
 func (s *Service) before(ctx context.Context, kind string) error {
+	if !s.initialized.Load() {
+		return store.RecoveryRequired
+	}
 	if err := s.prepare(ctx); err != nil {
 		return err
 	}
 	s.stateMu.Lock()
 	held := s.held
 	s.stateMu.Unlock()
-	if held && !humanRecovery(kind) {
+	if held && !humanRecovery(kind) && kind != "dispatch.settle" {
 		return store.RecoveryRequired
 	}
 	return nil
 }
 func (s *Service) latch(floor, observed int64) error {
-	id, err := uuid.NewRandom()
-	if err != nil {
-		s.config.FailStop()
-		return store.RecoveryRequired
-	}
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	s.held = true
-	// A pending detection is immutable. Repeated failed operations cannot replace
-	// its incident identity or overwrite the evidence awaiting persistence.
-	if len(s.pending) == 0 {
-		s.pending = append(s.pending, Marker{IncidentID: id.String(), ServerID: s.serverID, Kind: "clock", Floor: &floor, Observed: &observed})
+	// Repeated observations of the same pair reuse pending evidence; a new
+	// detection never replaces or suppresses a different pending incident.
+	for _, marker := range s.pending {
+		if marker.Kind == "clock" && *marker.Floor == floor && *marker.Observed == observed {
+			return nil
+		}
 	}
+	s.pending = append(s.pending, Marker{ServerID: s.serverID, Kind: "clock", Floor: &floor, Observed: &observed})
 	return nil
 }
+
+// latchRollback deduplicates only the same still-held immutable observation.
+// A different floor/observed pair needs independent evidence even during cleanup.
+func (s *Service) latchRollback(ctx context.Context, tx *sql.Tx, floor, observed int64) error {
+	var recorded bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents WHERE kind='clock' AND status='held' AND last_trusted_ns=? AND observed_ns=?)", floor, observed).Scan(&recorded); err != nil {
+		// Detection already happened. An unavailable deduplication read cannot
+		// discard the observation before the independent After flush.
+		if latchErr := s.latch(floor, observed); latchErr != nil {
+			return latchErr
+		}
+		return store.TemporarilyUnavailable
+	}
+	if recorded {
+		return nil
+	}
+	return s.latch(floor, observed)
+}
+
 func (s *Service) transactionTime(ctx context.Context, tx *sql.Tx, kind string) (time.Time, error) {
 	instant := s.config.Now()
 	ns, err := store.InstantNanos(instant)
@@ -98,17 +123,17 @@ func (s *Service) transactionTime(ctx context.Context, tx *sql.Tx, kind string) 
 		return time.Time{}, err
 	}
 	if checkpoint.Instant.Valid && ns < checkpoint.Instant.Int64 {
-		var alreadyHeld bool
-		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents WHERE kind='clock' AND status!='cleared')").Scan(&alreadyHeld); err != nil {
-			return time.Time{}, store.TemporarilyUnavailable
+		if err := s.latchRollback(ctx, tx, checkpoint.Instant.Int64, ns); err != nil {
+			return time.Time{}, err
 		}
-		if !alreadyHeld {
-			if err := s.latch(checkpoint.Instant.Int64, ns); err != nil {
-				return time.Time{}, err
-			}
-		}
-		if !humanRecovery(kind) {
+		if !humanRecovery(kind) && kind != "dispatch.settle" {
 			return time.Time{}, store.RecoveryRequired
+		}
+		if kind == "dispatch.settle" {
+			// Late outcome evidence remains recordable, but its timestamp
+			// cannot regress below the trusted floor. The marker retains the
+			// actual observed rollback sample independently.
+			instant = time.Unix(0, checkpoint.Instant.Int64)
 		}
 	} else {
 		if _, err := store.AdvanceClockCheckpoint(ctx, tx, ns); err != nil {
@@ -128,7 +153,7 @@ func (s *Service) transactionTime(ctx context.Context, tx *sql.Tx, kind string) 
 	s.stateMu.Lock()
 	held := s.held || durableHeld
 	s.stateMu.Unlock()
-	if held && !humanRecovery(kind) {
+	if held && !humanRecovery(kind) && kind != "dispatch.settle" {
 		return time.Time{}, store.RecoveryRequired
 	}
 	if principal, ok := store.CommandIdentity(ctx); ok && !humanRecovery(kind) {
@@ -149,6 +174,19 @@ func (s *Service) flush(ctx context.Context) error {
 	hasTrusted := s.trusted != nil
 	s.stateMu.Unlock()
 	for _, marker := range pending {
+		if marker.IncidentID == "" {
+			id, err := s.newIncidentID()
+			if err != nil {
+				s.config.FailStop()
+				return store.RecoveryRequired
+			}
+			marker.IncidentID = id.String()
+			// ioMu owns removal from the pending prefix; concurrent latches
+			// can only append. Assign once before either fallible persistence.
+			s.stateMu.Lock()
+			s.pending[0].IncidentID = marker.IncidentID
+			s.stateMu.Unlock()
+		}
 		if err := s.config.Markers.Put(ctx, marker); err != nil {
 			s.config.FailStop()
 			return store.RecoveryRequired
@@ -195,6 +233,9 @@ func (s *Service) flush(ctx context.Context) error {
 	return nil
 }
 func (s *Service) after() error {
+	if !s.initialized.Load() {
+		return store.RecoveryRequired
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), store.AuthenticationDeadline)
 	defer cancel()
 	s.ioMu.Lock()
@@ -207,7 +248,7 @@ func (s *Service) prepare(ctx context.Context) error {
 	if err := s.flush(ctx); err != nil {
 		return err
 	}
-	markers, err := s.config.Markers.List(ctx)
+	markers, err := s.listMarkers(ctx)
 	if err != nil {
 		s.stateMu.Lock()
 		s.held = true
@@ -260,14 +301,7 @@ func (s *Service) prepare(ctx context.Context) error {
 			return store.TransitionResult{}, err
 		}
 		if checkpoint.Instant.Valid && ns < checkpoint.Instant.Int64 {
-			var clockHeld bool
-			if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents WHERE kind='clock' AND status!='cleared')").Scan(&clockHeld); err != nil {
-				return store.TransitionResult{}, store.TemporarilyUnavailable
-			}
-			if !clockHeld {
-				return store.TransitionResult{}, s.latch(checkpoint.Instant.Int64, ns)
-			}
-			return store.TransitionResult{}, nil
+			return store.TransitionResult{}, s.latchRollback(ctx, tx, checkpoint.Instant.Int64, ns)
 		}
 		changed, err := store.AdvanceClockCheckpoint(ctx, tx, ns)
 		return store.TransitionResult{Changed: changed}, err
@@ -297,8 +331,10 @@ func (s *Service) Guard(ctx context.Context, tx *sql.Tx, principal string) error
 	return nil
 }
 
-// InspectRecovery is the runtime.Config inspector. It never starts workers or
-// clears holds and rejects use with any writer other than this service's owner.
+// InspectRecovery is called by runtime.Config.InspectRecovery after that
+// callback constructs New with the writer runtime.Start supplied. Do not bind a
+// preconstructed service from another DB. It never starts workers or clears
+// holds and rejects use with any writer other than this service's owner.
 func (s *Service) InspectRecovery(ctx context.Context, db *store.DB) (runtimeowner.RecoveryMode, error) {
 	if db != s.config.Store {
 		return 0, store.InvalidRequest
@@ -327,4 +363,13 @@ func (s *Service) authorizationFloor(ctx context.Context, tx *sql.Tx) (store.Clo
 	}
 	s.stateMu.Unlock()
 	return checkpoint, nil
+}
+
+func (s *Service) listMarkers(ctx context.Context) ([]Marker, error) {
+	markers, err := s.config.Markers.List(ctx)
+	var publication markerPublicationFailure
+	if errors.As(err, &publication) {
+		s.config.FailStop()
+	}
+	return markers, err
 }

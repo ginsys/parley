@@ -192,29 +192,19 @@ func (d *DB) Begin(ctx context.Context) (*sql.Tx, error) { return d.sql.BeginTx(
 // auto-retried or auto-resolved past this point — an operator resolves each
 // uncertain row by hand, as documented in docs/architecture.md.
 func (d *DB) RecoverUncertain(ctx context.Context) (int64, error) {
-	tx, err := d.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			tx.Rollback()
+	var n int64
+	_, err := d.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ CommitView) (TransitionResult, error) {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE envelopes SET state = 'uncertain', error_code='interrupted', error_detail='Dispatch was interrupted; host acceptance is unknown and automatic retry is disabled.', updated_at = ?
+			WHERE state = 'dispatching'`, AuthorityTime(ctx, time.Now).UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return TransitionResult{}, err
 		}
-	}()
-	res, err := tx.ExecContext(ctx, `
-		UPDATE envelopes SET state = 'uncertain', error_code='interrupted', error_detail='Dispatch was interrupted; host acceptance is unknown and automatic retry is disabled.', updated_at = ?
-		WHERE state = 'dispatching'`, time.Now().UTC().Format(time.RFC3339Nano))
+		n, err = res.RowsAffected()
+		return TransitionResult{Changed: n > 0}, err
+	}, nil)
 	if err != nil {
-		return 0, fmt.Errorf("recover uncertain: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("recover uncertain: rows affected: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	committed = true
 	return n, nil
 }

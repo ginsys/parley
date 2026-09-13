@@ -193,7 +193,10 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
         for state in ('shell', 'pager', 'editor', 'approval', 'busy', 'unknown'):
             with self.subTest(state=state):
                 child = self.spawn()
-                self.until(child, b'READY')
+                # Wait for the whole line: the PTY's ONLCR emits READY and its \r\n as one
+                # write, but under load the two can arrive in separate reads, and the
+                # empty-read assertion below then sees the line ending instead of silence.
+                self.until(child, b'READY\r\n')
                 with self.assertRaises(ValueError):
                     child.send(b'approve\n', generation='session-1', state=state)
                 self.assertFalse(any(e['kind'] == 'input' for e in child.events))
@@ -237,6 +240,70 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
         ran = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         self.assertNotEqual(ran.returncode, 0)
         self.assertEqual(output.read_bytes(), original)
+
+    def test_home_inherit_uses_real_environment_and_skips_temporary_home(self):
+        output = Path(self.tmp.name, 'inherit.json')
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--home', 'inherit',
+                '--', sys.executable, '-u', '-c', "import os; print(os.environ.get('HOME'), flush=True)"]
+        with patch.object(sys, 'argv', args), \
+                patch('wake_probe.tempfile.TemporaryDirectory',
+                      side_effect=AssertionError('inherit mode must not create a throwaway HOME')):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        self.assertEqual(record['home_mode'], 'inherit')
+        # The generation names the session `send` checks against; an inherit-mode capture
+        # labelled 'disposable' would let a token from the other mode pass as current.
+        self.assertEqual(record['generation'], 'inherit')
+        self.assertIsNone(record['home_cleanup_error'])
+        printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
+        self.assertIn(os.environ['HOME'].encode(), printed)
+
+    def test_home_inherit_with_explicit_cwd_sets_pwd_to_match_not_the_parents(self):
+        # inherit mode copies the whole parent environment, PWD included; a --cwd that differs
+        # from the parent's own cwd must not leave the child believing it is somewhere else.
+        output = Path(self.tmp.name, 'inherit-cwd.json')
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--home', 'inherit',
+                '--cwd', self.tmp.name, '--', sys.executable, '-u', '-c',
+                "import os; print(os.environ.get('PWD'), flush=True)"]
+        with patch.object(sys, 'argv', args), patch.dict(os.environ, {'PWD': '/nonexistent-stale'}):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
+        self.assertIn(os.path.realpath(self.tmp.name).encode(), printed)
+        self.assertNotIn(b'/nonexistent-stale', printed)
+
+    def test_home_missing_for_inherit_mode_is_a_usage_error(self):
+        output = Path(self.tmp.name, 'no-home.json')
+        args = ['wake_probe', '--output', str(output), '--home', 'inherit', '--', 'fixture']
+        with patch.object(sys, 'argv', args), patch.dict(os.environ, {'HOME': ''}):
+            with self.assertRaises(SystemExit):
+                main()
+        self.assertFalse(output.exists())
+
+    def test_disposable_is_the_default_home_mode(self):
+        output = Path(self.tmp.name, 'disposable.json')
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--',
+                sys.executable, '-u', '-c', "print('default mode', flush=True)"]
+        with patch.object(sys, 'argv', args):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        self.assertEqual(record['home_mode'], 'disposable')
+        self.assertEqual(record['generation'], 'disposable')
+        self.assertIsNotNone(record['cwd'])  # the throwaway HOME, recorded not implied
+
+    def test_explicit_cwd_is_recorded_as_the_resolved_effective_directory(self):
+        # Host behaviour varies by directory-level configuration, so a capture that does not
+        # name where the child ran cannot be reproduced or compared against another.
+        output = Path(self.tmp.name, 'cwd.json')
+        args = ['wake_probe', '--output', str(output), '--seconds', '2', '--cwd', self.tmp.name, '--',
+                sys.executable, '-u', '-c', "import os; print(os.getcwd(), flush=True)"]
+        with patch.object(sys, 'argv', args):
+            self.assertEqual(main(), 0)
+        record = json.loads(output.read_text())
+        # realpath, not abspath: the record must name the directory the child actually reached.
+        self.assertEqual(record['cwd'], os.path.realpath(self.tmp.name))
+        printed = b''.join(bytes.fromhex(e['hex']) for e in record['events'])
+        self.assertIn(os.path.realpath(self.tmp.name).encode(), printed)
 
     def test_missing_command_and_nonzero_exit_are_failed_captures(self):
         for command, expected in (([str(Path(self.tmp.name, 'missing-host'))], 127),

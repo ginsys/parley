@@ -3,6 +3,8 @@ package connection
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/ginsys/parley/internal/store"
@@ -52,6 +54,16 @@ func TestIngestionResumeReauthorizesReplayAndKeepsStaleBarrierClosed(t *testing.
 	}
 	r.OperationID = "80000000-0000-4000-8000-000000000003"
 	r.ExpectedBarrierVersion = 1
+	resolve := service.config.Resolve
+	for _, failure := range []error{store.TemporarilyUnavailable, fmt.Errorf("provider: %w", store.TemporarilyUnavailable), context.Canceled, context.DeadlineExceeded, errors.New("synthetic unavailable interval")} {
+		service.config.Resolve = func(context.Context, IngestionResumeRequest) (store.ReviewedInterval, error) {
+			return store.ReviewedInterval{}, failure
+		}
+		if receipt, err := service.Resume(ctx, p, r); err != store.TemporarilyUnavailable || receipt.AuditID != "" {
+			t.Errorf("transient resume=%+v %v", receipt, err)
+		}
+	}
+	service.config.Resolve = resolve
 	receipt, err := service.Resume(ctx, p, r)
 	if err != nil || receipt.Result.Code != "" {
 		t.Fatalf("resume=%+v %v", receipt, err)

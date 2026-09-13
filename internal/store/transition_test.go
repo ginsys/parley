@@ -106,4 +106,45 @@ func TestRevisionOverflowStopsOrdinaryTransitions(t *testing.T) {
 	}, nil); err != RecoveryRequired {
 		t.Fatalf("after overflow=%v", err)
 	}
+	if err := c.ClaimConnections(context.Background()); err != RecoveryRequired {
+		t.Errorf("connection claim after overflow=%v", err)
+	}
+	if c.connectionsClaimed {
+		t.Error("failed coordinator consumed connection ownership")
+	}
+}
+
+func TestUnchangedPublicationRollsBackBeforeFence(t *testing.T) {
+	for _, rejected := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "rejection"}[rejected], func(t *testing.T) {
+			db := commandDB(t)
+			c := db.Coordinator()
+			revision := c.revision
+			published := false
+			code, err := c.Transition(context.Background(), func(ctx context.Context, tx *sql.Tx, _ CommitView) (TransitionResult, error) {
+				_, err := insertSynthetic(ctx, tx)
+				result := TransitionResult{PublishUnchanged: true}
+				if rejected {
+					result.Code = AuthenticationFailed
+				}
+				return result, err
+			}, func(view CommitView) {
+				published = true
+				var count int
+				if err := db.sql.QueryRow("SELECT count(*) FROM conversations").Scan(&count); err != nil || count != 0 {
+					t.Errorf("publication saw unrolled-back effects: count=%d err=%v", count, err)
+				}
+				if view.Revision != revision {
+					t.Errorf("read fence advanced revision: %d", view.Revision)
+				}
+			})
+			want := Code("")
+			if rejected {
+				want = AuthenticationFailed
+			}
+			if err != nil || code != want || published == rejected || c.revision != revision {
+				t.Fatalf("unchanged transition code=%v err=%v published=%v revision=%d", code, err, published, c.revision)
+			}
+		})
+	}
 }

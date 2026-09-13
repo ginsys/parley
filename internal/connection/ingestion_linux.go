@@ -36,6 +36,9 @@ func NewIngestor(c IngestorConfig) (*Ingestor, error) {
 	return &Ingestor{c}, nil
 }
 func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor string) (err error) {
+	if !canonicalID(source) || !utf8.ValidString(cursor) || len(cursor) > store.MaxLocatorBytes {
+		return store.InvalidRequest
+	}
 	ctx, expiry := store.ObserveExpiries(ctx, i.config.Manager.store)
 	defer func() {
 		if persistErr := expiry.Persist(i.config.Manager.store, i.config.Manager.Invalidate); persistErr != nil {
@@ -43,21 +46,35 @@ func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor st
 		}
 	}()
 	m := i.config.Manager
+	var credential store.CredentialRecord
 	if err := m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
-		return store.TransitionResult{}, m.AuthorizeWork(ctx, tx, s, false)
+		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
+			return store.TransitionResult{}, err
+		}
+		if err := store.IngestionAllowed(ctx, tx, s.token.BindingID); err != nil {
+			return store.TransitionResult{}, err
+		}
+		var err error
+		credential, err = store.ReadCredential(ctx, tx, s.socket.credentialID)
+		return store.TransitionResult{}, err
 	}, nil); err != nil {
 		return err
 	}
 	verifyCtx, stop := s.hostEvidenceContext(ctx)
 	defer stop()
-	if err := i.config.Origin(verifyCtx, s.socket.native, s.token, source, cursor); err != nil || verifyCtx.Err() != nil {
-		return store.HostUnverified
+	evidenceErr := i.config.Origin(verifyCtx, s.socket.native, s.token, source, cursor)
+	if err := m.recheckIngestionEvidence(ctx, s, credential); err != nil {
+		return err
+	}
+	if err := ingestionEvidenceFailure(verifyCtx, evidenceErr); err != nil {
+		return err
 	}
 	return m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
 		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
 			return store.TransitionResult{}, err
 		}
-		return store.TransitionResult{Changed: true}, store.InitializeIngestionSource(ctx, tx, s.token.BindingID, source, cursor)
+		changed, err := store.InitializeIngestionSource(ctx, tx, s.token.BindingID, source, cursor)
+		return store.TransitionResult{Changed: changed}, err
 	}, nil)
 }
 func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out store.EventResult, err error) {
@@ -69,6 +86,7 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		}
 	}()
 	m := i.config.Manager
+	var credential store.CredentialRecord
 	if !utf8.ValidString(r.Text) {
 		return store.EventResult{}, store.InvalidRequest
 	}
@@ -78,7 +96,12 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		}
 	}
 	if err := m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
-		return store.TransitionResult{}, m.AuthorizeWork(ctx, tx, s, false)
+		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
+			return store.TransitionResult{}, err
+		}
+		var err error
+		credential, err = store.ReadCredential(ctx, tx, s.socket.credentialID)
+		return store.TransitionResult{}, err
 	}, nil); err != nil {
 		return store.EventResult{}, err
 	}
@@ -94,12 +117,12 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
 			return store.TransitionResult{}, err
 		}
-		if err := store.IngestionAllowed(ctx, tx, s.token.BindingID); err != nil {
-			return store.TransitionResult{}, err
-		}
 		var err error
 		previous, _, err = store.LookupEvent(ctx, tx, e)
-		return store.TransitionResult{}, err
+		if err != nil || previous.Replayed {
+			return store.TransitionResult{}, err
+		}
+		return store.TransitionResult{}, store.IngestionAllowed(ctx, tx, s.token.BindingID)
 	}, nil)
 	if err != nil {
 		return store.EventResult{}, err
@@ -109,8 +132,12 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 	}
 	verifyCtx, stop := s.hostEvidenceContext(ctx)
 	defer stop()
-	if err := i.config.Verify(verifyCtx, s.socket.native, s.token, r); err != nil || verifyCtx.Err() != nil {
-		return store.EventResult{}, store.HostUnverified
+	evidenceErr := i.config.Verify(verifyCtx, s.socket.native, s.token, r)
+	if err := m.recheckIngestionEvidence(ctx, s, credential); err != nil {
+		return store.EventResult{}, err
+	}
+	if err := ingestionEvidenceFailure(verifyCtx, evidenceErr); err != nil {
+		return store.EventResult{}, err
 	}
 	marker, parseErr := replymarker.Extract(r.Text)
 	var result store.EventResult
@@ -118,22 +145,29 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
 			return store.TransitionResult{}, err
 		}
+		var found bool
+		var err error
+		result, found, err = store.LookupEvent(ctx, tx, e)
+		if err != nil || result.Replayed {
+			return store.TransitionResult{}, err
+		}
 		if err := store.IngestionAllowed(ctx, tx, s.token.BindingID); err != nil {
 			return store.TransitionResult{}, err
 		}
-		var err error
-		result, err = store.StageEvent(ctx, tx, e)
-		if err != nil {
-			return store.TransitionResult{}, err
-		}
-		if result.Replayed {
-			return store.TransitionResult{}, nil
+		if !found {
+			result, err = store.StageEvent(ctx, tx, e)
+			if err != nil {
+				return store.TransitionResult{}, err
+			}
 		}
 		pending := func(code store.Code) (store.TransitionResult, error) {
 			result = store.EventResult{Classification: "pending", Code: code}
-			return store.TransitionResult{Changed: true}, nil
+			return store.TransitionResult{Changed: !found}, nil
 		}
 		if err := store.EventAtCursor(ctx, tx, e); err != nil {
+			if err == store.EventConflict {
+				return pending(store.EventConflict)
+			}
 			if err == store.TemporarilyUnavailable || err == store.HostUnverified {
 				return pending(store.TemporarilyUnavailable)
 			}
@@ -229,4 +263,29 @@ func (s *Session) hostEvidenceContext(ctx context.Context) (context.Context, fun
 		cancel()
 	}
 	return verified, func() { stop(); cancel() }
+}
+
+func (m *Manager) recheckIngestionEvidence(ctx context.Context, s *Session, credential store.CredentialRecord) error {
+	if m.observeCredentialExpiry(credential, m.now()) {
+		s.socket.cancel()
+		defer s.socket.Close()
+		if err := m.persistCredentialExpiry(credential); err != nil {
+			return err
+		}
+		return store.AuthenticationFailed
+	}
+	return m.sessionTransition(context.WithoutCancel(ctx), s, func(context.Context, *sql.Tx) (store.TransitionResult, error) { return store.TransitionResult{}, nil }, nil)
+}
+
+func ingestionEvidenceFailure(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return store.TemporarilyUnavailable
+	}
+	if errors.Is(err, store.HostUnverified) {
+		return store.HostUnverified
+	}
+	if err != nil {
+		return store.TemporarilyUnavailable
+	}
+	return nil
 }

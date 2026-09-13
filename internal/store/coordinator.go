@@ -165,7 +165,11 @@ func (c *Coordinator) execute(ctx context.Context, p CommandPrincipal, r Command
 	if _, err := tx.ExecContext(ctx, "RELEASE command_effect"); err != nil {
 		return CommandReceipt{}, storageCode(err)
 	}
-	if len(result.Resources) > 100 {
+	// Recovery completion must retain the complete exact incident set for
+	// post-commit cleanup replay; truncating it or imposing the ordinary result
+	// cap would make installations with over 99 clock incidents unrecoverable.
+	// The set comes from the trusted restore resolver, not caller-supplied JSON.
+	if len(result.Resources) > 100 && r.kind != "recovery.complete" {
 		return CommandReceipt{}, InvalidRequest
 	}
 	for _, resource := range result.Resources {

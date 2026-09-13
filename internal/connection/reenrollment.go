@@ -3,6 +3,7 @@ package connection
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/ginsys/parley/internal/store"
@@ -33,19 +34,22 @@ func (p *Provisioner) Reenroll(ctx context.Context, actor store.CommandPrincipal
 		return p.finish(ctx, actor, previous, CredentialFile{}, nil)
 	}
 	var binding store.BindingRecord
+	var bindingErr error
 	err = p.config.Store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		if err := p.config.Authorize(ctx, tx, actor); err != nil {
 			return err
 		}
-		var err error
-		binding, err = store.ReadBinding(ctx, tx, r.BindingID)
-		return err
+		binding, bindingErr = store.ReadBinding(ctx, tx, r.BindingID)
+		if errors.Is(bindingErr, store.BindingUnavailable) {
+			return nil
+		}
+		return bindingErr
 	})
 	if err != nil {
 		return ProvisioningResult{}, err
 	}
 	evidenceErr := error(store.HostUnverified)
-	if p.config.ReenrollEvidence != nil {
+	if bindingErr == nil && p.config.ReenrollEvidence != nil {
 		evidenceErr = p.config.ReenrollEvidence(ctx, r.HostEvidenceRef, NativeTuple{binding.HostKind, binding.NamespaceID, binding.SessionID})
 	}
 	var publisher Publisher
@@ -60,10 +64,19 @@ func (p *Provisioner) Reenroll(ctx context.Context, actor store.CommandPrincipal
 		if err := p.config.Guard(ctx, tx, "binding.reenroll"); err != nil {
 			return domainRejection(err)
 		}
-		if evidenceErr != nil {
-			return rejection(store.HostUnverified)
+		if bindingErr != nil {
+			return domainRejection(bindingErr)
 		}
-		if targetErr != nil || publisher == nil {
+		if evidenceErr != nil {
+			if errors.Is(evidenceErr, store.HostUnverified) {
+				return rejection(store.HostUnverified)
+			}
+			return store.CommandResult{}, evidenceErr
+		}
+		if targetErr != nil {
+			return domainRejection(targetErr)
+		}
+		if publisher == nil {
 			return rejection(store.Forbidden)
 		}
 		if !store.AuthorityTime(ctx, p.config.Now).Before(r.ExpiresAt) {
