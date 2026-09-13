@@ -278,3 +278,58 @@ func TestListEnumeratesBeforePromoting(t *testing.T) {
 		t.Fatalf("lost marker during promotion: %+v %v", markers, err)
 	}
 }
+
+func TestPromotionSyncPrecedesLaterEntryFailure(t *testing.T) {
+	for _, failSync := range []bool{false, true} {
+		t.Run(map[bool]string{false: "later-invalid", true: "sync-fails"}[failSync], func(t *testing.T) {
+			s, _, _ := recoveryFixture(t)
+			d := s.config.Markers.(*Directory)
+			marker := testMarker()
+			marker.ServerID = s.serverID
+			data, err := marker.encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending := ".pending-90000000-0000-4000-8000-000000000001"
+			invalid := "60000000-0000-4000-8000-000000000002"
+			if err := os.WriteFile(filepath.Join(d.path, pending), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(d.path, invalid), []byte("incomplete"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			listed := false
+			d.readNames = func(*os.File, int) ([]string, error) {
+				if listed {
+					return nil, io.EOF
+				}
+				listed = true
+				return []string{pending, invalid}, nil
+			}
+			syncs, stops := 0, 0
+			d.syncDirectory = func(fd int) error {
+				syncs++
+				if failSync {
+					return errors.New("synthetic sync failure")
+				}
+				return unix.Fsync(fd)
+			}
+			s.config.FailStop = func() { stops++ }
+			_, err = s.listMarkers(context.Background())
+			if syncs != 1 {
+				t.Errorf("promoted file not synced before later failure: calls=%d", syncs)
+			}
+			if failSync {
+				var publication markerPublicationFailure
+				if !errors.As(err, &publication) || stops != 1 {
+					t.Errorf("unknown promotion durability did not fail-stop: %v stops=%d", err, stops)
+				}
+			} else if err != store.RecoveryRequired || stops != 0 {
+				t.Errorf("later invalid entry=%v stops=%d", err, stops)
+			}
+			if _, err := os.Stat(filepath.Join(d.path, marker.IncidentID)); err != nil {
+				t.Errorf("promoted evidence lost=%v", err)
+			}
+		})
+	}
+}

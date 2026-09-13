@@ -118,6 +118,11 @@ func (d *Directory) promotePending(fd int, name string) (Marker, error) {
 	} else if err != nil {
 		return Marker{}, markerPublicationFailure{}
 	}
+	// A later entry can reject listing; finish this publication durably before
+	// proceeding so every post-mutation exit honors the fail-stop contract.
+	if err := d.syncDirectory(fd); err != nil {
+		return Marker{}, markerPublicationFailure{}
+	}
 	return marker, nil
 }
 func (d *Directory) List(ctx context.Context) ([]Marker, error) {

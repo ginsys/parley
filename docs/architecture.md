@@ -834,6 +834,8 @@ host-verification mismatch returns `host_unverified`, after the independent expi
 
 Marker listing can recover a fully encoded pending publication after a crash: it validates the
 private file and canonical marker contents, syncs the file, and promotes it without replacement.
+Each promotion syncs its directory before inspecting another entry; later validation/cancellation
+cannot leave a renamed marker unsynced, and a failed sync invokes the supervisor fail-stop.
 An existing destination must match exactly; incomplete, unsafe or conflicting files remain held.
 The directory is synced before successful listing, including retries after a failed promotion
 sync. No evidence is discarded and promotion alone never clears a recovery incident. Failure to make
