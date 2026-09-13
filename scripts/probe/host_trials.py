@@ -1563,17 +1563,6 @@ class CodexDriver(Driver):
 OPENCODE_FREE_MODEL = 'opencode/ling-3.0-flash-fin-free'  # captured: cost 0, no credential needed
 
 
-def opencode_session_id(stdout):
-    """`(sessionID, error)` from `opencode run --format json` events.
-
-    `sessionID` is the first string one seen on any event; `error` is the message of the first
-    `error` event, or None. Captured: a failing turn still creates and lists its session, so the
-    id must be minted even when an error follows.
-    """
-    session_ids, error = opencode_session_ids(stdout)
-    return next(iter(session_ids), None), error
-
-
 def opencode_session_ids(stdout):
     """Every distinct session ID in stream order, plus the first error event."""
     session_ids = {}
@@ -1770,6 +1759,17 @@ class OpenCodeDriver(Driver):
         self.sleep = sleep
         self.server = None
 
+    def _created_session(self, stdout):
+        session_ids, error = opencode_session_ids(stdout)
+        if len(session_ids) > 1:
+            self.strays.update(session_ids)
+            raise RuntimeError(f'ambiguous OpenCode creation IDs {list(session_ids)!r}; '
+                               'manual investigation required, no ownership granted')
+        session_id = next(iter(session_ids), None)
+        if session_id:
+            self.mint(session_id)
+        return session_id, error
+
     def create(self, prompt):
         """`opencode run --pure --format json --dir <cwd> --title <t> -m <model> '<prompt>'`.
 
@@ -1787,13 +1787,9 @@ class OpenCodeDriver(Driver):
             result = self.run(argv, capture_output=True, text=True, timeout=180, cwd=self.cwd,
                               stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as error:
-            session_id, _ = opencode_session_id(_partial_stdout(error))
-            if session_id:
-                self.mint(session_id)
+            self._created_session(_partial_stdout(error))
             raise
-        session_id, error = opencode_session_id(result.stdout)
-        if session_id:
-            self.mint(session_id)
+        session_id, error = self._created_session(result.stdout)
         if error is not None:
             raise RuntimeError(f'opencode run reported an error event: {error}')
         if result.returncode != 0:

@@ -365,8 +365,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
 - **OpenCode** (`OpenCodeDriver`). `create()` runs `opencode run --pure --format json --dir
   <probe cwd> --title <t> -m opencode/ling-3.0-flash-fin-free '<prompt>'` (the captured
   zero-cost model; the default one failed on a stale credential) and mints the first `sessionID`
-  seen on any event before checking for an `error` event or a nonzero exit — a failing turn
-  still creates the session. `submit()` needs `serve()` open: `opencode serve --pure --port <p>`
+  seen on the events before checking for an `error` event or a nonzero exit — a failing turn
+  still creates the session. Creation requires one consistent ID throughout the stream. Multiple
+  distinct IDs, including in timeout output, grant no ownership: all candidates are reported by
+  cleanup for manual investigation. `submit()` needs `serve()` open: `opencode serve --pure --port <p>`
   on a free loopback port chosen per call, refused if the port already answered (the session
   store is global, so a stranger's server would look identical). Any HTTP response, including
   4xx/5xx, proves a listener exists and prevents spawning. Our child is ready only once

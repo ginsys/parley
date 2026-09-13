@@ -57,7 +57,7 @@ from host_trials import (
     marker_token,
     opencode_export_events,
     opencode_export_version,
-    opencode_session_id,
+    opencode_session_ids,
     run_trial,
     run_trial_with_cleanup,
     strip_ansi,
@@ -516,17 +516,17 @@ def opencode_message(role, parts, created_ms, **info):
 
 
 class OpenCodeParsingTests(unittest.TestCase):
-    def test_session_id_is_the_first_one_seen_and_an_error_event_is_reported(self):
+    def test_session_ids_are_collected_and_an_error_event_is_reported(self):
         # Captured: a failing turn (401) still emits its sessionID and lists the session.
         stdout = '\n'.join([json.dumps({'type': 'step_start', 'sessionID': 'ses_1'}),
                             json.dumps({'type': 'error', 'sessionID': 'ses_1',
                                         'error': {'name': 'ProviderAuthError'}}),
                             'not json', json.dumps([1])])
-        session_id, error = opencode_session_id(stdout)
-        self.assertEqual(session_id, 'ses_1')
+        session_ids, error = opencode_session_ids(stdout)
+        self.assertEqual(list(session_ids), ['ses_1'])
         self.assertIn('ProviderAuthError', error)
-        self.assertEqual(opencode_session_id(''), (None, None))
-        self.assertEqual(opencode_session_id(json.dumps({'type': 'text', 'sessionID': ''})), (None, None))
+        self.assertEqual(opencode_session_ids(''), ({}, None))
+        self.assertEqual(opencode_session_ids(json.dumps({'type': 'text', 'sessionID': ''})), ({}, None))
 
     def test_export_extracts_text_parts_with_millisecond_creation_times(self):
         raw = opencode_export([
@@ -1705,6 +1705,20 @@ class OpenCodeDriverTests(DriverTestCase):
         with self.assertRaises(RuntimeError):
             driver.create('hello')
         self.assertEqual(driver.owned(), {'ses_1'})
+
+    def test_ambiguous_creation_reports_every_candidate_without_owning_any(self):
+        output = self.run_output().stdout + self.run_output(session_id='ses_2').stdout
+        for result in (FakeResult(0, output),
+                       subprocess.TimeoutExpired(cmd=['opencode'], timeout=180, output=output.encode())):
+            with self.subTest(result=result):
+                driver = self.driver(FakeRun([(['opencode', 'run'], result)]))
+                with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual([label for label, _ in sweep(driver)], ['ses_1', 'ses_2'])
+                for sid in ('ses_1', 'ses_2'):
+                    with self.assertRaises(ForeignSessionError):
+                        driver.teardown(sid)
 
     def test_create_mints_from_partial_output_on_a_timeout(self):
         partial = self.run_output().stdout.encode()
