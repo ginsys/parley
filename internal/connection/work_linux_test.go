@@ -647,3 +647,26 @@ func TestCommandReplayPersistsPreviouslyRememberedRecipientExpiry(t *testing.T) 
 		t.Fatal(err)
 	}
 }
+
+func TestRepeatedSourceInitializationPreservesCoordinatorRevision(t *testing.T) {
+	m, _, recipient, ingestor, request, _ := readyIngestion(t)
+	ctx := context.Background()
+	view := func() store.CommitView {
+		var got store.CommitView
+		_, err := m.store.Coordinator().Transition(ctx, func(_ context.Context, _ *sql.Tx, v store.CommitView) (store.TransitionResult, error) {
+			got = v
+			return store.TransitionResult{}, nil
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	before := view()
+	if err := ingestor.Initialize(ctx, recipient, request.Event.SourceID, request.Event.Before); err != nil {
+		t.Fatal(err)
+	}
+	if after := view(); after != before {
+		t.Fatalf("repeated initialization changed view: before=%+v after=%+v", before, after)
+	}
+}

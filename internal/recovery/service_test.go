@@ -3,6 +3,8 @@ package recovery
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"github.com/google/uuid"
 	"path/filepath"
 	"testing"
 	"time"
@@ -381,5 +383,88 @@ func TestSameRollbackDuringReconciledCleanupGetsNewIncident(t *testing.T) {
 	markers, err := s.config.Markers.List(ctx)
 	if err != nil || len(markers) != 2 {
 		t.Fatalf("reconciled incident swallowed new rollback: %+v %v", markers, err)
+	}
+}
+
+func TestStartupSettlementRechecksRecoveryAndUsesTrustedTime(t *testing.T) {
+	for _, scenario := range []string{"normal", "rollback", "writer-rollback", "restore"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, now, _ := recoveryFixture(t)
+			seedRestoredWork(t, s)
+			ctx := context.Background()
+			if mode, err := s.InspectRecovery(ctx, s.config.Store); err != nil || mode != runtimeowner.Normal {
+				t.Fatalf("inspection=%v %v", mode, err)
+			}
+			switch scenario {
+			case "rollback":
+				*now = time.Unix(100, 0)
+			case "writer-rollback":
+				calls := 0
+				s.config.Now = func() time.Time {
+					calls++
+					if calls == 1 {
+						return time.Unix(110, 0)
+					}
+					return time.Unix(100, 0)
+				}
+			case "restore":
+				if err := s.config.Markers.Put(ctx, Marker{IncidentID: "60000000-0000-4000-8000-000000000020", ServerID: s.serverID, Kind: "restore"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			n, err := s.config.Store.RecoverUncertain(ctx)
+			if scenario == "normal" {
+				if err != nil || n != 1 {
+					t.Fatalf("normal settlement=%d %v", n, err)
+				}
+			} else if err != store.RecoveryRequired || n != 0 {
+				t.Fatalf("settlement bypass=%d %v", n, err)
+			}
+			if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+				e, err := store.GetByID(ctx, tx, "50000000-0000-4000-8000-000000000002")
+				if err != nil {
+					return err
+				}
+				if scenario == "normal" {
+					if e.State != store.Uncertain || e.UpdatedAt != time.Unix(110, 0).UTC().Format(time.RFC3339Nano) {
+						t.Errorf("unchecked settlement=%+v", e)
+					}
+				} else if e.State != store.Dispatching || e.UpdatedAt != "2026-01-01T00:00:00Z" {
+					t.Errorf("held work mutated=%+v", e)
+				}
+				if e.DispatchAttempt != 4 {
+					t.Errorf("attempt mutated=%d", e.DispatchAttempt)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestIncidentIdentityFailureRetainsRollbackForSupervisedRetry(t *testing.T) {
+	s, now, _ := recoveryFixture(t)
+	ctx := context.Background()
+	stopped := 0
+	s.config.FailStop = func() { stopped++ }
+	s.newIncidentID = func() (uuid.UUID, error) { return uuid.Nil, errors.New("synthetic entropy unavailable") }
+	*now = time.Unix(100, 0)
+	if err := rejectOrdinary(t, s); err != store.RecoveryRequired {
+		t.Fatal(err)
+	}
+	if stopped == 0 || !s.held || len(s.pending) != 1 {
+		t.Fatalf("identity failure lost observation: stopped=%d held=%v pending=%v", stopped, s.held, s.pending)
+	}
+	// Supervised retry after the identity source recovers retains the earlier
+	// detection even when wall time has already been corrected.
+	s.newIncidentID = uuid.NewRandom
+	*now = time.Unix(200, 0)
+	if mode, err := s.InspectRecovery(ctx, s.config.Store); err != nil || mode != runtimeowner.Held {
+		t.Fatalf("corrected clock erased hold=%v %v", mode, err)
+	}
+	markers, err := s.config.Markers.List(ctx)
+	if err != nil || len(markers) != 1 || *markers[0].Floor != time.Unix(110, 0).UnixNano() || *markers[0].Observed != time.Unix(100, 0).UnixNano() {
+		t.Fatalf("lost detection=%+v %v", markers, err)
 	}
 }

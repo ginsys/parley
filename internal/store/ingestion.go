@@ -105,45 +105,39 @@ func EventAtCursor(ctx context.Context, tx *sql.Tx, e SourceEvent) error {
 
 // InitializeIngestionSource requires freshly verified source origin evidence. It
 // cannot replace a cursor, change source identity, or clear a revocation barrier.
-func InitializeIngestionSource(ctx context.Context, tx *sql.Tx, binding, source, cursor string) error {
+// It reports whether a new cursor was inserted.
+func InitializeIngestionSource(ctx context.Context, tx *sql.Tx, binding, source, cursor string) (bool, error) {
 	if !validUUID(binding) || !validUUID(source) || !validLocator(cursor, true) {
-		return InvalidRequest
+		return false, InvalidRequest
 	}
 	var held bool
 	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM ingestion_barriers WHERE binding_id=? AND status='held')", binding).Scan(&held); err != nil {
-		return storageCode(err)
+		return false, storageCode(err)
 	}
 	if held {
-		return SecurityHold
+		return false, SecurityHold
 	}
 	var oldSource, oldCursor string
 	err := tx.QueryRowContext(ctx, "SELECT source_id,cursor FROM ingestion_cursors WHERE binding_id=?", binding).Scan(&oldSource, &oldCursor)
 	if err == nil {
 		if oldSource == source && oldCursor == cursor {
-			return nil
+			return false, nil
 		}
-		return VersionConflict
+		return false, VersionConflict
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return storageCode(err)
+		return false, storageCode(err)
 	}
 	// Verified events may have arrived before initialization. Their immutable
 	// source/edges must stay reachable from the initial cursor.
-	var otherSource bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM ingestion_evidence WHERE binding_id=? AND classification='pending' AND source_id!=?)", binding, source).Scan(&otherSource); err != nil {
-		return storageCode(err)
-	}
-	if otherSource {
-		return EventConflict
-	}
 	if err := pendingAfterResume(ctx, tx, binding, source, cursor); err != nil {
-		return err
+		return false, err
 	}
 	_, err = tx.ExecContext(ctx, "INSERT INTO ingestion_cursors(binding_id,source_id,cursor) VALUES(?,?,?)", binding, source, cursor)
 	if err != nil {
-		return storageCode(err)
+		return false, storageCode(err)
 	}
-	return nil
+	return true, nil
 }
 func IngestionAllowed(ctx context.Context, tx *sql.Tx, binding string) error {
 	var held bool

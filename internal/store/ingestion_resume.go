@@ -63,7 +63,8 @@ func ResumeIngestion(ctx context.Context, tx *sql.Tx, r ResumeIngestionRequest) 
 	}
 	var source, cursor string
 	err = tx.QueryRowContext(ctx, "SELECT source_id,cursor FROM ingestion_cursors WHERE binding_id=?", b.ID).Scan(&source, &cursor)
-	if errors.Is(err, sql.ErrNoRows) {
+	initializing := errors.Is(err, sql.ErrNoRows)
+	if initializing {
 		if paused.Valid {
 			return ResourceChange{}, RecoveryRequired
 		}
@@ -95,7 +96,7 @@ func ResumeIngestion(ctx context.Context, tx *sql.Tx, r ResumeIngestionRequest) 
 	if cursor != r.Interval.After {
 		return ResourceChange{}, InvalidRequest
 	}
-	if len(r.Interval.Events) > 0 {
+	if len(r.Interval.Events) > 0 || initializing {
 		if err := pendingAfterResume(ctx, tx, b.ID, source, cursor); err != nil {
 			return ResourceChange{}, err
 		}
@@ -122,6 +123,14 @@ func ResumeIngestion(ctx context.Context, tx *sql.Tx, r ResumeIngestionRequest) 
 // may have jumped over retained evidence. Disconnected evidence needs a fuller
 // reviewed interval. No-advance resumes do not cross any pending work.
 func pendingAfterResume(ctx context.Context, tx *sql.Tx, binding, source, cursor string) error {
+	var otherSource bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM ingestion_evidence WHERE binding_id=? AND classification='pending' AND source_id!=?)", binding, source).Scan(&otherSource); err != nil {
+		return storageCode(err)
+	}
+	if otherSource {
+		return EventConflict
+	}
+
 	rows, err := tx.QueryContext(ctx, "SELECT cursor_before,cursor_after FROM ingestion_evidence WHERE binding_id=? AND source_id=? AND classification='pending' LIMIT 1001", binding, source)
 	if err != nil {
 		return storageCode(err)

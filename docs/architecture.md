@@ -794,3 +794,17 @@ Reviewed floor reset has no 99-clock-incident cap. Its trusted complete incident
 in the receipt for exact cleanup replay, including after marker-removal failure. Only this
 internal recovery command is exempt from the ordinary 100-resource result limit; identity,
 version and result validation still apply. No schema migration is added.
+
+Successful no-op expiry persistence publishes after rollback, forgetting already terminal
+credential observations without incrementing the coordinator revision or invalidating a newer
+session. Repeated source initialization reports whether it actually inserted the cursor, so
+its existing successful no-op session fence also preserves the revision.
+Startup settlement of interrupted dispatch now uses the coordinator: it rechecks recovery after
+the initial runtime inspection and again at writer time, and records the trusted timestamp.
+A newly detected rollback or restore hold leaves the dispatching rows and attempt evidence intact.
+
+An audited empty resume that establishes the first cursor must also validate pending source
+identity and edge reachability; no-advance replay of an existing cursor remains unchanged.
+Clock rollback observations enter the held pending queue before incident-ID generation. If that
+generation fails, fail-stop still applies and the original floor/observed pair remains available
+for supervised retry; corrected wall time cannot erase the pending observation.

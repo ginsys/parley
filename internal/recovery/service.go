@@ -25,12 +25,13 @@ type Service struct {
 	maintenance *store.RecoveryMaintenance
 	// Lock order: I/O serialization -> maintenance coordinator -> short state.
 	// Writer Time/Guard take state only and never acquire ioMu.
-	ioMu     sync.Mutex
-	stateMu  sync.Mutex
-	held     bool
-	pending  []Marker
-	trusted  *int64
-	serverID string
+	ioMu          sync.Mutex
+	stateMu       sync.Mutex
+	held          bool
+	pending       []Marker
+	trusted       *int64
+	serverID      string
+	newIncidentID func() (uuid.UUID, error)
 }
 
 func New(ctx context.Context, c Config) (*Service, error) {
@@ -40,7 +41,7 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	if c.Now == nil {
 		c.Now = time.Now
 	}
-	s := &Service{config: c}
+	s := &Service{config: c, newIncidentID: uuid.NewRandom}
 	maintenance, err := c.Store.Coordinator().InstallRecovery(store.RecoveryHooks{Before: s.before, Time: s.transactionTime, After: s.after})
 	if err != nil {
 		return nil, err
@@ -72,11 +73,6 @@ func (s *Service) before(ctx context.Context, kind string) error {
 	return nil
 }
 func (s *Service) latch(floor, observed int64) error {
-	id, err := uuid.NewRandom()
-	if err != nil {
-		s.config.FailStop()
-		return store.RecoveryRequired
-	}
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	s.held = true
@@ -87,7 +83,7 @@ func (s *Service) latch(floor, observed int64) error {
 			return nil
 		}
 	}
-	s.pending = append(s.pending, Marker{IncidentID: id.String(), ServerID: s.serverID, Kind: "clock", Floor: &floor, Observed: &observed})
+	s.pending = append(s.pending, Marker{ServerID: s.serverID, Kind: "clock", Floor: &floor, Observed: &observed})
 	return nil
 }
 
@@ -165,6 +161,19 @@ func (s *Service) flush(ctx context.Context) error {
 	hasTrusted := s.trusted != nil
 	s.stateMu.Unlock()
 	for _, marker := range pending {
+		if marker.IncidentID == "" {
+			id, err := s.newIncidentID()
+			if err != nil {
+				s.config.FailStop()
+				return store.RecoveryRequired
+			}
+			marker.IncidentID = id.String()
+			// ioMu owns removal from the pending prefix; concurrent latches
+			// can only append. Assign once before either fallible persistence.
+			s.stateMu.Lock()
+			s.pending[0].IncidentID = marker.IncidentID
+			s.stateMu.Unlock()
+		}
 		if err := s.config.Markers.Put(ctx, marker); err != nil {
 			s.config.FailStop()
 			return store.RecoveryRequired

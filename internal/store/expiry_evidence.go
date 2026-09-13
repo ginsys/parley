@@ -84,8 +84,17 @@ func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
 				bindings = append(bindings, binding)
 			}
 		}
-		return TransitionResult{Changed: changed}, nil
+		return TransitionResult{Changed: changed, PublishUnchanged: true}, nil
 	}, func(CommitView) {
+		// Retain failed and concurrently added observations, but a successful
+		// collector must not retry evidence already made terminal.
+		e.mu.Lock()
+		for id, observed := range observations {
+			if current, ok := e.observed[id]; ok && current.Deadline == observed.Deadline {
+				delete(e.observed, id)
+			}
+		}
+		e.mu.Unlock()
 		for id, observed := range observations {
 			db.coordinator.credentialExpiries.CompareAndDelete(id, observed.Deadline)
 		}
