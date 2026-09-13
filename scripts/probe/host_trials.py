@@ -1529,6 +1529,7 @@ class CodexDriver(Driver):
         self.rollout_path_for = rollout_path_for
         self.pty = pty
         self.clock = clock
+        self.queue_clients = {}
 
     def _created_thread(self, stdout):
         thread_ids, unusable = codex_thread_ids(stdout)
@@ -1622,9 +1623,12 @@ class CodexDriver(Driver):
         """
         self.require_owned(thread_id)
         self.submission_note = None
-        if self.mechanism == 'queue' and self.live_client_for(thread_id) is None:
-            raise SubmissionUncaptured('mechanism=queue needs a live resume client already serving the '
-                                       'thread (the settle callback opens one with attach()); nothing queued')
+        if self.mechanism == 'queue':
+            client = self.live_client_for(thread_id)
+            if client is None:
+                raise SubmissionUncaptured('mechanism=queue needs a live resume client already serving the '
+                                           'thread (the settle callback opens one with attach()); nothing queued')
+            self.queue_clients[thread_id] = client
         try:
             result = self.run(['codex', 'queue', '--thread', thread_id, '--message', message],
                               capture_output=True, text=True, timeout=15)
@@ -1634,12 +1638,15 @@ class CodexDriver(Driver):
                                            'whether the item was queued is unknown and nothing serves '
                                            'the thread') from error
             raise
+        finally:
+            if self.mechanism == 'queue' and not self._queue_client_live(thread_id):
+                self.submission_note = 'the exact serving client was lost during queue submission'
         if result.returncode != 0:
             raise SubmissionRejected(result.returncode, result.stderr)
         accepted_at = self.clock()
         if self.mechanism == 'queue-then-resume':
             try:
-                self.attach(thread_id)
+                self.queue_clients[thread_id] = self.attach(thread_id)
             except PtyNotReady as error:
                 # The item is queued (exit 0) but nothing will serve it: an unobservable trial,
                 # not a host that ignored the message.
@@ -1649,6 +1656,11 @@ class CodexDriver(Driver):
             # (captured: 15s with items queued); `run_trial` takes a number as the acceptance time.
             return accepted_at
         return True
+
+    def _queue_client_live(self, thread_id):
+        client = self.queue_clients[thread_id]
+        return (any(held is client for held in self.clients) and not client.eof
+                and getattr(client, 'serves', None) == thread_id)
 
     def observe(self, thread_id, *, marker, submitted_at):
         """Read the thread's rollout; an unreadable or undatable rollout is unobservable."""
@@ -1662,7 +1674,7 @@ class CodexDriver(Driver):
         except (OSError, UnicodeDecodeError):
             return Observation(observable=False)
         observation = detect_outcomes(events, marker, submitted_at=submitted_at, turn_stream=True)
-        if unusable:
+        if unusable or (thread_id in self.queue_clients and not self._queue_client_live(thread_id)):
             observation.observable = False
         return observation
 

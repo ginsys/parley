@@ -391,6 +391,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `SubmissionUncaptured`, since nothing serves the thread yet. Ordinary queue submission requires
   a successfully readied live client for the exact owned thread: another owned thread's client
   or a held client whose readiness was never established cannot authorize queueing.
+  The exact client is retained across queueing and observation: if it exits, is removed, or
+  loses its thread association, missing delivery outcomes become unobservable. A replacement
+  client cannot mask that loss. Exit-zero acceptance and positive rollout evidence remain valid.
   `attach()` answers the captured
   first-run trust dialog with Enter (which persists a trust entry for the probe directory in
   `$CODEX_HOME/config.toml`), waits for the composer placeholder `› Ask Codex to do anything`

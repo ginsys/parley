@@ -1737,6 +1737,50 @@ class CodexDriverTests(DriverTestCase):
         with self.assertRaises(subprocess.TimeoutExpired):
             driver.submit(THREAD_ID, 'msg')
 
+    def test_losing_the_exact_queue_client_preserves_acceptance_but_not_negative_evidence(self):
+        for loss in ('exit', 'remove', 'replace'):
+            for timeout in (False, True):
+                with self.subTest(loss=loss, timeout=timeout):
+                    self.registry = SessionRegistry()
+
+                    def queue(argv):
+                        if loss == 'exit':
+                            client.eof = True
+                        else:
+                            driver.clients.remove(client)
+                            if loss == 'replace':
+                                driver.attach(THREAD_ID)
+                        if timeout:
+                            raise subprocess.TimeoutExpired(argv, 15)
+                        return FakeResult(0)
+
+                    run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                                   (['codex', 'queue'], queue)])
+                    driver = self.driver(run)
+                    driver.create('hello')
+                    client = driver.attach(THREAD_ID)
+                    self.transcripts[THREAD_ID] = self.write_lines('lost-client.jsonl', rollout_lines(
+                        messages=[('2026-09-13T09:42:01.000Z', 'user', MARKER)]))
+                    if timeout:
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            driver.submit(THREAD_ID, 'msg')
+                    else:
+                        self.assertIs(driver.submit(THREAD_ID, 'msg'), True)
+                    observation = driver.observe(THREAD_ID, marker=MARKER, submitted_at=0)
+                    self.assertIn('visible', observation.outcomes)
+                    self.assertFalse(observation.observable)
+
+    def test_queue_client_loss_during_observation_invalidates_missing_outcomes(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()), (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        client = driver.attach(THREAD_ID)
+        self.transcripts[THREAD_ID] = self.write_lines('later-client-loss.jsonl', rollout_lines())
+        self.assertIs(driver.submit(THREAD_ID, 'msg'), True)
+        self.assertTrue(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
+        client.eof = True
+        self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
+
     def test_submit_and_observe_refuse_a_foreign_thread(self):
         driver = self.driver(FakeRun([]))
         for call in (lambda: driver.submit('other', 'x'),
