@@ -284,7 +284,12 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   output to stay quiet for 3 s, the capture's own criterion, then types the message in short
   chunks with a separate Enter and **keeps the client attached**; it returns `None`, because a
   PTY write is never host acceptance. The detach is the sweep's job: `close_clients()` sends
-  Ctrl-Z (captured to detach with the session still running) to every held client; a write that
+  Ctrl-Z (captured to detach with the session still running) to every held client. For busy and
+  approval trials, the settle callback first calls `attach(id)` while idle, then establishes the
+  precondition through that client. Submission reuses that live, ready client for the exact owned
+  session without waiting for idle again. Only a successful initial readiness check associates a
+  client with its session; an unready or exited client is never reused. Without such a client,
+  mid-turn attachment is refused because its readiness screen has not been captured. A write that
   fails for anything but an already-exited client is collected as a cleanup failure, like a
   failed close, rather than escaping and aborting the sweep before anything is closed or
   reported. The capture

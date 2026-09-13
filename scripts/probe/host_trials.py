@@ -669,6 +669,11 @@ class Driver:
         self.clients.append(self.pty(argv, cwd=self.cwd))
         return self.clients[-1]
 
+    def live_client_for(self, session_id):
+        self.require_owned(session_id)
+        return next((client for client in self.clients
+                     if getattr(client, 'serves', None) == session_id and not client.eof), None)
+
     def close_clients(self):
         """Close every held client; one whose close fails stays on `clients` and is reported.
 
@@ -1073,6 +1078,23 @@ class ClaudeDriver(Driver):
                                         f'{session_id}: {result.stderr}')
         return True
 
+    def attach(self, session_id):
+        """Hold a ready client before establishing a busy or approval trial's precondition.
+
+        Only a successful initial idle-composer check makes a client reusable. A held unready
+        or exited client still belongs to cleanup, but cannot establish submission readiness.
+        """
+        self.require_owned(session_id)
+        entry = self.status(session_id)
+        if entry is None or entry.get('pid') is None or entry.get('state') != 'done':
+            raise SubmissionUncaptured('initial attach requires a live idle session; '
+                                       'mid-turn attach readiness is uncaptured')
+        client = self.open_client(['claude', 'attach', session_id])
+        if not client.wait_for(CLAUDE_READY_PATTERN, quiet=3.0, timeout=30):
+            raise SubmissionUncaptured(f'attach never showed the composer: {client.screen()!r}')
+        client.serves = session_id
+        return client
+
     def _submit_attach(self, session_id, entry, message):
         """Type into `claude attach <id>` under a PTY and keep the client attached afterwards.
 
@@ -1091,10 +1113,9 @@ class ClaudeDriver(Driver):
         """
         if entry.get('pid') is None:
             raise SubmissionUncaptured('attach to a stopped session is uncaptured; use mechanism=resume')
-        client = self.open_client(['claude', 'attach', session_id])
-        # quiet=3.0 is the capture's own readiness criterion (3 s of output silence).
-        if not client.wait_for(CLAUDE_READY_PATTERN, quiet=3.0, timeout=30):
-            raise SubmissionUncaptured(f'attach never showed the composer: {client.screen()!r}')
+        client = self.live_client_for(session_id)
+        if client is None:
+            client = self.attach(session_id)
         screen_at_type = client.screen(400)
         typed_at = _utc_now()
         try:
@@ -1406,6 +1427,7 @@ class CodexDriver(Driver):
             client.close()
             self.clients.remove(client)
             raise PtyNotReady(f'codex resume {thread_id} {reason}', screen=screen)
+        client.serves = thread_id
         return client
 
     def submit(self, thread_id, message):

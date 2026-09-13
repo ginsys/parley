@@ -1035,6 +1035,41 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(driver.clients, [])
         self.assertGreaterEqual(self.clock.elapsed, 1.0)  # the detach was given the captured moment
 
+    def test_busy_submit_reuses_the_client_that_established_the_state(self):
+        driver, run = self.create_live()
+        client = driver.attach('69aa52ed')
+        client.type_line('synthetic prior turn')
+        run.scripts.insert(0, (['claude', 'agents'],
+                               listing([claude_entry(status='busy', state='working')])))
+        with unittest.mock.patch.object(client, 'wait_for', side_effect=AssertionError('idle wait')):
+            self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
+        self.assertEqual(FakePtyClient.launched, [client])
+        self.assertEqual(client.typed, ['synthetic prior turn', marker_message(MARKER)])
+
+    def test_an_exited_or_unready_attach_is_not_reused(self):
+        driver, run = self.create_live()
+        client = driver.attach('69aa52ed')
+        client.eof = True
+        self.assertIsNone(driver.live_client_for('69aa52ed'))
+        driver.pty = lambda argv, **kw: FakePtyClient(argv, ready=False, **kw)
+        with self.assertRaises(SubmissionUncaptured):
+            driver.attach('69aa52ed')
+        self.assertIsNone(driver.live_client_for('69aa52ed'))
+
+    def test_a_client_for_another_owned_session_is_not_reused(self):
+        driver, run = self.create_live()
+        driver.attach('69aa52ed')
+        driver.mint('12345678')
+        self.assertIsNone(driver.live_client_for('12345678'))
+
+    def test_busy_submit_without_an_established_client_refuses_mid_turn_attach(self):
+        driver, run = self.create_live()
+        run.scripts.insert(0, (['claude', 'agents'],
+                               listing([claude_entry(status='busy', state='working')])))
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertEqual(FakePtyClient.launched, [])
+
     def test_close_clients_skips_the_detach_for_a_client_that_already_exited(self):
         driver, run = self.create_live()
         driver.submit('69aa52ed', marker_message(MARKER))
