@@ -136,7 +136,7 @@ func (l *Lifecycle) HoldDisposition(ctx context.Context, p store.CommandPrincipa
 	if err != nil {
 		return store.CommandReceipt{}, err
 	}
-	if !canonicalID(r.IncidentID) || r.ExpectedHoldVersion < 1 || (r.Action != "release" && r.Action != "cancel") {
+	if r.Work.ID == "" || (r.Work.Kind != "envelope" && r.Work.Kind != "pending" && r.Work.Kind != "join") || !canonicalID(r.IncidentID) || r.ExpectedHoldVersion < 1 || (r.Action != "release" && r.Action != "cancel") {
 		return store.CommandReceipt{}, store.InvalidRequest
 	}
 	request, err := store.NewCommandRequest("hold.disposition", r.OperationID, store.Field{Name: "work", Value: store.Fields{{Name: "kind", Value: r.Work.Kind}, {Name: "id", Value: retainedWorkID(r.Work.ID)}}}, store.Field{Name: "incident_id", Value: r.IncidentID}, store.Field{Name: "expected_hold_version", Value: r.ExpectedHoldVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "reason", Value: reason})
