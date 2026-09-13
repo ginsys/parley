@@ -544,10 +544,52 @@ def opencode_message(role, parts, created_ms, **info):
     if isinstance(parts, list):
         parts = [{'sessionID': info['sessionID'], 'messageID': info['id'], **part}
                  if isinstance(part, dict) else part for part in parts]
-    return {'info': {'role': role, 'time': {'created': created_ms}, **info}, 'parts': parts}
+    stamp = {'created': created_ms}
+    if role == 'assistant':
+        stamp['completed'] = created_ms + 100
+    return {'info': {'role': role, 'time': stamp, **info}, 'parts': parts}
 
 
 class OpenCodeParsingTests(unittest.TestCase):
+    def test_ack_uses_completion_time_without_backdating_it_to_message_creation(self):
+        raw = opencode_export([opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1001000,
+                                               time={'created': 1001000, 'completed': 1121000})])
+        events, unusable = opencode_export_events(raw)
+        self.assertEqual(unusable, 0)
+        observation = detect_outcomes(events, MARKER, submitted_at=1000)
+        self.assertEqual(observation.outcomes, {'turn_start': 1001, 'ack': 1121})
+        trial = Trial(submitted=1000, outcomes=observation.outcomes)
+        self.assertEqual(trial.result('ack', 1121), 'not_observed')
+
+    def test_missing_or_invalid_completion_cannot_backdate_an_ack(self):
+        for completed in (None, True, '1002000', float('nan'), float('inf'), 1000000):
+            with self.subTest(completed=completed):
+                stamp = {'created': 1001000}
+                if completed is not None:
+                    stamp['completed'] = completed
+                raw = opencode_export([opencode_message('assistant', [{'type': 'text', 'text': MARKER}],
+                                                       1001000, time=stamp)])
+                events, _ = opencode_export_events(raw)
+                observation = detect_outcomes(events, MARKER, submitted_at=1000)
+                self.assertEqual(observation.outcomes, {'turn_start': 1001})
+                self.assertFalse(observation.observable)
+
+    def test_earliest_ack_completion_wins_even_if_messages_complete_out_of_order(self):
+        raw = opencode_export([
+            opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1001000,
+                             time={'created': 1001000, 'completed': 1121000}),
+            opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1002000,
+                             time={'created': 1002000, 'completed': 1003000})])
+        events, _ = opencode_export_events(raw)
+        self.assertEqual(detect_outcomes(events, MARKER, submitted_at=1000).outcomes['ack'], 1003)
+
+    def test_text_completed_after_submission_does_not_move_an_older_turn_start(self):
+        raw = opencode_export([opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 999000,
+                                               time={'created': 999000, 'completed': 1002000})])
+        events, _ = opencode_export_events(raw)
+        observation = detect_outcomes(events, MARKER, submitted_at=1000)
+        self.assertEqual(observation.outcomes, {'ack': 1002})
+
     def test_export_parts_require_a_captured_type(self):
         parts = [{'text': MARKER}] + [dict(type=kind, text=MARKER)
                                      for kind in (None, 1, [], {}, '', ' ', 'future-part')]
@@ -579,7 +621,8 @@ class OpenCodeParsingTests(unittest.TestCase):
         ])
         events, unusable = opencode_export_events(raw)
         self.assertEqual([(e.role, e.text, e.time) for e in events],
-                          [('user', MARKER, 1_757_754_001.0), ('assistant', f'ack {MARKER}', 1_757_754_002.5)])
+                          [('user', MARKER, 1_757_754_001.0), ('assistant', f'ack {MARKER}', 1_757_754_002.6)])
+        self.assertEqual(events[1].created_at, 1_757_754_002.5)
         self.assertEqual(unusable, 0)
 
     def test_malformed_export_documents_and_messages_are_unusable(self):

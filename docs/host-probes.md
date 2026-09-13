@@ -486,8 +486,13 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   even if the persistent export remains readable; positive export evidence still stands. `observe()` and
   `version()` read
   `opencode --pure export <id>`: `messages[].info.role`/`info.time.created` (ms epoch, used for
-  both roles so turn_start is the earliest assistant activity as on the other hosts) and the
-  `text` parts. Before observation or version extraction, the captured top-level `info.id`,
+  user messages and the earliest assistant activity), assistant `info.time.completed`, and the
+  `text` parts. Acknowledgement uses assistant completion as a conservative upper bound on text
+  emission, separately from creation. Missing, malformed or backward completion times cannot date
+  an acknowledgement; creation may still establish assistant activity. A reply completed after
+  its window remains late even when its message was created inside the window.
+  If multiple matching replies complete out of creation order, the earliest completion wins.
+  Before observation or version extraction, the captured top-level `info.id`,
   each message's `sessionID`, and each part's `sessionID` must name the owned session; each
   part's `messageID` must name its enclosing message, whose ID must be nonempty and unique.
   A missing or inconsistent binding makes the whole export unreadable, with no outcomes,

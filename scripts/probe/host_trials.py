@@ -237,6 +237,10 @@ class Event:
     # captured *not* being honoured).
     model: str | None = None
 
+    # OpenCode separates message creation from text completion. Keep creation only for
+    # assistant activity; `time` dates the completed text and therefore its acknowledgement.
+    created_at: float | None = None
+
 
 @dataclass
 class Observation:
@@ -305,6 +309,9 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
     started = None
     model = None
     for event in events:
+        if event.role == 'assistant' and event.created_at is not None and event.created_at >= submitted_at:
+            outcomes.setdefault('turn_start', event.created_at)
+            signals.setdefault('turn_start', SIGNAL_ASSISTANT_MESSAGE)
         if event.time is None:
             undated = True
             continue
@@ -327,10 +334,11 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
             continue
         if model is None:
             model = event.model
-        outcomes.setdefault('turn_start', event.time)
-        signals.setdefault('turn_start', SIGNAL_ASSISTANT_MESSAGE)
+        if event.created_at is None:
+            outcomes.setdefault('turn_start', event.time)
+            signals.setdefault('turn_start', SIGNAL_ASSISTANT_MESSAGE)
         if marker in event.text:
-            outcomes.setdefault('ack', event.time)
+            outcomes['ack'] = min(outcomes.get('ack', event.time), event.time)
             signals.setdefault('ack', SIGNAL_ASSISTANT_MESSAGE)
     if turn_stream:
         outcomes.pop('turn_start', None)
@@ -1769,8 +1777,9 @@ def opencode_export_events(raw):
 
     Captured shape: `{"info": {...}, "messages": [{"info": {"role": ..., "time": {"created":
     <ms epoch>, ...}, ...}, "parts": [{"type": "text", "text": ...}, ...]}]}`. `time.created`
-    is used for both roles (the assistant's `completed` also exists) so turn_start is the
-    earliest assistant activity, as on the other hosts; only `text` parts contribute text.
+    dates user messages and assistant activity; assistant `time.completed` dates completed
+    text conservatively, so acknowledgements cannot be backdated to creation. Missing or invalid
+    completion leaves activity observable but cannot date an acknowledgement. Only `text` parts contribute text.
     Unparseable output, a non-object top level, a non-list `messages`, a non-object message/info,
     a non-string role, a non-numeric creation time or a malformed part all count as unusable.
     An assistant message's `providerID`/`modelID` become `Event.model` (see
@@ -1814,8 +1823,18 @@ def opencode_export_events(raw):
         if texts is None:
             unusable += 1
             continue
-        events.append(Event(role=role, text=''.join(texts), time=created / 1000.0,
-                            model=opencode_message_model(info) if role == 'assistant' else None))
+        when = created / 1000.0
+        if role == 'assistant':
+            completed = info['time'].get('completed')
+            if (not isinstance(completed, (int, float)) or isinstance(completed, bool)
+                    or not math.isfinite(completed) or completed < created):
+                when = None
+                unusable += 1
+            else:
+                when = completed / 1000.0
+        events.append(Event(role=role, text=''.join(texts), time=when,
+                            model=opencode_message_model(info) if role == 'assistant' else None,
+                            created_at=created / 1000.0 if role == 'assistant' else None))
     return events, unusable
 
 
