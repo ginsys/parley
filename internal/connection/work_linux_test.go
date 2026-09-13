@@ -602,3 +602,48 @@ func TestIngestionInitializationPersistsExpiryObservedDuringAuthorization(t *tes
 		t.Fatalf("backward wall revived initialization credential: %v", err)
 	}
 }
+
+func TestCommandReplayPersistsPreviouslyRememberedRecipientExpiry(t *testing.T) {
+	m, author, auth := workFixture(t)
+	other := readyCapability(t, m, auth)
+	ctx := context.Background()
+	_, err := m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		_, err := tx.ExecContext(ctx, "CREATE TRIGGER fail_expiry BEFORE UPDATE OF status ON credentials WHEN NEW.status='expired' BEGIN SELECT RAISE(ABORT,'synthetic'); END")
+		return store.TransitionResult{Changed: true}, err
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.now = func() time.Time { return time.Unix(131, 0) }
+	request := SendRequest{OperationID: targetID, Conversation: "work", Recipient: "other", Text: "synthetic"}
+	if _, err := m.Send(ctx, author, request); err != store.TemporarilyUnavailable {
+		t.Fatalf("injected expiry persistence=%v", err)
+	}
+	m.now = func() time.Time { return time.Unix(110, 0) }
+	if err := m.Heartbeat(ctx, author); err != nil {
+		t.Fatalf("expiry failure blocked unrelated principal: %v", err)
+	}
+	_, err = m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		_, err := tx.ExecContext(ctx, "DROP TRIGGER fail_expiry")
+		return store.TransitionResult{Changed: true}, err
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := m.Send(ctx, author, request)
+	if err != nil || !receipt.Replayed || receipt.Result.Code != store.BindingUnavailable {
+		t.Fatalf("expiry retry=%+v %v", receipt, err)
+	}
+	if other.Context().Err() == nil {
+		t.Fatal("persisted expiry retained old capability")
+	}
+	if err := m.store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		c, err := store.ReadCredential(ctx, tx, other.socket.credentialID)
+		if err == nil && c.Status != "expired" {
+			t.Errorf("recovered storage did not retain expiry: %+v", c)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

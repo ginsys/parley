@@ -87,7 +87,7 @@ func (a *RestoreAdministration) Complete(ctx context.Context, p store.CommandPri
 			}
 			return store.CommandResult{}, evidenceErr
 		}
-		if len(disposition.ClockIncidents) > 99 || len(disposition.Retire) > 1000 || len(disposition.PendingWork) > 1000 {
+		if len(disposition.ClockIncidents) > 99 || len(disposition.PendingWork) > 1000 {
 			return store.CommandResult{}, store.CapacityExceeded
 		}
 		if disposition.ClockFloor == nil && len(disposition.ClockIncidents) != 0 {
@@ -122,6 +122,14 @@ func (a *RestoreAdministration) Complete(ctx context.Context, p store.CommandPri
 		}
 		var changes []store.ResourceChange
 		if floor := disposition.ClockFloor; floor != nil {
+			// Writer-time can detect a new rollback after Before flushed the
+			// reviewed durable set. Never reset against incomplete evidence.
+			s.stateMu.Lock()
+			pending := len(s.pending) != 0
+			s.stateMu.Unlock()
+			if pending {
+				return store.CommandResult{}, store.RecoveryRequired
+			}
 			// The trusted source has reviewed this floor; current writer time must also
 			// be at least that floor. Ordinary clock.reconcile never takes this path.
 			if now < floor.Reviewed {
