@@ -479,3 +479,50 @@ func TestAuthenticatedIngestionCursorFailureRollsBackACKReplyAndEvidence(t *test
 		t.Fatalf("retry=%+v %v", result, err)
 	}
 }
+
+func TestIngestionInitializationPersistsExpiryObservedDuringAuthorization(t *testing.T) {
+	m, _, auth := workFixture(t)
+	recipient := readyCapability(t, m, auth)
+	now := time.Unix(110, 0)
+	m.now = func() time.Time { return now }
+	// Cross the recipient's 130s credential deadline after sessionTransition's
+	// identity check, while its 30s socket liveness window is still valid.
+	m.guard = func(context.Context, *sql.Tx, string) error { now = time.Unix(131, 0); return nil }
+	ingestor, err := NewIngestor(IngestorConfig{Manager: m, Verify: func(context.Context, NativeTuple, Token, IngestRequest) error { return nil }, Origin: func(context.Context, NativeTuple, Token, string, string) error {
+		t.Fatal("expired origin consulted")
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ingestor.Initialize(context.Background(), recipient, "70000000-0000-4000-8000-000000000001", "start"); err != store.BindingUnavailable {
+		t.Fatalf("initialization=%v", err)
+	}
+	if err := m.store.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+		c, err := store.LatestCredential(ctx, tx, recipient.token.BindingID)
+		if err != nil {
+			return err
+		}
+		if c.Status != "expired" {
+			t.Errorf("initialization lost terminal expiry: %s", c.Status)
+		}
+		var cursors int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM ingestion_cursors").Scan(&cursors); err != nil {
+			return err
+		}
+		if cursors != 0 {
+			t.Errorf("expired initialization wrote %d cursors", cursors)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if recipient.Context().Err() == nil {
+		t.Error("expired initialization retained live capability")
+	}
+	now = time.Unix(110, 0)
+	m.guard = func(context.Context, *sql.Tx, string) error { return nil }
+	if err := m.Heartbeat(context.Background(), recipient); err != store.AuthenticationFailed {
+		t.Fatalf("backward wall revived initialization credential: %v", err)
+	}
+}
