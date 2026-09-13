@@ -249,7 +249,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   output to stay quiet for 3 s, the capture's own criterion, then types the message in short
   chunks with a separate Enter and **keeps the client attached**; it returns `None`, because a
   PTY write is never host acceptance. The detach is the sweep's job: `close_clients()` sends
-  Ctrl-Z (captured to detach with the session still running) to every held client. The capture
+  Ctrl-Z (captured to detach with the session still running) to every held client; a write that
+  fails for anything but an already-exited client is collected as a cleanup failure, like a
+  failed close, rather than escaping and aborting the sweep before anything is closed or
+  reported. The capture
   detached only after the reply was displayed — the user record landed at +0.27 s and the
   assistant reply at +2.6 s — so detaching as soon as the user record appeared would run every
   trial under an uncaptured mid-turn detach and make a missing `turn_start` or `ack`

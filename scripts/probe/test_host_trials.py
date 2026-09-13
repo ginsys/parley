@@ -693,6 +693,9 @@ class FakePtyClient:
         self.ready = ready
         self.trust_prompt = trust_prompt
         self.eof = eof
+        # Set by a test after launch to make the next write fail the way `os.write` can, without
+        # the client having exited (the real `send_keys` propagates `OSError` straight through).
+        self.write_error = None
         self.keys = []
         self.typed = []
         self.closed = False
@@ -720,6 +723,8 @@ class FakePtyClient:
     def send_keys(self, data):
         if self.closed or self.eof:
             raise ValueError('closed or exited session')
+        if self.write_error is not None:
+            raise self.write_error
         self.keys.append(data)
         return len(data)
 
@@ -935,6 +940,20 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertNotIn(b'\x1a', client.keys)
         self.assertTrue(client.closed)
         self.assertEqual(driver.clients, [])
+
+    def test_a_failed_detach_write_is_reported_and_does_not_escape_the_sweep(self):
+        # `send_keys` propagates OSError from os.write. Letting it out of close_clients() would
+        # abort sweep() before anything was closed or reported.
+        driver, run = self.create_live()
+        driver.submit('69aa52ed', marker_message(MARKER))
+        client, = FakePtyClient.launched
+        client.write_error = OSError('input/output error')
+        failures = sweep(driver)
+        self.assertEqual([kind for kind, _ in failures], ['client'])
+        self.assertIsInstance(failures[0][1], OSError)
+        self.assertTrue(client.closed)  # the base close still ran
+        self.assertEqual(driver.owned(), {'69aa52ed'})  # and no teardown followed a failed detach
+        self.assertEqual(run.argv('claude', 'rm'), [])
 
     def test_attach_client_exiting_while_typing_is_uncaptured(self):
         driver, run = self.create_live()

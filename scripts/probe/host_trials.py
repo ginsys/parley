@@ -877,17 +877,29 @@ class ClaudeDriver(Driver):
         The captured attach detached with Ctrl-Z *after* the reply was on screen and the client
         exited 0 with the session still listed. Holding the client until cleanup reproduces that;
         an exited client is skipped (`close()` below reaps it) and the kill remains the backstop.
+
+        A write that fails for any other reason (`send_keys` propagates `OSError` straight from
+        `os.write`) is collected as a cleanup failure and the base close still runs. Letting it
+        escape would abort `sweep()` before any client was closed or any teardown reported, mask
+        whatever exception the trial was already unwinding, and leave an authenticated session
+        live with nothing naming it. A collected failure also stops the sweep's teardowns, like a
+        failed close: the detach is the captured way to leave the session usable, and one that
+        did not happen is not evidence the session is safe to delete.
         """
+        failures = []
         detached = False
         for client in self.clients:
             try:
                 client.send_keys(b'\x1a')
             except ValueError:
                 continue  # already exited; nothing to detach from
+            except Exception as error:
+                failures.append(('client', error))
+                continue
             detached = True
         if detached:
             self.sleep(1.0)  # let the captured exit-0 detach complete before the kill backstop
-        return super().close_clients()
+        return failures + super().close_clients()
 
     def submit(self, session_id, message):
         self.registry.require_owned(self._key(session_id))
