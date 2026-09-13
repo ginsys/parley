@@ -1637,6 +1637,56 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(run.argv('claude', '--bg', '--resume')[0],
                           ['claude', '--bg', '--resume', SESSION_UUID, 'msg'])
 
+    def test_resume_daemon_loss_preserves_positive_evidence_but_invalidates_missing_outcomes(self):
+        for loss in ('exit', 'replace', 'missing', 'unreadable'):
+            with self.subTest(loss=loss):
+                self.registry = SessionRegistry()
+                entry = self.entry(pid=None)
+                entries = [entry]
+                run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', 'agents'], lambda argv: listing(entries))])
+                driver = self.driver(run, mechanism='resume')
+                driver.create('hello')
+                self.transcripts[SESSION_UUID] = self.write_lines('resumed.jsonl', [
+                    claude_record('user', MARKER, cwd=driver.cwd)])
+                self.assertTrue(driver.submit('69aa52ed', marker_message(MARKER)))
+                entry['pid'] = 4321
+                self.assertTrue(driver.observe('69aa52ed', marker=MARKER, submitted_at=0).observable)
+                if loss == 'missing':
+                    entries.clear()
+                elif loss == 'unreadable':
+                    run.scripts.insert(0, (['claude', 'agents'], subprocess.TimeoutExpired(['claude'], 15)))
+                else:
+                    entry['pid'] = None if loss == 'exit' else 9876
+                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                self.assertFalse(observation.observable)
+                self.assertEqual(set(observation.outcomes), {'visible'})
+                entry['pid'] = 4321
+                entries[:] = [entry]
+                self.assertFalse(driver.observe('69aa52ed', marker=MARKER, submitted_at=0).observable)
+
+    def test_resume_daemon_missing_at_first_poll_cannot_establish_negative_evidence(self):
+        for result in (FakeResult(0, 'backgrounded · 69aa52ed\n'),
+                       FakeResult(1, 'backgrounded · 69aa52ed\n', 'ambiguous'),
+                       subprocess.TimeoutExpired(['claude'], 60)):
+            with self.subTest(result=result):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', '--bg', '--resume'], result),
+                               (['claude', 'agents'], listing([self.entry(pid=None)]))])
+                driver = self.driver(run, mechanism='resume')
+                driver.create('hello')
+                self.transcripts[SESSION_UUID] = self.write_lines('missing-daemon.jsonl', [
+                    claude_record('user', 'initial prompt', cwd=driver.cwd)])
+                try:
+                    driver.submit('69aa52ed', marker_message(MARKER))
+                except subprocess.TimeoutExpired:
+                    pass
+                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                self.assertFalse(observation.observable)
+                self.assertEqual(observation.outcomes, {})
+
     def test_resume_submit_against_a_running_session_is_uncaptured(self):
         driver, run = self.create_live(mechanism='resume')
         with self.assertRaises(SubmissionUncaptured):

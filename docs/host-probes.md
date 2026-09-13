@@ -369,7 +369,12 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   is a copy under a new id — which, when stdout names one anyway, is minted whatever the exit
   status so the sweep removes it, and reported as a rejection. If the original ID is backgrounded
   before a nonzero exit, acceptance is ambiguous: it is unobservable and transcript polling
-  continues, since that daemon may already have received the marker. A copy named in the partial output
+  continues, since that daemon may already have received the marker. Each resumed observation
+  checks the cwd-filtered listing. The first post-submission observation retains the daemon PID;
+  a missing, replaced or unreadable PID makes missing delivery outcomes unobservable for the
+  remainder of that attempt, including if the daemon disappeared before the first poll. Positive
+  transcript evidence still stands. This also covers ambiguous exits and timeouts, without adding
+  listing latency to recorded command acceptance. A copy named in the partial output
   of a *timed-out* resume is uncaptured rather than a plain timeout: the message went to the copy,
   so polling the trial's own session would turn its absent marker into `not_observed` for a
   session that was never asked. `stop(id)` runs `claude stop` and

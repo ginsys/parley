@@ -991,6 +991,7 @@ class ClaudeDriver(Driver):
         self.monotonic = monotonic
         self.sessions = {}  # short id -> full sessionId (None until the listing supplied it)
         self.submission_clients = {}
+        self.resume_pids = {}  # None before first observation; 0 after continuity is lost
 
     def _listing(self):
         result = self.run(['claude', 'agents', '--json', '--all', '--cwd', self.cwd],
@@ -1040,6 +1041,23 @@ class ClaudeDriver(Driver):
     def _mint(self, session_id):
         self.mint(session_id)
         self.sessions.setdefault(session_id, None)
+
+    def _resume_daemon_live(self, session_id):
+        if session_id not in self.resume_pids:
+            return True  # no resumed submission to observe
+        expected = self.resume_pids[session_id]
+        if expected == 0:
+            return False
+        try:
+            entry = self.status(session_id)
+            pid = entry['pid'] if entry is not None else None
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            pid = None
+        if pid is None or (expected is not None and pid != expected):
+            self.resume_pids[session_id] = 0
+            return False
+        self.resume_pids[session_id] = pid
+        return True
 
     def _settle_creation_turn(self, session_id, timeout=CLAUDE_CREATION_TURN_CAP):
         """Wait until the listing reports the creation turn finished; return its entry.
@@ -1163,6 +1181,7 @@ class ClaudeDriver(Driver):
         acknowledgement remains independent evidence of receipt.
         """
         self.require_owned(session_id)
+        daemon_live = self._resume_daemon_live(session_id)
         parsed = self._read_transcript(session_id, claude_transcript_events)
         if parsed is None:
             return Observation(observable=False)
@@ -1172,7 +1191,7 @@ class ClaudeDriver(Driver):
         client_lost = client is not None and (
             not any(held is client for held in self.clients) or client.eof
             or getattr(client, 'serves', None) != session_id)
-        if unusable or client_lost:
+        if unusable or client_lost or not daemon_live:
             observation.observable = False
         return observation
 
@@ -1246,6 +1265,7 @@ class ClaudeDriver(Driver):
         if session_uuid is None:
             raise RuntimeError(f'listing carries no sessionId for {session_id}')
         argv = ['claude', '--bg', '--resume', session_uuid, message]
+        self.resume_pids[session_id] = None
         try:
             result = self.run(argv, capture_output=True, text=True, timeout=60, cwd=self.cwd,
                               stdin=subprocess.DEVNULL)
