@@ -60,6 +60,21 @@ func TestBindingRevocationIsAuditedAndCancelsExactConnection(t *testing.T) {
 	if err != nil || retired.Result.Code != "" {
 		t.Fatalf("retire=%+v %v", retired, err)
 	}
+	retireReplay, err := service.Retire(ctx, actor, request)
+	if err != nil || !retireReplay.Replayed {
+		t.Fatalf("retire replay=%+v %v", retireReplay, err)
+	}
+	for _, receipt := range []store.CommandReceipt{result, replay, retired, retireReplay} {
+		found := false
+		for _, resource := range receipt.Result.Resources {
+			if resource.Kind == "credential" && resource.ID == auth.credentialID && resource.Before == 1 && resource.After == 1 {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("receipt omitted immutable credential metadata: %+v", receipt.Result.Resources)
+		}
+	}
 	if err := m.store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		b, err := store.ReadBinding(ctx, tx, request.BindingID)
 		if err != nil {

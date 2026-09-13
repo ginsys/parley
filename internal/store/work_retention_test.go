@@ -59,6 +59,13 @@ func TestRevocationHoldsAuthoredWorkAndBarrierAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var created int64
+	if err := tx.QueryRowContext(ctx, "SELECT created_at_ns FROM security_holds WHERE work_id=?", authored).Scan(&created); err != nil || created != 110000000000 {
+		t.Errorf("hold creation time=%d err=%v", created, err)
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE security_holds SET created_at_ns=created_at_ns+1,hold_version=hold_version+1,status='released' WHERE work_id=?", authored); err == nil {
+		t.Error("hold creation time was mutable")
+	}
 	if change.BindingVersion != 2 || change.BarrierVersion != 1 {
 		t.Fatalf("change=%+v", change)
 	}

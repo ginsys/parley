@@ -216,7 +216,10 @@ Authenticated work records the accepting binding and credential version using re
 Renewal may carry the envelope's effective grant forward without rewriting this provenance.
 Revocation and retirement disable the binding, terminalize its current credential, append an
 incident, hold outstanding authored work across all credential versions and pause ingestion in
-one audited transaction. Exact legacy sender matches receive independent security holds too.
+one audited transaction. Each hold retains the trusted creation instant in immutable signed
+nanoseconds. Revoke and retire receipts retain the credential ID and unchanged historical version
+alongside binding, incident and barrier metadata; replay returns the same metadata without secrets.
+Exact legacy sender matches receive independent security holds too.
 Work merely addressed to that binding is not treated as authored by it. Admission supplies its
 pending-work extension through trusted callbacks; no pending-request implementation ships here.
 Re-enrollment requires new reviewed host evidence and a fresh credential for the same tuple;
