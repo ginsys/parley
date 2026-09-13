@@ -854,3 +854,7 @@ Origin verification receives only canonical nonzero source UUIDs and UTF-8 curso
 4096 bytes. Malformed initialization coordinates return `invalid_request` before provider I/O.
 Historical dispatch compatibility checks include the 256-byte limit for conversation and both
 peer identifiers; oversized rows remain untouched with `incompatible_identifier` diagnostics.
+
+Namespace retirement is idempotent only within its original incident. A later incident naming
+that already-retired namespace receives `version_conflict`; immutable retirement evidence is
+never relinked or reported as a new retirement. Reviewed later recovery can omit prior retirements.
