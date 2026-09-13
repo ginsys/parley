@@ -1,9 +1,3 @@
-// Package dispatch implements Parley's ordinary bridge operations: Send
-// (either peer's adapter queues a message) and Dispatch (the single-process
-// step that claims budget, hands the message to a Transport, and records
-// the outcome). Unlike controller, nothing here writes a grant — Send only
-// ever reads the current grant to stamp grant_version and reject a
-// revoked/missing one.
 package dispatch
 
 import (
@@ -13,9 +7,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
-
-	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -67,78 +58,17 @@ type Transport interface {
 	Deliver(ctx context.Context, e store.Envelope) error
 }
 
-type Bridge struct {
-	db        *store.DB
-	transport Transport
-	queries   store.Queries
+type settlementStore struct {
+	db      *store.DB
+	queries store.Queries
 }
 
-func New(db *store.DB, t Transport) *Bridge {
-	return &Bridge{db: db, transport: t, queries: db.Queries()}
+func newSettlement(db *store.DB) *settlementStore {
+	return &settlementStore{db: db, queries: db.Queries()}
 }
 
 var ErrNotPermitted = errors.New("grant does not permit this peer pair or direction")
 var ErrStaleGrantVersion = errors.New("envelope grant version is no longer current")
-
-// Send accepts a new message into the queue. It stamps grant_version from
-// whatever is current right now; a later renewal cancels this row if it's
-// still queued when the renewal commits (see controller.Renew). Send never
-// calls the transport itself — that's Dispatch's job — so a crash between
-// accept and delivery leaves the message safely queued, not lost.
-func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, inReplyTo *string) (*store.Envelope, error) {
-	if b.db.RecoveryControlled() {
-		return nil, store.RecoveryRequired
-	}
-	for _, id := range []string{conversation, from, to} {
-		if err := bridgetext.ValidateMetadata(id); err != nil {
-			return nil, err
-		}
-	}
-
-	tx, err := b.db.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			tx.Rollback()
-		}
-	}()
-
-	g, err := store.CurrentGrant(ctx, tx, conversation)
-	if err != nil {
-		return nil, err
-	}
-
-	if g.Expired(time.Now()) {
-		return nil, ErrGrantExpired
-	}
-	if !g.Permits(from, to, time.Now()) {
-		return nil, ErrNotPermitted
-	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	e := store.Envelope{
-		ID:           uuid.NewString(),
-		Conversation: conversation,
-		FromPeer:     from,
-		ToPeer:       to,
-		Text:         text,
-		GrantVersion: g.GrantVersion,
-		InReplyTo:    inReplyTo,
-		State:        store.Queued,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
-	if err := store.InsertQueued(ctx, tx, e); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	committed = true
-	return &e, nil
-}
 
 // Outcome exposes delivery state and bounded diagnostics without treating
 // a queued/budget-exhausted candidate as a host attempt.
@@ -150,70 +80,7 @@ type Outcome struct {
 	ErrorDetail string
 }
 
-// Dispatch attempts delivery of one queued envelope: claim its budget slot
-// and transition it to 'dispatching' in a single BEGIN IMMEDIATE
-// transaction, then call the transport outside that transaction, then
-// record the outcome. Returns the envelope's state after the attempt.
-//
-// If the envelope is no longer 'queued' (already claimed, cancelled by a
-// concurrent revoke/renew, or already terminal), Dispatch does nothing and
-// returns its current state with no error — this is the serialization the
-// design relies on, not a failure.
-func (b *Bridge) Dispatch(ctx context.Context, envelopeID string) (store.EnvelopeState, error) {
-	outcome, err := b.DispatchOutcome(ctx, envelopeID)
-	return outcome.State, err
-}
-func (b *Bridge) DispatchOutcome(ctx context.Context, envelopeID string) (Outcome, error) {
-	outcome := Outcome{ID: envelopeID}
-	state, err := b.dispatch(ctx, envelopeID, &outcome)
-	outcome.State = state
-	return outcome, err
-}
-func (b *Bridge) dispatch(ctx context.Context, envelopeID string, outcome *Outcome) (store.EnvelopeState, error) {
-	claimedEnvelope, claimed, err := b.claim(ctx, envelopeID)
-	if err != nil {
-		if errors.Is(err, bridgetext.ErrInvalidMetadata) {
-			current, stateErr := b.currentOutcome(ctx, envelopeID)
-			if stateErr != nil {
-				return "", stateErr
-			}
-			*outcome = current
-			outcome.ErrorCode = "incompatible_identifier"
-			outcome.ErrorDetail = "Stored identifiers require human compatibility review before delivery."
-			return current.State, err
-		}
-		if errors.Is(err, ErrBudgetExhausted) {
-			outcome.ErrorCode = "budget_exhausted"
-			outcome.ErrorDetail = "Grant budget is exhausted; delivery awaits human renewal."
-			return store.Queued, err
-		}
-		if errors.Is(err, ErrGrantExpired) || errors.Is(err, ErrNotPermitted) || errors.Is(err, ErrStaleGrantVersion) || errors.Is(err, store.ErrNoActiveGrant) {
-			// claim() leaves a reply's row untouched on expiry (so a future
-			// renewal can still carry it forward) but cancels an ordinary
-			// send outright — ask the row itself what actually happened
-			// rather than assuming which of the two this envelope was.
-			current, stateErr := b.currentOutcome(ctx, envelopeID)
-			if stateErr != nil {
-				return "", stateErr
-			}
-			*outcome = current
-			return current.State, err
-		}
-		return "", err
-	}
-	if !claimed {
-		current, err := b.currentOutcome(ctx, envelopeID)
-		*outcome = current
-		return current.State, err
-	}
-
-	deliverErr := b.transport.Deliver(ctx, *claimedEnvelope)
-	settled, err := b.settle(context.WithoutCancel(ctx), claimedEnvelope, deliverErr)
-	*outcome = settled
-	return settled.State, err
-}
-
-func (b *Bridge) settle(ctx context.Context, claimed *store.Envelope, deliverErr error) (outcome Outcome, err error) {
+func (b *settlementStore) settle(ctx context.Context, claimed *store.Envelope, deliverErr error) (outcome Outcome, err error) {
 	// A failed transaction cannot report its intended state as durable evidence.
 	// Preserve attempt information, but leave the stored outcome unknown on error.
 	defer func() {
@@ -299,13 +166,10 @@ func (b *Bridge) settle(ctx context.Context, claimed *store.Envelope, deliverErr
 // is different — its source turn is already permanently 'acked' with no
 // live sender left to resubmit it — so it is worth rescuing onto whatever
 // grant is current now. "Is a reply" is judged by e.TrustedReply, not merely
-// e.InReplyTo != nil: TrustedReply is set only by codex.IngestTurn, which
+// e.InReplyTo != nil: TrustedReply is set only by authenticated ingestion, which
 // validates in_reply_to against the specific original envelope it atomically
-// acks before queuing this one. dispatch.Bridge.Send accepts an arbitrary
-// caller-supplied inReplyTo with no validation, so an ordinary send naming
-// any envelope's id — even a genuinely acked one — must not qualify for this
-// rescue path either; it has to be cancelled like any other old-grant
-// message.
+// acks before queuing this one. Historical ordinary messages may contain
+// an untrusted correlation ID; those must not qualify for reply carry-forward.
 //
 // A trusted reply is re-stamped onto the successor version even if that
 // grant is already expired, mirroring CarryForwardQueuedReplies's own
@@ -337,110 +201,7 @@ func resolveRequeueVersion(ctx context.Context, tx *sql.Tx, e *store.Envelope) (
 	return g.GrantVersion, ok, err
 }
 
-// claim runs the atomic budget-claim + dispatching transition. Returns
-// claimed=false (no error) for either ErrBudgetExhausted's cause or a
-// concurrent state change — callers distinguish by re-reading state.
-func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope, bool, error) {
-	if b.db.RecoveryControlled() {
-		return nil, false, store.RecoveryRequired
-	}
-	tx, err := b.db.Begin(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			tx.Rollback()
-		}
-	}()
-
-	e, err := store.GetByID(ctx, tx, envelopeID)
-	if err != nil {
-		return nil, false, err
-	}
-	if e.State != store.Queued {
-		return nil, false, nil
-	}
-
-	// Compatibility rejection is observational: leave historical state and budget intact.
-	for _, id := range []string{e.Conversation, e.FromPeer, e.ToPeer} {
-		if err := bridgetext.ValidateMetadata(id); err != nil {
-			return nil, false, err
-		}
-	}
-	g, err := store.CurrentGrant(ctx, tx, e.Conversation)
-	if err == nil {
-		for _, id := range []string{g.Conversation, g.PeerAID, g.PeerBID} {
-			if err := bridgetext.ValidateMetadata(id); err != nil {
-				return nil, false, err
-			}
-		}
-	}
-	authErr := err
-	if err == nil {
-		authErr = authorizeEnvelope(g, e, time.Now())
-	}
-	if authErr != nil {
-		if !errors.Is(authErr, store.ErrNoActiveGrant) && !errors.Is(authErr, ErrGrantExpired) && !errors.Is(authErr, ErrNotPermitted) && !errors.Is(authErr, ErrStaleGrantVersion) {
-			return nil, false, authErr
-		}
-		if errors.Is(authErr, ErrGrantExpired) && e.TrustedReply {
-			return nil, false, authErr
-		}
-		if err := store.SetState(ctx, tx, e.ID, store.Queued, store.Cancelled, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-			return nil, false, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, false, err
-		}
-		committed = true
-		return nil, false, authErr
-	}
-
-	held, err := store.WorkHeld(ctx, tx, store.WorkRef{Kind: "envelope", ID: e.ID})
-	if err != nil || held {
-		return nil, false, err
-	}
-	ok, err := store.ClaimExchange(ctx, tx, e.Conversation, e.GrantVersion)
-	if err != nil {
-		return nil, false, err
-	}
-	if !ok {
-		current, err := store.CurrentGrant(ctx, tx, e.Conversation)
-		if err != nil {
-			return nil, false, err
-		}
-		if err := authorizeEnvelope(current, e, time.Now()); err != nil {
-			return nil, false, err
-		}
-		if current.ExchangesUsed >= current.MaxExchanges {
-			return nil, false, ErrBudgetExhausted
-		}
-		return nil, false, fmt.Errorf("budget claim failed without exhaustion")
-	}
-
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	transitioned, err := store.TransitionToDispatching(ctx, tx, envelopeID, now)
-	if err != nil {
-		return nil, false, err
-	}
-	if !transitioned {
-		// Can't happen under a single BEGIN IMMEDIATE writer without a bug
-		// elsewhere, since nothing else could have changed this row between
-		// the two statements above within the same transaction.
-		return nil, false, fmt.Errorf("dispatch: envelope %s left queued state between claim and transition", envelopeID)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, false, err
-	}
-	committed = true
-	e.State = store.Dispatching
-	e.DispatchAttempt++
-	return e, true, nil
-}
-
-func (b *Bridge) currentOutcome(ctx context.Context, envelopeID string) (Outcome, error) {
+func (b *settlementStore) currentOutcome(ctx context.Context, envelopeID string) (Outcome, error) {
 	e, err := b.queries.Outcome(ctx, envelopeID)
 	if err != nil {
 		return Outcome{ID: envelopeID}, err

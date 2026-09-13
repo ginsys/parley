@@ -501,7 +501,7 @@ At core baseline `a8beeffd1bbbfaf0033e086e68af74c5108cb56a`, compare
 [budget claims/refunds](../../internal/store/grants.go),
 [carry-forward and attempt settlement](../../internal/store/envelopes.go),
 [dispatch authorization](../../internal/dispatch/dispatch.go),
-[atomic reply ingestion](../../internal/adapter/codex/ingest.go) and
+[atomic reply ingestion](https://github.com/ginsys/parley/blob/a8beeffd1bbbfaf0033e086e68af74c5108cb56a/internal/adapter/codex/ingest.go) and
 [numbered migrations](../../internal/store/migrations.go).
 
 Specification review must assess the first-runtime supported subset, error/operation contracts,

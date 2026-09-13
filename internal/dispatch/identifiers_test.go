@@ -5,14 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	bridgefixture "github.com/ginsys/parley/internal/testfixture/bridge"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/ginsys/parley/internal/adapter/codex"
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/controller"
-	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -77,15 +76,15 @@ func TestIncompatibleHistoryRejectsNewWorkWithoutMutation(t *testing.T) {
 				ctx := context.Background()
 				beforeG, beforeE, beforeN := identifierState(t, db, c)
 				tr := newFakeTransport()
-				bridge := dispatch.New(db, tr)
+				bridge := bridgefixture.New(t, db, tr)
 				if _, err := controller.New(db).Renew(ctx, controller.RenewParams{Conversation: c, MaxExchanges: 5}); !errors.Is(err, bridgetext.ErrInvalidMetadata) {
 					t.Errorf("renew: %v", err)
 				}
-				if _, err := bridge.Send(ctx, c, a, b, "new", nil); !errors.Is(err, bridgetext.ErrInvalidMetadata) {
+				if _, err := bridge.Send(ctx, c, a, b, "new", nil); !errors.Is(err, store.InvalidRequest) {
 					t.Errorf("send: %v", err)
 				}
 				outcome, err := bridge.DispatchOutcome(ctx, e.ID)
-				if !errors.Is(err, bridgetext.ErrInvalidMetadata) || outcome.State != store.Queued || outcome.Attempted {
+				if !errors.Is(err, store.InvalidRequest) || outcome.State != store.Queued || outcome.Attempted || outcome.ErrorCode != "incompatible_identifier" || outcome.ErrorDetail == "" {
 					t.Errorf("dispatch: %+v, %v", outcome, err)
 				}
 				if len(tr.delivered) != 0 {
@@ -139,7 +138,7 @@ func TestIncompatibleReplyCannotAcknowledgeOriginal(t *testing.T) {
 				t.Fatal(err)
 			}
 			turn := "```BRIDGE-REPLY\n" + string(payload) + "\n```"
-			if _, err := codex.IngestTurn(ctx, db, c, b, a, turn); !errors.Is(err, bridgetext.ErrInvalidMetadata) {
+			if _, err := bridgefixture.IngestTurn(t, ctx, db, c, b, a, turn); !errors.Is(err, store.InvalidRequest) {
 				t.Errorf("ingest: %v", err)
 			}
 			afterG, afterE, afterN := identifierState(t, db, c)
@@ -162,7 +161,7 @@ func TestCompatibleConversationWorksAlongsideIncompatibleHistory(t *testing.T) {
 		t.Fatal("accepted keys changed")
 	}
 	tr := newFakeTransport()
-	bridge := dispatch.New(db, tr)
+	bridge := bridgefixture.New(t, db, tr)
 	e, err := bridge.Send(ctx, c, a, b, "世界", nil)
 	if err != nil {
 		t.Fatal(err)

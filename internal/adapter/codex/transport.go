@@ -1,7 +1,6 @@
 // Package codex implements Parley's Codex-side adapter: a Transport that
-// hands text to a Codex thread via `codex queue`, and a reply
-// ingester that reads a thread's turns for BRIDGE-REPLY markers
-// (internal/replymarker).
+// hands text to a Codex thread via `codex queue`. Authenticated reply ingestion
+// is shared in internal/connection and requires trusted native source evidence.
 package codex
 
 import (

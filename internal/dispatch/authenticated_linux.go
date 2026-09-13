@@ -11,11 +11,11 @@ import (
 	"github.com/ginsys/parley/internal/store"
 )
 
-// AuthenticatedBridge is the internal replacement consumed in the mechanical
-// caller migration. TransportFor must bind deterministic delivery to the supplied
+// AuthenticatedBridge accepts and claims work through private capabilities.
+// TransportFor must bind deterministic delivery to the supplied
 // exact private Session; it may not resolve a newer connection during Deliver.
 type AuthenticatedBridge struct {
-	bridge       *Bridge
+	bridge       *settlementStore
 	manager      *connection.Manager
 	transportFor func(*connection.Session) Transport
 	now          func() time.Time
@@ -28,7 +28,7 @@ func NewAuthenticated(db *store.DB, m *connection.Manager, transportFor func(*co
 	if now == nil {
 		now = time.Now
 	}
-	return &AuthenticatedBridge{bridge: New(db, nil), manager: m, transportFor: transportFor, now: now}, nil
+	return &AuthenticatedBridge{bridge: newSettlement(db), manager: m, transportFor: transportFor, now: now}, nil
 }
 func (b *AuthenticatedBridge) Send(ctx context.Context, s *connection.Session, r connection.SendRequest) (store.CommandReceipt, error) {
 	return b.manager.Send(ctx, s, r)
@@ -41,10 +41,55 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 			err = persistErr
 		}
 	}()
+	claimed, recipient, claimErr, err := b.claim(ctx, id)
+	if err != nil || claimed == nil {
+		outcome, readErr := b.bridge.currentOutcome(ctx, id)
+		if readErr != nil {
+			return outcome, readErr
+		}
+		if err == store.BindingUnavailable || err == store.SecurityHold || err == store.NotReady || err == store.AuthenticationFailed {
+			return outcome, nil
+		}
+		if err != nil {
+			return outcome, err
+		}
+		if errors.Is(claimErr, ErrBudgetExhausted) {
+			outcome.ErrorCode = "budget_exhausted"
+			outcome.ErrorDetail = "Grant budget is exhausted; delivery awaits human renewal."
+		} else if claimErr == store.InvalidRequest {
+			outcome.ErrorCode = "incompatible_identifier"
+			outcome.ErrorDetail = "Stored identifiers require human compatibility review before delivery."
+		}
+		return outcome, claimErr
+	}
+	// The captured capability is immutable even if its live slot is replaced.
+	// Cooperative cancellation crosses handoff; settlement retains uncertainty.
+	attempt, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(recipient.Context(), cancel)
+	defer stop()
+	transport := b.transportFor(recipient)
+	var deliveryErr error
+	if transport == nil || recipient.Context().Err() != nil {
+		deliveryErr = ErrNoAttempt
+	} else {
+		deliveryErr = transport.Deliver(attempt, *claimed)
+	}
+	return b.bridge.settle(context.WithoutCancel(ctx), claimed, deliveryErr)
+}
+
+// Dispatch returns the durable state for callers that do not need diagnostics.
+func (b *AuthenticatedBridge) Dispatch(ctx context.Context, id string) (store.EnvelopeState, error) {
+	outcome, err := b.DispatchOutcome(ctx, id)
+	return outcome.State, err
+}
+
+// claim returns the exact committed recipient capability with its envelope.
+func (b *AuthenticatedBridge) claim(ctx context.Context, id string) (*store.Envelope, *connection.Session, error, error) {
 	var claimed *store.Envelope
 	var recipient *connection.Session
 	var claimErr error
-	_, err = b.bridge.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+	_, err := b.bridge.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
 		e, err := store.GetByID(ctx, tx, id)
 		if err != nil {
 			return store.TransitionResult{}, err
@@ -54,11 +99,18 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 		}
 		for _, key := range []string{e.Conversation, e.FromPeer, e.ToPeer} {
 			if bridgetext.ValidateMetadata(key) != nil {
-				return store.TransitionResult{}, store.InvalidRequest
+				claimErr = store.InvalidRequest
+				return store.TransitionResult{}, nil
 			}
 		}
 		g, err := store.CurrentGrant(ctx, tx, e.Conversation)
 		if err == nil {
+			for _, key := range []string{g.Conversation, g.PeerAID, g.PeerBID} {
+				if bridgetext.ValidateMetadata(key) != nil {
+					claimErr = store.InvalidRequest
+					return store.TransitionResult{}, nil
+				}
+			}
 			err = authorizeEnvelope(g, e, store.AuthorityTime(ctx, b.now))
 		}
 		if err != nil {
@@ -99,31 +151,5 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 		claimed = e
 		return store.TransitionResult{Changed: true}, nil
 	}, nil)
-	if err != nil || claimed == nil {
-		outcome, readErr := b.bridge.currentOutcome(ctx, id)
-		if readErr != nil {
-			return outcome, readErr
-		}
-		if err == store.BindingUnavailable || err == store.SecurityHold || err == store.NotReady || err == store.AuthenticationFailed {
-			return outcome, nil
-		}
-		if err != nil {
-			return outcome, err
-		}
-		return outcome, claimErr
-	}
-	// The captured capability is immutable even if its live slot is replaced.
-	// Cooperative cancellation crosses handoff; settlement retains uncertainty.
-	attempt, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stop := context.AfterFunc(recipient.Context(), cancel)
-	defer stop()
-	transport := b.transportFor(recipient)
-	var deliveryErr error
-	if transport == nil || recipient.Context().Err() != nil {
-		deliveryErr = ErrNoAttempt
-	} else {
-		deliveryErr = transport.Deliver(attempt, *claimed)
-	}
-	return b.bridge.settle(context.WithoutCancel(ctx), claimed, deliveryErr)
+	return claimed, recipient, claimErr, err
 }

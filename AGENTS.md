@@ -18,7 +18,7 @@ lifecycle/holds. Their callers are controlled fixtures; authenticated ordinary-w
 a runnable bridge remain pending. Do not treat anything below `internal/` as wired to a live session yet —
 `dispatch.Transport` is an interface with no real Channels implementation in this repo so far,
 `Handshake.sendProbe`/`Ack` are not wired to an actual Channels connection or the `reply` tool, and
-`codex.ExecSender`/`IngestTurn` are untested against an actual `codex` CLI or rollout file.
+`codex.ExecSender` and the native-source ingestion providers are untested against an actual `codex` CLI or rollout file.
 
 ## The protected controller
 
@@ -276,7 +276,10 @@ Ordinary acceptance derives its author from a private, current Session capabilit
 rechecks immutable provenance, both bindings, grant/version, holds, readiness and budget in one
 coordinated claim, then captures the exact recipient capability for transport. Replacement cannot
 retarget an already claimed attempt. Attempt counters fail on signed-64-bit overflow without a
-budget mutation. These internal APIs currently have test-only callers pending caller migration.
+budget mutation. The existing poller consumes authenticated dispatch. Raw sender-string Send
+and Codex IngestTurn entrypoints have been removed; ingestion uses connection.Ingestor. Shared
+synthetic capability helpers under internal/testfixture are for tests only. Never import them
+from an ordinary adapter, controller or runtime. Their permissive providers confer no live trust.
 
 Ingestion retains native-event identity, source digest/revision and cursor edges permanently.
 Authenticate before retained-result lookup; exact terminal replay/conflict precedes fresh host I/O.

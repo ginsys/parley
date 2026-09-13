@@ -461,7 +461,7 @@ connecting live hosts additionally requires the repository's full live-connectio
 
 Baseline: `9cc3a5a795fdc48989ab08e6a527f5d4b6c01457`. Current
 [dispatch](../../internal/dispatch/dispatch.go) accepts a caller-supplied sender and separately
-claims/settles delivery; [ingestion](../../internal/adapter/codex/ingest.go) atomically validates,
+claims/settles delivery; [ingestion](https://github.com/ginsys/parley/blob/9cc3a5a795fdc48989ab08e6a527f5d4b6c01457/internal/adapter/codex/ingest.go) atomically validates,
 ACKs and queues replies; [readiness](../../internal/adapter/claude/handshake.go) uses process-local
 generations. The [store migrations](../../internal/store/migrations.go) own ordered upgrades.
 This specification extends those boundaries; it does not describe them as already authenticated.
