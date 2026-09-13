@@ -245,7 +245,8 @@ after recovery while quarantine and delivery evidence remain unchanged. Disposit
 digests encode malformed UTF-8 work IDs as a tagged base64 object; valid text keeps its existing
 canonical representation. Evidence lookup and storage use the original bytes, so incompatible
 historical IDs remain addressable without replacement-character aliases. This also applies to
-security-hold dispositions for legacy work.
+security-hold dispositions for legacy work. Empty IDs and unknown work kinds fail request
+validation before retaining an operation result, allowing correction under the same operation ID.
 
 Release changes only the selected hold or quarantine version. A second incident remains effective.
 Cancellation is terminal; only queued work changes to cancelled, while dispatched/uncertain and
