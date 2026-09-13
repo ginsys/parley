@@ -750,12 +750,13 @@ class ClaudeDriver(Driver):
             if short:
                 self._mint(short)
             raise
+        short = backgrounded_id(result.stdout)
+        if short:
+            self._mint(short)  # before the exit check: a nonzero exit after the line is still a session
         if result.returncode != 0:
             raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')
-        short = backgrounded_id(result.stdout)
         if short is None:
             raise RuntimeError(f'claude --bg printed no backgrounded line: {result.stdout!r}')
-        self._mint(short)
         if self.status(short) is None:
             raise RuntimeError(f'claude --bg printed {short} but the listing under {self.cwd} lacks it')
         return short
@@ -846,14 +847,15 @@ class ClaudeDriver(Driver):
             if started and started != session_id:
                 self._mint(started)
             raise
+        started = backgrounded_id(result.stdout)
+        if started and started != session_id:
+            self._mint(started)  # a copy named on stdout is live whatever the exit status says
         if result.returncode != 0:
             raise SubmissionRejected(result.returncode, result.stderr)
-        started = backgrounded_id(result.stdout)
         if started is None:
             raise SubmissionUncaptured(f'--bg --resume exited 0 without a backgrounded line: '
                                        f'{result.stdout!r} / {result.stderr!r}')
         if started != session_id:
-            self._mint(started)
             raise SubmissionRejected(0, f'started a copy {started} instead of continuing '
                                         f'{session_id}: {result.stderr}')
         return True

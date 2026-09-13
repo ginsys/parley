@@ -740,6 +740,14 @@ class ClaudeDriverTests(DriverTestCase):
                     driver.create('hello')
                 self.assertEqual(driver.owned(), set())
 
+    def test_create_mints_a_backgrounded_id_even_when_the_exit_status_is_nonzero(self):
+        # The line names a session the daemon started; a later failure in the same command
+        # (or a wrapper's exit status) does not unstart it.
+        driver = self.driver(FakeRun([(['claude', '--bg'], FakeResult(1, 'backgrounded · 69aa52ed\n', 'boom'))]))
+        with self.assertRaises(RuntimeError):
+            driver.create('hello')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
     def test_status_and_teardown_refuse_a_foreign_id(self):
         driver = self.driver(FakeRun([(['claude', 'agents'], listing([claude_entry('deadbeef')]))]))
         for method in (driver.status, driver.teardown, driver.version, driver.attach
@@ -861,6 +869,16 @@ class ClaudeDriverTests(DriverTestCase):
             driver.submit('69aa52ed', 'msg')
         self.assertEqual(caught.exception.returncode, 1)
         self.assertIn('No conversation found', caught.exception.stderr)
+
+    def test_resume_submit_nonzero_exit_still_mints_a_copy_named_on_stdout(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], FakeResult(1, 'backgrounded · 0badc0de\n', 'then failed')),
+                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        with self.assertRaises(SubmissionRejected):
+            driver.submit('69aa52ed', 'msg')
+        self.assertEqual(driver.owned(), {'69aa52ed', '0badc0de'})
 
     def test_resume_submit_timeout_mints_a_copy_seen_in_partial_output(self):
         error = subprocess.TimeoutExpired(cmd=['claude'], timeout=60, output=b'backgrounded \xc2\xb7 0badc0de\n')
