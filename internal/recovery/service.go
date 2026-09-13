@@ -95,7 +95,7 @@ func (s *Service) latch(floor, observed int64) error {
 // A different floor/observed pair needs independent evidence even during cleanup.
 func (s *Service) latchRollback(ctx context.Context, tx *sql.Tx, floor, observed int64) error {
 	var recorded bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents WHERE kind='clock' AND status!='cleared' AND last_trusted_ns=? AND observed_ns=?)", floor, observed).Scan(&recorded); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents WHERE kind='clock' AND status='held' AND last_trusted_ns=? AND observed_ns=?)", floor, observed).Scan(&recorded); err != nil {
 		// Detection already happened. An unavailable deduplication read cannot
 		// discard the observation before the independent After flush.
 		if latchErr := s.latch(floor, observed); latchErr != nil {

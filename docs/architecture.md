@@ -742,7 +742,8 @@ actual process/supervisor integration remains required before live use. No persi
 claimed when every persistence path fails, or for a rollback never recorded before a crash and
 subsequent clock correction. Distinct detected floor/observed pairs retain independent incidents
 even while another clock incident is held or awaiting cleanup; repeated identical observations
-reuse that evidence. A failed deduplication read retains the detection for independent persistence.
+reuse that evidence only while its incident is held. Reconciled incidents are being cleared, so
+a repeated detection needs fresh evidence. A failed deduplication read retains the detection.
 Once a marker or held database incident exists, corrected wall time and restart cannot clear it. Restore detection requires the operator to establish a fresh external marker.
 
 Internal human `clock.reconcile` verifies reviewed source evidence and nondecreasing samples at
@@ -752,6 +753,10 @@ Recording an existing reconciled incident is idempotent because its global hold 
 the storage primitive rejects reuse of a cleared incident without changing its terminal evidence.
 Retries reauthorize before looking up the receipt and may finish only that committed cleanup. Other
 incidents keep the global gate closed. `recovery.complete` follows the same two-phase protocol.
+After a reviewed ingestion advance, remaining pending events must form reachable edges from the
+new cursor boundary. Disconnected evidence rejects the interval rather than guessing the order of
+opaque cursors; up to 1000 remaining pending events are inspected, with capacity failure above it.
+An empty interval advances nothing and can leave pending evidence for ordinary retry.
 For both operations and `ingestion.resume`, only an explicit host-verification mismatch retains
 a terminal evidence rejection. Provider failures, cancellation and evidence deadlines leave no
 receipt or business effect, so the same operation ID can retry after evidence becomes available.
