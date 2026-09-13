@@ -1235,6 +1235,8 @@ class ClaudeDriver(Driver):
             raise SubmissionUncaptured(
                 f'--bg --resume against a running session is uncaptured (pid {entry["pid"]}); '
                 'stop it first')
+        if entry.get('state') != 'done':
+            raise SubmissionUncaptured('--bg --resume requires the captured stopped state done')
         session_uuid = self._session_uuid(session_id)
         if session_uuid is None:
             raise RuntimeError(f'listing carries no sessionId for {session_id}')

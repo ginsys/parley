@@ -1612,6 +1612,21 @@ class ClaudeDriverTests(DriverTestCase):
             driver.submit('69aa52ed', 'msg')
         self.assertEqual(run.argv('claude', '--bg', '--resume'), [])
 
+    def test_resume_requires_done_even_after_the_pid_disappears(self):
+        for state in ('working', 'unknown'):
+            with self.subTest(state=state):
+                self.registry = SessionRegistry()
+                entry = self.entry()
+                run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', 'agents'], lambda argv: listing([entry]))])
+                driver = self.driver(run, mechanism='resume')
+                driver.create('hello')
+                entry.update(pid=None, state=state)
+                with self.assertRaises(SubmissionUncaptured):
+                    driver.submit('69aa52ed', 'msg')
+                self.assertEqual(run.argv('claude', '--bg', '--resume'), [])
+
     def test_resume_submit_that_starts_a_copy_mints_it_and_reports_a_rejection(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 0badc0de\n')),

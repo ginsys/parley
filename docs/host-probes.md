@@ -359,8 +359,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   rechecks that exact client. Exit, removal, replacement or changed session binding makes missing
   transcript outcomes unobservable even when the persisted transcript remains readable; positive
   transcript evidence still stands. `resume` runs `claude --bg --resume <sessionId> '<msg>'` with no other
-  flags against a *stopped* session (the captured restarted path); a running session (`pid` set)
-  is refused as uncaptured, since with flags, or against a running session, the captured result
+  flags against a *stopped* session with `pid` null and `state: "done"` (the captured restarted
+  path). A missing PID with a still-working or unknown state is refused before resuming, as is
+  a running session (`pid` set), since with flags, or against a running session, the captured result
   is a copy under a new id — which, when stdout names one anyway, is minted whatever the exit
   status so the sweep removes it, and reported as a rejection. If the original ID is backgrounded
   before a nonzero exit, acceptance is ambiguous: it is unobservable and transcript polling
