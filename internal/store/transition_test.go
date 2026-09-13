@@ -106,4 +106,10 @@ func TestRevisionOverflowStopsOrdinaryTransitions(t *testing.T) {
 	}, nil); err != RecoveryRequired {
 		t.Fatalf("after overflow=%v", err)
 	}
+	if err := c.ClaimConnections(context.Background()); err != RecoveryRequired {
+		t.Errorf("connection claim after overflow=%v", err)
+	}
+	if c.connectionsClaimed {
+		t.Error("failed coordinator consumed connection ownership")
+	}
 }

@@ -68,6 +68,9 @@ func (c *Coordinator) ClaimConnections(ctx context.Context) error {
 		return storageCode(err)
 	}
 	defer func() { <-c.gate }()
+	if c.failed {
+		return RecoveryRequired
+	}
 	if c.connectionsClaimed {
 		return InvalidRequest
 	}

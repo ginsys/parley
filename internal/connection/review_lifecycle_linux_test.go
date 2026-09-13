@@ -76,6 +76,7 @@ func TestFailedHostVerificationPersistsCredentialExpiry(t *testing.T) {
 		{"unavailable", store.TemporarilyUnavailable, 200},
 		{"cancelled", context.Canceled, 200},
 		{"liveness_also_expired", store.HostUnverified, 230},
+		{"socket_cancelled", context.Canceled, 230},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m, auth, now := attachmentFixture(t)
@@ -90,6 +91,9 @@ func TestFailedHostVerificationPersistsCredentialExpiry(t *testing.T) {
 				*now = time.Unix(tc.finished, 0)
 				if tc.failure == context.Canceled {
 					cancel()
+				}
+				if tc.name == "socket_cancelled" {
+					m.expire(s.socket)
 				}
 				return tc.failure
 			}
@@ -107,6 +111,10 @@ func TestFailedHostVerificationPersistsCredentialExpiry(t *testing.T) {
 				return err
 			}); err != nil {
 				t.Fatal(err)
+			}
+			*now = time.Unix(199, 0)
+			if _, err := m.Inspect(context.Background(), acceptSocket(t, m), auth); err != store.AuthenticationFailed {
+				t.Errorf("clock rollback revived expired credential: %v", err)
 			}
 		})
 	}
