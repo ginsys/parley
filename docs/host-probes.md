@@ -201,7 +201,13 @@ recorder's equivalent and applies only to PTY captures. Every matrix cell this p
 therefore carries the developer's real credentials and config; it is not the clean-room
 isolation `--home disposable` gives the PTY fixtures above. Each driver refuses at construction
 any probe directory that is not owned by the current operator, is group/world writable, or is
-not empty: the directory keys a Codex trust
+not empty. Its resolved ancestor chain must belong to the operator or root, and any shared
+writable ancestor must have the sticky bit so other users cannot replace the owned child path.
+This permits ordinary sticky temporary roots while rejecting writable non-sticky parents,
+including unsafe ancestors above a private intermediate directory. It does not isolate against
+the operator or root. The small controlled probe-directory fixtures use private directories
+under Linux's sticky `/tmp` rather than inheriting potentially unsafe `TMPDIR` ancestry; build
+caches and verification logs can remain in scratch. The directory keys a Codex trust
 entry in `$CODEX_HOME/config.toml`, the slug of Claude's transcript directory, and whatever a real
 repository's contents would feed the model. The one exception is a `.git` left by a bare
 `git init` — what the captured Codex probe directory was, since `codex resume` gets no

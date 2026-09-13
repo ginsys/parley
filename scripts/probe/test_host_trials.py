@@ -814,12 +814,14 @@ class FakePtyClient:
 
 class DriverTestCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        # These small Linux probe fixtures need a trusted sticky ancestor; inherited TMPDIR
+        # may have group-writable parents. Build caches and verification logs stay in scratch.
+        self.tmp = tempfile.TemporaryDirectory(dir='/tmp')
         self.addCleanup(self.tmp.cleanup)
         self.cwd = self.tmp.name
         # Fixture files live in their own private directory: the probe cwd must stay empty, and
         # its parent is the shared temp root where fixed names would collide across runs.
-        self.fixtures = tempfile.TemporaryDirectory()
+        self.fixtures = tempfile.TemporaryDirectory(dir='/tmp')
         self.addCleanup(self.fixtures.cleanup)
         self.registry = SessionRegistry()
         FakePtyClient.launched = []
@@ -946,6 +948,38 @@ class ClaudeDriverTests(DriverTestCase):
             with self.assertRaisesRegex(ValueError, 'owned'):
                 self.driver(FakeRun([]))
 
+    def test_writable_non_sticky_ancestors_are_refused(self):
+        for mode in (0o770, 0o777):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory(dir=self.fixtures.name) as parent:
+                child = os.path.join(parent, 'nested', 'probe')
+                os.makedirs(child, mode=0o700)
+                os.chmod(parent, mode)
+                with self.assertRaisesRegex(ValueError, 'ancestor'):
+                    self.driver(FakeRun([]), cwd=child)
+
+    def test_operator_owned_sticky_ancestor_preserves_child_ownership(self):
+        with tempfile.TemporaryDirectory(dir=self.fixtures.name) as parent:
+            child = os.path.join(parent, 'probe')
+            os.mkdir(child, 0o700)
+            os.chmod(parent, 0o1777)
+            self.driver(FakeRun([]), cwd=child)
+
+    def test_an_untrusted_ancestor_owner_is_refused_even_without_shared_write(self):
+        original_stat = os.stat
+        parent = os.path.dirname(self.cwd)
+
+        def changed_owner(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if path == parent:
+                fields = list(result)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return result
+
+        with unittest.mock.patch('os.stat', side_effect=changed_owner):
+            with self.assertRaisesRegex(ValueError, 'ancestor'):
+                self.driver(FakeRun([]))
+
     def test_a_freshly_initialized_git_directory_is_allowed(self):
         # Real `git init`, not a hand-built skeleton: the predicate has to accept what the
         # captured Codex probe directory actually was.
@@ -1011,7 +1045,7 @@ class ClaudeDriverTests(DriverTestCase):
                               ('info/exclude', 'uncontrolled-pattern\n'),
                               ('hooks/pre-commit.sample', 'uncontrolled sample\n')):
             with self.subTest(name=name):
-                with tempfile.TemporaryDirectory() as cwd:
+                with tempfile.TemporaryDirectory(dir=self.fixtures.name) as cwd:
                     self.git('init', '--quiet', cwd)
                     with open(os.path.join(cwd, '.git', name), 'w') as handle:
                         handle.write(content)
@@ -1043,7 +1077,7 @@ class ClaudeDriverTests(DriverTestCase):
         self.git('-C', store, 'commit', '--quiet', '--allow-empty', '-m', 'history')
         for name in ('refs', 'objects'):
             with self.subTest(name=name):
-                fresh = tempfile.TemporaryDirectory()
+                fresh = tempfile.TemporaryDirectory(dir=self.fixtures.name)
                 self.addCleanup(fresh.cleanup)
                 self.git('init', '--quiet', fresh.name)
                 target = os.path.join(fresh.name, '.git', name)

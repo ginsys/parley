@@ -693,6 +693,17 @@ def private_directory(cwd):
         raise ValueError('probe cwd must be owned by the current operator')
     if metadata.st_mode & 0o022:
         raise ValueError('probe cwd must not be writable by the group or other users')
+    ancestor = os.path.dirname(path)
+    while True:
+        parent_metadata = os.stat(ancestor)
+        if parent_metadata.st_uid not in (0, os.geteuid()):
+            raise ValueError(f'probe cwd ancestor has an untrusted owner: {ancestor!r}')
+        if parent_metadata.st_mode & 0o022 and not parent_metadata.st_mode & stat.S_ISVTX:
+            raise ValueError(f'probe cwd ancestor permits replacement by other users: {ancestor!r}')
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            break
+        ancestor = parent
     entries = set(os.listdir(path))
     extra = entries - {'.git'}
     if extra:
