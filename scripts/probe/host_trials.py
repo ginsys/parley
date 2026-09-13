@@ -686,6 +686,11 @@ def private_directory(cwd):
     path = os.path.realpath(cwd)
     if not os.path.isdir(path):
         raise ValueError(f'probe cwd is not a directory: {cwd!r}')
+    metadata = os.stat(path)
+    if metadata.st_uid != os.geteuid():
+        raise ValueError('probe cwd must be owned by the current operator')
+    if metadata.st_mode & 0o022:
+        raise ValueError('probe cwd must not be writable by the group or other users')
     entries = set(os.listdir(path))
     extra = entries - {'.git'}
     if extra:

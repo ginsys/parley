@@ -861,6 +861,19 @@ class ClaudeDriverTests(DriverTestCase):
         with self.assertRaises(ValueError):
             self.driver(FakeRun([]), cwd=os.path.join(self.cwd, 'missing'))
 
+    def test_probe_cwd_must_be_operator_owned_and_not_writable_by_others(self):
+        for mode in (0o770, 0o777):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.cwd, mode)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'writable'):
+                        self.driver(FakeRun([]))
+                finally:
+                    os.chmod(self.cwd, 0o700)
+        with unittest.mock.patch('os.geteuid', return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(ValueError, 'owned'):
+                self.driver(FakeRun([]))
+
     def test_a_freshly_initialized_git_directory_is_allowed(self):
         # Real `git init`, not a hand-built skeleton: the predicate has to accept what the
         # captured Codex probe directory actually was.
