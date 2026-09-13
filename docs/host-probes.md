@@ -219,15 +219,21 @@ same registry sees the same ids but not the first one's held clients, servers or
 session the host created in that instant is findable only by a human (`claude agents --json
 --all --cwd <probe cwd>`; the newest rollout under `$CODEX_HOME/sessions` naming the probe cwd;
 the newest `parley-probe-*` row of the global `opencode --pure session list`, removed with
-`opencode --pure session delete <id>`). The `opencode serve` child and every PTY client have the
-same shape in a narrower instant: each is created and handed to its owner in a single statement
-inside the handler that closes it, but an interrupt delivered between the OS creating the child
-and its handle reaching Python leaves a process nothing in-process can name. That gap is one
-bytecode boundary and can only be closed by masking SIGINT around the spawn, which would hand the
-host child an uncaptured signal mask — the one thing this runner will not do. Both children run in
-their own process group, so a terminal Ctrl-C does not reach them either; `ss -lptn` on the probe
-run's port finds a stranded server, and a stranded client is a `claude attach`/`codex resume`
-process under the probe cwd.
+`opencode --pure session delete <id>`). The `opencode serve` child has the same shape in a
+narrower instant: it is spawned and held in one statement inside the handler that closes it, but
+an interrupt delivered between the OS creating it and its handle reaching Python leaves a process
+nothing in-process can name. Its child runs in its own process group, so a terminal Ctrl-C does
+not reach it either; `ss -lptn` on the probe run's port finds a stranded server.
+
+PTY clients do **not** share that gap. `PtyProcess.__init__` blocks SIGINT across `pty.fork()`,
+restores the prior mask in the child before `exec`, stores `pid`/`fd` in the parent before
+unblocking, and closes the child if the pending interrupt then raises. The `serve` child gets no
+equivalent because `subprocess.Popen` offers no way to restore the mask in the child before
+`exec` — only `preexec_fn`, which is unsafe in a process that runs the PTY drain threads — so
+masking there would hand the host child an uncaptured signal mask, which this runner will not do.
+What remains for both is the last store of an already-owned handle: the interpreter can deliver an
+interrupt between a constructor returning and the append or attribute assignment that puts the
+handle where cleanup reads it. That is one bytecode and is not closable from inside the process.
 
 ### Drivers
 
