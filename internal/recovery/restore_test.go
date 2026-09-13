@@ -66,7 +66,7 @@ func seedRestoredWork(t *testing.T, s *Service) {
 	}
 }
 func TestRestoreRetiresNamespaceWithoutReplayingSnapshotEffects(t *testing.T) {
-	a, s, _, r := restoreAdministration(t)
+	a, s, now, r := restoreAdministration(t)
 	seedRestoredWork(t, s)
 	ctx := context.Background()
 	// Missing the affected binding cannot release restored grant budgets.
@@ -100,6 +100,13 @@ func TestRestoreRetiresNamespaceWithoutReplayingSnapshotEffects(t *testing.T) {
 		b, err := store.ReadBinding(ctx, tx, restoredBinding)
 		if err != nil {
 			return err
+		}
+		var missing int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM security_holds WHERE created_at_ns != ?", now.UnixNano()).Scan(&missing); err != nil {
+			return err
+		}
+		if missing != 0 {
+			t.Errorf("holds missing trusted creation instant: %d", missing)
 		}
 		if b.Status != "retired" {
 			t.Errorf("revival=%+v", b)

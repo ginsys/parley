@@ -113,7 +113,7 @@ func (a *RestoreAdministration) Complete(ctx context.Context, p store.CommandPri
 		if activeNamespaces {
 			return rejection(store.VersionConflict)
 		}
-		if err := store.HoldRestoredWork(ctx, tx, r.IncidentID, disposition.PendingWork); err != nil {
+		if err := store.HoldRestoredWork(ctx, tx, r.IncidentID, disposition.PendingWork, now); err != nil {
 			return store.CommandResult{}, err
 		}
 		var changes []store.ResourceChange

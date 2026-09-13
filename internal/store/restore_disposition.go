@@ -62,7 +62,7 @@ func RetireRecoveryNamespace(ctx context.Context, tx *sql.Tx, incident string, r
 
 // HoldRestoredWork conservatively retains every outstanding envelope independently
 // of snapshot delivery state. No ACK, budget or attempt evidence is rewritten.
-func HoldRestoredWork(ctx context.Context, tx *sql.Tx, incident string, pending []WorkRef) error {
+func HoldRestoredWork(ctx context.Context, tx *sql.Tx, incident string, pending []WorkRef, nowNS int64) error {
 	if !validUUID(incident) {
 		return InvalidRequest
 	}
@@ -91,7 +91,7 @@ func HoldRestoredWork(ctx context.Context, tx *sql.Tx, incident string, pending 
 			break
 		}
 		for _, id := range ids {
-			if err := insertRestoreHold(ctx, tx, incident, WorkRef{Kind: "envelope", ID: id}); err != nil {
+			if err := insertRestoreHold(ctx, tx, incident, WorkRef{Kind: "envelope", ID: id}, nowNS); err != nil {
 				return err
 			}
 		}
@@ -102,13 +102,13 @@ func HoldRestoredWork(ctx context.Context, tx *sql.Tx, incident string, pending 
 		if work.Kind == "envelope" {
 			return InvalidRequest
 		}
-		if err := insertRestoreHold(ctx, tx, incident, work); err != nil {
+		if err := insertRestoreHold(ctx, tx, incident, work, nowNS); err != nil {
 			return err
 		}
 	}
 	return nil
 }
-func insertRestoreHold(ctx context.Context, tx *sql.Tx, incident string, work WorkRef) error {
+func insertRestoreHold(ctx context.Context, tx *sql.Tx, incident string, work WorkRef, nowNS int64) error {
 	if !work.valid() {
 		return InvalidRequest
 	}
@@ -123,7 +123,7 @@ func insertRestoreHold(ctx context.Context, tx *sql.Tx, incident string, work Wo
 	if err != nil {
 		return TemporarilyUnavailable
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO security_holds(hold_id,work_kind,work_id,incident_id,recovery_incident_id) VALUES(?,?,?,?,?)", id.String(), work.Kind, work.ID, incident, incident)
+	_, err = tx.ExecContext(ctx, "INSERT INTO security_holds(hold_id,work_kind,work_id,incident_id,recovery_incident_id,created_at_ns) VALUES(?,?,?,?,?,?)", id.String(), work.Kind, work.ID, incident, incident, nowNS)
 	if err != nil {
 		return storageCode(err)
 	}
