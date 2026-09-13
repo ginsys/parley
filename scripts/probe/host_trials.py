@@ -589,6 +589,10 @@ BACKGROUNDED_PATTERN = re.compile(r'^backgrounded\s+\S+\s+([0-9a-f]{8})\s*$')
 # and does not match; a permission dialog's layout is uncaptured.
 CLAUDE_READY_PATTERN = r'(?m)^❯[ \xa0]*$'
 CLAUDE_MECHANISMS = ('attach', 'resume')
+# How long `create()` waits for the creation turn to finish. The captured turn took 12 s for a
+# one-word reply; the ceiling is generous because a turn still running past it is an error, not a
+# trial -- see `ClaudeDriver._settle_creation_turn`.
+CLAUDE_CREATION_TURN_CAP = 180.0
 
 
 def backgrounded_id(stdout):
@@ -771,6 +775,36 @@ class ClaudeDriver(Driver):
         self.registry.mint(self._key(session_id))
         self.sessions.setdefault(session_id, None)
 
+    def _settle_creation_turn(self, session_id, timeout=CLAUDE_CREATION_TURN_CAP):
+        """Wait until the listing reports the creation turn finished; return its entry.
+
+        `claude --bg` returns while that turn is still working: the captured listing taken
+        immediately afterwards reads `state: "working"`, and the creation prompt's assistant
+        record landed 12 s later (docs/host-probe-preflight.md, 2026-09-13). Returning then would
+        let the creation reply arrive *after* `run_trial` stamps `submitted_at`, and
+        `detect_outcomes` would count it as this trial's `turn_start` and serving model without
+        the marker ever having been sent. `state` is the boundary the host itself publishes
+        (captured `working` → `done`, with `pid` still set and the session alive); `status` read
+        `idle` throughout that same turn and is not it.
+
+        Every trial state settles here rather than in a settle callback: a busy trial's long turn,
+        a restarted trial's `stop` and an idle trial's submission all have to start from a session
+        whose creation turn is over. A turn still running at the cap raises -- the session stays
+        owned, so the sweep removes it.
+        """
+        deadline = self.monotonic() + timeout
+        while True:
+            entry = self.status(session_id)
+            if entry is None:
+                raise RuntimeError(f'claude --bg printed {session_id} but the listing under '
+                                   f'{self.cwd} lacks it')
+            if entry.get('state') == 'done':
+                return entry
+            if self.monotonic() >= deadline:
+                raise RuntimeError(f'the creation turn of {session_id} was still '
+                                   f'{entry.get("state")!r} after {timeout}s')
+            self.sleep(1.0)
+
     def create(self, prompt):
         """`claude --bg --model <m> '<prompt>'`; the id comes from stdout line 1, then the listing.
 
@@ -779,6 +813,9 @@ class ClaudeDriver(Driver):
         its id mints from the partial output before re-raising. A Ctrl-C mid-command loses that
         output: the session, if any, is then only findable by a human running
         `claude agents --json --all --cwd <cwd>`.
+
+        Returns only once the creation turn has finished (`_settle_creation_turn`), so a caller
+        that submits immediately is not observing that turn's reply.
         """
         argv = ['claude', '--bg', '--model', self.model, prompt]
         try:
@@ -796,8 +833,7 @@ class ClaudeDriver(Driver):
             raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')
         if short is None:
             raise RuntimeError(f'claude --bg printed no backgrounded line: {result.stdout!r}')
-        if self.status(short) is None:
-            raise RuntimeError(f'claude --bg printed {short} but the listing under {self.cwd} lacks it')
+        self._settle_creation_turn(short)
         return short
 
     def _session_uuid(self, session_id):

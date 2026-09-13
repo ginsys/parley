@@ -226,7 +226,15 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
 - **Claude** (`ClaudeDriver`). `create()` runs `claude --bg --model <m> '<prompt>'` from the
   probe directory, mints the short id from stdout line 1 (`backgrounded · <id>`) before checking
   the exit status or running the confirming `claude agents --json --all --cwd <probe cwd>`
-  listing, and on a `subprocess.TimeoutExpired` mints from the partial output before re-raising. `status(id)`
+  listing, and on a `subprocess.TimeoutExpired` mints from the partial output before re-raising.
+  It then waits for that listing to report the creation turn finished (`state: "done"`) before
+  returning: `claude --bg` returns while the turn is still working — the captured listing taken
+  immediately afterwards reads `state: "working"` and the creation reply landed 12 s later — so a
+  trial submitting straight away would stamp `submitted_at` before that reply arrived and count
+  the creation turn's own assistant record as its `turn_start` and serving model. `state` is the
+  boundary the host publishes; `status` read `idle` throughout the same turn. Every trial state
+  settles there rather than in a settle callback, and a turn still running at the 180 s cap is an
+  error, with the session left owned for the sweep. `status(id)`
   returns the owned entry from that listing (`pid`, `status`, `state`, `sessionId`) for settle
   callbacks. `observe()` reads the session's own transcript
   (`$HOME/.claude/projects/*/<sessionId>.jsonl`): `user` records carry a string `content`,

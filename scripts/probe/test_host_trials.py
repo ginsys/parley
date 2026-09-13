@@ -799,6 +799,28 @@ class ClaudeDriverTests(DriverTestCase):
                           ['claude', 'agents', '--json', '--all', '--cwd', driver.cwd])
         self.assertEqual(driver.sessions['69aa52ed'], SESSION_UUID)
 
+    def test_create_waits_for_the_creation_turn_to_leave_working(self):
+        # `claude --bg` returns while the creation turn runs (captured `state: "working"`, reply
+        # 12 s later). Returning then would put that reply inside the trial's own window.
+        states = ['working', 'working', 'done']
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'],
+                        lambda argv: listing([claude_entry(state=states.pop(0) if len(states) > 1
+                                                           else states[0])]))])
+        driver = self.driver(run)
+        self.assertEqual(driver.create('hello'), '69aa52ed')
+        self.assertEqual(states, ['done'])
+        self.assertEqual(self.clock.monotonic(), 2.0)  # one 1s sleep per still-working listing
+
+    def test_create_fails_when_the_creation_turn_never_finishes(self):
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([claude_entry(state='working')]))])
+        driver = self.driver(run)
+        with self.assertRaises(RuntimeError) as caught:
+            driver.create('hello')
+        self.assertIn("still 'working'", str(caught.exception))
+        self.assertEqual(driver.owned(), {'69aa52ed'})  # the sweep still has to remove it
+
     def test_create_keeps_the_id_owned_when_the_listing_lacks_it(self):
         # The daemon printed its id: it exists. A listing that disagrees is an error the sweep
         # still has to act on.
