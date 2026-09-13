@@ -1389,6 +1389,27 @@ class ClaudeDriverTests(DriverTestCase):
         with self.assertRaises(ForeignSessionError):
             driver.observe('deadbeef', marker=MARKER, submitted_at=0.0)
 
+    def test_partial_claude_history_cannot_establish_negative_delivery_evidence(self):
+        for roles in ((), ('user',), ('assistant',), ('user', 'assistant')):
+            with self.subTest(roles=roles):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', 'agents'], listing([self.entry()]))])
+                driver = self.driver(run)
+                driver.create('initial prompt')
+                lines = [claude_record(role, MARKER if role == 'user' else
+                                       [{'type': 'text', 'text': MARKER}], cwd=driver.cwd)
+                         for role in roles]
+                self.transcripts[SESSION_UUID] = self.write_lines('partial-claude.jsonl', lines)
+                absent = driver.observe('69aa52ed', marker=MARKER, submitted_at=2_000_000_000)
+                self.assertEqual(absent.outcomes, {})
+                self.assertEqual(absent.observable, len(roles) == 2)
+                positive = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                if 'user' in roles:
+                    self.assertIn('visible', positive.outcomes)
+                if 'assistant' in roles:
+                    self.assertIn('ack', positive.outcomes)
+
     def test_observe_reads_the_owned_transcript_and_marks_unusable_reads_unobservable(self):
         run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', 'agents'], listing([self.entry()]))])
@@ -1481,9 +1502,12 @@ class ClaudeDriverTests(DriverTestCase):
                 driver, _ = self.create_live()
                 client = driver.attach('69aa52ed')
                 self.transcripts[SESSION_UUID] = self.write_lines('lost-attach.jsonl', [
+                    claude_record('assistant', [{'type': 'text', 'text': 'PONG'}],
+                                  stamp='2026-09-13T08:59:59.000Z', cwd=driver.cwd),
                     claude_record('user', MARKER, cwd=driver.cwd)])
+                submitted_at = 1_789_290_000.0
                 self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
-                self.assertTrue(driver.observe('69aa52ed', marker=MARKER, submitted_at=0).observable)
+                self.assertTrue(driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at).observable)
                 if loss == 'exit':
                     client.eof = True
                 elif loss == 'rebind':
@@ -1492,7 +1516,7 @@ class ClaudeDriverTests(DriverTestCase):
                     driver.clients.remove(client)
                     if loss == 'replace':
                         driver.attach('69aa52ed')
-                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at)
                 self.assertFalse(observation.observable)
                 self.assertEqual(set(observation.outcomes), {'visible'})
 
@@ -1651,22 +1675,25 @@ class ClaudeDriverTests(DriverTestCase):
                 driver = self.driver(run, mechanism='resume')
                 driver.create('hello')
                 self.transcripts[SESSION_UUID] = self.write_lines('resumed.jsonl', [
+                    claude_record('assistant', [{'type': 'text', 'text': 'PONG'}],
+                                  stamp='2026-09-13T08:59:59.000Z', cwd=driver.cwd),
                     claude_record('user', MARKER, cwd=driver.cwd)])
+                submitted_at = 1_789_290_000.0
                 self.assertTrue(driver.submit('69aa52ed', marker_message(MARKER)))
                 entry['pid'] = 4321
-                self.assertTrue(driver.observe('69aa52ed', marker=MARKER, submitted_at=0).observable)
+                self.assertTrue(driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at).observable)
                 if loss == 'missing':
                     entries.clear()
                 elif loss == 'unreadable':
                     run.scripts.insert(0, (['claude', 'agents'], subprocess.TimeoutExpired(['claude'], 15)))
                 else:
                     entry['pid'] = None if loss == 'exit' else 9876
-                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at)
                 self.assertFalse(observation.observable)
                 self.assertEqual(set(observation.outcomes), {'visible'})
                 entry['pid'] = 4321
                 entries[:] = [entry]
-                self.assertFalse(driver.observe('69aa52ed', marker=MARKER, submitted_at=0).observable)
+                self.assertFalse(driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at).observable)
 
     def test_resume_daemon_missing_at_first_poll_cannot_establish_negative_evidence(self):
         for result in (FakeResult(0, 'backgrounded · 69aa52ed\n'),
@@ -2122,11 +2149,13 @@ class CodexDriverTests(DriverTestCase):
         driver = self.driver(run)
         driver.create('hello')
         client = driver.attach(THREAD_ID)
-        self.transcripts[THREAD_ID] = self.write_lines('later-client-loss.jsonl', rollout_lines(cwd=driver.cwd))
+        self.transcripts[THREAD_ID] = self.write_lines('later-client-loss.jsonl', rollout_lines(
+            cwd=driver.cwd, messages=[('2026-09-13T09:41:00.000Z', 'user', 'initial prompt'),
+                                     ('2026-09-13T09:41:01.000Z', 'assistant', 'PONG')]))
         self.assertIs(driver.submit(THREAD_ID, 'msg'), True)
-        self.assertTrue(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
+        self.assertTrue(driver.observe(THREAD_ID, marker=MARKER, submitted_at=1_789_292_520.0).observable)
         client.eof = True
-        self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
+        self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=1_789_292_520.0).observable)
 
     def test_submit_and_observe_refuse_a_foreign_thread(self):
         driver = self.driver(FakeRun([]))
@@ -2287,6 +2316,24 @@ class CodexDriverTests(DriverTestCase):
                 with self.assertRaisesRegex(ValueError, 'uncaptured'):
                     driver.attach(THREAD_ID, sandbox=sandbox, approval=approval)
                 self.assertEqual(FakePtyClient.launched, [])
+
+    def test_partial_codex_history_cannot_establish_negative_delivery_evidence(self):
+        for roles in ((), ('user',), ('assistant',), ('user', 'assistant')):
+            with self.subTest(roles=roles):
+                self.registry = SessionRegistry()
+                driver = self.driver(FakeRun([(['codex', 'exec'], self.exec_output())]))
+                driver.create('initial prompt')
+                messages = [('2026-09-13T09:42:01.000Z', role, MARKER) for role in roles]
+                self.transcripts[THREAD_ID] = self.write_lines(
+                    'partial-codex.jsonl', rollout_lines(cwd=driver.cwd, messages=messages))
+                absent = driver.observe(THREAD_ID, marker=MARKER, submitted_at=2_000_000_000)
+                self.assertEqual(absent.outcomes, {})
+                self.assertEqual(absent.observable, len(roles) == 2)
+                positive = driver.observe(THREAD_ID, marker=MARKER, submitted_at=0)
+                if 'user' in roles:
+                    self.assertIn('visible', positive.outcomes)
+                if 'assistant' in roles:
+                    self.assertIn('ack', positive.outcomes)
 
     def test_observe_reads_the_rollout_with_the_turn_stream_and_fails_closed(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])

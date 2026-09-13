@@ -558,6 +558,11 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   captured shape, not completeness of the entire history. `teardown()` is
   `opencode --pure session delete <id>`. The server is closed by the sweep after teardown.
 
+All three readers require parsed user and assistant records before missing delivery outcomes
+can be treated as observable: successful creation has already produced that initial turn.
+An empty, metadata-only or one-sided history supplies positive evidence only. This minimum
+captured-shape check does not establish completeness of the entire historical transcript.
+
 Readiness patterns and typing cadence live in `PtyClient`, which wraps `wake_probe.PtyProcess`
 for fork/exec and teardown only. Its output is drained continuously by a background thread into
 a bounded window: a client held open through a 900 s busy trial would otherwise either fill the

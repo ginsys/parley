@@ -1187,11 +1187,12 @@ class ClaudeDriver(Driver):
             return Observation(observable=False)
         events, unusable = parsed
         observation = detect_outcomes(events, marker, submitted_at=submitted_at)
+        creation_roles_present = {'user', 'assistant'} <= {event.role for event in events}
         client = self.submission_clients.get(session_id)
         client_lost = client is not None and (
             not any(held is client for held in self.clients) or client.eof
             or getattr(client, 'serves', None) != session_id)
-        if unusable or client_lost or not daemon_live:
+        if unusable or not creation_roles_present or client_lost or not daemon_live:
             observation.observable = False
         return observation
 
@@ -1745,7 +1746,9 @@ class CodexDriver(Driver):
             return Observation(observable=False)
         events, unusable = codex_rollout_events(lines)
         observation = detect_outcomes(events, marker, submitted_at=submitted_at, turn_stream=True)
-        if unusable or (thread_id in self.queue_clients and not self._queue_client_live(thread_id)):
+        creation_roles_present = {'user', 'assistant'} <= {event.role for event in events}
+        if (unusable or not creation_roles_present or
+                (thread_id in self.queue_clients and not self._queue_client_live(thread_id))):
             observation.observable = False
         return observation
 
