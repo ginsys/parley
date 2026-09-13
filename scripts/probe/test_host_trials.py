@@ -1558,9 +1558,10 @@ class ClaudeDriverTests(DriverTestCase):
             self.driver(FakeRun([]), mechanism='channels')
 
 
-def rollout_lines(*, cli_version='0.154.0', messages=()):
+def rollout_lines(*, cli_version='0.154.0', cwd='/synthetic', messages=()):
     lines = [json.dumps({'timestamp': '2026-09-13T09:41:51.650Z', 'type': 'session_meta',
-                         'payload': {'id': THREAD_ID, 'cli_version': cli_version}})]
+                         'payload': {'id': THREAD_ID, 'session_id': THREAD_ID, 'cwd': cwd,
+                                     'cli_version': cli_version}})]
     for stamp, role, text in messages:
         part_type = 'input_text' if role == 'user' else 'output_text'
         lines.append(json.dumps({'timestamp': stamp, 'type': 'response_item',
@@ -1760,6 +1761,7 @@ class CodexDriverTests(DriverTestCase):
                     driver.create('hello')
                     client = driver.attach(THREAD_ID)
                     self.transcripts[THREAD_ID] = self.write_lines('lost-client.jsonl', rollout_lines(
+                        cwd=driver.cwd,
                         messages=[('2026-09-13T09:42:01.000Z', 'user', MARKER)]))
                     if timeout:
                         with self.assertRaises(subprocess.TimeoutExpired):
@@ -1775,7 +1777,7 @@ class CodexDriverTests(DriverTestCase):
         driver = self.driver(run)
         driver.create('hello')
         client = driver.attach(THREAD_ID)
-        self.transcripts[THREAD_ID] = self.write_lines('later-client-loss.jsonl', rollout_lines())
+        self.transcripts[THREAD_ID] = self.write_lines('later-client-loss.jsonl', rollout_lines(cwd=driver.cwd))
         self.assertIs(driver.submit(THREAD_ID, 'msg'), True)
         self.assertTrue(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
         client.eof = True
@@ -1872,7 +1874,7 @@ class CodexDriverTests(DriverTestCase):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])
         driver = self.driver(run)
         driver.create('hello')
-        self.transcripts[THREAD_ID] = self.write_lines('r.jsonl', rollout_lines(messages=[
+        self.transcripts[THREAD_ID] = self.write_lines('r.jsonl', rollout_lines(cwd=driver.cwd, messages=[
             ('2026-09-13T09:42:01.000Z', 'user', f'injected host text {MARKER}'),
             ('2026-09-13T09:42:03.000Z', 'assistant', MARKER)]))
         observation = driver.observe(THREAD_ID, marker=MARKER, submitted_at=1_789_292_520.0)  # 09:42:00Z
@@ -1895,11 +1897,36 @@ class CodexDriverTests(DriverTestCase):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])
         driver = self.driver(run)
         driver.create('hello')
-        self.transcripts[THREAD_ID] = self.write_lines('r.jsonl', rollout_lines(cli_version='0.154.0'))
+        self.transcripts[THREAD_ID] = self.write_lines('r.jsonl', rollout_lines(cwd=driver.cwd, cli_version='0.154.0'))
         self.assertEqual(driver.version(THREAD_ID), '0.154.0')
         self.assertEqual(run.argv('codex', '--version'), [])
         self.transcripts.pop(THREAD_ID)
         self.assertIsNone(driver.version(THREAD_ID))
+
+    def test_rollout_identity_and_cwd_gate_outcomes_and_version(self):
+        driver = self.driver(FakeRun([(['codex', 'exec'], self.exec_output())]))
+        driver.create('hello')
+        original = rollout_lines(cwd=driver.cwd, messages=[
+            ('2026-09-13T09:42:01.000Z', 'user', MARKER),
+            ('2026-09-13T09:42:03.000Z', 'assistant', MARKER)])
+        cases = [('missing metadata', original[1:])]
+        for key in ('id', 'session_id', 'cwd'):
+            for value in (None, '', 'foreign'):
+                metadata = json.loads(original[0])
+                if value is None:
+                    del metadata['payload'][key]
+                else:
+                    metadata['payload'][key] = value
+                bad = json.dumps(metadata)
+                cases.append((f'{key}={value}', [bad, *original[1:]]))
+                cases.append((f'conflicting later {key}={value}', [*original, bad]))
+        for name, lines in cases:
+            with self.subTest(name=name):
+                self.transcripts[THREAD_ID] = self.write_lines('wrong-rollout.jsonl', lines)
+                observation = driver.observe(THREAD_ID, marker=MARKER, submitted_at=0)
+                self.assertFalse(observation.observable)
+                self.assertEqual(observation.outcomes, {})
+                self.assertIsNone(driver.version(THREAD_ID))
 
     def test_teardown_deletes_with_force_and_releases_only_on_exit_zero(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output()),

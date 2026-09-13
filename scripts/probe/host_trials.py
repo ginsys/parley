@@ -1665,14 +1665,10 @@ class CodexDriver(Driver):
     def observe(self, thread_id, *, marker, submitted_at):
         """Read the thread's rollout; an unreadable or undatable rollout is unobservable."""
         self.require_owned(thread_id)
-        path = self.rollout_path_for(thread_id)
-        if path is None:
+        lines = self._read_rollout(thread_id)
+        if lines is None:
             return Observation(observable=False)
-        try:
-            with open(path, encoding='utf-8') as handle:
-                events, unusable = codex_rollout_events(handle)
-        except (OSError, UnicodeDecodeError):
-            return Observation(observable=False)
+        events, unusable = codex_rollout_events(lines)
         observation = detect_outcomes(events, marker, submitted_at=submitted_at, turn_stream=True)
         if unusable or (thread_id in self.queue_clients and not self._queue_client_live(thread_id)):
             observation.observable = False
@@ -1698,14 +1694,34 @@ class CodexDriver(Driver):
         (docs/host-probe-preflight.md, 2026-09-11), so the client's version is not a fallback.
         """
         self.require_owned(thread_id)
+        lines = self._read_rollout(thread_id)
+        return codex_session_version(lines) if lines is not None else None
+
+    def _read_rollout(self, thread_id):
+        """Bind the complete snapshot to its owned thread and cwd before extracting evidence."""
+        self.require_owned(thread_id)
         path = self.rollout_path_for(thread_id)
         if path is None:
             return None
         try:
             with open(path, encoding='utf-8') as handle:
-                return codex_session_version(handle)
+                lines = handle.readlines()
         except (OSError, UnicodeDecodeError):
             return None
+        found = False
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue  # The event parser marks malformed lines unobservable.
+            if not isinstance(record, dict) or record.get('type') != 'session_meta':
+                continue
+            payload = record.get('payload')
+            if (not isinstance(payload, dict) or payload.get('id') != thread_id
+                    or payload.get('session_id') != thread_id or payload.get('cwd') != self.cwd):
+                return None
+            found = True
+        return lines if found else None
 
 
 # --- OpenCode: `opencode run --pure --format json`, `serve` + `run --attach`, `export` -----------

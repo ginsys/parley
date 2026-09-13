@@ -371,6 +371,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   before globbing, so metacharacters cannot select another session's transcript. The thread is
   then idle with no live process. A rollout that disappears between discovery and its metadata
   read makes that poll unobservable and its version unknown; later polls retry discovery.
+  Rollout filenames only locate candidates: before outcomes or version are extracted, every
+  `session_meta` must carry the owned UUID in both captured `payload.id` and `payload.session_id`
+  fields, and the exact probe cwd in `payload.cwd`. Missing or conflicting metadata makes the
+  entire snapshot unobservable, including positive evidence, and leaves the version unknown.
   `observe()` reads the rollout
   (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`): `response_item`/`message`
   records with roles `user`/`assistant` (`developer` carries fixed instructions and is skipped),
