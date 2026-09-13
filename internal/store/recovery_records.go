@@ -78,6 +78,11 @@ func RecordRecovery(ctx context.Context, tx *sql.Tx, r RecoveryRecord) (bool, er
 		if old.ServerID != r.ServerID || old.Kind != r.Kind || old.Floor != r.Floor || old.Observed != r.Observed {
 			return false, RecoveryRequired
 		}
+		// Reconciled records still hold work during marker-removal retries.
+		// Cleared identities are terminal and cannot record a new incident.
+		if old.Status == "cleared" {
+			return false, RecoveryRequired
+		}
 		return false, nil
 	}
 	if err != NotFound {
