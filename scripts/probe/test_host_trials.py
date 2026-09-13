@@ -1843,7 +1843,7 @@ class OpenCodeDriverTests(DriverTestCase):
             driver.submit('ses_1', 'msg')
         self.assertIn('ProviderAuthError', str(caught.exception))
 
-    def test_a_partial_attach_stream_naming_another_session_is_uncaptured_and_mints_it(self):
+    def test_a_partial_attach_stream_naming_another_session_never_adopts_it(self):
         partial = self.run_output(session_id='ses_2').stdout.encode()
         error = subprocess.TimeoutExpired(cmd=['opencode'], timeout=60, output=partial)
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
@@ -1854,7 +1854,13 @@ class OpenCodeDriverTests(DriverTestCase):
         with self.assertRaises(SubmissionUncaptured) as caught:
             driver.submit('ses_1', 'msg')
         self.assertIn('ses_2', str(caught.exception))
-        self.assertEqual(driver.owned(), {'ses_1', 'ses_2'})
+        self.assertEqual(driver.owned(), {'ses_1'})
+        with self.assertRaises(ForeignSessionError):
+            driver.teardown('ses_2')
+        driver.teardown = lambda sid: driver.release(sid)
+        failures = sweep(driver)
+        self.assertEqual([label for label, _ in failures], ['ses_2'])
+        self.assertIn('manual', str(failures[0][1]))
 
     def test_submit_attaches_to_our_server_and_reports_exit_status(self):
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
@@ -1883,7 +1889,7 @@ class OpenCodeDriverTests(DriverTestCase):
         self.assertIn('None', str(caught.exception))
         self.assertEqual(driver.owned(), {'ses_1'})
 
-    def test_an_exit_zero_attach_naming_another_session_is_uncaptured_and_mints_it(self):
+    def test_an_exit_zero_attach_naming_another_session_never_adopts_it(self):
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
                        (['opencode', 'run', '--pure', '--format', 'json', '--attach'],
                         self.run_output(session_id='ses_2'))])
@@ -1893,8 +1899,14 @@ class OpenCodeDriverTests(DriverTestCase):
         with self.assertRaises(SubmissionUncaptured) as caught:
             driver.submit('ses_1', 'msg')
         self.assertIn('ses_2', str(caught.exception))
-        # Whatever the run wrote to must be swept, not left behind under real credentials.
-        self.assertEqual(driver.owned(), {'ses_1', 'ses_2'})
+        # An attach event can name a human's existing session; it proves no creation authority.
+        self.assertEqual(driver.owned(), {'ses_1'})
+        with self.assertRaises(ForeignSessionError):
+            driver.teardown('ses_2')
+        driver.teardown = lambda sid: driver.release(sid)
+        failures = sweep(driver)
+        self.assertEqual([label for label, _ in failures], ['ses_2'])
+        self.assertIn('manual', str(failures[0][1]))
 
     def test_an_error_event_on_an_exit_zero_attach_is_uncaptured_never_accepted(self):
         # Captured on `create()`: a provider/credential/model failure is a structured `error`
@@ -2038,6 +2050,7 @@ class FakeDriver(Driver):
                  teardown_errors=None, submission_note=None, registry=None, on_observe=None):
         self.registry = registry or SessionRegistry()
         self.clients = []
+        self.strays = set()
         self.observations = list(observations or [Observation()])
         self.accepted = accepted
         self.submit_error = submit_error

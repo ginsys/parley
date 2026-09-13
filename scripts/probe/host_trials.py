@@ -631,6 +631,7 @@ class Driver:
         self.registry = registry
         self.cwd = private_directory(cwd)
         self.clients = []
+        self.strays = set()
         # Free-text evidence about the last submit() call for a mechanism with no exit status of
         # its own (the attach path); `run_trial` copies it into `TrialRun.submission_diagnostic`.
         self.submission_note = None
@@ -1792,15 +1793,14 @@ class OpenCodeDriver(Driver):
                 self.server = None
         return failures
 
-    def _mint_stray(self, attached_id, session_id):
-        """Own a session the attach named instead of the requested one, before anything raises.
+    def _record_stray(self, attached_id, session_id):
+        """Report a mismatched attach id without treating it as creation evidence.
 
-        Minted exactly as `create()` mints: a session this run caused to exist must be in
-        `owned()` whatever happens next. Idempotent, because a second submission can be
-        redirected to the same stray id and the registry refuses a repeat mint.
+        It may name a pre-existing human session. Only a human can investigate it; recording
+        the id must never grant submit, observe or teardown authority.
         """
-        if attached_id is not None and attached_id != session_id and attached_id not in self.owned():
-            self.mint(attached_id)
+        if attached_id is not None and attached_id != session_id:
+            self.strays.add(attached_id)
 
     def submit(self, session_id, message):
         """`opencode run --pure --format json --attach <url> --session <id>`; exit 0 is acceptance.
@@ -1814,7 +1814,7 @@ class OpenCodeDriver(Driver):
         -- or naming none at all -- is not evidence that this session received the marker: the
         trial would poll the requested session, find no marker and record `not_observed` for a
         host that was never asked. Either shape is `SubmissionUncaptured`, and a different id is
-        minted first so the sweep deletes whatever the run actually wrote to.
+        recorded for manual investigation without granting ownership or deletion authority.
 
         A timeout is checked the same way, against both the child and the partial event stream.
         `run --attach` hanging until its own timeout is what a `serve` child dying under it looks
@@ -1822,7 +1822,7 @@ class OpenCodeDriver(Driver):
         poll the export, which is readable independently of the server, and record the absent
         marker as `not_observed` for a host whose submission path had disappeared or had already
         said it failed. A dead child, an error event already printed, or an id already named that
-        is not this session all make the timeout `SubmissionUncaptured`, with any stray id minted
+        is not this session all make the timeout `SubmissionUncaptured`, with any stray id recorded
         first. A partial stream naming *nothing* re-raises, since a truncated stream's silence is
         not evidence of misdirection and the message may well have reached the session.
         """
@@ -1840,7 +1840,7 @@ class OpenCodeDriver(Driver):
                               stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as error:
             partial_id, partial_error = opencode_session_id(_partial_stdout(error))
-            self._mint_stray(partial_id, session_id)
+            self._record_stray(partial_id, session_id)
             if self.server.process.poll() is not None:
                 raise SubmissionUncaptured(
                     f'run --attach timed out against a serve child that had exited '
@@ -1854,7 +1854,7 @@ class OpenCodeDriver(Driver):
                     f'where the marker landed is uncaptured') from error
             raise
         attached_id, event_error = opencode_session_id(result.stdout)
-        self._mint_stray(attached_id, session_id)
+        self._record_stray(attached_id, session_id)
         if result.returncode != 0:
             if self.server.process.poll() is not None:
                 # A dead server is this runner's failure, not the host refusing the message.
@@ -2184,6 +2184,9 @@ def sweep(driver):
             except Exception as error:
                 failures.append((session_id, error))
     failures.extend(driver.close_servers())
+    failures.extend((session_id, RuntimeError('unexpected attach session; manual investigation '
+                                              'required, no cleanup authority granted'))
+                    for session_id in sorted(driver.strays))
     return failures
 
 
