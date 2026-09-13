@@ -546,13 +546,19 @@ class Driver:
         return {key[len(prefix):] for key in self.registry.created if key.startswith(prefix)}
 
     def close_clients(self):
+        """Close every held client; one whose close fails stays on `clients` and is reported.
+
+        A failed close may leave the child alive, and it is the only handle to it: dropping it
+        would make the child unrecoverable and let the sweep delete a thread it still serves.
+        """
         failures = []
         for client in list(self.clients):
             try:
                 client.close()
             except Exception as error:
                 failures.append(('client', error))
-        self.clients.clear()
+            else:
+                self.clients.remove(client)
         return failures
 
     def close_servers(self):
@@ -1807,16 +1813,18 @@ def sweep(driver):
     Order matters and is fixed here: PTY clients first (a Codex resume client is the process
     serving its thread, and must be gone before `codex delete`), then each owned id in sorted
     order over a copy of `owned()`, then servers (an export during teardown reads the same store
-    the server holds). A failed teardown retains ownership and is reported, never re-raised
-    mid-sweep, so one bad id cannot leave the rest alive. A second Ctrl-C during the sweep still
-    aborts it.
+    the server holds). A client that failed to close may still be serving a session, so no
+    session is torn down in that case: every id stays owned and is reported with the client's
+    failure. A failed teardown retains ownership and is reported, never re-raised mid-sweep, so
+    one bad id cannot leave the rest alive. A second Ctrl-C during the sweep still aborts it.
     """
     failures = driver.close_clients()
-    for session_id in sorted(driver.owned()):
-        try:
-            driver.teardown(session_id)
-        except Exception as error:
-            failures.append((session_id, error))
+    if not failures:
+        for session_id in sorted(driver.owned()):
+            try:
+                driver.teardown(session_id)
+            except Exception as error:
+                failures.append((session_id, error))
     failures.extend(driver.close_servers())
     return failures
 

@@ -202,7 +202,11 @@ whose sweep failed raises `CleanupFailed` carrying the `TrialRun`, since the evi
 even though a live, authenticated session remains for a human to remove. A teardown that cannot
 confirm removal retains ownership rather than releasing it — releasing on a no-op would read as a
 session having been cleaned up when it had not; likewise a server that survives SIGKILL stays
-held and is reported. A sweep covers the driver instance it is given: another instance over the
+held and is reported. A client whose `close()` failed is kept on the driver too, and the sweep
+then tears *nothing* down: that client may still be the process serving its session (a Codex
+resume client is exactly that), and its handle is the only one there is, so deleting the session
+anyway could remove a thread still in use and dropping the handle would leave the child
+unrecoverable and unnamed. Every id stays owned and is reported alongside the client's failure. A sweep covers the driver instance it is given: another instance over the
 same registry sees the same ids but not the first one's held clients, servers or cached Claude
 `sessionId`s, so sweep every instance that did work. One gap stays open by design: a Ctrl-C while
 `claude --bg`, `codex exec` or `opencode run` is still running loses that command's output, and a

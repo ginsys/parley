@@ -2056,12 +2056,28 @@ class SweepTests(unittest.TestCase):
         driver = FakeDriver(teardown_errors={'a': RuntimeError('stop left a running')})
         driver.registry.mint('fake:a')
         driver.registry.mint('fake:b')
-        driver.clients.append(ClosingClient(driver.order, fail=True))
+        driver.clients.append(ClosingClient(driver.order))
         failures = sweep(driver)
-        self.assertEqual([label for label, _ in failures], ['client', 'a'])
+        self.assertEqual([label for label, _ in failures], ['a'])
         self.assertEqual(driver.torn_down, ['a', 'b'])
         self.assertEqual(driver.owned(), {'a'})
         self.assertEqual(driver.server_closes, 1)
+
+    def test_a_client_that_failed_to_close_blocks_every_teardown_and_stays_held(self):
+        # A client whose close failed may still be the process serving its session, and it is the
+        # only handle to it: tearing the session down anyway would delete a thread still in use,
+        # and dropping the handle would leave the child unrecoverable and unnamed.
+        driver = FakeDriver()
+        driver.registry.mint('fake:a')
+        driver.registry.mint('fake:b')
+        client = ClosingClient(driver.order, fail=True)
+        driver.clients.append(client)
+        failures = sweep(driver)
+        self.assertEqual([label for label, _ in failures], ['client'])
+        self.assertEqual(driver.torn_down, [])
+        self.assertEqual(driver.owned(), {'a', 'b'})
+        self.assertEqual(driver.clients, [client])
+        self.assertEqual(driver.server_closes, 1)  # the server is this run's, and still closes
 
 
 class RunTrialWithCleanupTests(unittest.TestCase):
