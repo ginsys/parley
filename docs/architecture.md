@@ -77,6 +77,10 @@ that authenticated attachment must supply. Rotation compares both expected versi
 the old credential, increments binding/credential versions and invalidates runtime state after
 commit under the coordinator gate. Rejected or replayed rotation cannot invalidate a connection.
 Legacy enrollment requires the trusted eligibility provider; it is never inferred from a peer key.
+The host verifier explicitly returns `host_unverified` for mismatched or unsupported evidence;
+only that verification failure becomes a retained rejection. Unavailable evidence, cancellation
+and other provider errors leave no enrollment, receipt or audit entry, so the same operation ID
+can retry after recovery. Provider errors pass through the coordinator's fixed-code sanitization.
 
 Authorized retries consult retained receipts before host/target checks or mutation preconditions.
 They return committed metadata and current publication evidence, never a secret or a second file.

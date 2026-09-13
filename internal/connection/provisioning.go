@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"github.com/ginsys/parley/internal/bridgetext"
 	"time"
 	"unicode/utf8"
@@ -61,6 +62,9 @@ func (f PublisherFunc) Publish(ctx context.Context, c CredentialFile) error { re
 // All capabilities are supplied by trusted runtime configuration. Missing host,
 // authority, legacy or recovery providers fail closed, including in development.
 // Target resolves a configured UUID reference, never a request-supplied path.
+// Verify returns nil for matching evidence, HostUnverified for mismatch or an
+// unsupported mechanism, and an error such as TemporarilyUnavailable for an
+// unavailable source. Only HostUnverified is a retained verification rejection.
 type ProvisioningConfig struct {
 	Store             *store.DB
 	Now               func() time.Time
@@ -139,7 +143,10 @@ func (p *Provisioner) Register(ctx context.Context, actor store.CommandPrincipal
 			return domainRejection(err)
 		}
 		if evidenceErr != nil {
-			return rejection(store.HostUnverified)
+			if errors.Is(evidenceErr, store.HostUnverified) {
+				return rejection(store.HostUnverified)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
 		if targetErr != nil || publisher == nil {
 			return rejection(store.Forbidden)
