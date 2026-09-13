@@ -1611,29 +1611,58 @@ def http_status(url):
 class Server:
     """A running `opencode serve` this driver started: its process group and base URL."""
 
-    def __init__(self, process, url):
+    POLL = 0.1
+
+    def __init__(self, process, url, *, sleep=time.sleep):
         self.process = process
         self.url = url
+        self.sleep = sleep
+
+    def _group_alive(self, pgid):
+        """Whether any process is still in the group, the leader reaped first if it has exited.
+
+        Signal 0 is the existence test: it reaches the whole group, so it answers about the
+        descendants `serve` may have left behind and not only about the handle we hold. An
+        unreaped leader is still a group member, hence the `poll()` -- otherwise a zombie would
+        read as a live server forever. (A group id can in principle be reused once the group is
+        empty; that would report a stranger as our survivor, which errs towards reporting.)
+        """
+        self.process.poll()
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    def _wait_for_group(self, pgid, grace):
+        """Wait up to `grace` for the whole group to go. True once it has."""
+        for _ in range(max(1, round(grace / self.POLL))):
+            if not self._group_alive(pgid):
+                return True
+            self.sleep(self.POLL)
+        return not self._group_alive(pgid)
 
     def close(self):
         """SIGTERM the server's own process group, then SIGKILL if it lingers.
 
-        A process still alive after both is an error, so the sweep reports a server it could
-        not stop instead of forgetting it.
+        The *group*, not the handle: `serve` is spawned with `start_new_session=True`, so it
+        leads a group of its own, and waiting on the Popen alone would call a server stopped
+        while a child that outlived it still held the port and still answered on the same URL --
+        exactly what the `serve()` precondition refusing an already-answering URL then reads as
+        a foreign server. A process still alive after both signals is an error, so the sweep
+        reports a server it could not stop instead of forgetting it.
         """
-        if self.process.poll() is None:
-            for signum, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
-                try:
-                    os.killpg(self.process.pid, signum)
-                except ProcessLookupError:
-                    break
-                try:
-                    self.process.wait(timeout=grace)
-                    break
-                except subprocess.TimeoutExpired:
-                    continue
-        if self.process.poll() is None:
-            raise RuntimeError(f'opencode serve (pid {self.process.pid}) survived SIGTERM and SIGKILL')
+        pgid = self.process.pid
+        for signum, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+            if not self._group_alive(pgid):
+                return
+            try:
+                os.killpg(pgid, signum)
+            except ProcessLookupError:
+                return
+            if self._wait_for_group(pgid, grace):
+                return
+        raise RuntimeError(f'opencode serve (process group {pgid}) survived SIGTERM and SIGKILL')
 
 
 class OpenCodeDriver(Driver):
@@ -1725,7 +1754,7 @@ class OpenCodeDriver(Driver):
             self.server = Server(self.popen(['opencode', 'serve', '--pure', '--port', str(port)],
                                             cwd=self.cwd, stdin=subprocess.DEVNULL,
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                            start_new_session=True), url)
+                                            start_new_session=True), url, sleep=self.sleep)
             while True:
                 if self.server.process.poll() is not None:
                     raise RuntimeError(f'opencode serve exited {self.server.process.returncode} '

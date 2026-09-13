@@ -1660,11 +1660,24 @@ class OpenCodeDriverTests(DriverTestCase):
         self.servers.append(process)
         return process
 
-    def patch_killpg(self):
+    def patch_killpg(self, *, survivors=0):
+        """Model a process group, not just the Popen leader.
+
+        `Server.close()` asks about the whole group with signal 0, which must not be recorded as
+        a kill and must not stop anything; `survivors` keeps that many descendants alive through
+        every real signal, the shape a `serve` child leaving something behind takes on the host.
+        """
         killed = []
+        remaining = {}  # pid -> group members left, once a signal has been through
 
         def killpg(pid, signum):
+            spawned = any(process.pid == pid for process in self.servers)
+            if not spawned or remaining.get(pid, 1 + survivors) == 0:
+                raise ProcessLookupError(pid)
+            if signum == 0:
+                return
             killed.append((pid, signum))
+            remaining[pid] = survivors
             for process in self.servers:
                 if process.pid == pid:
                     process.returncode = -signum
@@ -1935,7 +1948,12 @@ class OpenCodeDriverTests(DriverTestCase):
 
     def test_close_servers_reports_a_child_that_survives_sigkill_and_keeps_holding_it(self):
         signals = []
-        patcher = unittest.mock.patch('os.killpg', lambda pid, signum: signals.append(signum))
+
+        def killpg(pid, signum):
+            if signum:  # signal 0 is the group-liveness probe, not a kill
+                signals.append(signum)
+
+        patcher = unittest.mock.patch('os.killpg', killpg)
         patcher.start()
         self.addCleanup(patcher.stop)
         driver = self.driver(FakeRun([]), port=4096)
@@ -1945,6 +1963,21 @@ class OpenCodeDriverTests(DriverTestCase):
         self.assertIsInstance(failures[0][1], RuntimeError)
         self.assertEqual(signals, [15, 9])
         self.assertIsNotNone(driver.server)  # still ours to report, never silently forgotten
+
+    def test_close_servers_reports_a_descendant_that_outlives_the_serve_child(self):
+        # The leader exiting is not the server stopping: `serve` is its own session leader, so
+        # anything it spawned stays in the group, keeps the port bound and keeps answering on the
+        # same URL. Waiting on the Popen handle alone reported that as a clean stop, released the
+        # handle, and left the next `serve()` to refuse its own leftover as a foreign server.
+        killed = self.patch_killpg(survivors=1)
+        driver = self.driver(FakeRun([]), port=4096)
+        driver.serve()
+        failures = driver.close_servers()
+        self.assertEqual([label for label, _ in failures], ['server'])
+        self.assertIn('survived SIGTERM and SIGKILL', str(failures[0][1]))
+        self.assertEqual(killed, [(4321, 15), (4321, 9)])
+        self.assertIsNotNone(driver.server.process.returncode)  # the leader did exit
+        self.assertIsNotNone(driver.server)  # and the handle is kept anyway
 
     def test_foreign_ids_are_refused_everywhere(self):
         driver = self.driver(FakeRun([]))

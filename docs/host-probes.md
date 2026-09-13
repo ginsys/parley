@@ -356,7 +356,12 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   held in one statement inside the handler that closes it, so any failure or Ctrl-C during that
   wait closes it before re-raising — and, as in `close_servers()`, the handle is dropped only
   once the close succeeded, so a child that survived SIGKILL stays held for the sweep to retry
-  and report. Submission is
+  and report. Closing means the whole process group, SIGTERM then SIGKILL, each waited out with
+  signal 0 against the group rather than with the Popen handle: the child is spawned in a session
+  of its own, so a descendant that outlives it stays in that group, keeps the port bound and
+  keeps answering on the same URL. Judged by the handle alone that reads as a clean stop, the
+  handle is released, and the next `serve()` refuses the run's own leftover as a stranger's
+  server. Submission is
   `opencode run --pure --format json --attach http://127.0.0.1:<p> --session <id> -m <model>
   '<msg>'`, judged on both the exit status and the event stream. A structured `error` event is
   `SubmissionUncaptured` even on exit 0 — that exit-zero-with-an-error shape is the one `create()`
