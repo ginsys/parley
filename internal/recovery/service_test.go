@@ -243,3 +243,116 @@ func TestClockPreparationIncludesRolledBackObservationWaitingForFlush(t *testing
 		t.Fatalf("correction erased observed rollback=%v", err)
 	}
 }
+
+func TestLaterRollbackRetainsIndependentEvidence(t *testing.T) {
+	for _, status := range []string{"held", "reconciled"} {
+		for _, path := range []string{"prepare", "transaction"} {
+			t.Run(status+"/"+path, func(t *testing.T) {
+				s, now, _ := recoveryFixture(t)
+				ctx := context.Background()
+				*now = time.Unix(100, 0)
+				if err := rejectOrdinary(t, s); err != store.RecoveryRequired {
+					t.Fatal(err)
+				}
+				original, err := s.config.Markers.List(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if status == "reconciled" {
+					_, err = s.maintenance.Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+						_, err := store.ReconcileRecovery(ctx, tx, original[0].IncidentID, 1, recoveryEvidence)
+						return store.TransitionResult{Changed: true}, err
+					}, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				*now = time.Unix(200, 0)
+				if _, err := s.InspectRecovery(ctx, s.config.Store); err != nil {
+					t.Fatal(err)
+				}
+				*now = time.Unix(175, 0)
+				for range 2 {
+					if path == "prepare" {
+						if _, err := s.InspectRecovery(ctx, s.config.Store); err != nil {
+							t.Fatal(err)
+						}
+					} else {
+						_, err := s.maintenance.Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+							_, err := s.transactionTime(ctx, tx, "human_inspection")
+							return store.TransitionResult{}, err
+						}, nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := s.after(); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				*now = time.Unix(210, 0)
+				markers, err := s.config.Markers.List(ctx)
+				if err != nil || len(markers) != 2 {
+					t.Fatalf("later rollback evidence=%+v %v", markers, err)
+				}
+				for _, m := range markers {
+					if m.IncidentID == original[0].IncidentID {
+						if !sameMarker(m, original[0]) {
+							t.Fatal("original evidence changed")
+						}
+						continue
+					}
+					if *m.Floor != time.Unix(200, 0).UnixNano() || *m.Observed != time.Unix(175, 0).UnixNano() {
+						t.Fatalf("wrong later evidence=%+v", m)
+					}
+					if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+						r, err := store.ReadRecovery(ctx, tx, m.IncidentID)
+						if err == nil && (r.Status != "held" || r.Floor.Int64 != *m.Floor || r.Observed.Int64 != *m.Observed) {
+							t.Errorf("durable evidence=%+v", r)
+						}
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestMalformedMarkerCannotBecomeRecoveryRecord(t *testing.T) {
+	s, _, _ := recoveryFixture(t)
+	instant := int64(100)
+	for _, marker := range []Marker{
+		{IncidentID: recoveryEvidence, ServerID: s.serverID, Kind: "clock", Floor: &instant},
+		{IncidentID: recoveryEvidence, ServerID: s.serverID, Kind: "clock", Observed: &instant},
+	} {
+		_, err := s.maintenance.Transition(context.Background(), func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+			changed, err := store.RecordRecovery(ctx, tx, marker.record())
+			return store.TransitionResult{Changed: changed}, err
+		}, nil)
+		if err != store.InvalidRequest {
+			t.Fatalf("malformed marker=%v", err)
+		}
+	}
+}
+
+func TestRollbackObservationSurvivesFailedDedupLookup(t *testing.T) {
+	s, _, _ := recoveryFixture(t)
+	ctx := context.Background()
+	_, err := s.maintenance.Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		return store.TransitionResult{}, s.latchRollback(canceled, tx, 110000000000, 100000000000)
+	}, nil)
+	if err != store.TemporarilyUnavailable {
+		t.Fatalf("canceled lookup=%v", err)
+	}
+	if err := s.after(); err != nil {
+		t.Fatal(err)
+	}
+	markers, err := s.config.Markers.List(ctx)
+	if err != nil || len(markers) != 1 {
+		t.Fatalf("lookup failure lost detected rollback: %+v %v", markers, err)
+	}
+}

@@ -33,12 +33,19 @@ func recordExpiry(ctx context.Context, c CredentialRecord) {
 	}
 }
 func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	if db != e.owner {
 		return InvalidRequest
 	}
-	if len(e.observed) == 0 {
+	// Never hold the evidence mutex while waiting on the writer: collection
+	// takes this mutex from inside a writer transaction. Preserve observations
+	// for retry if persistence fails, and leave concurrently added ones intact.
+	e.mu.Lock()
+	observations := make(map[string]CredentialExpiry, len(e.observed))
+	for id, observed := range e.observed {
+		observations[id] = observed
+	}
+	e.mu.Unlock()
+	if len(observations) == 0 {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), AuthenticationDeadline)
@@ -46,7 +53,7 @@ func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
 	var bindings []string
 	_, err := db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ CommitView) (TransitionResult, error) {
 		changed := false
-		for id, observed := range e.observed {
+		for id, observed := range observations {
 			result, err := tx.ExecContext(ctx, "UPDATE credentials SET status='expired' WHERE credential_id=? AND expires_at_ns=? AND status='current'", id, observed.Deadline)
 			if err != nil {
 				return TransitionResult{}, err
@@ -62,7 +69,7 @@ func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
 		}
 		return TransitionResult{Changed: changed}, nil
 	}, func(CommitView) {
-		for id := range e.observed {
+		for id := range observations {
 			db.coordinator.credentialExpiries.Delete(id)
 		}
 		if invalidate != nil {

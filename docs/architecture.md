@@ -729,6 +729,8 @@ validated authorization instant. A durable preceding checkpoint remains even whe
 work rejects. A rollback detected in the writer immediately holds ordinary operations and is flushed
 after the gate is released. The old direct acceptance/claim/ingestion paths refuse a recovery-owned
 store, while exact settlement remains available to retain an already attempted delivery's outcome.
+Authenticated dispatch reports incompatible historical identifiers with the explicit compatibility
+diagnostic, without rewriting the envelope, consuming budget or contacting a transport.
 
 The Linux marker repository uses a pre-existing private directory and descriptor-relative,
 no-follow operations. Marker creation is non-replacing and syncs the file and parent directory.
@@ -737,8 +739,10 @@ already absent file. Malformed entries, unsafe paths and reused cleared incident
 External publication failure invokes a mandatory nonblocking supervisor fail-stop callback; its
 actual process/supervisor integration remains required before live use. No persistence guarantee is
 claimed when every persistence path fails, or for a rollback never recorded before a crash and
-subsequent clock correction. Once a marker or held database incident exists, corrected wall time and
-restart cannot clear it. Restore detection requires the operator to establish a fresh external marker.
+subsequent clock correction. Distinct detected floor/observed pairs retain independent incidents
+even while another clock incident is held or awaiting cleanup; repeated identical observations
+reuse that evidence. A failed deduplication read retains the detection for independent persistence.
+Once a marker or held database incident exists, corrected wall time and restart cannot clear it. Restore detection requires the operator to establish a fresh external marker.
 
 Internal human `clock.reconcile` verifies reviewed source evidence and nondecreasing samples at
 least one monotonic second apart outside the writer, then rechecks the current floor/version. The
@@ -758,5 +762,8 @@ identities cannot use them to authorize new work. A reviewed bad-floor dispositi
 retires affected authority, matches the exact checkpoint version and all held clock incidents, and
 records the floor change against the same audit. Ordinary reconciliation never lowers the floor.
 Recovery does not clear individual security holds, ingestion barriers or persisted expiry.
+Expiry persistence snapshots observations before acquiring the writer, preserving retry evidence
+without reversing the collection lock order. Malformed marker fields reach validation errors
+instead of pointer dereferences.
 Trusted writer authorization helpers enforce remembered exact-credential expiry denials even
 when their caller has not installed an expiry observation collector.
