@@ -36,6 +36,8 @@ func (m Marker) record() store.RecoveryRecord {
 	r := store.RecoveryRecord{ID: m.IncidentID, ServerID: m.ServerID, Kind: m.Kind, Version: 1, Status: "held"}
 	if m.Floor != nil {
 		r.Floor = sql.NullInt64{Int64: *m.Floor, Valid: true}
+	}
+	if m.Observed != nil {
 		r.Observed = sql.NullInt64{Int64: *m.Observed, Valid: true}
 	}
 	return r

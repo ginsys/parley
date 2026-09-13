@@ -44,6 +44,7 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 	var claimed *store.Envelope
 	var recipient *connection.Session
 	var claimErr error
+	var incompatible bool
 	_, err = b.bridge.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
 		e, err := store.GetByID(ctx, tx, id)
 		if err != nil {
@@ -54,6 +55,7 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 		}
 		for _, key := range []string{e.Conversation, e.FromPeer, e.ToPeer} {
 			if bridgetext.ValidateMetadata(key) != nil {
+				incompatible = true
 				return store.TransitionResult{}, store.InvalidRequest
 			}
 		}
@@ -103,6 +105,11 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 		outcome, readErr := b.bridge.currentOutcome(ctx, id)
 		if readErr != nil {
 			return outcome, readErr
+		}
+		if incompatible {
+			outcome.ErrorCode = "incompatible_identifier"
+			outcome.ErrorDetail = "Stored identifiers require human compatibility review before delivery."
+			return outcome, err
 		}
 		if err == store.BindingUnavailable || err == store.SecurityHold || err == store.NotReady || err == store.AuthenticationFailed {
 			return outcome, nil

@@ -80,13 +80,35 @@ func (s *Service) latch(floor, observed int64) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	s.held = true
-	// A pending detection is immutable. Repeated failed operations cannot replace
-	// its incident identity or overwrite the evidence awaiting persistence.
-	if len(s.pending) == 0 {
-		s.pending = append(s.pending, Marker{IncidentID: id.String(), ServerID: s.serverID, Kind: "clock", Floor: &floor, Observed: &observed})
+	// Repeated observations of the same pair reuse pending evidence; a new
+	// detection never replaces or suppresses a different pending incident.
+	for _, marker := range s.pending {
+		if marker.Kind == "clock" && *marker.Floor == floor && *marker.Observed == observed {
+			return nil
+		}
 	}
+	s.pending = append(s.pending, Marker{IncidentID: id.String(), ServerID: s.serverID, Kind: "clock", Floor: &floor, Observed: &observed})
 	return nil
 }
+
+// latchRollback deduplicates only the same still-held immutable observation.
+// A different floor/observed pair needs independent evidence even during cleanup.
+func (s *Service) latchRollback(ctx context.Context, tx *sql.Tx, floor, observed int64) error {
+	var recorded bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents WHERE kind='clock' AND status!='cleared' AND last_trusted_ns=? AND observed_ns=?)", floor, observed).Scan(&recorded); err != nil {
+		// Detection already happened. An unavailable deduplication read cannot
+		// discard the observation before the independent After flush.
+		if latchErr := s.latch(floor, observed); latchErr != nil {
+			return latchErr
+		}
+		return store.TemporarilyUnavailable
+	}
+	if recorded {
+		return nil
+	}
+	return s.latch(floor, observed)
+}
+
 func (s *Service) transactionTime(ctx context.Context, tx *sql.Tx, kind string) (time.Time, error) {
 	instant := s.config.Now()
 	ns, err := store.InstantNanos(instant)
@@ -98,14 +120,8 @@ func (s *Service) transactionTime(ctx context.Context, tx *sql.Tx, kind string) 
 		return time.Time{}, err
 	}
 	if checkpoint.Instant.Valid && ns < checkpoint.Instant.Int64 {
-		var alreadyHeld bool
-		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents WHERE kind='clock' AND status!='cleared')").Scan(&alreadyHeld); err != nil {
-			return time.Time{}, store.TemporarilyUnavailable
-		}
-		if !alreadyHeld {
-			if err := s.latch(checkpoint.Instant.Int64, ns); err != nil {
-				return time.Time{}, err
-			}
+		if err := s.latchRollback(ctx, tx, checkpoint.Instant.Int64, ns); err != nil {
+			return time.Time{}, err
 		}
 		if !humanRecovery(kind) {
 			return time.Time{}, store.RecoveryRequired
@@ -260,14 +276,7 @@ func (s *Service) prepare(ctx context.Context) error {
 			return store.TransitionResult{}, err
 		}
 		if checkpoint.Instant.Valid && ns < checkpoint.Instant.Int64 {
-			var clockHeld bool
-			if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM recovery_incidents WHERE kind='clock' AND status!='cleared')").Scan(&clockHeld); err != nil {
-				return store.TransitionResult{}, store.TemporarilyUnavailable
-			}
-			if !clockHeld {
-				return store.TransitionResult{}, s.latch(checkpoint.Instant.Int64, ns)
-			}
-			return store.TransitionResult{}, nil
+			return store.TransitionResult{}, s.latchRollback(ctx, tx, checkpoint.Instant.Int64, ns)
 		}
 		changed, err := store.AdvanceClockCheckpoint(ctx, tx, ns)
 		return store.TransitionResult{Changed: changed}, err

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -211,4 +212,62 @@ func TestAuthenticatedClaimHonorsAuthoredRevocationHold(t *testing.T) {
 		t.Fatalf("held claim=%+v %v", out, err)
 	}
 	f.assertBudget(t, 0)
+}
+
+func TestAuthenticatedCompatibilityDiagnosticPreservesHistory(t *testing.T) {
+	for _, bad := range []string{"caf\u00e9", "a\xff", "a\x7f"} {
+		for _, field := range []string{"conversation", "from_peer", "to_peer"} {
+			t.Run(fmt.Sprintf("%s/%x", field, bad), func(t *testing.T) {
+				f := authenticatedSetup(t)
+				id := f.send(t)
+				ctx := context.Background()
+				_, err := f.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+					if field == "conversation" {
+						if err := store.EnsureConversation(ctx, tx, bad, bad, "1970-01-01T00:00:00Z"); err != nil {
+							return store.TransitionResult{}, err
+						}
+						grant, err := store.CurrentGrant(ctx, tx, "work")
+						if err != nil {
+							return store.TransitionResult{}, err
+						}
+						grant.Conversation = bad
+						if err := store.InsertGrant(ctx, tx, *grant); err != nil {
+							return store.TransitionResult{}, err
+						}
+					}
+					_, err := tx.ExecContext(ctx, "UPDATE envelopes SET "+field+"=? WHERE id=?", bad, id)
+					return store.TransitionResult{Changed: true}, err
+				}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var before *store.Envelope
+				if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+					var err error
+					before, err = store.GetByID(ctx, tx, id)
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				b, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport { t.Fatal("incompatible work reached transport"); return nil }, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				out, err := b.DispatchOutcome(ctx, id)
+				if err != store.InvalidRequest || out.Attempted || out.State != store.Queued || out.ErrorCode != "incompatible_identifier" || out.ErrorDetail == "" {
+					t.Fatalf("compatibility=%+v %v", out, err)
+				}
+				if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+					after, err := store.GetByID(ctx, tx, id)
+					if err == nil && !reflect.DeepEqual(before, after) {
+						t.Error("compatibility rejection changed row")
+					}
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				f.assertBudget(t, 0)
+			})
+		}
+	}
 }
