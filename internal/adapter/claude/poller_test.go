@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	bridgefixture "github.com/ginsys/parley/internal/testfixture/bridge"
 	"path/filepath"
 	"testing"
 	"time"
 
 	adapterclaude "github.com/ginsys/parley/internal/adapter/claude"
-	"github.com/ginsys/parley/internal/adapter/codex"
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
@@ -30,7 +30,7 @@ func TestPollerRetryableBatchDoesNotStarveLaterMessages(t *testing.T) {
 		}
 		return nil
 	})
-	b := dispatch.New(db, transport)
+	b := bridgefixture.New(t, db, transport)
 	for i := 0; i < store.MaxQueueBatch; i++ {
 		if _, err := b.Send(ctx, "c", "a", "b", "retry later", nil); err != nil {
 			t.Fatal(err)
@@ -52,7 +52,7 @@ func TestPollerRetryableBatchDoesNotStarveLaterMessages(t *testing.T) {
 	if !hs.Ack(probe.last()) {
 		t.Fatal("ack")
 	}
-	poller := adapterclaude.NewPoller(db, b, hs, "c", "b")
+	poller := adapterclaude.NewPoller(db, b.AuthenticatedBridge, hs, "c", "b")
 	outcomes, err := poller.Tick(ctx)
 	if err != nil || len(outcomes) != 100 || attempts != 100 {
 		t.Fatalf("first batch: %d %d %v", len(outcomes), attempts, err)
@@ -109,7 +109,7 @@ func TestPollerResumesAtBudgetBlockedReplyAfterRenewal(t *testing.T) {
 	if _, err := ctrl.Grant(ctx, controller.GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 4}); err != nil {
 		t.Fatal(err)
 	}
-	b := dispatch.New(db, &fakeTransport{})
+	b := bridgefixture.New(t, db, &fakeTransport{})
 	var replies []string
 	for i := 0; i < 3; i++ {
 		original, err := b.Send(ctx, "c", "b", "a", "original", nil)
@@ -120,7 +120,7 @@ func TestPollerResumesAtBudgetBlockedReplyAfterRenewal(t *testing.T) {
 			t.Fatal(err)
 		}
 		marker := fmt.Sprintf("```BRIDGE-REPLY\n{\"in_reply_to\":%q,\"to\":\"b\",\"text\":\"reply\"}\n```", original.ID)
-		reply, err := codex.IngestTurn(ctx, db, "c", "a", "b", marker)
+		reply, err := bridgefixture.IngestTurn(t, ctx, db, "c", "a", "b", marker)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -138,7 +138,7 @@ func TestPollerResumesAtBudgetBlockedReplyAfterRenewal(t *testing.T) {
 	if !hs.Ack(probe.last()) {
 		t.Fatal("ack")
 	}
-	poller := adapterclaude.NewPoller(db, b, hs, "c", "b")
+	poller := adapterclaude.NewPoller(db, b.AuthenticatedBridge, hs, "c", "b")
 	first, err := poller.Tick(ctx)
 	if !errors.Is(err, dispatch.ErrBudgetExhausted) || len(first) != 2 || first[1].ID != replies[1] || first[1].Attempted {
 		t.Fatalf("budget outcomes: %+v %v", first, err)

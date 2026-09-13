@@ -16,13 +16,13 @@ type Poller struct {
 	tickMu       sync.Mutex
 	after        *store.QueueCursor
 	queries      store.Queries
-	bridge       *dispatch.Bridge
+	bridge       *dispatch.AuthenticatedBridge
 	handshake    *Handshake
 	conversation string
 	toPeer       string
 }
 
-func NewPoller(db *store.DB, bridge *dispatch.Bridge, handshake *Handshake, conversation, toPeer string) *Poller {
+func NewPoller(db *store.DB, bridge *dispatch.AuthenticatedBridge, handshake *Handshake, conversation, toPeer string) *Poller {
 	return &Poller{queries: db.Queries(), bridge: bridge, handshake: handshake, conversation: conversation, toPeer: toPeer}
 }
 

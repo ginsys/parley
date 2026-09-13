@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	bridgefixture "github.com/ginsys/parley/internal/testfixture/bridge"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
+	"github.com/ginsys/parley/internal/testfixture/identity"
 )
 
 // fakeTransport records every delivered envelope and can be told to fail or
@@ -84,7 +86,7 @@ func TestConcurrentBudgetExhaustion(t *testing.T) {
 	grantOne(t, ctrl, "conv-budget", 1)
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 	ctx := context.Background()
 
 	e1, err := bridge.Send(ctx, "conv-budget", "claude-session-a", "codex-thread-b", "first", nil)
@@ -143,7 +145,7 @@ func TestRevokeVsDispatch(t *testing.T) {
 	grantOne(t, ctrl, "conv-revoke", 10)
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 	ctx := context.Background()
 
 	dispatched, err := bridge.Send(ctx, "conv-revoke", "claude-session-a", "codex-thread-b", "will be dispatching", nil)
@@ -184,7 +186,7 @@ func TestRevokeVsDispatch(t *testing.T) {
 		t.Fatalf("want cancelled on disk, got %s", e.State)
 	}
 
-	if _, err := bridge.Send(ctx, "conv-revoke", "claude-session-a", "codex-thread-b", "after revoke", nil); !errors.Is(err, store.ErrNoActiveGrant) {
+	if _, err := bridge.Send(ctx, "conv-revoke", "claude-session-a", "codex-thread-b", "after revoke", nil); !errors.Is(err, store.Forbidden) {
 		t.Fatalf("send after revoke: want ErrNoActiveGrant, got %v", err)
 	}
 }
@@ -198,7 +200,7 @@ func TestCrashAfterHandoffRecoversUncertain(t *testing.T) {
 	grantOne(t, ctrl, "conv-crash", 5)
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 	ctx := context.Background()
 
 	e, err := bridge.Send(ctx, "conv-crash", "claude-session-a", "codex-thread-b", "in flight when we died", nil)
@@ -263,7 +265,7 @@ func TestDispatchRecordsOutcomeDespiteContextCanceledDuringDeliver(t *testing.T)
 		cancel() // simulate the ctx being invalidated while Deliver is running
 		return errors.New("delivery refused")
 	})
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	e, err := bridge.Send(context.Background(), "conv-cancel-during-deliver", "claude-session-a", "codex-thread-b", "hi", nil)
 	if err != nil {
@@ -308,7 +310,7 @@ func TestStaleGrantVersionCancelledByRenewal(t *testing.T) {
 	grantOne(t, ctrl, "conv-renew", 10)
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 	ctx := context.Background()
 
 	stale, err := bridge.Send(ctx, "conv-renew", "claude-session-a", "codex-thread-b", "queued under v1", nil)
@@ -368,8 +370,8 @@ func ackEnvelope(t *testing.T, db *store.DB, conversation, id string, grantVersi
 }
 
 // sendTrustedReply inserts a queued reply envelope with TrustedReply set,
-// standing in for what codex.IngestTurn does atomically (ack the original,
-// then queue this reply) — dispatch.Bridge.Send has no parameter for this
+// standing in for what authenticated ingestion does atomically (ack the original,
+// then queue this reply) — connection.Manager.Send has no parameter for this
 // column and can never produce one, by design (see the finding
 // 3973918513/3973918530-follow-up regression tests below), so tests that
 // need a genuine reply for the carry-forward/rescue paths must construct one
@@ -377,6 +379,10 @@ func ackEnvelope(t *testing.T, db *store.DB, conversation, id string, grantVersi
 func sendTrustedReply(t *testing.T, db *store.DB, conversation, from, to, text, inReplyTo string, grantVersion int64) *store.Envelope {
 	t.Helper()
 	ctx := context.Background()
+	ids := identity.For(t, db)
+	if err := ids.GrantPeers(); err != nil {
+		t.Fatal(err)
+	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -395,6 +401,9 @@ func sendTrustedReply(t *testing.T, db *store.DB, conversation, from, to, text, 
 	}
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("insert trusted reply: %v", err)
+	}
+	if err := identity.Record(ctx, tx, e); err != nil {
+		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
@@ -416,7 +425,7 @@ func TestRenewCarriesForwardQueuedReplyInsteadOfCancelling(t *testing.T) {
 	ackEnvelope(t, db, "conv-reply-renew", "original-envelope-id", 1)
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 	ctx := context.Background()
 
 	reply := sendTrustedReply(t, db, "conv-reply-renew", "codex-thread-b", "claude-session-a", "reply text", "original-envelope-id", 1)
@@ -462,7 +471,7 @@ func TestGrantExpiryRecheckedAtDispatch(t *testing.T) {
 	}
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	e, err := bridge.Send(ctx, "conv-expiry-dispatch", "claude-session-a", "codex-thread-b", "queued before expiry", nil)
 	if err != nil {
@@ -493,7 +502,7 @@ func TestDispatchRequeuesAndRefundsNeverAttemptedDelivery(t *testing.T) {
 	grantOne(t, ctrl, "conv-no-attempt", 1)
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 	ctx := context.Background()
 
 	e, err := bridge.Send(ctx, "conv-no-attempt", "claude-session-a", "codex-thread-b", "never attempted", nil)
@@ -546,7 +555,7 @@ func TestDispatchCancelsUnattemptedOrdinarySendWhenGrantRenewedMidFlight(t *test
 		}
 		return dispatch.ErrNoAttempt
 	})
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	e, err := bridge.Send(ctx, "conv-no-attempt-renewed", "claude-session-a", "codex-thread-b", "ordinary send", nil)
 	if err != nil {
@@ -602,7 +611,7 @@ func TestDispatchRescuesUnattemptedReplyOntoRenewedGrantVersion(t *testing.T) {
 		}
 		return nil
 	})
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	reply := sendTrustedReply(t, db, "conv-reply-rescue", "codex-thread-b", "claude-session-a", "reply text", "original-envelope-id", 1)
 
@@ -667,7 +676,7 @@ func TestDispatchRescuesUnattemptedReplyOntoAlreadyExpiredSuccessorGrant(t *test
 		}
 		return nil
 	})
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	reply := sendTrustedReply(t, db, "conv-reply-rescue-expired", "codex-thread-b", "claude-session-a", "reply text", "original-envelope-id", 1)
 
@@ -718,7 +727,7 @@ func TestDispatchCancelsUnattemptedReplyWhenNoActiveGrantSurvives(t *testing.T) 
 		}
 		return dispatch.ErrNoAttempt
 	})
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	reply := sendTrustedReply(t, db, "conv-reply-revoked", "codex-thread-b", "claude-session-a", "reply text", "original-envelope-id", 1)
 
@@ -756,7 +765,7 @@ func TestGrantExpiryPreservesQueuedReplyForRenewal(t *testing.T) {
 	ackEnvelope(t, db, "conv-expiry-reply", "original-envelope-id", 1)
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	reply := sendTrustedReply(t, db, "conv-expiry-reply", "codex-thread-b", "claude-session-a", "reply before expiry", "original-envelope-id", 1)
 
@@ -800,7 +809,7 @@ func TestDispatchFailsPermanentlyRejectedWithoutRequeueLoop(t *testing.T) {
 	transport := transportFunc(func(dctx context.Context, e store.Envelope) error {
 		return fmt.Errorf("wrap: %w", dispatch.ErrPermanentlyRejected)
 	})
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	e, err := bridge.Send(ctx, "conv-permanent-reject", "claude-session-a", "codex-thread-b", "too big", nil)
 	if err != nil {
@@ -839,8 +848,8 @@ func TestDispatchFailsPermanentlyRejectedWithoutRequeueLoop(t *testing.T) {
 
 // Regression for finding 3973918530 on PR #3: CarryForwardQueuedReplies
 // previously trusted a bare non-nil in_reply_to as proof of being a genuine
-// reply, but dispatch.Bridge.Send takes an arbitrary caller-supplied
-// inReplyTo with no validation — an ordinary send naming an unrelated
+// reply, but historical ordinary sends accepted caller-supplied
+// inReplyTo without validation — an ordinary send naming an unrelated
 // envelope (here, one that was never acked at all) must be cancelled by a
 // renewal like any other old-grant message, not silently carried forward as
 // if it were a real reply.
@@ -851,7 +860,7 @@ func TestRenewDoesNotCarryForwardFakeReplyWithUnackedOriginal(t *testing.T) {
 	ctx := context.Background()
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	notActuallyAcked := "not-an-acked-envelope"
 	forged, err := bridge.Send(ctx, "conv-fake-reply", "claude-session-a", "codex-thread-b", "pretending to be a reply", &notActuallyAcked)
@@ -888,7 +897,7 @@ func TestRenewDoesNotCarryForwardOrdinarySendEvenNamingAGenuinelyAckedOriginal(t
 	ctx := context.Background()
 
 	transport := newFakeTransport()
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	target := "genuinely-acked-envelope"
 	forged, err := bridge.Send(ctx, "conv-fake-reply-real-target", "claude-session-a", "codex-thread-b", "pretending to be a reply", &target)
@@ -926,7 +935,7 @@ func TestDispatchDoesNotRescueOrdinarySendEvenNamingAGenuinelyAckedOriginal(t *t
 		}
 		return dispatch.ErrNoAttempt
 	})
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 
 	target := "genuinely-acked-envelope"
 	forged, err := bridge.Send(ctx, "conv-fake-rescue-real-target", "claude-session-a", "codex-thread-b", "pretending to be a reply", &target)
