@@ -105,9 +105,14 @@ class FakeRun:
 
 
 class RegistryTests(unittest.TestCase):
+    # The owner is any object; the registry only ever compares identity. These use plain
+    # sentinels so the store's own contract is tested without a driver in the way.
+    OWNER = object()
+    OTHER = object()
+
     def test_mint_then_require_owned_then_release(self):
         registry = SessionRegistry()
-        registry.mint('a')
+        registry.mint('a', self.OWNER)
         registry.require_owned('a')  # does not raise
         registry.release('a')
         with self.assertRaises(ForeignSessionError):
@@ -115,22 +120,34 @@ class RegistryTests(unittest.TestCase):
 
     def test_foreign_session_is_refused(self):
         registry = SessionRegistry()
-        registry.mint('a')
+        registry.mint('a', self.OWNER)
         with self.assertRaises(ForeignSessionError):
             registry.require_owned('some-real-background-session-id')
 
     def test_duplicate_mint_and_empty_id_are_rejected(self):
         registry = SessionRegistry()
-        registry.mint('a')
+        registry.mint('a', self.OWNER)
         with self.assertRaises(ValueError):
-            registry.mint('a')
+            registry.mint('a', self.OWNER)
         with self.assertRaises(ValueError):
-            registry.mint('')
+            registry.mint('', self.OWNER)
 
     def test_release_of_foreign_session_is_refused(self):
         registry = SessionRegistry()
         with self.assertRaises(ForeignSessionError):
             registry.release('never-created')
+
+    def test_the_id_and_its_owner_are_stored_together(self):
+        # One store, so an interrupt cannot leave a created session registered and unattributed:
+        # the sweep would then pass over a live session while its key blocked re-registration.
+        registry = SessionRegistry()
+        registry.mint('a', self.OWNER)
+        registry.mint('b', self.OTHER)
+        self.assertIs(registry.owner('a'), self.OWNER)
+        self.assertEqual(registry.owned_by(self.OWNER), {'a'})
+        self.assertEqual(registry.owned_by(self.OTHER), {'b'})
+        registry.release('a')
+        self.assertEqual(registry.owned_by(self.OWNER), set())
 
 
 class DetectOutcomesTests(unittest.TestCase):
@@ -1521,7 +1538,7 @@ class CrossDriverNamespaceTests(DriverTestCase):
         codex.mint('abc')  # the same name in another namespace is another session
         self.assertEqual(claude.owned(), {'abc'})
         self.assertEqual(codex.owned(), {'abc'})
-        self.assertEqual(self.registry.created, {'claude:abc', 'codex:abc'})
+        self.assertEqual(self.registry.created, {'claude:abc': claude, 'codex:abc': codex})
         codex.release('abc')
         self.assertEqual(claude.owned(), {'abc'})
         self.assertEqual(codex.owned(), set())
@@ -2021,7 +2038,6 @@ class FakeDriver(Driver):
                  teardown_errors=None, submission_note=None, registry=None, on_observe=None):
         self.registry = registry or SessionRegistry()
         self.clients = []
-        self.minted = set()
         self.observations = list(observations or [Observation()])
         self.accepted = accepted
         self.submit_error = submit_error
@@ -2588,12 +2604,13 @@ class SweepTests(unittest.TestCase):
         driver = FakeDriver()
         driver.mint('b')
         driver.mint('a')
-        driver.registry.mint('other:zzz')  # another driver's session on the shared registry
+        other = object()
+        driver.registry.mint('other:zzz', other)  # another driver's session on the shared registry
         driver.clients.append(ClosingClient(driver.order))
         self.assertEqual(sweep(driver), [])
         self.assertEqual(driver.order, ['client', 'teardown:a', 'teardown:b', 'close_servers'])
         self.assertEqual(driver.owned(), set())
-        self.assertEqual(driver.registry.created, {'other:zzz'})
+        self.assertEqual(driver.registry.created, {'other:zzz': other})
         self.assertEqual(driver.clients, [])
 
     def test_sweep_continues_past_a_failed_teardown_and_reports_it(self):

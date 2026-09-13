@@ -160,25 +160,39 @@ class SessionRegistry:
     id this registry did not itself mint via `mint()` -- enforced here, not left to each driver
     to remember. Keys are namespaced `<host>:<id>` by the drivers, so a Codex thread that happens
     to share a name with a Claude session never satisfies the other driver's check.
+
+    Each key is stored *with the driver instance that minted it*, in the one store, because
+    registration and ownership must not be separable: a Ctrl-C landing between two writes would
+    leave a created host session registered but owned by nobody, so the sweep would pass over a
+    live real-HOME session while the key that names it blocked re-registration. `created[key] =
+    owner` is a single store, so the id is registered and attributed together or not at all.
     """
 
-    created: set = field(default_factory=set)
+    created: dict = field(default_factory=dict)
 
-    def mint(self, session_id):
+    def mint(self, session_id, owner):
         if not session_id:
             raise ValueError('empty session id')
         if session_id in self.created:
             raise ValueError(f'session already registered: {session_id}')
-        self.created.add(session_id)
+        self.created[session_id] = owner
         return session_id
 
-    def require_owned(self, session_id):
+    def owner(self, session_id):
+        """The instance that minted `session_id`; `ForeignSessionError` if this run did not."""
         if session_id not in self.created:
             raise ForeignSessionError(f'refusing to operate on foreign session: {session_id}')
+        return self.created[session_id]
+
+    def require_owned(self, session_id):
+        self.owner(session_id)
+
+    def owned_by(self, owner):
+        return {key for key, held in self.created.items() if held is owner}
 
     def release(self, session_id):
         self.require_owned(session_id)
-        self.created.discard(session_id)
+        self.created.pop(session_id, None)
 
 
 MARKER_PATTERN = re.compile(r'^PARLEY-PROBE-[0-9a-f]{32}$')
@@ -597,14 +611,15 @@ def private_directory(cwd):
 class Driver:
     """What every host driver shares: namespaced ownership, transient handles, a private cwd.
 
-    Ownership is *per instance*, not per registry: `mint()` records an id both in the shared
-    `SessionRegistry` (which keeps the run-wide "never touch a foreign session" guarantee) and in
-    this instance's own `minted` set, and `owned()`/`require_owned()` read the latter. Two
-    instances of one host driver over a shared registry therefore cannot reach each other's
+    Ownership is *per instance*, not per registry: `mint()` records the id in the shared
+    `SessionRegistry` (which keeps the run-wide "never touch a foreign session" guarantee)
+    together with this instance as its owner, and `owned()`/`require_owned()` read that owner.
+    Two instances of one host driver over a shared registry therefore cannot reach each other's
     sessions -- without that, sweeping instance A would close only A's clients and then tear down
     B's sessions while B's PTY client or server was still serving them, so one
     `run_trial_with_cleanup()` could delete another live trial. A copy minted inside `submit()`
-    lands in the same set and is swept with the session it copied.
+    is attributed the same way and is swept with the session it copied. One store, not two: see
+    `SessionRegistry` for why registration and attribution cannot be separable.
     `clients` holds open `PtyClient`s (closed by `sweep()` before any teardown, since a Codex
     resume client is what serves its thread); `close_servers()` is the hook for a driver that
     runs a server process (closed after teardown).
@@ -616,9 +631,6 @@ class Driver:
         self.registry = registry
         self.cwd = private_directory(cwd)
         self.clients = []
-        # Ids this instance created. The registry keeps the run-wide set; this keeps the sweep
-        # and every operation from reaching a sibling instance's live sessions.
-        self.minted = set()
         # Free-text evidence about the last submit() call for a mechanism with no exit status of
         # its own (the attach path); `run_trial` copies it into `TrialRun.submission_diagnostic`.
         self.submission_note = None
@@ -627,26 +639,22 @@ class Driver:
         return f'{self.NAMESPACE}:{session_id}'
 
     def mint(self, session_id):
-        key = self._key(session_id)
-        self.registry.mint(key)
-        self.minted.add(session_id)
+        self.registry.mint(self._key(session_id), self)
         return session_id
 
     def require_owned(self, session_id):
-        key = self._key(session_id)
-        self.registry.require_owned(key)
-        if session_id not in self.minted:
+        if self.registry.owner(self._key(session_id)) is not self:
             raise ForeignSessionError(
                 f'refusing to operate on {session_id}: created by another driver instance over '
                 f'the same registry, which still holds its clients and servers')
 
     def release(self, session_id):
-        key = self._key(session_id)
-        self.registry.release(key)
-        self.minted.discard(session_id)
+        self.require_owned(session_id)
+        self.registry.release(self._key(session_id))
 
     def owned(self):
-        return set(self.minted)
+        cut = len(self.NAMESPACE) + 1
+        return {key[cut:] for key in self.registry.owned_by(self)}
 
     def open_client(self, argv):
         """Launch a PTY client in the probe cwd and hold it, in one statement.
@@ -1791,7 +1799,7 @@ class OpenCodeDriver(Driver):
         `owned()` whatever happens next. Idempotent, because a second submission can be
         redirected to the same stray id and the registry refuses a repeat mint.
         """
-        if attached_id is not None and attached_id != session_id and attached_id not in self.minted:
+        if attached_id is not None and attached_id != session_id and attached_id not in self.owned():
             self.mint(attached_id)
 
     def submit(self, session_id, message):

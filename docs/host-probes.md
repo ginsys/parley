@@ -181,12 +181,16 @@ own creation output — stdout line 1 of `claude --bg`, the `thread.started` eve
 rollout directory. A driver has no adoption path at all: a thread this run did not create cannot
 be handed to it.
 
-Ownership is also *per driver instance*, not merely per namespace. Each driver keeps its own set
-of minted ids alongside the shared registry, and `owned()` and the refusal above both read that
-set, so two instances of one host driver sharing a registry cannot reach each other's sessions.
-Without that, sweeping one instance would close only its own PTY clients and servers and then tear
-down the other instance's sessions while that instance's client or server was still serving them —
-one `run_trial_with_cleanup()` deleting another live trial.
+Ownership is also *per driver instance*, not merely per namespace. The registry stores each id
+together with the driver instance that minted it, and `owned()` and the refusal above both read
+that owner, so two instances of one host driver sharing a registry cannot reach each other's
+sessions. Without that, sweeping one instance would close only its own PTY clients and servers and
+then tear down the other instance's sessions while that instance's client or server was still
+serving them — one `run_trial_with_cleanup()` deleting another live trial. Id and owner live in
+one store rather than two, and are written in one statement, because the two facts must not be
+separable: an interrupt landing between them would register a created session that no instance
+owned, so the sweep would pass over a live authenticated session while the key naming it blocked
+re-registration.
 
 Trials run under the real HOME so the host session is actually authenticated, per the owner's
 2026-09-11 decision — disposable at the *session* level, not the HOME level. The runner has no
