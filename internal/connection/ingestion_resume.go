@@ -3,6 +3,7 @@ package connection
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -43,7 +44,7 @@ func (s *IngestionRecovery) Resume(ctx context.Context, p store.CommandPrincipal
 	evidenceCtx, cancel := context.WithTimeout(ctx, store.ReadinessDeadline)
 	interval, evidenceErr := s.config.Resolve(evidenceCtx, r)
 	if evidenceCtx.Err() != nil {
-		evidenceErr = store.HostUnverified
+		evidenceErr = evidenceCtx.Err()
 	}
 	cancel()
 	return s.config.Store.Coordinator().Execute(ctx, p, request, authorize, func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
@@ -51,7 +52,10 @@ func (s *IngestionRecovery) Resume(ctx context.Context, p store.CommandPrincipal
 			return domainRejection(err)
 		}
 		if evidenceErr != nil {
-			return rejection(store.HostUnverified)
+			if errors.Is(evidenceErr, store.HostUnverified) {
+				return rejection(store.HostUnverified)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
 		change, err := store.ResumeIngestion(ctx, tx, store.ResumeIngestionRequest{BindingID: r.BindingID, ExpectedBindingVersion: r.ExpectedBindingVersion, ExpectedBarrierVersion: r.ExpectedBarrierVersion, EvidenceRef: r.DispositionRef, PrincipalID: p.ID, OperationID: r.OperationID, Interval: interval})
 		if err != nil {

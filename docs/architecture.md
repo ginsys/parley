@@ -747,6 +747,9 @@ Recording an existing reconciled incident is idempotent because its global hold 
 the storage primitive rejects reuse of a cleared incident without changing its terminal evidence.
 Retries reauthorize before looking up the receipt and may finish only that committed cleanup. Other
 incidents keep the global gate closed. `recovery.complete` follows the same two-phase protocol.
+For both operations and `ingestion.resume`, only an explicit host-verification mismatch retains
+a terminal evidence rejection. Provider failures, cancellation and evidence deadlines leave no
+receipt or business effect, so the same operation ID can retry after evidence becomes available.
 Its implemented restore policy is conservative: every restored binding must be permanently retired,
 and every outstanding envelope receives an independent restore hold with the same trusted creation
 instant as the retirement transaction. Surviving-history import is

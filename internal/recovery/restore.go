@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"database/sql"
+	"errors"
 
 	"github.com/ginsys/parley/internal/store"
 )
@@ -59,7 +60,7 @@ func (a *RestoreAdministration) Complete(ctx context.Context, p store.CommandPri
 	evidenceCtx, cancel := context.WithTimeout(ctx, store.ReadinessDeadline)
 	disposition, evidenceErr := a.resolve(evidenceCtx, r)
 	if evidenceCtx.Err() != nil {
-		evidenceErr = store.HostUnverified
+		evidenceErr = evidenceCtx.Err()
 	}
 	cancel()
 	var newFloor *int64
@@ -81,7 +82,10 @@ func (a *RestoreAdministration) Complete(ctx context.Context, p store.CommandPri
 			return rejection(store.RequestTerminal)
 		}
 		if evidenceErr != nil {
-			return rejection(store.HostUnverified)
+			if errors.Is(evidenceErr, store.HostUnverified) {
+				return rejection(store.HostUnverified)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
 		if len(disposition.ClockIncidents) > 99 || len(disposition.Retire) > 1000 || len(disposition.PendingWork) > 1000 {
 			return store.CommandResult{}, store.CapacityExceeded
