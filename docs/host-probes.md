@@ -461,7 +461,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   cleanup for manual investigation. Nonempty malformed JSON or non-object event lines fail
   validation, as do event types other than captured `step_start`, `text`, `step_finish` and `error`.
   Every event needs a nonempty string `sessionID`, and a present `part` must carry that same
-  session identity. Conflicting top-level
+  session identity. Success events (`step_start`, `text`, `step_finish`) require that part;
+  the captured `error` event may omit it. Conflicting top-level
   and part IDs grant no creation ownership; attach reports the unexpected ID without adoption.
   Malformed events fail
   creation and make attach submission `SubmissionUncaptured`, regardless of exit status or

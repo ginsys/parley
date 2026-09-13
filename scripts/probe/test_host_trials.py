@@ -640,7 +640,8 @@ class OpenCodeParsingTests(unittest.TestCase):
 
     def test_session_ids_are_collected_and_an_error_event_is_reported(self):
         # Captured: a failing turn (401) still emits its sessionID and lists the session.
-        stdout = '\n'.join([json.dumps({'type': 'step_start', 'sessionID': 'ses_1'}),
+        stdout = '\n'.join([json.dumps({'type': 'step_start', 'sessionID': 'ses_1',
+                                        'part': {'type': 'step-start', 'sessionID': 'ses_1'}}),
                             json.dumps({'type': 'error', 'sessionID': 'ses_1',
                                         'error': {'name': 'ProviderAuthError'}}),
                             'not json', json.dumps([1])])
@@ -649,7 +650,7 @@ class OpenCodeParsingTests(unittest.TestCase):
         self.assertIn('ProviderAuthError', error)
         self.assertEqual(unusable, 2)
         self.assertEqual(opencode_session_ids(''), ({}, None, 0))
-        self.assertEqual(opencode_session_ids(json.dumps({'type': 'text', 'sessionID': ''})), ({}, None, 1))
+        self.assertEqual(opencode_session_ids(json.dumps({'type': 'text', 'sessionID': ''})), ({}, None, 2))
 
     def test_export_extracts_text_parts_with_millisecond_creation_times(self):
         raw = opencode_export([
@@ -2573,6 +2574,31 @@ class OpenCodeDriverTests(DriverTestCase):
                         driver.serve()
                         with self.assertRaisesRegex(SubmissionUncaptured, 'malformed'):
                             driver.submit('ses_1', 'msg')
+
+    def test_success_events_require_parts_on_creation_and_attach(self):
+        for kind in ('step_start', 'text', 'step_finish'):
+            for returncode in (0, 1, 'timeout'):
+                for operation in ('create', 'attach'):
+                    with self.subTest(kind=kind, returncode=returncode, operation=operation):
+                        self.registry = SessionRegistry()
+                        self.answering = False
+                        output = json.dumps({'type': kind, 'sessionID': 'ses_1'})
+                        result = (subprocess.TimeoutExpired(['opencode'], 60, output=output)
+                                  if returncode == 'timeout' else FakeResult(returncode, output))
+                        if operation == 'create':
+                            driver = self.driver(FakeRun([(['opencode', 'run'], result)]))
+                            with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                                driver.create('hello')
+                        else:
+                            run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'],
+                                            self.run_output()),
+                                           (['opencode', 'run', '--pure', '--format', 'json', '--attach'], result)])
+                            driver = self.driver(run, port=4096)
+                            driver.create('hello')
+                            driver.serve()
+                            with self.assertRaisesRegex(SubmissionUncaptured, 'malformed'):
+                                driver.submit('ses_1', 'msg')
+                        self.assertEqual(driver.owned(), {'ses_1'})
 
     def test_malformed_attach_stream_is_uncaptured_even_with_a_matching_id(self):
         for suffix in ('{"type":', '[1]', 'null', '"text"', '{"type":"text"}',
