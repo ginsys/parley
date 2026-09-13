@@ -132,7 +132,12 @@ authentication cancels that socket with authentication_failed. Successful inspec
 a restricted identity and returns epoch, committed generation and active status; it reserves no
 attachment or readiness. Inspected sockets remain within the nonattached bound. Every lookup and
 attachment rechecks credential hash, native tuple, kernel UID, lifecycle and server-time expiry.
-Observed credential expiry commits terminal state before it can be revived by an earlier clock.
+Credential expiry is checked again after guards and at post-commit publication. An expiry first
+observed after commit prevents installation and is persisted with an independent bounded context.
+An exact-credential denial remains in the store coordinator if persistence fails, so an earlier
+clock cannot revive that identity. Persistence compares the immutable identity/deadline and cannot
+expire a rotated successor. This shared denial primitive is introduced with attachment and is also
+consumed by the later recovery/ordinary-work expiry collector.
 The required trusted guard supplies global clock/recovery policy in the later recovery slice.
 
 Attachment compares and increments the durable generation in an immediate transaction. Its
@@ -147,7 +152,12 @@ further coordinator operations and publishes no slot.
 
 Host verification runs outside the coordinator and is cancelled with the socket lifetime. Each
 explicit readiness attempt starts unready with a fresh random nonce and a thirty-second deadline.
+Only explicit `host_unverified` errors mean mismatched/unsupported evidence; other verifier errors
+return a sanitized `temporarily_unavailable`. Socket cancellation returns `authentication_failed`.
 The trusted adapter ACK must match the verified native tuple, exact token and current nonce.
+Verifier completion and ACK publication recheck the attempt deadline after commit. Heartbeats
+recheck socket and credential deadlines there too, using the validated instant for deadline renewal;
+a timer that has not fired yet cannot let a late heartbeat revive an expired slot.
 Heartbeats update liveness alone: adapters must send them every ten seconds, and thirty seconds
 without one expires the slot. Delayed callbacks check current socket ownership; due slots cannot
 block a replacement while their timer is waiting. Cancellation takes effect immediately even if
