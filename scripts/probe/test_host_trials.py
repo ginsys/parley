@@ -724,7 +724,8 @@ class StripAnsiTests(unittest.TestCase):
         collapsed = ('>You are in <probe-cwd>Doyoutrustthecontentsofthisdirectory?Workingwithuntrusted'
                      'contents...› 1. Yes, continue2.No,quitPress enter to continue')
         self.assertRegex(collapsed, CODEX_TRUST_PATTERN)
-        self.assertRegex('Do you trust the contents of this directory?', CODEX_TRUST_PATTERN)
+        self.assertNotRegex('Do you trust the contents of this directory?', CODEX_TRUST_PATTERN)
+        self.assertNotRegex(collapsed + '\n› Ask Codex to do anything', CODEX_TRUST_PATTERN)
 
 
 PTY_CHILD = '''
@@ -877,7 +878,11 @@ class FakePtyClient:
         self.keys = []
         self.typed = []
         self.closed = False
-        self.text = ('Doyoutrustthecontentsofthisdirectory?\n› Ask Codex to do anything\n'
+        self.text = ('› Ask Codex to do anything\n'
+                     'Doyoutrustthecontentsofthisdirectory?Workingwithuntrustedcontents'
+                     'comeswithhigherriskofpromptinjection.Trustingthedirectoryallows'
+                     'project-localconfig,hooks,andexecpoliciestoload.'
+                     '› 1. Yes, continue2.No,quitPress enter to continue\n'
                      if trust_prompt else '')
         FakePtyClient.launched.append(self)
 
@@ -2161,6 +2166,26 @@ class CodexDriverTests(DriverTestCase):
         client = driver.attach(THREAD_ID)
         self.assertEqual(client.keys, [b'\r'])
         self.assertEqual(driver.clients, [client])
+
+    def test_historical_trust_text_does_not_answer_the_current_composer(self):
+        for history in ('Do you trust the contents of this directory?',
+                        'Doyoutrustthecontentsofthisdirectory?',
+                        'Doyoutrustthecontentsofthisdirectory?Workingwithuntrustedcontents'
+                        '...› 1. Yes, continue2.No,quitPress enter to continue'):
+            with self.subTest(history=history):
+                self.registry = SessionRegistry()
+                FakePtyClient.launched.clear()
+
+                def pty(argv, *, cwd):
+                    client = FakePtyClient(argv, cwd=cwd)
+                    client.text = history + '\n'
+                    return client
+
+                driver = self.driver(FakeRun([(['codex', 'exec'], self.exec_output())]), pty=pty)
+                driver.create('hello')
+                client = driver.attach(THREAD_ID)
+                self.assertEqual(client.keys, [])
+                self.assertIs(driver.live_client_for(THREAD_ID), client)
 
     def test_attach_is_not_ready_when_the_composer_never_follows_the_answered_trust_dialog(self):
         # The placeholder drawn beneath the dialog must not count: only output after the Enter does.

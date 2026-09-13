@@ -1404,7 +1404,11 @@ class ClaudeDriver(Driver):
 # stripped the trust dialog reads `Doyoutrustthecontentsofthisdirectory?` (captured); both
 # patterns therefore tolerate absent whitespace.
 CODEX_READY_PATTERN = r'Ask\s*Codex\s*to\s*do\s*anything'
-CODEX_TRUST_PATTERN = re.compile(r'Do\s*you\s*trust\s*the\s*contents\s*of\s*this\s*directory')
+CODEX_TRUST_PATTERN = re.compile(
+    r'Do\s*you\s*trust\s*the\s*contents\s*of\s*this\s*directory\?\s*'
+    r'Working\s*with\s*untrusted\s*contents.*?'
+    r'›\s*1\.\s*Yes,\s*continue\s*2\.\s*No,\s*quit\s*'
+    r'Press\s*enter\s*to\s*continue\s*\Z', re.DOTALL)
 CODEX_MECHANISMS = ('queue', 'queue-then-resume')
 
 

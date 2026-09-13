@@ -431,7 +431,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   client cannot mask that loss. Exit-zero acceptance and positive rollout evidence remain valid.
   `attach()` answers the captured
   first-run trust dialog with Enter (which persists a trust entry for the probe directory in
-  `$CODEX_HOME/config.toml`), waits for the composer placeholder `› Ask Codex to do anything`
+  `$CODEX_HOME/config.toml`). Detection requires the captured question, warning and numbered
+  Yes/No choices ending in `Press enter to continue` at the output tail. A question quoted in
+  history, or an old dialog followed by a newer composer, cannot trigger Enter. It waits for
+  the composer placeholder `› Ask Codex to do anything`
   drawn after that answer plus 3 s of quiet — the placeholder is drawn while a turn or the dialog
   is still up — and raises `PtyNotReady` with the stripped screen otherwise; inside `submit()`
   queue exit-zero acceptance is retained even when resume readiness fails. The diagnostic records
