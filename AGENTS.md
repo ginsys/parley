@@ -259,6 +259,10 @@ operation receipts. Publish slot/readiness state after commit under the gate; ke
 I/O outside callbacks. Cancellation may fail closed immediately when a transaction cannot publish
 cleanup. Subsequent housekeeping removes cancelled records. View-revision overflow stops ordinary
 service. Deadline-crossing authorization cannot return a usable expired attachment.
+Recheck credential/liveness deadlines after guards and after commit before installing process state.
+Observed expiry is denial evidence, not a successful publication: remember the exact credential
+before a fallible expiry write, and persist it independently of caller cancellation. Failed storage
+must retain that denial through clock rollback; a rotated successor has a different identity.
 
 Host verification is a mandatory trusted capability and runs with the exact native tuple/token,
 outside the gate and cancelled by socket lifetime. Readiness requires a fresh nonce per explicit

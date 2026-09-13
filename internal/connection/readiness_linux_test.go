@@ -100,10 +100,20 @@ func TestHostVerifierFailClosedAndStaleCompletion(t *testing.T) {
 					socket.Close()
 					return nil
 				}
+				if kind == "mismatch" {
+					return store.HostUnverified
+				}
 				return errors.New("untrusted host diagnostic")
 			}
 			_, err = m.BeginReadiness(ctx, s)
-			if err != store.HostUnverified && err != store.AuthenticationFailed {
+			want := store.HostUnverified
+			if kind == "unavailable" {
+				want = store.TemporarilyUnavailable
+			}
+			if kind == "disconnect" {
+				want = store.AuthenticationFailed
+			}
+			if err != want {
 				t.Fatalf("host result=%v", err)
 			}
 			if err := m.RequireReady(ctx, s); err == nil {
@@ -132,7 +142,7 @@ func TestDisconnectCancelsRunningHostVerification(t *testing.T) {
 	socket.Close()
 	select {
 	case err := <-done:
-		if err != store.HostUnverified {
+		if err != store.AuthenticationFailed {
 			t.Fatalf("result=%v", err)
 		}
 	case <-time.After(time.Second):

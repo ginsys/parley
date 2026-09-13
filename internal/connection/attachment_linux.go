@@ -336,10 +336,9 @@ func (m *Manager) authenticate(ctx context.Context, tx *sql.Tx, s *Socket, a Aut
 	if s.credentialID != "" && (s.credentialID != a.credentialID || s.bindingID != b.ID || s.native != a.native) {
 		return b, c, false, store.AuthenticationFailed
 	}
-	if !m.now().Before(time.Unix(0, c.ExpiresAtNS)) {
-		_, err := tx.ExecContext(ctx, "UPDATE credentials SET status='expired' WHERE credential_id=? AND status='current'", c.ID)
+	if expired, err := m.expireCredential(ctx, tx, c); expired {
 		if err != nil {
-			return b, c, false, err
+			return b, c, true, err
 		}
 		return b, c, true, store.AuthenticationFailed
 	}
@@ -383,6 +382,14 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 		if err := m.guard(ctx, tx, b.ID); err != nil {
 			return store.TransitionResult{}, err
 		}
+		var expiryErr error
+		expired, expiryErr = m.expireCredential(ctx, tx, c)
+		if expiryErr != nil {
+			return store.TransitionResult{}, expiryErr
+		}
+		if expired {
+			return store.TransitionResult{Changed: true, Code: store.AuthenticationFailed}, nil
+		}
 		if !m.owned(s) || m.expired(s, m.now()) {
 			rejected = true
 			return store.TransitionResult{Changed: true, Code: store.AuthenticationFailed}, nil
@@ -390,6 +397,9 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 		snapshot = Snapshot{view.Epoch, b.Generation, m.active(b.ID)}
 		return store.TransitionResult{Changed: s.credentialID == "" || m.hasDueSockets()}, nil
 	}, func(store.CommitView) {
+		if !expired && !rejected && m.observeCredentialExpiry(c, m.now()) {
+			expired = true
+		}
 		if expired {
 			m.Invalidate(b.ID)
 		} else if rejected {
@@ -403,14 +413,19 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 			m.bind(s, b, c)
 		}
 	})
-	if err == nil && code != "" {
+	if expired {
+		s.cancel()
+		if persistErr := m.persistCredentialExpiry(c); persistErr != nil {
+			err = persistErr
+		}
+	}
+	if err == nil && (expired || rejected) {
+		err = store.AuthenticationFailed
+	} else if err == nil && code != "" {
 		err = code
 	}
-	if err == nil && rejected {
-		err = store.AuthenticationFailed
-	}
 	if err != nil {
-		if (rejected || err == store.AuthenticationFailed) && s != nil && s.manager == m {
+		if (expired || rejected || err == store.AuthenticationFailed) && s != nil && s.manager == m {
 			s.Close()
 		}
 		return Snapshot{}, err
@@ -445,6 +460,14 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 		if err := m.guard(ctx, tx, b.ID); err != nil {
 			return store.TransitionResult{}, err
 		}
+		var expiryErr error
+		expired, expiryErr = m.expireCredential(ctx, tx, c)
+		if expiryErr != nil {
+			return store.TransitionResult{}, expiryErr
+		}
+		if expired {
+			return store.TransitionResult{Changed: true, Code: store.AuthenticationFailed}, nil
+		}
 		if !m.owned(s) || m.expired(s, m.now()) {
 			rejected = true
 			return store.TransitionResult{Changed: true, Code: store.AuthenticationFailed}, nil
@@ -469,6 +492,9 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 		result = &Session{socket: s, token: Token{b.ID, b.PeerID, view.Epoch, c.Version, next, s.uid}}
 		return store.TransitionResult{Changed: true}, nil
 	}, func(store.CommitView) {
+		if !expired && !rejected && m.observeCredentialExpiry(c, m.now()) {
+			expired = true
+		}
 		if expired {
 			m.Invalidate(b.ID)
 		} else if rejected {
@@ -487,14 +513,19 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 			}
 		}
 	})
-	if err == nil && code != "" {
+	if expired {
+		s.cancel()
+		if persistErr := m.persistCredentialExpiry(c); persistErr != nil {
+			err = persistErr
+		}
+	}
+	if err == nil && (expired || rejected) {
+		err = store.AuthenticationFailed
+	} else if err == nil && code != "" {
 		err = code
 	}
-	if err == nil && rejected {
-		err = store.AuthenticationFailed
-	}
 	if err != nil {
-		if (rejected || err == store.AuthenticationFailed) && s != nil && s.manager == m {
+		if (expired || rejected || err == store.AuthenticationFailed) && s != nil && s.manager == m {
 			s.Close()
 		}
 		return nil, err

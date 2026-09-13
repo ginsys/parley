@@ -56,6 +56,7 @@ type Coordinator struct {
 	revision           int64
 	failed             bool
 	connectionsClaimed bool
+	credentialExpiries sync.Map
 	now                func() time.Time
 }
 
