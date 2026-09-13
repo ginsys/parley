@@ -317,6 +317,14 @@ class ClaudeParsingTests(unittest.TestCase):
                  claude_record('user', [{'type': 'text', 'text': MARKER}])]
         self.assertEqual(claude_transcript_events(lines), ([], 2))
 
+    def test_assistant_parts_require_a_captured_type(self):
+        parts = [{'text': MARKER}] + [dict(type=kind, text=MARKER)
+                                     for kind in (None, 1, [], {}, '', ' ', 'future-part')]
+        for part in parts:
+            with self.subTest(part=part):
+                self.assertEqual(claude_transcript_events([claude_record('assistant', [part])]),
+                                 ([], 1))
+
     def test_the_assistant_records_model_is_carried_and_never_inferred(self):
         # Captured at 2.1.270: `message.model` names the serving model, and it is not the one
         # `--model` asked for. Nothing else on a record supplies it, so anything but a string on

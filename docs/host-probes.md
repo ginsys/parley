@@ -300,7 +300,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   have the captured eight-hex-digit shape and full IDs the lowercase hyphenated UUID shape.
   The short ID must equal the full UUID's first eight digits, as captured; once bound, the full
   UUID cannot change under the same owned short ID. Neither malformed nor changed bindings
-  may redirect transcript reads. Malformed rows,
+  may redirect transcript reads. Assistant content parts must use the captured `text` or
+  `thinking` types; missing, malformed or unknown types make the record unusable instead of
+  silently hiding a marker and producing negative evidence. Malformed rows,
   duplicate IDs and missing PIDs fail the listing; they never prove that a session is absent or
   stopped and cannot authorize `rm` after a failed `stop`. A transcript candidate disappearing
   between discovery and stat makes that read unobservable; later polls retry discovery and a

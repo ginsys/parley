@@ -873,11 +873,11 @@ def claude_transcript_events(lines):
         elif kind == 'assistant' and isinstance(content, list):
             texts = []
             for part in content:
-                if not isinstance(part, dict):
+                if not isinstance(part, dict) or part.get('type') not in ('text', 'thinking'):
                     texts = None
                     break
                 if part.get('type') != 'text':
-                    continue  # thinking/tool parts carry no transcript text but the record stands
+                    continue  # the captured thinking part carries no transcript text
                 if not isinstance(part.get('text'), str):
                     texts = None
                     break
