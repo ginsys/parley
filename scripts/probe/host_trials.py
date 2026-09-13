@@ -1807,6 +1807,63 @@ def http_status(url):
         return error.code
 
 
+class ServerOutput:
+    """Drain the owned child's pipe, recognizing only its captured complete readiness line."""
+
+    LIMIT = 16384
+
+    def __init__(self, stream, url):
+        self.stream = stream
+        self.ready = False
+        self.failed = False
+        self.eof = False
+        self.pending = b''
+        self.discard = False
+        self.expected = f'opencode server listening on {url}'.encode()
+        self.closing = threading.Event()
+        self.thread = threading.Thread(target=self._drain, daemon=True)
+
+    def start(self):
+        os.set_blocking(self.stream.fileno(), False)
+        self.thread.start()
+
+    def _drain(self):
+        try:
+            while not self.closing.is_set():
+                readable, _, _ = select.select([self.stream], [], [], 0.1)
+                if not readable:
+                    continue
+                try:
+                    data = os.read(self.stream.fileno(), 4096)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    self.eof = True
+                    return
+                parts = data.split(b'\n')
+                for index, part in enumerate(parts):
+                    if not self.discard:
+                        self.pending += part
+                        if len(self.pending) > self.LIMIT:
+                            self.pending = b''
+                            self.discard = True
+                    if index < len(parts) - 1:
+                        if not self.discard and self.pending == self.expected:
+                            self.ready = True
+                        self.pending = b''
+                        self.discard = False
+        except (OSError, ValueError):
+            self.failed = True
+
+    def close(self):
+        self.closing.set()
+        if self.thread.ident is not None:
+            self.thread.join(timeout=2)
+            if self.thread.is_alive():
+                raise RuntimeError('opencode stdout drain did not stop')
+        self.stream.close()
+
+
 class Server:
     """A running `opencode serve` this driver started: its process group and base URL."""
 
@@ -1816,6 +1873,13 @@ class Server:
         self.process = process
         self.url = url
         self.sleep = sleep
+        self.output = None
+
+    def close_output(self):
+        if self.output is not None:
+            self.output.close()
+        elif self.process.stdout is not None:
+            self.process.stdout.close()
 
     def _group_alive(self, pgid):
         """Whether any process is still in the group, the leader reaped first if it has exited.
@@ -1854,6 +1918,7 @@ class Server:
         pgid = self.process.pid
         for signum, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
             if not self._group_alive(pgid):
+                self.close_output()
                 return
             if self.process.returncode is not None:
                 raise RuntimeError(f'opencode serve leader {pgid} was reaped; process-group '
@@ -1863,8 +1928,10 @@ class Server:
             try:
                 os.killpg(pgid, signum)
             except ProcessLookupError:
+                self.close_output()
                 return
             if self._wait_for_group(pgid, grace):
+                self.close_output()
                 return
         raise RuntimeError(f'opencode serve (process group {pgid}) survived SIGTERM and SIGKILL')
 
@@ -1881,7 +1948,8 @@ class OpenCodeDriver(Driver):
     NAMESPACE = 'opencode'
 
     def __init__(self, registry, *, run=subprocess.run, popen=subprocess.Popen, http_get=http_status,
-                 cwd, model=OPENCODE_FREE_MODEL, port=None, sleep=time.sleep):
+                 cwd, model=OPENCODE_FREE_MODEL, port=None, sleep=time.sleep,
+                 output_reader=ServerOutput):
         super().__init__(registry, cwd=cwd)
         self.run = run
         self.popen = popen
@@ -1889,6 +1957,7 @@ class OpenCodeDriver(Driver):
         self.model = model
         self.port = port
         self.sleep = sleep
+        self.output_reader = output_reader
         self.server = None
 
     def _created_session(self, stdout):
@@ -1937,7 +2006,8 @@ class OpenCodeDriver(Driver):
     def serve(self, timeout=20.0):
         """Start `opencode serve --pure --port <p>` and wait until *our* child answers.
 
-        Readiness is "GET /session answers while the child is still alive"; a port that already
+        Readiness requires the child's captured stdout listening line for this URL, followed by
+        GET /session returning 200 while the child is still alive; a port that already
         answered before the child started is refused, since the global session store means a
         stranger's server would look identical. The child gets its own session so `close()` can
         signal the whole group -- which also means a terminal Ctrl-C never reaches it, and this
@@ -1955,6 +2025,8 @@ class OpenCodeDriver(Driver):
             if self.server.process.poll() is not None:
                 raise RuntimeError(f'the held opencode serve exited {self.server.process.returncode}; '
                                    'close_servers() before serving again')
+            if self.server.output is None or not self.server.output.ready or self.server.output.failed:
+                raise RuntimeError('the held opencode serve has no verified readiness; close_servers() first')
             return self.server
         port = self.port or free_port()
         url = f'http://127.0.0.1:{port}'
@@ -1968,17 +2040,28 @@ class OpenCodeDriver(Driver):
         try:
             self.server = Server(self.popen(['opencode', 'serve', '--pure', '--port', str(port)],
                                             cwd=self.cwd, stdin=subprocess.DEVNULL,
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                             start_new_session=True), url, sleep=self.sleep)
+            self.server.output = self.output_reader(self.server.process.stdout, url)
+            self.server.output.start()
             while True:
                 if self.server.process.poll() is not None:
                     raise RuntimeError(f'opencode serve exited {self.server.process.returncode} '
                                        'before answering')
+                if self.server.output.failed or (self.server.output.eof and not self.server.output.ready):
+                    raise RuntimeError('opencode serve stdout ended or failed before verified readiness')
+                if not self.server.output.ready:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f'opencode serve readiness line absent within {timeout}s')
+                    self.sleep(0.25)
+                    continue
                 try:
                     status = self.http_get(f'{url}/session')
                     if status != 200:
                         raise RuntimeError(f'opencode serve returned HTTP {status}; '
                                            'the captured readiness response is 200')
+                    if self.server.process.poll() is not None:
+                        raise RuntimeError('opencode serve exited during readiness verification')
                     break
                 except (urllib.error.URLError, TimeoutError):
                     if time.monotonic() >= deadline:

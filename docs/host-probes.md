@@ -404,8 +404,14 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `submit()` needs `serve()` open: `opencode serve --pure --port <p>`
   on a free loopback port chosen per call, refused if the port already answered (the session
   store is global, so a stranger's server would look identical). Any HTTP response, including
-  4xx/5xx, proves a listener exists and prevents spawning. Our child is ready only once
-  `GET /session` returns the captured 200 while it is still alive; other statuses fail startup.
+  4xx/5xx, proves a listener exists and prevents spawning. Our child must first emit the captured
+  complete stdout line `opencode server listening on http://127.0.0.1:<p>` for its own URL;
+  only then can `GET /session` returning the captured 200 while it is still alive prove readiness.
+  This prevents a listener racing the preflight check from standing in for a child that failed
+  to bind. Other statuses fail startup. The owned stdout pipe is continuously drained with a
+  bounded 16 KiB partial-line buffer, including after readiness; oversized lines are discarded.
+  A failed drain or EOF without that line fails startup. Pipe/thread setup is inside the held
+  child's cleanup boundary, and successful process-group cleanup also closes its reader.
   Read timeouts after spawning retry within the startup deadline. A preflight read timeout
   remains a refusal: it cannot prove that the port is free of another listener.
   The password variable is uncaptured, so the server is

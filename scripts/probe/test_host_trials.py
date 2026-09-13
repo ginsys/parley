@@ -5,6 +5,7 @@ PTY client is exercised against controlled Python children (the pattern `test_wa
 uses). Every host-facing shape in the fixtures mirrors a capture in docs/host-probe-preflight.md.
 """
 
+import io
 import json
 import os
 import re
@@ -1833,6 +1834,80 @@ class CrossDriverNamespaceTests(DriverTestCase):
                 method()
 
 
+class ServerOutputTests(unittest.TestCase):
+    URL = 'http://127.0.0.1:4096'
+
+    def reader(self):
+        read_fd, write_fd = os.pipe()
+        reader = host_trials.ServerOutput(os.fdopen(read_fd, 'rb'), self.URL)
+        self.addCleanup(reader.close)
+        writer = os.fdopen(write_fd, 'wb', buffering=0)
+        self.addCleanup(writer.close)
+        return reader, writer
+
+    def test_split_readiness_and_large_output_are_drained_with_bounded_storage(self):
+        reader, writer = self.reader()
+        reader.start()
+        writer.write(b'Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.\n')
+        writer.write(b'opencode server listen')
+        writer.write(f'ing on {self.URL}\n'.encode())
+        writer.write(b'x' * (reader.LIMIT * 20))
+        writer.close()
+        reader.thread.join(timeout=2)
+        self.assertFalse(reader.thread.is_alive())
+        self.assertTrue(reader.ready)
+        self.assertTrue(reader.eof)
+        self.assertFalse(reader.failed)
+        self.assertLessEqual(len(reader.pending), reader.LIMIT)
+
+    def test_wrong_url_unterminated_and_embedded_lines_do_not_prove_readiness(self):
+        for data in (b'opencode server listening on http://127.0.0.1:4097\n',
+                     f'opencode server listening on {self.URL}'.encode(),
+                     f'prefix opencode server listening on {self.URL}\n'.encode(),
+                     b'x' * host_trials.ServerOutput.LIMIT +
+                     f'opencode server listening on {self.URL}\n'.encode()):
+            with self.subTest(data_length=len(data)):
+                reader, writer = self.reader()
+                reader.start()
+                writer.write(data)
+                writer.close()
+                reader.thread.join(timeout=2)
+                self.assertTrue(reader.eof)
+                self.assertFalse(reader.ready)
+
+    def test_select_failure_marks_reader_failed(self):
+        reader, _ = self.reader()
+        with unittest.mock.patch('select.select', side_effect=OSError('synthetic')):
+            reader.start()
+            reader.thread.join(timeout=2)
+        self.assertTrue(reader.failed)
+        self.assertFalse(reader.ready)
+
+    def test_close_after_thread_start_failure_closes_owned_pipe(self):
+        reader, _ = self.reader()
+        with unittest.mock.patch.object(reader.thread, 'start', side_effect=RuntimeError('synthetic')):
+            with self.assertRaises(RuntimeError):
+                reader.start()
+        reader.close()
+        self.assertTrue(reader.stream.closed)
+
+
+class FakeServerOutput:
+    def __init__(self, stream, url):
+        self.stream = stream
+        self.expected = f'opencode server listening on {url}\n'.encode()
+        self.ready = False
+        self.failed = False
+        self.eof = False
+
+    def start(self):
+        self.ready = self.expected in self.stream.readlines()
+        self.eof = True
+
+    def close(self):
+        self.stream.close()
+
+
 class FakePopen:
     def __init__(self, argv, **kwargs):
         self.argv = argv
@@ -1840,6 +1915,8 @@ class FakePopen:
         self.pid = 4321
         self.returncode = None
         self.signals = []
+        port = argv[argv.index('--port') + 1]
+        self.stdout = io.BytesIO(f'opencode server listening on http://127.0.0.1:{port}\n'.encode())
 
     def poll(self):
         return self.returncode
@@ -1851,6 +1928,27 @@ class FakePopen:
 
 
 class OpenCodeDriverTests(DriverTestCase):
+    def test_foreign_http_after_spawn_cannot_replace_child_readiness(self):
+        def popen(argv, **kwargs):
+            process = self.popen(argv, **kwargs)
+            process.stdout = io.BytesIO(b'bind failed\n')
+            return process
+
+        driver = self.driver(FakeRun([]), popen=popen, port=4096)
+        with self.assertRaisesRegex(RuntimeError, 'readiness'):
+            driver.serve(timeout=0)
+        self.assertIsNone(driver.server)
+        self.assertEqual(len(self.gets), 1)  # only the pre-spawn listener check
+        self.assertTrue(self.servers[0].stdout.closed)
+
+    def test_reader_start_failure_closes_child_and_pipe(self):
+        driver = self.driver(FakeRun([]), port=4096)
+        with unittest.mock.patch.object(FakeServerOutput, 'start', side_effect=RuntimeError('synthetic')):
+            with self.assertRaisesRegex(RuntimeError, 'synthetic'):
+                driver.serve()
+        self.assertIsNone(driver.server)
+        self.assertTrue(self.servers[0].stdout.closed)
+
     def test_malformed_creation_stream_is_never_successful(self):
         for suffix in ('{"type":', '[1]', 'null', '"text"'):
             with self.subTest(suffix=suffix):
@@ -1890,6 +1988,7 @@ class OpenCodeDriverTests(DriverTestCase):
         kwargs.setdefault('popen', self.popen)
         kwargs.setdefault('http_get', self.http_get)
         kwargs.setdefault('sleep', lambda seconds: None)
+        kwargs.setdefault('output_reader', FakeServerOutput)
         return OpenCodeDriver(self.registry, run=run, cwd=self.cwd, **kwargs)
 
     def setUp(self):
@@ -1897,6 +1996,8 @@ class OpenCodeDriverTests(DriverTestCase):
         self.servers = []
         self.answering = False  # whether GET /session answers before our child starts
         self.gets = []
+        # Even unexpected fixture failures must never signal a real PID.
+        self.patch_killpg()
 
     def popen(self, argv, **kwargs):
         process = FakePopen(argv, **kwargs)
@@ -2026,7 +2127,8 @@ class OpenCodeDriverTests(DriverTestCase):
         remaining = {}  # pid -> group members left, once a signal has been through
 
         def killpg(pid, signum):
-            spawned = any(process.pid == pid for process in self.servers)
+            spawned = any(process.pid == pid and (process.returncode is None or survivors)
+                          for process in self.servers)
             if not spawned or remaining.get(pid, 1 + survivors) == 0:
                 raise ProcessLookupError(pid)
             if signum == 0:
