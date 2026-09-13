@@ -854,6 +854,11 @@ class ClaudeDriverTests(DriverTestCase):
         # captured Codex probe directory actually was.
         self.git('init', '--quiet', self.cwd)
         self.driver(FakeRun([]))  # does not raise
+        self.driver(FakeRun([]))  # validation never changes the shared probe directory
+
+    def test_fresh_git_can_use_a_non_default_initial_branch(self):
+        self.git('init', '--quiet', '--initial-branch=probe/initial', self.cwd)
+        self.driver(FakeRun([]))
 
     def test_a_git_directory_carrying_history_is_refused(self):
         # An existing repository whose worktree files were deleted looks empty apart from `.git`,
@@ -885,6 +890,22 @@ class ClaudeDriverTests(DriverTestCase):
             handle.write('#!/bin/sh\nexit 0\n')
         with self.assertRaises(ValueError):
             self.driver(FakeRun([]))
+
+    def test_other_git_metadata_must_match_a_fresh_initialization(self):
+        for name, content in (('info/attributes', '* synthetic-attribute\n'),
+                              ('HEAD', 'ref: refs/tags/other\n'),
+                              ('HEAD', 'ref: refs/heads/../other\n'),
+                              ('unexpected', 'uncontrolled metadata\n'),
+                              ('description', 'uncontrolled instructions\n'),
+                              ('info/exclude', 'uncontrolled-pattern\n'),
+                              ('hooks/pre-commit.sample', 'uncontrolled sample\n')):
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as cwd:
+                    self.git('init', '--quiet', cwd)
+                    with open(os.path.join(cwd, '.git', name), 'w') as handle:
+                        handle.write(content)
+                    with self.assertRaises(ValueError):
+                        self.driver(FakeRun([]), cwd=cwd)
 
     def test_a_git_file_pointing_at_another_store_is_refused(self):
         # A linked worktree or a submodule: the store, and everything in it, lives elsewhere.

@@ -53,7 +53,9 @@ import re
 import select
 import signal
 import socket
+import stat
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -594,6 +596,9 @@ def unfresh_git_reason(path):
             if os.path.islink(candidate):
                 return (f'`{os.path.relpath(candidate, path)}` is a symlink: `git init` leaves '
                         f'none, and reading through it would leave the probe directory')
+            if not (stat.S_ISDIR(os.lstat(candidate).st_mode) or
+                    stat.S_ISREG(os.lstat(candidate).st_mode)):
+                return f'`{os.path.relpath(candidate, path)}` is not a regular file or directory'
     for root, _directories, files in os.walk(os.path.join(git, 'refs')):
         if files:
             return f'`{os.path.join(root, sorted(files)[0])}` exists'
@@ -619,6 +624,50 @@ def unfresh_git_reason(path):
             return f'`.git/objects/{entry}` exists'
         if os.listdir(os.path.join(objects, entry)):
             return f'`.git/objects/{entry}` is not empty'
+    return git_baseline_difference(git)
+
+
+def git_baseline_difference(git):
+    """Compare the entire store to neutral installed Git output without initializing the cwd.
+
+    Config has already passed the narrow semantic check above. HEAD supplies only the initial
+    branch name; Git validates it while creating a separate disposable baseline. Everything
+    else, including templates, must match that baseline exactly.
+    """
+    try:
+        with open(os.path.join(git, 'HEAD'), encoding='ascii') as handle:
+            head = handle.read(4096)
+        match = re.fullmatch(r'ref: refs/heads/([^\n\r]+)\n', head)
+        if match is None:
+            return '`.git/HEAD` is not an initial branch reference'
+        env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                   GIT_CONFIG_NOSYSTEM='1')
+        with tempfile.TemporaryDirectory(prefix='parley-git-baseline-') as baseline:
+            subprocess.run(['git', 'init', '--quiet', '--initial-branch=' + match[1], baseline],
+                           env=env, check=True, capture_output=True, timeout=10)
+            expected = os.path.join(baseline, '.git')
+
+            def catalog(root):
+                return {os.path.relpath(os.path.join(directory, name), root): kind
+                        for directory, directories, files in os.walk(root)
+                        for names, kind in ((directories, 'directory'), (files, 'file'))
+                        for name in names}
+
+            actual_catalog = catalog(git)
+            if actual_catalog != catalog(expected):
+                return '`.git` paths differ from a fresh initialization'
+            for name, kind in actual_catalog.items():
+                if kind != 'file' or name == 'config':
+                    continue
+                actual_file, expected_file = os.path.join(git, name), os.path.join(expected, name)
+                if os.path.getsize(actual_file) != os.path.getsize(expected_file):
+                    return f'`.git/{name}` differs from a fresh initialization'
+                with open(actual_file, 'rb') as actual, open(expected_file, 'rb') as reference:
+                    if actual.read() != reference.read():
+                        return f'`.git/{name}` differs from a fresh initialization'
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError):
+        return '`.git` could not be compared with a neutral fresh initialization'
     return None
 
 

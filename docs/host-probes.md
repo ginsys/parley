@@ -215,9 +215,15 @@ a directory whose emptiness is the whole precondition. Hooks must be regular `.s
 active hooks are refused. Configuration must contain only the fresh Linux `[core]` baseline:
 `repositoryformatversion = 0`, boolean `filemode`, `bare = false`, and `logallrefupdates = true`,
 each once. Includes, extra sections or keys and modified values are refused. A fixture runs real
-`git init` to check that this baseline still matches the installed Git. Drivers validate the same
-directory independently; they do not initialize it themselves. This keeps repeated driver
-construction compatible without trusting repository settings that could execute commands.
+`git init` to check that this baseline still matches the installed Git. Validation also creates
+a separate temporary baseline with installed Git, ignoring inherited Git environment settings
+and global/system configuration. HEAD must name an initial branch accepted by Git; every other
+path, file type and file's contents (apart from the separately checked config) must match that
+baseline. Extra attributes, modified templates and unknown metadata are refused. This requires
+Git to be available; initialization failure or its ten-second timeout refuses the directory.
+Drivers validate the same directory independently without initializing or changing it. The
+temporary baseline is removed on exit. This keeps repeated driver construction compatible
+without trusting repository settings that could execute commands.
 
 Cleanup is part of the module, not left to a caller: `run_trial_with_cleanup()` is the entry
 point real trials use. It runs `run_trial()` and, on every exit path, `sweep()`s the driver:
