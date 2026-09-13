@@ -805,3 +805,69 @@ func TestIngestionEvidenceFailuresRemainRetryable(t *testing.T) {
 		}
 	}
 }
+
+func TestInitializeChecksBarrierBeforeOrigin(t *testing.T) {
+	m, _, recipient, ingestor, request, _ := readyIngestion(t)
+	ctx := context.Background()
+	_, err := m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		_, err := tx.ExecContext(ctx, "INSERT INTO ingestion_barriers(binding_id,barrier_version,status,paused_cursor) VALUES(?,1,'held',?)", recipient.token.BindingID, request.Event.Before)
+		return store.TransitionResult{Changed: true}, err
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	ingestor.config.Origin = func(context.Context, NativeTuple, Token, string, string) error { calls++; return nil }
+	if err := ingestor.Initialize(ctx, recipient, request.Event.SourceID, request.Event.Before); err != store.SecurityHold {
+		t.Fatalf("held initialize=%v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("held initialization called origin %d times", calls)
+	}
+}
+
+func TestIngestionRetainsVerifiedFork(t *testing.T) {
+	m, _, recipient, ingestor, request, _ := readyIngestion(t)
+	ctx := context.Background()
+	// First retain an edge before its predecessor has arrived.
+	request.Event.Before = "future"
+	request.Event.After = "left"
+	if result, err := ingestor.Ingest(ctx, recipient, request); err != nil || result.Classification != "pending" {
+		t.Fatalf("first edge=%+v %v", result, err)
+	}
+	// Advance to that predecessor using another verified ordinary event.
+	predecessor := request
+	predecessor.Event.ID = "predecessor"
+	predecessor.Event.Before, predecessor.Event.After = "start", "future"
+	predecessor.Text = "ordinary native output"
+	if result, err := ingestor.Ingest(ctx, recipient, predecessor); err != nil || result.Classification != "no_marker" {
+		t.Fatalf("predecessor=%+v %v", result, err)
+	}
+	fork := request
+	fork.Event.ID, fork.Event.After = "fork", "right"
+	for n := 0; n < 2; n++ {
+		result, err := ingestor.Ingest(ctx, recipient, fork)
+		if err != nil || result.Classification != "pending" || result.Code != store.EventConflict {
+			t.Errorf("fork=%+v %v", result, err)
+		}
+	}
+	if err := m.store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM ingestion_evidence WHERE classification='pending' AND cursor_before='future'").Scan(&count); err != nil {
+			return err
+		}
+		if count != 2 {
+			t.Errorf("lost verified fork: pending edges=%d", count)
+		}
+		var cursor string
+		if err := tx.QueryRowContext(ctx, "SELECT cursor FROM ingestion_cursors WHERE binding_id=?", recipient.token.BindingID).Scan(&cursor); err != nil {
+			return err
+		}
+		if cursor != "future" {
+			t.Errorf("fork advanced cursor=%q", cursor)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -468,3 +468,25 @@ func TestIncidentIdentityFailureRetainsRollbackForSupervisedRetry(t *testing.T) 
 		t.Fatalf("lost detection=%+v %v", markers, err)
 	}
 }
+
+func TestFailedRecoveryConstructionKeepsCoordinatorClosed(t *testing.T) {
+	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "failed-init.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	service, err := New(ctx, Config{Store: db, Markers: markerDirectory(t), Now: func() time.Time { return time.Unix(110, 0) }, FailStop: func() {}})
+	if err == nil || service != nil {
+		t.Fatalf("cancelled construction=%v %v", service, err)
+	}
+	called := false
+	_, err = db.Coordinator().Transition(context.Background(), func(context.Context, *sql.Tx, store.CommitView) (store.TransitionResult, error) {
+		called = true
+		return store.TransitionResult{}, nil
+	}, nil)
+	if err != store.RecoveryRequired || called {
+		t.Fatalf("failed initialization admitted work: %v called=%v", err, called)
+	}
+}

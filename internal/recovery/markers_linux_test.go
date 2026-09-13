@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -218,5 +219,62 @@ func TestPendingPromotionFailureInvokesSupervisorFailStop(t *testing.T) {
 	}
 	if stopped == 0 {
 		t.Fatal("promotion publication failure did not fail-stop")
+	}
+}
+
+func TestSameMarkerPartialTimes(t *testing.T) {
+	for _, field := range []string{"floor", "observed"} {
+		t.Run(field, func(t *testing.T) {
+			a, b := testMarker(), testMarker()
+			x, y := int64(1), int64(1)
+			if field == "floor" {
+				a.Floor, b.Floor = &x, &y
+			} else {
+				a.Observed, b.Observed = &x, &y
+			}
+			if !sameMarker(a, b) {
+				t.Fatal("equal partial times differ")
+			}
+			y = 2
+			if sameMarker(a, b) {
+				t.Fatal("unequal partial times compare equal")
+			}
+		})
+	}
+}
+
+func TestListEnumeratesBeforePromoting(t *testing.T) {
+	d := markerDirectory(t)
+	a, b := testMarker(), testMarker()
+	b.IncidentID = "60000000-0000-4000-8000-000000000002"
+	pending := ".pending-80000000-0000-4000-8000-000000000001"
+	data, err := a.encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d.path, pending), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	d.readNames = func(*os.File, int) ([]string, error) {
+		calls++
+		if calls == 1 {
+			return []string{pending}, nil
+		}
+		if calls == 2 {
+			// A directory mutation during enumeration may make readdir skip B.
+			if _, err := os.Stat(filepath.Join(d.path, pending)); errors.Is(err, os.ErrNotExist) {
+				return nil, io.EOF
+			}
+			return []string{b.IncidentID}, nil
+		}
+		return nil, io.EOF
+	}
+	markers, err := d.List(context.Background())
+	if err != nil || len(markers) != 2 {
+		t.Fatalf("lost marker during promotion: %+v %v", markers, err)
 	}
 }

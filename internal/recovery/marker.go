@@ -49,7 +49,10 @@ func sameMarker(a, b Marker) bool {
 	if (a.Floor == nil) != (b.Floor == nil) || (a.Observed == nil) != (b.Observed == nil) {
 		return false
 	}
-	return a.Floor == nil || (*a.Floor == *b.Floor && *a.Observed == *b.Observed)
+	if a.Floor != nil && *a.Floor != *b.Floor {
+		return false
+	}
+	return a.Observed == nil || *a.Observed == *b.Observed
 }
 
 // Markers is trusted external storage, independent of the restored database.
