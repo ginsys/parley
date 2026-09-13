@@ -1613,9 +1613,10 @@ OPENCODE_FREE_MODEL = 'opencode/ling-3.0-flash-fin-free'  # captured: cost 0, no
 
 
 def opencode_session_ids(stdout):
-    """Every distinct session ID in stream order, plus the first error event."""
+    """Every distinct session ID, the first error event, and malformed-line count."""
     session_ids = {}
     error = None
+    unusable = 0
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -1623,14 +1624,16 @@ def opencode_session_ids(stdout):
         try:
             event = json.loads(line)
         except ValueError:
+            unusable += 1
             continue
         if not isinstance(event, dict):
+            unusable += 1
             continue
         if isinstance(event.get('sessionID'), str) and event['sessionID']:
             session_ids[event['sessionID']] = None
         if error is None and event.get('type') == 'error':
             error = json.dumps(event.get('error'))
-    return session_ids, error
+    return session_ids, error, unusable
 
 
 def opencode_export_events(raw):
@@ -1809,7 +1812,7 @@ class OpenCodeDriver(Driver):
         self.server = None
 
     def _created_session(self, stdout):
-        session_ids, error = opencode_session_ids(stdout)
+        session_ids, error, unusable = opencode_session_ids(stdout)
         if len(session_ids) > 1:
             self.strays.update(session_ids)
             raise RuntimeError(f'ambiguous OpenCode creation IDs {list(session_ids)!r}; '
@@ -1817,13 +1820,17 @@ class OpenCodeDriver(Driver):
         session_id = next(iter(session_ids), None)
         if session_id:
             self.mint(session_id)
+        if unusable:
+            raise RuntimeError('opencode creation stream contains malformed event lines')
         return session_id, error
 
     def create(self, prompt):
         """`opencode run --pure --format json --dir <cwd> --title <t> -m <model> '<prompt>'`.
 
-        The first `sessionID` on any event is minted before anything else is checked: a failing
-        turn (captured: an `error` event for a stale credential) still creates the session.
+        One consistent `sessionID` is minted before turn errors are checked: a failing turn
+        (captured: an `error` event for a stale credential) still creates the session. Multiple
+        IDs grant no ownership; malformed lines fail creation after retaining any unique ID
+        for cleanup.
         Whether an error event or a nonzero exit takes precedence is uncaptured; both raise. A
         Ctrl-C mid-command loses the output: the session, if any, is then only findable by a
         human as the newest `parley-probe-*` row of the global `opencode --pure session list`,
@@ -1921,11 +1928,14 @@ class OpenCodeDriver(Driver):
         It may name a pre-existing human session. Only a human can investigate it; recording
         the id must never grant submit, observe or teardown authority.
         """
-        session_ids, error = opencode_session_ids(stdout)
+        session_ids, error, unusable = opencode_session_ids(stdout)
         unexpected = set(session_ids) - {session_id}
         self.strays.update(unexpected)
         if unexpected:
             raise SubmissionUncaptured(f'run --attach named unexpected sessions {sorted(unexpected)!r}; '
+                                       'where the marker landed is uncaptured')
+        if unusable:
+            raise SubmissionUncaptured('run --attach contains malformed event lines; '
                                        'where the marker landed is uncaptured')
         return next(iter(session_ids), None), error
 

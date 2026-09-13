@@ -370,11 +370,15 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   has disagreed with a rollout on the same day.
 - **OpenCode** (`OpenCodeDriver`). `create()` runs `opencode run --pure --format json --dir
   <probe cwd> --title <t> -m opencode/ling-3.0-flash-fin-free '<prompt>'` (the captured
-  zero-cost model; the default one failed on a stale credential) and mints the first `sessionID`
-  seen on the events before checking for an `error` event or a nonzero exit — a failing turn
+  zero-cost model; the default one failed on a stale credential) and mints a unique `sessionID`
+  from the events before checking for an `error` event or a nonzero exit — a failing turn
   still creates the session. Creation requires one consistent ID throughout the stream. Multiple
   distinct IDs, including in timeout output, grant no ownership: all candidates are reported by
-  cleanup for manual investigation. `submit()` needs `serve()` open: `opencode serve --pure --port <p>`
+  cleanup for manual investigation. Nonempty malformed JSON or non-object event lines fail
+  creation and make attach submission `SubmissionUncaptured`, regardless of exit status or
+  timeout; a matching ID elsewhere cannot make an unreadable stream trustworthy. A unique
+  creation ID remains available for cleanup after malformed output fails the command.
+  `submit()` needs `serve()` open: `opencode serve --pure --port <p>`
   on a free loopback port chosen per call, refused if the port already answered (the session
   store is global, so a stranger's server would look identical). Any HTTP response, including
   4xx/5xx, proves a listener exists and prevents spawning. Our child is ready only once

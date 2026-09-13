@@ -522,11 +522,12 @@ class OpenCodeParsingTests(unittest.TestCase):
                             json.dumps({'type': 'error', 'sessionID': 'ses_1',
                                         'error': {'name': 'ProviderAuthError'}}),
                             'not json', json.dumps([1])])
-        session_ids, error = opencode_session_ids(stdout)
+        session_ids, error, unusable = opencode_session_ids(stdout)
         self.assertEqual(list(session_ids), ['ses_1'])
         self.assertIn('ProviderAuthError', error)
-        self.assertEqual(opencode_session_ids(''), ({}, None))
-        self.assertEqual(opencode_session_ids(json.dumps({'type': 'text', 'sessionID': ''})), ({}, None))
+        self.assertEqual(unusable, 2)
+        self.assertEqual(opencode_session_ids(''), ({}, None, 0))
+        self.assertEqual(opencode_session_ids(json.dumps({'type': 'text', 'sessionID': ''})), ({}, None, 0))
 
     def test_export_extracts_text_parts_with_millisecond_creation_times(self):
         raw = opencode_export([
@@ -1679,6 +1680,41 @@ class FakePopen:
 
 
 class OpenCodeDriverTests(DriverTestCase):
+    def test_malformed_creation_stream_is_never_successful(self):
+        for suffix in ('{"type":', '[1]', 'null', '"text"'):
+            with self.subTest(suffix=suffix):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['opencode', 'run'],
+                                FakeResult(0, self.run_output().stdout + '\n' + suffix))])
+                driver = self.driver(run)
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.create('hello')
+                # The one proven creation ID remains available for cleanup after failure.
+                self.assertEqual(driver.owned(), {'ses_1'})
+
+    def test_malformed_attach_stream_is_uncaptured_even_with_a_matching_id(self):
+        for suffix in ('{"type":', '[1]', 'null', '"text"'):
+            for returncode in (0, 1, 'timeout'):
+                with self.subTest(suffix=suffix, returncode=returncode):
+                    self.registry = SessionRegistry()
+                    self.servers = []
+                    self.answering = False
+                    output = self.run_output().stdout + '\n' + suffix
+
+                    def attach(argv):
+                        if returncode == 'timeout':
+                            raise subprocess.TimeoutExpired(argv, 60, output=output)
+                        return FakeResult(returncode, output)
+
+                    run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'],
+                                    self.run_output()),
+                                   (['opencode', 'run', '--pure', '--format', 'json', '--attach'], attach)])
+                    driver = self.driver(run, port=4096)
+                    driver.create('hello')
+                    driver.serve()
+                    with self.assertRaisesRegex(SubmissionUncaptured, 'malformed'):
+                        driver.submit('ses_1', 'msg')
+
     def driver(self, run, **kwargs):
         kwargs.setdefault('popen', self.popen)
         kwargs.setdefault('http_get', self.http_get)
