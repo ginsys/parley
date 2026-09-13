@@ -3240,6 +3240,28 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(any(run.observable[name] for name in ('visible', 'turn_start', 'ack')))
         self.assertFalse(run.turn_end_observable)
 
+    def test_interrupted_poll_finalization_rechecks_clock_drift(self):
+        for location in ('sleep', 'observe'):
+            for step in (60.0, -60.0):
+                with self.subTest(location=location, step=step):
+                    clock = FakeClock()
+                    driver = FakeDriver(clock=clock, observations=[Observation(
+                        outcomes={'visible': 1001}, model='synthetic-model')])
+
+                    def interrupt(*args):
+                        clock.wall += step
+                        raise KeyboardInterrupt
+
+                    if location == 'observe':
+                        driver.on_observe = interrupt
+                    run = run_trial(driver, prompt='hi', marker=MARKER, clock=clock.time,
+                                    monotonic=clock.monotonic, sleep=interrupt)
+                    self.assertTrue(run.interrupted)
+                    self.assertAlmostEqual(run.clock_step, step)
+                    self.assertEqual(run.outcomes, {})
+                    self.assertIsNone(run.model)
+                    self.assertFalse(any(run.observable.values()))
+
     def test_a_clock_correction_also_discards_the_attributed_model(self):
         for step in (60.0, -60.0):
             with self.subTest(step=step):

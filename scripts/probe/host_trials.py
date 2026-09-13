@@ -2574,6 +2574,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
             sleep(min(poll_interval, remaining))
     except KeyboardInterrupt:
         interrupted = True
+        clock_step = clock_drift()
     if accepted_at is not None:
         outcomes['accepted'] = accepted_at
         signals['accepted'] = SIGNAL_SUBMIT_EXIT_STATUS

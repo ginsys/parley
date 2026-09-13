@@ -652,6 +652,8 @@ the wall-clock read with monotonic reads. Those brackets bound the possible elap
 difference, so descheduling between reads widens uncertainty instead of declaring a clock step.
 The same bracketed check runs before returning a submission rejection, which skips polling;
 a clock correction during the rejected command cannot turn elapsed wall time into a result.
+Interrupted polling rechecks drift before retaining partial evidence too; a correction during
+the interrupted sleep or observation invalidates timestamps and model attribution.
 The trial ends only when that entire interval diverges past one second — far above the 500 ppm NTP
 slew ceiling, which is 0.45 s across the whole 900 s busy cap, and far below the smallest 10 s
 window: every outcome `unobservable`, every outcome timestamp and the serving model dropped
