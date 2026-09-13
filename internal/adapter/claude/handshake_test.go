@@ -3,6 +3,7 @@ package claude_test
 import (
 	"context"
 	"errors"
+	bridgefixture "github.com/ginsys/parley/internal/testfixture/bridge"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -105,7 +106,7 @@ func TestDelayedReadinessKeepsQueued(t *testing.T) {
 	grantOne(t, ctrl, "conv-readiness")
 
 	transport := &fakeTransport{}
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 	ctx := context.Background()
 
 	e, err := bridge.Send(ctx, "conv-readiness", "codex-thread-b", "claude-session-a", "hello", nil)
@@ -121,7 +122,7 @@ func TestDelayedReadinessKeepsQueued(t *testing.T) {
 	if err := hs.Start(); err != nil {
 		t.Fatalf("start handshake: %v", err)
 	}
-	poller := adapterclaude.NewPoller(db, bridge, hs, "conv-readiness", "claude-session-a")
+	poller := adapterclaude.NewPoller(db, bridge.AuthenticatedBridge, hs, "conv-readiness", "claude-session-a")
 
 	// Not yet acked: Tick must not dispatch anything.
 	ids, err := poller.Tick(ctx)
@@ -168,7 +169,7 @@ func TestHandshakeTimeoutRetriesOnlyHandshake(t *testing.T) {
 	grantOne(t, ctrl, "conv-timeout")
 
 	transport := &fakeTransport{}
-	bridge := dispatch.New(db, transport)
+	bridge := bridgefixture.New(t, db, transport)
 	ctx := context.Background()
 
 	e, err := bridge.Send(ctx, "conv-timeout", "codex-thread-b", "claude-session-a", "queued during wait", nil)
@@ -198,7 +199,7 @@ func TestHandshakeTimeoutRetriesOnlyHandshake(t *testing.T) {
 	if hs.Ready() {
 		t.Fatalf("handshake must not be ready without a matching ack")
 	}
-	poller := adapterclaude.NewPoller(db, bridge, hs, "conv-timeout", "claude-session-a")
+	poller := adapterclaude.NewPoller(db, bridge.AuthenticatedBridge, hs, "conv-timeout", "claude-session-a")
 	ids, err := poller.Tick(ctx)
 	if err != nil {
 		t.Fatalf("tick during retries: %v", err)
@@ -334,8 +335,8 @@ func TestPollerStopsMidBatchWhenReadinessRevoked(t *testing.T) {
 			hs.Stop() // simulate a reconnect revoking readiness mid-batch
 		}
 	}
-	b := dispatch.New(db, transport)
-	poller := adapterclaude.NewPoller(db, b, hs, "conv-mid-batch", "claude-session-a")
+	b := bridgefixture.New(t, db, transport)
+	poller := adapterclaude.NewPoller(db, b.AuthenticatedBridge, hs, "conv-mid-batch", "claude-session-a")
 
 	attempted, err := poller.Tick(ctx)
 	if err != nil {
@@ -396,8 +397,8 @@ func TestPollerStopsMidBatchWhenGenerationChangesDespiteReady(t *testing.T) {
 			t.Fatalf("ack on the new connection must succeed")
 		}
 	}
-	b := dispatch.New(db, transport)
-	poller := adapterclaude.NewPoller(db, b, hs, "conv-mid-batch-gen", "claude-session-a")
+	b := bridgefixture.New(t, db, transport)
+	poller := adapterclaude.NewPoller(db, b.AuthenticatedBridge, hs, "conv-mid-batch-gen", "claude-session-a")
 
 	attempted, err := poller.Tick(ctx)
 	if err != nil {
@@ -459,8 +460,8 @@ func TestPollerStopsBatchOnBudgetExhaustion(t *testing.T) {
 	}
 
 	transport := &fakeTransport{}
-	b := dispatch.New(db, transport)
-	poller := adapterclaude.NewPoller(db, b, hs, conversation, "claude-session-a")
+	b := bridgefixture.New(t, db, transport)
+	poller := adapterclaude.NewPoller(db, b.AuthenticatedBridge, hs, conversation, "claude-session-a")
 
 	// Exhaustion is a candidate outcome, never a host attempt.
 	attempted, err := poller.Tick(ctx)
@@ -478,9 +479,9 @@ func TestPollerStopsBatchOnBudgetExhaustion(t *testing.T) {
 	}
 }
 
-func bridge(t *testing.T, db *store.DB) *dispatch.Bridge {
+func bridge(t *testing.T, db *store.DB) *bridgefixture.Fixture {
 	t.Helper()
-	return dispatch.New(db, &fakeTransport{})
+	return bridgefixture.New(t, db, &fakeTransport{})
 }
 
 // transportFunc adapts a plain function to dispatch.Transport, for tests
@@ -535,8 +536,8 @@ func TestPollerCancelsInFlightDispatchWhenGenerationInvalidatedMidDelivery(t *te
 		}
 		return dctx.Err()
 	})
-	b := dispatch.New(db, transport)
-	poller := adapterclaude.NewPoller(db, b, hs, "conv-cancel-mid-delivery", "claude-session-a")
+	b := bridgefixture.New(t, db, transport)
+	poller := adapterclaude.NewPoller(db, b.AuthenticatedBridge, hs, "conv-cancel-mid-delivery", "claude-session-a")
 
 	done := make(chan struct{})
 	go func() {

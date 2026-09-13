@@ -14,7 +14,7 @@ const holdIncident = "60000000-0000-4000-8000-000000000001"
 const holdPrincipal = "70000000-0000-4000-8000-000000000001"
 const holdOperation = "80000000-0000-4000-8000-000000000001"
 
-func attributeWork(t *testing.T, db *store.DB, e *store.Envelope) {
+func attributeWork(t *testing.T, db *store.DB, e *store.Envelope) string {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := db.Begin(ctx)
@@ -22,17 +22,19 @@ func attributeWork(t *testing.T, db *store.DB, e *store.Envelope) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	b := store.BindingRecord{ID: holdBinding, PeerID: e.FromPeer, HostKind: "codex_cli", NamespaceID: "synthetic", SessionID: "native", ConnectorUID: 1000, Status: "enabled", Version: 1}
-	c := store.CredentialRecord{BindingID: b.ID, ID: "40000000-0000-4000-8000-000000000001", Version: 1, Status: "current", ExpiresAtNS: time.Now().Add(time.Hour).UnixNano()}
-	if err := store.InsertBindingCredential(ctx, tx, b, c); err != nil {
+	// setupSettlement now creates authenticated provenance itself. Verify the
+	// exact author instead of constructing a duplicate synthetic binding.
+	var binding string
+	if err := tx.QueryRowContext(ctx, "SELECT binding_id FROM work_provenance WHERE work_id=?", e.ID).Scan(&binding); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordAuthenticatedEnvelope(ctx, tx, e.ID, b.ID, 1); err != nil {
-		t.Fatal(err)
+	if binding == "" {
+		t.Fatal("missing authenticated author")
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
+	return binding
 }
 func revokeWork(t *testing.T, db *store.DB, e *store.Envelope, cancelWork bool) {
 	t.Helper()
@@ -42,7 +44,11 @@ func revokeWork(t *testing.T, db *store.DB, e *store.Envelope, cancelWork bool) 
 		t.Fatal(err)
 	}
 	result, err := db.Coordinator().Execute(ctx, store.CommandPrincipal{ID: holdPrincipal}, req, func(context.Context, *sql.Tx) error { return nil }, func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
-		_, err := store.RevokeBinding(ctx, tx, store.RevocationRequest{BindingID: holdBinding, IncidentID: holdIncident, ExpectedBindingVersion: 1, ExpectedCredentialVersion: 1, NowNS: time.Now().UnixNano()}, nil)
+		var binding string
+		if err := tx.QueryRowContext(ctx, "SELECT binding_id FROM work_provenance WHERE work_id=?", e.ID).Scan(&binding); err != nil {
+			return store.CommandResult{}, err
+		}
+		_, err := store.RevokeBinding(ctx, tx, store.RevocationRequest{BindingID: binding, IncidentID: holdIncident, ExpectedBindingVersion: 1, ExpectedCredentialVersion: 1, NowNS: time.Now().UnixNano()}, nil)
 		if err == nil && cancelWork {
 			_, err = store.ApplyWorkDisposition(ctx, tx, store.DispositionRequest{Work: store.WorkRef{Kind: "envelope", ID: e.ID}, IncidentID: holdIncident, ExpectedVersion: 1, Action: "cancel", ReasonCode: "compromise", PrincipalID: holdPrincipal, OperationID: holdOperation, NowNS: time.Now().UnixNano()}, nil)
 		}
@@ -60,7 +66,7 @@ func TestHeldLateSettlementPreservesEvidenceAndRefundsOnce(t *testing.T) {
 		t.Run(map[bool]string{false: "held", true: "cancelled"}[cancelWork], func(t *testing.T) {
 			db, b, e, _ := setupSettlement(t)
 			ctx := context.Background()
-			attributeWork(t, db, e)
+			expectedBinding := attributeWork(t, db, e)
 			claimed, ok, err := b.claim(ctx, e.ID)
 			if err != nil || !ok {
 				t.Fatalf("claim=%v %v", ok, err)
@@ -97,7 +103,7 @@ func TestHeldLateSettlementPreservesEvidenceAndRefundsOnce(t *testing.T) {
 			if err := tx.QueryRowContext(ctx, "SELECT binding_id,credential_version,original_grant_version FROM work_provenance WHERE work_id=?", e.ID).Scan(&binding, &credential, &grant); err != nil {
 				t.Fatal(err)
 			}
-			if binding != holdBinding || credential != 1 || grant != 1 {
+			if binding != expectedBinding || credential != 1 || grant != 1 {
 				t.Fatal("late settlement rewrote provenance")
 			}
 		})

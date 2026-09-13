@@ -153,12 +153,12 @@ Controlled fixtures cover C03 authentication forgery and one-attempt closure; C0
 attachment, lost readiness across restart and bounded reconnect; C05 stale callbacks and exact
 disconnect; C06 synthetic verifier matching/failure; C17 deadline equality, terminal expiry and
 counter bounds; and C18 wrong-UID rejection and accepted same-account credential possession.
-These internal APIs currently have test-only callers. Human endpoints/admission remain owned by
+Attachment is consumed by the authenticated work APIs and synthetic fixtures. Human endpoints/admission remain owned by
 [#28](https://github.com/ginsys/parley/issues/28), real host evidence by
 [#30](https://github.com/ginsys/parley/issues/30) and [#31](https://github.com/ginsys/parley/issues/31).
 There is no runnable listener, wire parser, human credential CLI or live-session validation in
-this slice. Grants continue through the existing protected controller; authenticated ordinary
-acceptance, dispatch and ingestion follow in the storage/recovery and caller-migration slices.
+this implementation. Grants continue through the existing protected controller; ordinary
+acceptance, dispatch and ingestion require private authenticated Session capabilities.
 
 ## Internal retained work and binding lifecycle
 
@@ -184,7 +184,7 @@ The internal Lifecycle service exposes revoke, retire, hold disposition and lega
 Provisioner adds re-enrollment. Current administrator authorization precedes private replay;
 evidence I/O occurs outside the writer and mutation guards recheck under the coordinator. Audit
 and effects commit before socket invalidation. Missing capabilities fail closed. These APIs have
-test-only callers until the ordinary caller migration; they add no human endpoint or credential
+test-only human-operation callers; they add no human endpoint or credential
 CLI, and grants still come from the protected controller.
 
 Release changes only the selected hold or quarantine version. A second incident remains effective.
@@ -628,7 +628,11 @@ acceptance. `dispatch.AuthenticatedBridge` claims only after both current bindin
 provenance, grant/version, hold state, exact recipient readiness and budget have been checked under
 the shared coordinator. Transport receives the captured recipient Session after commit. A closed
 claim cannot retarget its replacement, and an unattempted handoff uses the existing exact-token
-settlement/refund transaction. These replacement APIs have test-only callers until caller migration.
+settlement/refund transaction. The existing Claude poller now consumes this bridge. Raw sender-string
+Send and Codex IngestTurn entrypoints have been removed. Ingestion consumers use the shared
+connection.Ingestor with trusted source evidence and a private Session. Legacy regression fixtures
+construct synthetic capabilities and explicit provenance; production code never imports those
+test helpers. Fixed authenticated error codes replace detailed legacy acceptance errors.
 
 `connection.Ingestor` requires trusted native-source verification and origin providers. It stores
 source event identity, digest, revision and cursor edges independently of process epoch. Current

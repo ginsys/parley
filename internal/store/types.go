@@ -111,7 +111,7 @@ type Envelope struct {
 	Text            string
 	GrantVersion    int64
 	InReplyTo       *string
-	// TrustedReply is set only by codex.IngestTurn, the one path that
+	// TrustedReply is set only by authenticated ingestion, the path that
 	// atomically acks the original envelope and validates in_reply_to
 	// against it (replymarker.Validate) before queuing this row. Send has no
 	// parameter for it and always leaves it false — a bare non-nil

@@ -19,7 +19,7 @@ type testTransport struct{ err error }
 
 func (t testTransport) Deliver(context.Context, store.Envelope) error { return t.err }
 
-func setupSettlement(t *testing.T) (*store.DB, *Bridge, *store.Envelope, string) {
+func setupSettlement(t *testing.T) (*store.DB, *settlementFixture, *store.Envelope, string) {
 	t.Helper()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "settle.db")
@@ -34,7 +34,7 @@ func setupSettlement(t *testing.T) (*store.DB, *Bridge, *store.Envelope, string)
 	if _, err := controller.New(db).Grant(ctx, controller.GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 5}); err != nil {
 		t.Fatal(err)
 	}
-	bridge := New(db, testTransport{})
+	bridge := newSettlementFixture(t, db, testTransport{})
 	e, err := bridge.Send(ctx, "c", "a", "b", "message", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +183,7 @@ func TestCrashAfterHandoffRecoversUncertainWithoutReplay(t *testing.T) {
 	if err != nil || count != 1 {
 		t.Fatalf("recover=%d %v", count, err)
 	}
-	b := New(db, testTransport{})
+	b := newSettlementFixture(t, db, testTransport{})
 	outcome, err := b.DispatchOutcome(context.Background(), e.ID)
 	if err != nil || outcome.State != store.Uncertain || outcome.Attempted || outcome.ErrorCode != "interrupted" {
 		t.Fatalf("replayed uncertain: %+v %v", outcome, err)
@@ -212,7 +212,7 @@ func TestCrashHandoffHelper(t *testing.T) {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	b := New(db, testTransport{})
+	b := newSettlementFixture(t, db, testTransport{})
 	e, ok, err := b.claim(ctx, os.Getenv("PARLEY_CRASH_HELPER_ID"))
 	if err != nil || !ok {
 		t.Fatalf("claim: %v", err)

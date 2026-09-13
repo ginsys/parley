@@ -212,3 +212,44 @@ func TestAuthenticatedClaimHonorsAuthoredRevocationHold(t *testing.T) {
 	}
 	f.assertBudget(t, 0)
 }
+
+func TestAuthenticatedBudgetDiagnosticOverridesPriorAttemptWithoutRewritingIt(t *testing.T) {
+	f := authenticatedSetup(t)
+	makeReady(t, f.manager, f.recipient)
+	calls := 0
+	b, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport {
+		return authenticatedTransport(func(context.Context, store.Envelope) error { calls++; return ErrNoAttempt })
+	}, func() time.Time { return time.Unix(110, 0) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := f.send(t)
+	ctx := context.Background()
+	first, err := b.DispatchOutcome(ctx, id)
+	if err != nil || first.ErrorCode != "not_attempted" {
+		t.Fatalf("first=%+v %v", first, err)
+	}
+	_, err = f.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		for i := 0; i < 5; i++ {
+			ok, err := store.ClaimExchange(ctx, tx, "work", 1)
+			if err != nil {
+				return store.TransitionResult{}, err
+			}
+			if !ok {
+				t.Fatal("synthetic competing budget claim")
+			}
+		}
+		return store.TransitionResult{Changed: true}, nil
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := b.DispatchOutcome(ctx, id)
+	if err != ErrBudgetExhausted || outcome.Attempted || outcome.State != store.Queued || outcome.ErrorCode != "budget_exhausted" || outcome.ErrorDetail == "" || calls != 1 {
+		t.Fatalf("budget outcome=%+v %v calls%d", outcome, err, calls)
+	}
+	saved, err := f.db.Queries().Outcome(ctx, id)
+	if err != nil || saved.ErrorCode != "not_attempted" {
+		t.Fatalf("unattempted claim rewrote history=%+v %v", saved, err)
+	}
+}

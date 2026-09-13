@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	bridgefixture "github.com/ginsys/parley/internal/testfixture/bridge"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/ginsys/parley/internal/adapter/codex"
 	"github.com/ginsys/parley/internal/bridgetext"
+	"github.com/ginsys/parley/internal/connection"
 	"github.com/ginsys/parley/internal/controller"
-	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
+	"github.com/ginsys/parley/internal/testfixture/identity"
+	"github.com/google/uuid"
 )
 
 // Insert through the storage primitives to model historical data, not new enrollment.
@@ -66,6 +68,32 @@ func identifierState(t *testing.T, db *store.DB, c string) (*store.Grant, *store
 	return g, e, n
 }
 
+func assertCompatibleBindings(t *testing.T, db *store.DB) {
+	t.Helper()
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	rows, err := tx.Query("SELECT peer_id FROM bindings")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var peer string
+		if err := rows.Scan(&peer); err != nil {
+			t.Fatal(err)
+		}
+		if bridgetext.ValidateMetadata(peer) != nil {
+			t.Errorf("fixture enrolled incompatible historical peer %q", peer)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestIncompatibleHistoryRejectsNewWorkWithoutMutation(t *testing.T) {
 	for _, bad := range []string{"a\xff", "a\xfe", "café", "a\ufffd", "\x7f", "   "} {
 		for field := 0; field < 3; field++ {
@@ -77,20 +105,31 @@ func TestIncompatibleHistoryRejectsNewWorkWithoutMutation(t *testing.T) {
 				ctx := context.Background()
 				beforeG, beforeE, beforeN := identifierState(t, db, c)
 				tr := newFakeTransport()
-				bridge := dispatch.New(db, tr)
+				bridge := bridgefixture.New(t, db, tr)
 				if _, err := controller.New(db).Renew(ctx, controller.RenewParams{Conversation: c, MaxExchanges: 5}); !errors.Is(err, bridgetext.ErrInvalidMetadata) {
 					t.Errorf("renew: %v", err)
 				}
-				if _, err := bridge.Send(ctx, c, a, b, "new", nil); !errors.Is(err, bridgetext.ErrInvalidMetadata) {
+				// Keep the private author valid; place each incompatible key in
+				// the real request so fixture enrollment cannot mask rejection.
+				author, recipient := a, b
+				if field == 1 {
+					author, recipient = b, a
+				}
+				session, err := bridge.Identity.Session(author)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := bridge.AuthenticatedBridge.Send(ctx, session, connection.SendRequest{OperationID: uuid.NewString(), Conversation: c, Recipient: recipient, Text: "new"}); !errors.Is(err, store.InvalidRequest) {
 					t.Errorf("send: %v", err)
 				}
 				outcome, err := bridge.DispatchOutcome(ctx, e.ID)
-				if !errors.Is(err, bridgetext.ErrInvalidMetadata) || outcome.State != store.Queued || outcome.Attempted {
+				if !errors.Is(err, store.InvalidRequest) || outcome.State != store.Queued || outcome.Attempted || outcome.ErrorCode != "incompatible_identifier" || outcome.ErrorDetail == "" {
 					t.Errorf("dispatch: %+v, %v", outcome, err)
 				}
 				if len(tr.delivered) != 0 {
 					t.Error("transport invoked")
 				}
+				assertCompatibleBindings(t, db)
 				afterG, afterE, afterN := identifierState(t, db, c)
 				if !reflect.DeepEqual(beforeG, afterG) || !reflect.DeepEqual(beforeE, afterE) || beforeN != afterN {
 					t.Fatal("rejection changed historical state")
@@ -134,14 +173,15 @@ func TestIncompatibleReplyCannotAcknowledgeOriginal(t *testing.T) {
 				t.Fatal(err)
 			}
 			beforeG, beforeE, beforeN := identifierState(t, db, c)
-			payload, err := json.Marshal(map[string]string{"to": a, "in_reply_to": e.ID, "text": "reply"})
+			payload, err := json.Marshal(map[string]string{"to": "a", "in_reply_to": e.ID, "text": "reply"})
 			if err != nil {
 				t.Fatal(err)
 			}
 			turn := "```BRIDGE-REPLY\n" + string(payload) + "\n```"
-			if _, err := codex.IngestTurn(ctx, db, c, b, a, turn); !errors.Is(err, bridgetext.ErrInvalidMetadata) {
+			if _, err := bridgefixture.IngestTurn(t, ctx, db, "c", "b", "a", turn); !errors.Is(err, store.InvalidRequest) {
 				t.Errorf("ingest: %v", err)
 			}
+			assertCompatibleBindings(t, db)
 			afterG, afterE, afterN := identifierState(t, db, c)
 			if !reflect.DeepEqual(beforeG, afterG) || !reflect.DeepEqual(beforeE, afterE) || beforeN != afterN {
 				t.Fatal("reply rejection acknowledged or queued work")
@@ -162,7 +202,7 @@ func TestCompatibleConversationWorksAlongsideIncompatibleHistory(t *testing.T) {
 		t.Fatal("accepted keys changed")
 	}
 	tr := newFakeTransport()
-	bridge := dispatch.New(db, tr)
+	bridge := bridgefixture.New(t, db, tr)
 	e, err := bridge.Send(ctx, c, a, b, "世界", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -175,5 +215,27 @@ func TestCompatibleConversationWorksAlongsideIncompatibleHistory(t *testing.T) {
 	}
 	if len(tr.delivered) != 1 {
 		t.Fatal("unaffected delivery did not run exactly once")
+	}
+}
+
+func TestSyntheticSessionRejectsIncompatiblePeerBeforeStorage(t *testing.T) {
+	db := openTestDB(t)
+	f := identity.For(t, db)
+	for _, peer := range []string{"a\xff", "café", "   "} {
+		if _, err := f.Session(peer); !errors.Is(err, identity.ErrInvalidPeer) {
+			t.Errorf("expected distinct fixture validation for %q: %v", peer, err)
+		}
+	}
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var bindings, credentials int
+	if err := tx.QueryRow("SELECT (SELECT count(*) FROM bindings), (SELECT count(*) FROM credentials)").Scan(&bindings, &credentials); err != nil {
+		t.Fatal(err)
+	}
+	if bindings != 0 || credentials != 0 {
+		t.Fatalf("invalid fixture mutated identity: bindings=%d credentials=%d", bindings, credentials)
 	}
 }

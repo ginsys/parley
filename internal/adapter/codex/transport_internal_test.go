@@ -18,7 +18,7 @@ import (
 // context already canceled/expired before the process ever started must not
 // be classified as an ambiguous ('uncertain') outcome — nothing could have
 // committed. It's not merely "not ambiguous" either: it's definitely never
-// attempted, so dispatch.Bridge refunds the budget claim and requeues it,
+// attempted, so authenticated dispatch refunds the budget claim and requeues it,
 // rather than leaving it as a terminal failure that loses the message.
 func TestRunAndClassifyPreStartCancellationIsNeverAttempted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
