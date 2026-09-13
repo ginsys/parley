@@ -2097,8 +2097,8 @@ class OpenCodeDriver(Driver):
         IDs grant no ownership; malformed lines fail creation after retaining any unique ID
         for cleanup.
         Whether an error event or a nonzero exit takes precedence is uncaptured; both raise. A
-        Ctrl-C mid-command loses the output: the session, if any, is then only findable by a
-        human as the newest `parley-probe-*` row of the global `opencode --pure session list`,
+        Ctrl-C mid-command loses the output: the exception reports the exact generated title
+        and cwd for manual investigation in the global `opencode --pure session list`,
         removed with `opencode --pure session delete <id>`.
         """
         title = f'parley-probe-{uuid.uuid4().hex[:12]}'
@@ -2107,6 +2107,11 @@ class OpenCodeDriver(Driver):
         try:
             result = self.run(argv, capture_output=True, text=True, timeout=180, cwd=self.cwd,
                               stdin=subprocess.DEVNULL)
+        except KeyboardInterrupt as error:
+            error.add_note(f'OpenCode creation output lost; manual investigation required for '
+                           f'title {title!r} in probe cwd {self.cwd!r}. A session may remain; '
+                           'no session ID is known and no ownership is granted.')
+            raise
         except subprocess.TimeoutExpired as error:
             self._created_session(_partial_stdout(error))
             raise

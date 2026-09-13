@@ -2315,6 +2315,23 @@ class FakePopen:
 
 
 class OpenCodeDriverTests(DriverTestCase):
+    def test_interrupted_creation_reports_exact_manual_discovery_locator(self):
+        original = KeyboardInterrupt()
+        run = FakeRun([(['opencode', 'run'], original)])
+        driver = self.driver(run)
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            driver.create('hello')
+        self.assertIs(caught.exception, original)
+        argv = run.calls[0][0]
+        title = argv[argv.index('--title') + 1]
+        notes = '\n'.join(getattr(original, '__notes__', []))
+        self.assertIn(title, notes)
+        self.assertIn(self.cwd, notes)
+        self.assertIn('manual investigation', notes)
+        self.assertEqual(driver.owned(), set())
+        self.assertEqual(driver.strays, set())
+        self.assertEqual(len(run.calls), 1)
+
     def test_export_directory_must_match_the_private_probe_cwd(self):
         for directory in (None, '', '/foreign'):
             with self.subTest(directory=directory):

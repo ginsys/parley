@@ -258,10 +258,13 @@ work. One gap stays open by design: a Ctrl-C while
 Claude makes one bounded (15-second command timeout), cwd-filtered listing snapshot and reports
 all visible unowned candidates without adopting, stopping or deleting them. Failed discovery and
 later arrivals remain uncertain, explicitly noted on the cancellation. Codex and OpenCode still
-require manual discovery when interrupted output names no session. The human discovery routes
+require manual discovery when interrupted output names no session. OpenCode adds the exact
+generated title and probe cwd to the original interruption so the operator has a specific locator;
+the session ID remains unknown and no automatic listing, adoption or deletion is attempted.
+The human discovery routes
 are `claude agents --json
 --all --cwd <probe cwd>`; the newest rollout under `$CODEX_HOME/sessions` naming the probe cwd;
-the newest `parley-probe-*` row of the global `opencode --pure session list`, removed with
+the matching generated title in the global `opencode --pure session list`, removed with
 `opencode --pure session delete <id>`. The `opencode serve` child has the same shape in a
 narrower instant: it is spawned and held in one statement inside the handler that closes it, but
 an interrupt delivered between the OS creating it and its handle reaching Python leaves a process
