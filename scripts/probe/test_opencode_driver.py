@@ -839,13 +839,45 @@ class OpenCodeDriverTests(DriverTestCase):
         run.scripts.insert(0, (['opencode', '--pure', 'export'], FakeResult(0, 'garbage')))
         self.assertFalse(driver.observe('ses_1', marker=MARKER, submitted_at=0.0).observable)
 
+    def test_missing_creation_turn_records_make_absent_outcomes_unobservable(self):
+        user = opencode_message('user', [{'type': 'text', 'text': 'initial prompt'}], 900000)
+        assistant = opencode_message('assistant', [{'type': 'text', 'text': 'PONG'}], 901000)
+        for messages in ([], [user], [assistant], [user, assistant]):
+            with self.subTest(roles=[message['info']['role'] for message in messages]):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['opencode', 'run'], self.run_output()),
+                               (['opencode', '--pure', 'export'],
+                                FakeResult(0, opencode_export(messages, directory=self.cwd)))])
+                driver = self.driver(run)
+                driver.create('initial prompt')
+                observation = driver.observe('ses_1', marker=MARKER, submitted_at=1000)
+                self.assertEqual(observation.outcomes, {})
+                self.assertEqual(observation.observable, len(messages) == 2)
+
+    def test_partial_export_keeps_positive_evidence_without_authorizing_negative_evidence(self):
+        for role, outcome in (('user', 'visible'), ('assistant', 'ack')):
+            with self.subTest(role=role):
+                self.registry = SessionRegistry()
+                export = opencode_export([
+                    opencode_message(role, [{'type': 'text', 'text': MARKER}], 1001000)],
+                    directory=self.cwd)
+                run = FakeRun([(['opencode', 'run'], self.run_output()),
+                               (['opencode', '--pure', 'export'], FakeResult(0, export))])
+                driver = self.driver(run)
+                driver.create('initial prompt')
+                observation = driver.observe('ses_1', marker=MARKER, submitted_at=1000)
+                self.assertIn(outcome, observation.outcomes)
+                self.assertFalse(observation.observable)
+
     def test_losing_the_submission_server_invalidates_only_missing_outcomes(self):
         for loss in ('exit', 'remove', 'replace'):
             with self.subTest(loss=loss):
                 self.registry = SessionRegistry()
                 self.answering = False
-                export = opencode_export([opencode_message('user', [{'type': 'text', 'text': MARKER}], 1000)],
-                                         directory=self.cwd)
+                export = opencode_export([
+                    opencode_message('assistant', [{'type': 'text', 'text': 'PONG'}], 500),
+                    opencode_message('user', [{'type': 'text', 'text': MARKER}], 1000)],
+                    directory=self.cwd)
                 run = FakeRun([(['opencode', 'run'], self.run_output()),
                                (['opencode', '--pure', 'export'], FakeResult(0, export))])
                 driver = self.driver(run)

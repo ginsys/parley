@@ -552,7 +552,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   model or version taken from it. User messages accept only captured `text` parts; assistant
   messages also accept `step-start`, `reasoning` and `step-finish`. Untyped, malformed,
   role-incompatible and unknown parts make their message unusable; an unparseable
-  or malformed document is unobservable. `teardown()` is
+  or malformed document is unobservable. Successful creation already records a user/assistant
+  turn, so exports lacking parsed records of either role cannot establish negative delivery
+  evidence. Positive events in such a partial snapshot remain usable. This checks the minimum
+  captured shape, not completeness of the entire history. `teardown()` is
   `opencode --pure session delete <id>`. The server is closed by the sweep after teardown.
 
 Readiness patterns and typing cadence live in `PtyClient`, which wraps `wake_probe.PtyProcess`

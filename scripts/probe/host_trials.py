@@ -2370,8 +2370,12 @@ class OpenCodeDriver(Driver):
             return Observation(observable=False)
         events, unusable = opencode_export_events(raw)
         observation = detect_outcomes(events, marker, submitted_at=submitted_at)
+        # Successful creation already stored a user/assistant turn. An empty or one-sided
+        # snapshot cannot establish absence of later delivery; retain its positive events only.
+        creation_roles_present = {'user', 'assistant'} <= {event.role for event in events}
         server = self.submission_servers.get(session_id)
-        if unusable or (server is not None and (server is not self.server or server.process.poll() is not None)):
+        if (unusable or not creation_roles_present or
+                (server is not None and (server is not self.server or server.process.poll() is not None))):
             observation.observable = False
         return observation
 
