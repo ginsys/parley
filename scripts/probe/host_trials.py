@@ -924,6 +924,12 @@ class ClaudeDriver(Driver):
         no-flag resume against a running session is uncaptured, so a listed `pid` refuses as
         `SubmissionUncaptured`. A copy is still a live session this runner started: it is minted
         (so the sweep removes it) and reported as a command-level rejection.
+
+        A copy named on stdout settles the question even when the command then times out: the
+        message went to the copy, so the trial's own session will never show it. Re-raising the
+        timeout would send `run_trial` down its may-have-delivered path, polling the original and
+        turning its absent marker into `not_observed` -- negative evidence about a host that was
+        never asked. That case is `SubmissionUncaptured`, with the copy minted for the sweep.
         """
         if entry.get('pid') is not None:
             raise SubmissionUncaptured(
@@ -940,6 +946,9 @@ class ClaudeDriver(Driver):
             started = backgrounded_id(_partial_stdout(error))
             if started and started != session_id:
                 self._mint(started)
+                raise SubmissionUncaptured(
+                    f'--bg --resume timed out after starting a copy {started}: the message went '
+                    f'to that copy, not to {session_id}') from error
             raise
         started = backgrounded_id(result.stdout)
         if started and started != session_id:

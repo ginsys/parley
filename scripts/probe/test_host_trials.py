@@ -1042,8 +1042,23 @@ class ClaudeDriverTests(DriverTestCase):
             driver.submit('69aa52ed', 'msg')
         self.assertEqual(driver.owned(), {'69aa52ed', '0badc0de'})
 
-    def test_resume_submit_timeout_mints_a_copy_seen_in_partial_output(self):
+    def test_resume_submit_timeout_that_named_a_copy_is_uncaptured_not_a_timeout(self):
+        # The copy proves where the message went. Re-raising the timeout would poll the original
+        # and turn its absent marker into `not_observed`.
         error = subprocess.TimeoutExpired(cmd=['claude'], timeout=60, output=b'backgrounded \xc2\xb7 0badc0de\n')
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], error),
+                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        with self.assertRaises(SubmissionUncaptured) as caught:
+            driver.submit('69aa52ed', 'msg')
+        self.assertIn('0badc0de', str(caught.exception))
+        self.assertEqual(driver.owned(), {'69aa52ed', '0badc0de'})
+
+    def test_resume_submit_timeout_with_no_copy_named_stays_a_timeout(self):
+        # Nothing says where the message went, so the trial polls its own session.
+        error = subprocess.TimeoutExpired(cmd=['claude'], timeout=60, output=b'')
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], error),
                        (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
@@ -1051,7 +1066,7 @@ class ClaudeDriverTests(DriverTestCase):
         driver.create('hello')
         with self.assertRaises(subprocess.TimeoutExpired):
             driver.submit('69aa52ed', 'msg')
-        self.assertEqual(driver.owned(), {'69aa52ed', '0badc0de'})
+        self.assertEqual(driver.owned(), {'69aa52ed'})
 
     def test_teardown_stops_confirms_the_pid_is_gone_then_removes(self):
         listings = iter([listing([claude_entry()]), listing([claude_entry(pid=None, status=None)])])
