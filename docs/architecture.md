@@ -157,6 +157,11 @@ view-revision overflow additionally stops ordinary service. A deadline crossing 
 or publication cannot install a usable expired socket. Connection transitions have their own
 transaction rules, separate from ordinary operation-result receipts. An uncertain commit disables
 further coordinator operations and publishes no slot.
+Successful no-op inspection, repeat attachment, readiness checks and duplicate ACKs explicitly
+request a final process-state fence after transaction rollback under the same coordinator gate.
+That fence advances no revision and commits no accidental SQL. Unchanged rejections still suppress
+publication; credential/liveness expiry observed by a successful read's fence follows the same
+independent expiry-persistence path as a deadline crossing after a write commit.
 
 Host verification runs outside the coordinator and is cancelled with the socket lifetime. Each
 explicit readiness attempt starts unready with a fresh random nonce and a thirty-second deadline.

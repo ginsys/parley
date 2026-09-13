@@ -408,7 +408,7 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 			return store.TransitionResult{Changed: true, Code: store.AuthenticationFailed}, nil
 		}
 		snapshot = Snapshot{view.Epoch, b.Generation, m.active(b.ID, m.now())}
-		return store.TransitionResult{Changed: s.credentialID == "" || m.hasDueSockets()}, nil
+		return store.TransitionResult{Changed: s.credentialID == "" || m.hasDueSockets(), PublishUnchanged: true}, nil
 	}, func(store.CommitView) {
 		now := m.now()
 		if !expired && !rejected && m.observeCredentialExpiry(c, now) {
@@ -499,7 +499,7 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 		}
 		if s.session != nil && m.slots[b.ID] == s.session {
 			result = s.session
-			return store.TransitionResult{}, nil
+			return store.TransitionResult{PublishUnchanged: true}, nil
 		}
 		if m.active(b.ID, m.now()) {
 			return store.TransitionResult{Changed: s.credentialID == "", Code: store.AlreadyConnected}, nil
