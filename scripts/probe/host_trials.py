@@ -521,20 +521,57 @@ class PtyClient:
 
 # --- Driver base --------------------------------------------------------------------------------
 
+def unfresh_git_reason(path):
+    """Why `<path>/.git` is not the history-free repository `git init` leaves, or None.
+
+    Checked rather than trusted: an existing repository whose worktree files were merely deleted,
+    and a `.git` *file* pointing at a linked worktree or a submodule's real store elsewhere, both
+    carry the name `.git` and would hand the authenticated hosts real history and configuration.
+    A `git init` and nothing else leaves no index, no reflog, no refs and no objects; anything
+    beyond that is history.
+    """
+    git = os.path.join(path, '.git')
+    if not os.path.isdir(git):
+        return '`.git` is not a directory: it points at a store outside the probe directory'
+    for name in ('index', 'packed-refs', 'logs', 'shallow'):
+        if os.path.exists(os.path.join(git, name)):
+            return f'`.git/{name}` exists'
+    for root, _directories, files in os.walk(os.path.join(git, 'refs')):
+        if files:
+            return f'`{os.path.join(root, sorted(files)[0])}` exists'
+    objects = os.path.join(git, 'objects')
+    for entry in sorted(os.listdir(objects)) if os.path.isdir(objects) else ():
+        if entry not in ('info', 'pack'):
+            return f'`.git/objects/{entry}` exists'
+        if os.listdir(os.path.join(objects, entry)):
+            return f'`.git/objects/{entry}` is not empty'
+    return None
+
+
 def private_directory(cwd):
-    """The resolved probe directory, refused unless it is empty (a bare `.git` is allowed).
+    """The resolved probe directory, refused unless it is empty or holds only a fresh `.git`.
 
     `cwd` keys three real-HOME side effects: Codex persists a trust entry for it in
     `$CODEX_HOME/config.toml`, Claude files the transcript under a slug of it, and a real
     repository's contents would feed the model. A fresh private directory per run is the
     precondition every capture was made under (docs/host-probe-preflight.md, 2026-09-13).
+
+    The `.git` exception exists because that capture's Codex probe directory was `git init`ed
+    (`codex resume` is given no `--skip-git-repo-check`), and it is only ever a *fresh* one --
+    see `unfresh_git_reason`.
     """
     path = os.path.realpath(cwd)
     if not os.path.isdir(path):
         raise ValueError(f'probe cwd is not a directory: {cwd!r}')
-    extra = set(os.listdir(path)) - {'.git'}
+    entries = set(os.listdir(path))
+    extra = entries - {'.git'}
     if extra:
         raise ValueError(f'probe cwd must be a fresh private directory; found {sorted(extra)} in {path}')
+    if '.git' in entries:
+        reason = unfresh_git_reason(path)
+        if reason is not None:
+            raise ValueError(f'probe cwd {path} holds a repository with history rather than a bare '
+                             f'`git init`: {reason}')
     return path
 
 

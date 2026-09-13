@@ -774,6 +774,22 @@ class DriverTestCase(unittest.TestCase):
         FakePtyClient.launched = []
         self.transcripts = {}
 
+    def git(self, *args):
+        """Run one real `git` command, insulated from the operator's own configuration.
+
+        `private_directory`'s `.git` exception is a claim about what `git init` leaves on disk,
+        so the fixtures make a real one rather than a hand-built skeleton that could agree with
+        a wrong predicate. `git` is not a host CLI and creates no session; the AGENTS.md rule it
+        must not break is launching an installed Claude/Codex/OpenCode, which this does not.
+        """
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                   GIT_CONFIG_NOSYSTEM='1', GIT_AUTHOR_NAME='probe', GIT_AUTHOR_EMAIL='probe@invalid',
+                   GIT_COMMITTER_NAME='probe', GIT_COMMITTER_EMAIL='probe@invalid')
+        try:
+            subprocess.run(['git', *args], check=True, env=env, capture_output=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            self.skipTest(f'git unavailable or failed: {error}')
+
     def transcript_path_for(self, session_uuid):
         return self.transcripts.get(session_uuid)
 
@@ -813,9 +829,26 @@ class ClaudeDriverTests(DriverTestCase):
         with self.assertRaises(ValueError):
             self.driver(FakeRun([]), cwd=os.path.join(self.cwd, 'missing'))
 
-    def test_a_bare_git_directory_is_allowed(self):
-        os.mkdir(os.path.join(self.cwd, '.git'))
+    def test_a_freshly_initialized_git_directory_is_allowed(self):
+        # Real `git init`, not a hand-built skeleton: the predicate has to accept what the
+        # captured Codex probe directory actually was.
+        self.git('init', '--quiet', self.cwd)
         self.driver(FakeRun([]))  # does not raise
+
+    def test_a_git_directory_carrying_history_is_refused(self):
+        # An existing repository whose worktree files were deleted looks empty apart from `.git`,
+        # and would feed the authenticated hosts real history and configuration.
+        self.git('init', '--quiet', self.cwd)
+        self.git('-C', self.cwd, 'commit', '--quiet', '--allow-empty', '-m', 'history')
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
+
+    def test_a_git_file_pointing_at_another_store_is_refused(self):
+        # A linked worktree or a submodule: the store, and everything in it, lives elsewhere.
+        with open(os.path.join(self.cwd, '.git'), 'w') as handle:
+            handle.write(f'gitdir: {os.path.join(self.fixtures.name, "real-store")}\n')
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
 
     def test_create_mints_from_stdout_line_one_then_confirms_via_the_listing(self):
         run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n  claude attach 69aa52ed\n')),

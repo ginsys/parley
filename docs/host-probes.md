@@ -189,9 +189,15 @@ command inherits the operator's environment, and its PTY clients inherit it plus
 recorder's equivalent and applies only to PTY captures. Every matrix cell this produces
 therefore carries the developer's real credentials and config; it is not the clean-room
 isolation `--home disposable` gives the PTY fixtures above. Each driver refuses at construction
-any probe directory that is not empty (a bare `.git` is allowed): the directory keys a Codex trust
+any probe directory that is not empty: the directory keys a Codex trust
 entry in `$CODEX_HOME/config.toml`, the slug of Claude's transcript directory, and whatever a real
-repository's contents would feed the model.
+repository's contents would feed the model. The one exception is a `.git` left by a bare
+`git init` — what the captured Codex probe directory was, since `codex resume` gets no
+`--skip-git-repo-check` — and it is checked, not trusted: a `.git` holding an index, a reflog,
+any ref or any object is a repository with history, and a `.git` that is a file rather than a
+directory points at a linked worktree or submodule store outside the probe directory. Both are
+refused, because either would hand the authenticated hosts real history and configuration under
+a directory whose emptiness is the whole precondition.
 
 Cleanup is part of the module, not left to a caller: `run_trial_with_cleanup()` is the entry
 point real trials use. It runs `run_trial()` and, on every exit path, `sweep()`s the driver:
