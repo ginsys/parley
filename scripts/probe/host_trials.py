@@ -1763,7 +1763,8 @@ def opencode_export_events(raw):
             continue
         texts = []
         for part in parts:
-            if not isinstance(part, dict):
+            if (not isinstance(part, dict) or
+                    part.get('type') not in ('text', 'step-start', 'reasoning', 'step-finish')):
                 texts = None
                 break
             if part.get('type') != 'text':

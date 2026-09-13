@@ -544,6 +544,15 @@ def opencode_message(role, parts, created_ms, **info):
 
 
 class OpenCodeParsingTests(unittest.TestCase):
+    def test_export_parts_require_a_captured_type(self):
+        parts = [{'text': MARKER}] + [dict(type=kind, text=MARKER)
+                                     for kind in (None, 1, [], {}, '', ' ', 'future-part')]
+        for part in parts:
+            for role in ('user', 'assistant'):
+                with self.subTest(part=part, role=role):
+                    raw = opencode_export([opencode_message(role, [part], 1_757_754_001_000)])
+                    self.assertEqual(opencode_export_events(raw), ([], 1))
+
     def test_session_ids_are_collected_and_an_error_event_is_reported(self):
         # Captured: a failing turn (401) still emits its sessionID and lists the session.
         stdout = '\n'.join([json.dumps({'type': 'step_start', 'sessionID': 'ses_1'}),
