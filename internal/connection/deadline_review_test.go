@@ -191,7 +191,7 @@ func TestFailedExpiryPersistenceRetainsDenialAcrossClockRollback(t *testing.T) {
 	*now = time.Unix(199, 0)
 	socket := acceptSocket(t, m)
 	crossAuthorizationDeadline(t, m, *now, time.Unix(200, 0), "commit")
-	if _, err := m.Attach(ctx, socket, auth, 0); err != store.TemporarilyUnavailable {
+	if _, err := m.Attach(ctx, socket, auth, 0); err != store.AuthenticationFailed {
 		t.Errorf("failed expiry evidence=%v", err)
 	}
 	if !m.store.CredentialExpiryObserved(auth.credentialID) || len(m.slots) != 0 || socket.Context().Err() == nil {
@@ -199,7 +199,7 @@ func TestFailedExpiryPersistenceRetainsDenialAcrossClockRollback(t *testing.T) {
 	}
 	m.now = func() time.Time { return *now }
 	m.guard = func(context.Context, *sql.Tx, string) error { return nil }
-	if _, err := m.Inspect(ctx, acceptSocket(t, m), auth); err != store.TemporarilyUnavailable {
+	if _, err := m.Inspect(ctx, acceptSocket(t, m), auth); err != store.AuthenticationFailed {
 		t.Errorf("rollback bypassed unpersisted expiry: %v", err)
 	}
 	_, err = m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
