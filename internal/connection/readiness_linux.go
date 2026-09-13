@@ -59,7 +59,9 @@ func (m *Manager) sessionTransition(ctx context.Context, s *Session,
 		if !m.owned(s.socket) || m.expired(s.socket, m.now()) {
 			return store.TransitionResult{Code: store.AuthenticationFailed}, nil
 		}
-		return change(ctx, tx)
+		result, err := change(ctx, tx)
+		result.PublishUnchanged = true
+		return result, err
 	}, func(store.CommitView) {
 		now := m.now()
 		if !expired && m.observeCredentialExpiry(credential, now) {

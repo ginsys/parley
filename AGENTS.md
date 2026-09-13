@@ -262,6 +262,9 @@ I/O outside callbacks. Cancellation may fail closed immediately when a transacti
 cleanup. Subsequent housekeeping removes cancelled records. View-revision overflow stops ordinary
 service. Deadline-crossing authorization cannot return a usable expired attachment.
 Recheck credential/liveness deadlines after guards and after commit before installing process state.
+Successful no-op connection calls must opt into the same final fence after rollback under the
+coordinator gate. Roll back accidental SQL first; neither advance revision nor publish an unchanged
+rejection. Read-only success must not skip the credential/liveness fence.
 Carry that validated publication instant through pruning and initial liveness; do not substitute
 later unchecked clock samples. Admission must also reject post-commit expiry/cancellation, including
 cancellation during timer installation, releasing the socket registry entry and capacity.

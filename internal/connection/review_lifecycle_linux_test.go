@@ -119,3 +119,45 @@ func TestFailedHostVerificationPersistsCredentialExpiry(t *testing.T) {
 		})
 	}
 }
+
+func TestUnchangedOperationsRecheckDeadlinesAfterRollback(t *testing.T) {
+	for _, operation := range []string{"inspect", "attach", "require_ready", "ack"} {
+		for _, deadline := range []string{"liveness", "credential"} {
+			t.Run(operation+"/"+deadline, func(t *testing.T) {
+				m, auth, now := attachmentFixture(t)
+				ctx := context.Background()
+				before, after := time.Unix(139, 0), time.Unix(140, 0)
+				if deadline == "credential" {
+					*now = time.Unix(198, 0)
+					before, after = time.Unix(199, 0), time.Unix(200, 0)
+				}
+				socket := acceptSocket(t, m)
+				s, err := m.Attach(ctx, socket, auth, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				probe, err := m.BeginReadiness(ctx, s)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := m.Acknowledge(ctx, s, probe); err != nil {
+					t.Fatal(err)
+				}
+				crossAuthorizationDeadline(t, m, before, after, "commit")
+				switch operation {
+				case "inspect":
+					_, err = m.Inspect(ctx, socket, auth)
+				case "attach":
+					_, err = m.Attach(ctx, socket, auth, 0)
+				case "require_ready":
+					err = m.RequireReady(ctx, s)
+				case "ack":
+					err = m.Acknowledge(ctx, s, probe)
+				}
+				if err != store.AuthenticationFailed || socket.Context().Err() == nil || len(m.slots) != 0 {
+					t.Errorf("unchanged operation=%v closed=%v slots=%d", err, socket.Context().Err() != nil, len(m.slots))
+				}
+			})
+		}
+	}
+}
