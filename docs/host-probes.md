@@ -547,8 +547,8 @@ the wall-clock read with monotonic reads. Those brackets bound the possible elap
 difference, so descheduling between reads widens uncertainty instead of declaring a clock step.
 The trial ends only when that entire interval diverges past one second — far above the 500 ppm NTP
 slew ceiling, which is 0.45 s across the whole 900 s busy cap, and far below the smallest 10 s
-window: every outcome `unobservable`, every timestamp dropped rather than
-published on a timeline that shifted under it, and the divergence recorded on `TrialRun` as
+window: every outcome `unobservable`, every outcome timestamp and the serving model dropped
+because their attribution used the shifted timeline, and the divergence recorded on `TrialRun` as
 `clock_step` as the minimum proven divergence for the cell to cite in their place. A correction
 inside a sampling bracket's uncertainty cannot be distinguished from scheduling delay. One case
 stays outside that: a step backwards

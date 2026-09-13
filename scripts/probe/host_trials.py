@@ -2295,6 +2295,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
         # timestamps are dropped rather than reported: a stamp on a broken timeline invites
         # exactly the reasoning it cannot support, and `clock_step` is the evidence a cell cites.
         outcomes, signals, accepted_at, turn_end = {}, {}, None, None
+        model = None  # Attribution used the same invalidated host-event timeline.
         observable = {name: False for name in OUTCOME_NAMES}
         turn_end_observable = False
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,

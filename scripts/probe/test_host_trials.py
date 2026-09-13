@@ -2403,6 +2403,17 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(any(run.observable[name] for name in ('visible', 'turn_start', 'ack')))
         self.assertFalse(run.turn_end_observable)
 
+    def test_a_clock_correction_also_discards_the_attributed_model(self):
+        for step in (60.0, -60.0):
+            with self.subTest(step=step):
+                clock = FakeClock()
+                driver = FakeDriver(
+                    observations=[Observation(outcomes={'turn_start': 1001.0}, model='prior-model')],
+                    clock=clock, on_observe=lambda: setattr(clock, 'wall', clock.wall + step))
+                run = self.run_one(driver, clock)
+                self.assertIsNotNone(run.clock_step)
+                self.assertIsNone(run.model)
+
     def test_a_wall_clock_correction_during_polling_makes_the_whole_trial_unobservable(self):
         # Every compared stamp is wall time, so a correction moves host events relative to their
         # windows -- a +60s step alone turns a reply 2s after submission into one 62s after it,
