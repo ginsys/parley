@@ -57,7 +57,8 @@ func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor st
 		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
 			return store.TransitionResult{}, err
 		}
-		return store.TransitionResult{Changed: true}, store.InitializeIngestionSource(ctx, tx, s.token.BindingID, source, cursor)
+		changed, err := store.InitializeIngestionSource(ctx, tx, s.token.BindingID, source, cursor)
+		return store.TransitionResult{Changed: changed}, err
 	}, nil)
 }
 func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out store.EventResult, err error) {

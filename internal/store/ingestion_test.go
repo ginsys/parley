@@ -17,7 +17,7 @@ func sourceFixture(t *testing.T) (*DB, SourceEvent) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	if err := InitializeIngestionSource(context.Background(), tx, b.ID, e.SourceID, e.Before); err != nil {
+	if _, err := InitializeIngestionSource(context.Background(), tx, b.ID, e.SourceID, e.Before); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -325,7 +325,7 @@ func TestInitializationCannotStrandRetainedPendingEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer tx.Rollback()
-			err = InitializeIngestionSource(ctx, tx, b.ID, source, cursor)
+			_, err = InitializeIngestionSource(ctx, tx, b.ID, source, cursor)
 			if want != "" {
 				if err != want {
 					t.Fatalf("initialization bypass=%v want %v", err, want)
@@ -343,6 +343,50 @@ func TestInitializationCannotStrandRetainedPendingEvidence(t *testing.T) {
 				}
 				if err := FinishEvent(ctx, tx, event, EventResult{Classification: "no_marker"}, 0); err != nil {
 					t.Fatalf("retained event unreachable=%v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestEmptyResumeCannotInitializePastPendingEvidence(t *testing.T) {
+	for _, variant := range []string{"past-event", "different-source", "at-first-edge"} {
+		t.Run(variant, func(t *testing.T) {
+			db, b, _, _ := retainedWorkFixture(t)
+			ctx := context.Background()
+			e := SourceEvent{BindingID: b.ID, EventID: "early", SourceID: "70000000-0000-4000-8000-000000000001", Revision: "one", Digest: sha256.Sum256([]byte("synthetic")), Before: "start", After: "next"}
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			if _, err := StageEvent(ctx, tx, e); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(ctx, "INSERT INTO ingestion_barriers(binding_id,barrier_version,status) VALUES(?,1,'held')", b.ID); err != nil {
+				t.Fatal(err)
+			}
+			source, cursor := e.SourceID, e.Before
+			want := Code("")
+			switch variant {
+			case "past-event":
+				cursor = e.After
+				want = EventConflict
+			case "different-source":
+				source = "70000000-0000-4000-8000-000000000002"
+				want = EventConflict
+			}
+			_, err = ResumeIngestion(ctx, tx, ResumeIngestionRequest{BindingID: b.ID, ExpectedBindingVersion: 1, ExpectedBarrierVersion: 1, EvidenceRef: "80000000-0000-4000-8000-000000000010", PrincipalID: testPrincipal, OperationID: testOperation, Interval: ReviewedInterval{SourceID: source, Before: cursor, After: cursor}})
+			if want != "" {
+				if err != want {
+					t.Fatalf("resume stranded evidence=%v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := EventAtCursor(ctx, tx, e); err != nil {
+					t.Fatalf("resume lost pending retry=%v", err)
 				}
 			}
 		})
