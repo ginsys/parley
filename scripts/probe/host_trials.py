@@ -1618,10 +1618,12 @@ class CodexDriver(Driver):
         Answers only the captured first-run trust dialog (Enter, which persists a trust entry for
         `cwd` in `$CODEX_HOME/config.toml` -- a documented side effect); anything else that keeps
         the composer from settling raises `PtyNotReady` with the screen. The default flags cannot
-        produce an approval prompt, so an approval settle must ask for other ones. Any items
+        produce an approval prompt; other flags need a separate capture before support. Any items
         already queued are delivered at start (captured), before the composer is ready.
         """
         self.require_owned(thread_id)
+        if (sandbox, approval) != ('read-only', 'never'):
+            raise ValueError('Codex attach options are uncaptured; only -s read-only -a never is supported')
         argv = ['codex', '--no-alt-screen', '-s', sandbox, '-a', approval, '-C', self.cwd,
                 'resume', thread_id]
         client = self.open_client(argv)

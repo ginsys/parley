@@ -403,7 +403,7 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `SubmissionRejected` with the stderr. A queued item is delivered by whichever process next
   serves the thread (captured: a live idle TUI within ~7 s; a `resume` at its start), so with
   mechanism `queue` a settle callback must have opened `attach(thread_id)` beforehand — a
-  `codex --no-alt-screen -s <sandbox> -a <approval> -C <probe cwd> resume <thread_id>` client
+  `codex --no-alt-screen -s read-only -a never -C <probe cwd> resume <thread_id>` client
   under a PTY, held on the driver until the sweep closes it. With no *live* client open — none
   held, or every held one already exited — `submit()`
   raises `SubmissionUncaptured` before queueing anything, since the trial could only time out.
@@ -425,7 +425,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   that failure, and only missing delivery outcomes become unobservable. A client that exits on the dialog, so that the Enter cannot
   be written at all, is that same not-ready case and is named as one, rather than escaping as the
   raw `OSError` `os.write` produced. The default `-a never` cannot produce an
-  approval prompt, so an approval settle has to ask for other flags. `teardown()` runs
+  approval prompt. Other sandbox/approval arguments are rejected before launching a client;
+  approval-state support needs a separate capture before the runner can accept new options.
+  `teardown()` runs
   `codex delete --force <id>` and releases only on exit 0; what it does to a still-queued item is
   uncaptured. `version()` is the rollout's first `session_meta.payload.cli_version` — the
   creating `exec`'s, not necessarily the resume client's — and never `codex --version`, which

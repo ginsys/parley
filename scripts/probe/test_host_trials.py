@@ -2098,12 +2098,17 @@ class CodexDriverTests(DriverTestCase):
         self.assertTrue(client.closed)
         self.assertEqual(driver.clients, [])
 
-    def test_attach_accepts_other_sandbox_and_approval_flags(self):
+    def test_attach_rejects_uncaptured_sandbox_and_approval_flags_before_launch(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])
         driver = self.driver(run)
         driver.create('hello')
-        client = driver.attach(THREAD_ID, sandbox='workspace-write', approval='untrusted')
-        self.assertEqual(client.argv[2:6], ['-s', 'workspace-write', '-a', 'untrusted'])
+        for sandbox, approval in (('workspace-write', 'never'), ('danger-full-access', 'never'),
+                                  ('read-only', 'on-request'), ('read-only', 'untrusted'),
+                                  (None, 'never'), ('read-only', None)):
+            with self.subTest(sandbox=sandbox, approval=approval):
+                with self.assertRaisesRegex(ValueError, 'uncaptured'):
+                    driver.attach(THREAD_ID, sandbox=sandbox, approval=approval)
+                self.assertEqual(FakePtyClient.launched, [])
 
     def test_observe_reads_the_rollout_with_the_turn_stream_and_fails_closed(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])
