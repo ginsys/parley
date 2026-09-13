@@ -838,3 +838,14 @@ Missing incidents in `clock.reconcile` and `recovery.complete` retain audited te
 results. Creating the incident later cannot change the same operation ID's result. An incident
 appearing between clock preflight and the mutation writer instead requires a fresh verification
 attempt without committing a receipt.
+
+Initialization checks the ingestion barrier before trusted origin I/O and again before storing
+the cursor. A verified new edge that forks at the current cursor remains pending with
+`event_conflict`; it cannot disappear through rollback or permit a later resume to overlook it.
+Marker listing finishes bounded enumeration before promotion mutates the directory. Canonical
+and pending names each have the configured capacity bound; unique incident materialization has
+the same bound. Partial timestamp shapes compare safely even before marker validation.
+
+Recovery hooks stay fail closed until their constructor finishes installation identity loading
+and preparation. A failed constructor retains this denial; the trusted owner must reopen the
+store for a fresh supervised initialization instead of falling back to unguarded services.

@@ -48,6 +48,9 @@ func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor st
 		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
 			return store.TransitionResult{}, err
 		}
+		if err := store.IngestionAllowed(ctx, tx, s.token.BindingID); err != nil {
+			return store.TransitionResult{}, err
+		}
 		var err error
 		credential, err = store.ReadCredential(ctx, tx, s.socket.credentialID)
 		return store.TransitionResult{}, err
@@ -159,6 +162,9 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 			return store.TransitionResult{Changed: !found}, nil
 		}
 		if err := store.EventAtCursor(ctx, tx, e); err != nil {
+			if err == store.EventConflict {
+				return pending(store.EventConflict)
+			}
 			if err == store.TemporarilyUnavailable || err == store.HostUnverified {
 				return pending(store.TemporarilyUnavailable)
 			}

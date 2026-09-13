@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	runtimeowner "github.com/ginsys/parley/internal/runtime"
@@ -22,6 +23,7 @@ type Config struct {
 	FailStop func()
 }
 type Service struct {
+	initialized atomic.Bool
 	config      Config
 	maintenance *store.RecoveryMaintenance
 	// Lock order: I/O serialization -> maintenance coordinator -> short state.
@@ -56,12 +58,16 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	if err := s.prepare(ctx); err != nil {
 		return nil, err
 	}
+	s.initialized.Store(true)
 	return s, nil
 }
 func humanRecovery(kind string) bool {
 	return kind == "human_inspection" || kind == "clock.reconcile" || kind == "recovery.complete"
 }
 func (s *Service) before(ctx context.Context, kind string) error {
+	if !s.initialized.Load() {
+		return store.RecoveryRequired
+	}
 	if err := s.prepare(ctx); err != nil {
 		return err
 	}
@@ -227,6 +233,9 @@ func (s *Service) flush(ctx context.Context) error {
 	return nil
 }
 func (s *Service) after() error {
+	if !s.initialized.Load() {
+		return store.RecoveryRequired
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), store.AuthenticationDeadline)
 	defer cancel()
 	s.ioMu.Lock()
