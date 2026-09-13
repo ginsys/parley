@@ -1096,7 +1096,7 @@ class CodexDriver(Driver):
     NAMESPACE = 'codex'
 
     def __init__(self, registry, *, run=subprocess.run, cwd, model=None, mechanism='queue',
-                 rollout_path_for=default_codex_rollout_path, pty=PtyClient):
+                 rollout_path_for=default_codex_rollout_path, pty=PtyClient, clock=time.time):
         if mechanism not in CODEX_MECHANISMS:
             raise ValueError(f'unknown submission mechanism: {mechanism!r}')
         super().__init__(registry, cwd=cwd)
@@ -1105,6 +1105,7 @@ class CodexDriver(Driver):
         self.mechanism = mechanism
         self.rollout_path_for = rollout_path_for
         self.pty = pty
+        self.clock = clock
 
     def create(self, prompt):
         """`codex exec --json -s read-only --skip-git-repo-check -C <cwd> '<prompt>'`.
@@ -1188,6 +1189,7 @@ class CodexDriver(Driver):
             raise
         if result.returncode != 0:
             raise SubmissionRejected(result.returncode, result.stderr)
+        accepted_at = self.clock()
         if self.mechanism == 'queue-then-resume':
             try:
                 self.attach(thread_id)
@@ -1196,6 +1198,9 @@ class CodexDriver(Driver):
                 # not a host that ignored the message.
                 raise SubmissionUncaptured(f'queued, but the resume that should deliver it '
                                            f'never became ready: {error}') from error
+            # The host accepted when `codex queue` exited, not after the resume client's startup
+            # (captured: 15s with items queued); `run_trial` takes a number as the acceptance time.
+            return accepted_at
         return True
 
     def observe(self, thread_id, *, marker, submitted_at):
@@ -1602,7 +1607,10 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     `ValueError` before any session exists.
 
     `submit()`'s result drives acceptance: `True` is accepted, stamped when `submit` *returns*
-    (a slow submission is not backdated into its 10s window); `False` or `SubmissionRejected` is
+    (a slow submission is not backdated into its 10s window); a number is the `clock` reading at
+    which the driver itself saw the host accept, for a `submit()` that keeps working after that
+    point (Codex `queue-then-resume` opens its client only after `codex queue` exited 0); `False`
+    or `SubmissionRejected` is
     a real, observed rejection -- `accepted` stays observable, but no polling happens and the
     transcript outcomes are unobservable, since nothing was delivered; `None`, or a
     `subprocess.TimeoutExpired` from the call, means the message went through a channel with no
@@ -1675,9 +1683,16 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     except subprocess.TimeoutExpired:
         accepted = None
     submission_diagnostic = submission_diagnostic or getattr(driver, 'submission_note', None)
+    accepted_at = None
     if accepted is None:
         accepted_unobservable = True
-    elif accepted is False:
+    elif accepted is True:
+        accepted_at = clock()
+    elif isinstance(accepted, (int, float)) and not isinstance(accepted, bool) and math.isfinite(accepted):
+        accepted_at = float(accepted)
+    elif accepted is not False:
+        raise TypeError(f'submit() returned {accepted!r}; expected True, False, None or an acceptance time')
+    if accepted is False:
         # `accepted` itself is observable negative evidence, but `classify_trial` still waits
         # for its 10s window: `Trial.result` has no "already resolved" input. Nothing was
         # delivered, so the transcript outcomes are unobservable rather than polled to a
@@ -1688,7 +1703,6 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
                         outcomes={}, state=state, marker=marker, version=version, supported=supported,
                         observable=observable, turn_end_observable=False,
                         submission_diagnostic=submission_diagnostic)
-    accepted_at = None if accepted_unobservable else clock()
     outcomes = {}
     signals = {}
     turn_end = None

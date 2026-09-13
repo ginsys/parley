@@ -1049,9 +1049,11 @@ class CodexDriverTests(DriverTestCase):
 
         run = FakeRun([(['codex', 'exec'], self.exec_output()),
                        (['codex', 'queue'], queue)])
-        driver = self.driver(run, mechanism='queue-then-resume')
+        readings = iter([1234.5, 1250.0])  # queue exit, then whatever comes after the client
+        driver = self.driver(run, mechanism='queue-then-resume', clock=lambda: next(readings))
         driver.create('hello')
-        self.assertTrue(driver.submit(THREAD_ID, 'msg'))
+        # Acceptance is the `codex queue` exit, stamped before the resume client's startup.
+        self.assertEqual(driver.submit(THREAD_ID, 'msg'), 1234.5)
         client, = FakePtyClient.launched
         self.assertEqual(client.argv, ['codex', '--no-alt-screen', '-s', 'read-only', '-a', 'never',
                                        '-C', driver.cwd, 'resume', THREAD_ID])
@@ -1516,6 +1518,21 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.submitted_at, 1000.0)
         self.assertEqual(run.accepted_at, 1012.0)
         self.assertEqual(run.outcomes['accepted'], 1012.0)
+
+    def test_a_numeric_submit_result_is_the_drivers_own_acceptance_time(self):
+        # Codex queue-then-resume: `codex queue` exits 0, then the resume client takes 15s to
+        # start. Stamping at return would push a real acceptance out of its 10s window.
+        clock = FakeClock()
+        driver = FakeDriver(accepted=1003.5, clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertEqual(run.accepted_at, 1003.5)
+        self.assertEqual(run.outcomes['accepted'], 1003.5)
+        self.assertEqual(run.signals['accepted'], SIGNAL_SUBMIT_EXIT_STATUS)
+        self.assertGreater(clock.time(), 1003.5)  # submit() returned later than it stamped
+        for bad in ('yes', float('nan'), object()):
+            with self.subTest(result=bad):
+                with self.assertRaises(TypeError):
+                    self.run_one(FakeDriver(accepted=bad, clock=FakeClock()), FakeClock())
 
     def test_the_result_carries_which_signal_established_each_outcome(self):
         clock = FakeClock()
