@@ -349,11 +349,11 @@ class CodexParsingTests(unittest.TestCase):
     def test_thread_ids_come_from_thread_started_events(self):
         stdout = '\n'.join([json.dumps({'type': 'thread.started', 'thread_id': THREAD_ID}),
                             json.dumps({'type': 'turn.started'}), 'not json'])
-        self.assertEqual(list(codex_thread_ids(stdout)), [THREAD_ID])
-        self.assertEqual(codex_thread_ids(json.dumps({'type': 'turn.started'})), {})
-        self.assertEqual(codex_thread_ids(json.dumps({'type': 'thread.started', 'thread_id': ''})), {})
-        self.assertEqual(codex_thread_ids(json.dumps({'type': 'thread.started', 'thread_id': 5})), {})
-        self.assertEqual(codex_thread_ids(''), {})
+        self.assertEqual(codex_thread_ids(stdout), ({THREAD_ID: None}, 1))
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'turn.started'})), ({}, 0))
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'thread.started', 'thread_id': ''})), ({}, 1))
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'thread.started', 'thread_id': 5})), ({}, 1))
+        self.assertEqual(codex_thread_ids(''), ({}, 0))
 
     def test_rollout_extracts_user_and_assistant_skips_developer_and_other_types(self):
         lines = [
@@ -1487,6 +1487,18 @@ class CodexDriverTests(DriverTestCase):
                 for candidate in (THREAD_ID, other):
                     with self.assertRaises(ForeignSessionError):
                         driver.teardown(candidate)
+
+    def test_malformed_codex_creation_cannot_hide_behind_a_valid_thread_event(self):
+        for suffix in ('{"type":', '[1]', 'null',
+                       json.dumps({'type': 'thread.started', 'thread_id': 5})):
+            with self.subTest(suffix=suffix):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['codex', 'exec'],
+                                FakeResult(0, self.exec_output().stdout + '\n' + suffix))])
+                driver = self.driver(run)
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), {THREAD_ID})
 
     def test_create_mints_before_checking_the_exit_status_and_from_partial_output(self):
         run = FakeRun([(['codex', 'exec'], FakeResult(2, self.exec_output().stdout, 'quota'))])

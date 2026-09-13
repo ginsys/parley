@@ -344,7 +344,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `codex exec --json -s read-only --skip-git-repo-check -C <probe cwd> '<prompt>'` with stdin
   closed, mints a unique `thread.started.thread_id` before checking exit status, including partial
   timeout output, and returns once the turn ends. Multiple distinct creation IDs grant no
-  ownership; every candidate is reported for investigation without deletion authority. The thread is
+  ownership; every candidate is reported for investigation without deletion authority. Malformed
+  JSON, non-object records and unusable `thread.started` records fail creation even if another
+  event names a valid thread; its unique creation ID remains owned for cleanup. The thread is
   then idle with no live process. A rollout that disappears between discovery and its metadata
   read makes that poll unobservable and its version unknown; later polls retry discovery.
   `observe()` reads the rollout

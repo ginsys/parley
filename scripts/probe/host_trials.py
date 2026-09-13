@@ -1305,8 +1305,9 @@ CODEX_MECHANISMS = ('queue', 'queue-then-resume')
 
 
 def codex_thread_ids(stdout):
-    """Distinct `thread.started.thread_id` values in stream order."""
+    """Distinct `thread.started.thread_id` values and unusable-record count."""
     thread_ids = {}
+    unusable = 0
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -1314,11 +1315,16 @@ def codex_thread_ids(stdout):
         try:
             record = json.loads(line)
         except ValueError:
+            unusable += 1
             continue
-        if isinstance(record, dict) and record.get('type') == 'thread.started' \
-                and isinstance(record.get('thread_id'), str) and record['thread_id']:
-            thread_ids[record['thread_id']] = None
-    return thread_ids
+        if not isinstance(record, dict):
+            unusable += 1
+        elif record.get('type') == 'thread.started':
+            if isinstance(record.get('thread_id'), str) and record['thread_id']:
+                thread_ids[record['thread_id']] = None
+            else:
+                unusable += 1
+    return thread_ids, unusable
 
 
 def codex_session_version(lines):
@@ -1485,7 +1491,7 @@ class CodexDriver(Driver):
         self.clock = clock
 
     def _created_thread(self, stdout):
-        thread_ids = codex_thread_ids(stdout)
+        thread_ids, unusable = codex_thread_ids(stdout)
         if len(thread_ids) > 1:
             self.strays.update(thread_ids)
             raise RuntimeError(f'ambiguous Codex creation IDs {list(thread_ids)!r}; '
@@ -1493,6 +1499,8 @@ class CodexDriver(Driver):
         thread_id = next(iter(thread_ids), None)
         if thread_id:
             self.mint(thread_id)
+        if unusable:
+            raise RuntimeError('codex creation stream contains malformed event records')
         return thread_id
 
     def create(self, prompt):
