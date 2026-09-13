@@ -239,15 +239,66 @@ func readyIngestion(t *testing.T) (*Manager, *Session, *Session, *Ingestor, Inge
 	}
 	return m, author, recipient, ingestor, request, id
 }
-func TestIngestionRejectsInvalidUTF8BeforeHashing(t *testing.T) {
-	_, _, recipient, ingestor, request, _ := readyIngestion(t)
-	for _, text := range []string{string([]byte{0x80}), string([]byte{0x81})} {
-		request.Text = text
-		if _, err := ingestor.Ingest(context.Background(), recipient, request); err != store.InvalidRequest {
-			t.Fatalf("invalid source=%v", err)
+func TestIngestionRejectsInvalidUTF8WithoutRetainedEffects(t *testing.T) {
+	m, _, recipient, ingestor, request, id := readyIngestion(t)
+	ctx := context.Background()
+	fields := []string{"text", "event_id", "source_id", "revision", "before", "after"}
+	checkInvalid := func(t *testing.T, field string, invalid string) {
+		t.Helper()
+		bad := request
+		switch field {
+		case "text":
+			bad.Text = invalid
+		case "event_id":
+			bad.Event.ID = invalid
+		case "source_id":
+			bad.Event.SourceID = invalid
+		case "revision":
+			bad.Event.Revision = invalid
+		case "before":
+			bad.Event.Before = invalid
+		case "after":
+			bad.Event.After = invalid
+		}
+		out, err := ingestor.Ingest(ctx, recipient, bad)
+		if err != store.InvalidRequest || out.Replayed {
+			t.Fatalf("invalid source=%+v %v", out, err)
 		}
 	}
+	for _, field := range fields {
+		t.Run(field, func(t *testing.T) {
+			for _, invalid := range []string{string([]byte{0x80}), string([]byte{0x81})} {
+				checkInvalid(t, field, invalid)
+			}
+		})
+	}
+	if err := m.store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var events, envelopes int
+		var cursor string
+		if err := tx.QueryRowContext(ctx, "SELECT (SELECT count(*) FROM ingestion_evidence), (SELECT count(*) FROM envelopes), (SELECT cursor FROM ingestion_cursors)").Scan(&events, &envelopes, &cursor); err != nil {
+			return err
+		}
+		original, err := store.GetByID(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if events != 0 || envelopes != 1 || cursor != "start" || original.State != store.HandedOff {
+			t.Errorf("invalid event changed work: events=%d envelopes=%d cursor=%q state=%s", events, envelopes, cursor, original.State)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := ingestor.Ingest(ctx, recipient, request)
+	if err != nil || accepted.Classification != "accepted" {
+		t.Fatalf("valid source=%+v %v", accepted, err)
+	}
+	// Malformed fields must also fail before retained replay can be returned.
+	for _, field := range fields {
+		checkInvalid(t, field, string([]byte{0x80}))
+	}
 }
+
 func TestCancelledOriginalDoesNotPinCursor(t *testing.T) {
 	m, author, recipient, ingestor, request, id := readyIngestion(t)
 	ctx := context.Background()
