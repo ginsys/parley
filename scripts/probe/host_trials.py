@@ -1723,8 +1723,10 @@ class CodexDriver(Driver):
             self.queue_clients[thread_id] = None
             try:
                 self.queue_clients[thread_id] = self.attach(thread_id)
-            except PtyNotReady as error:
-                self.submission_note = f'queued, but the resume client never became ready: {error}'
+            except (OSError, RuntimeError) as error:
+                # PtyNotReady is a RuntimeError too. Fork/PTY and drain-thread startup can
+                # fail before a readiness screen exists; none erases the successful queue exit.
+                self.submission_note = f'queued, but the resume client failed to start or become ready: {error}'
             # The host accepted when `codex queue` exited, not after the resume client's startup
             # (captured: 15s with items queued); `run_trial` takes a number as the acceptance time.
             return accepted_at

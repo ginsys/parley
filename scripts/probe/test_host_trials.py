@@ -2169,6 +2169,52 @@ class CodexDriverTests(DriverTestCase):
         self.assertTrue(FakePtyClient.launched[0].closed)
         self.assertEqual(driver.clients, [])
 
+    def test_resume_startup_failure_preserves_queue_acceptance_through_cleanup_and_classification(self):
+        for error in (OSError(11, 'synthetic fork exhaustion'),
+                      RuntimeError('synthetic thread startup failure')):
+            with self.subTest(error=type(error).__name__):
+                self.registry = SessionRegistry()
+                clock = FakeClock()
+
+                def refusing_pty(argv, *, cwd):
+                    raise error
+
+                run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                               (['codex', 'queue'], FakeResult(0)),
+                               (['codex', 'delete'], FakeResult(0))])
+                driver = self.driver(run, mechanism='queue-then-resume', clock=clock.time,
+                                     pty=refusing_pty)
+                self.transcripts[THREAD_ID] = self.write_lines('startup-failure.jsonl',
+                                                             rollout_lines(cwd=driver.cwd))
+                result = run_trial_with_cleanup(
+                    driver, prompt='synthetic', marker=MARKER, state='restarted',
+                    settle=lambda thread_id: None, clock=clock.time, monotonic=clock.time,
+                    sleep=clock.sleep)
+                classified = classify_trial(
+                    Trial(submitted=result.submitted_at, state=result.state, outcomes=result.outcomes),
+                    clock.time(), supported=result.supported, observable=result.observable)
+                self.assertEqual(classified, dict(accepted='observed', visible='unobservable',
+                                                  turn_start='unobservable', ack='unobservable'))
+                self.assertIn(str(error), result.submission_diagnostic)
+                self.assertEqual(len(run.argv('codex', 'queue')), 1)
+                self.assertEqual(len(run.argv('codex', 'delete')), 1)
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual(driver.clients, [])
+
+    def test_resume_startup_interruption_still_propagates(self):
+        def interrupted_pty(argv, *, cwd):
+            raise KeyboardInterrupt
+
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], FakeResult(0)),
+                       (['codex', 'delete'], FakeResult(0))])
+        driver = self.driver(run, mechanism='queue-then-resume', pty=interrupted_pty)
+        with self.assertRaises(KeyboardInterrupt):
+            run_trial_with_cleanup(driver, prompt='synthetic', state='restarted',
+                                   settle=lambda thread_id: None)
+        self.assertEqual(len(run.argv('codex', 'delete')), 1)
+        self.assertEqual(driver.owned(), set())
+
     def test_attach_answers_the_first_run_trust_prompt_with_enter(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])
         driver = self.driver(run, pty=lambda argv, *, cwd: FakePtyClient(argv, cwd=cwd, trust_prompt=True))
@@ -2214,7 +2260,7 @@ class CodexDriverTests(DriverTestCase):
     def test_a_failed_pty_write_answering_the_trust_dialog_is_not_ready(self):
         # `send_keys` propagates OSError from `os.write` when the child died before the drain
         # thread saw EOF. Unclassified it escaped `attach()` raw, and through `submit()` under
-        # mechanism=queue-then-resume, where only PtyNotReady becomes `SubmissionUncaptured`.
+        # mechanism=queue-then-resume, which now preserves queue acceptance on resume failure.
         def failing(argv, *, cwd):
             client = FakePtyClient(argv, cwd=cwd, trust_prompt=True)
             client.write_error = OSError(5, 'Input/output error')
