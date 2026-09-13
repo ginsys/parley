@@ -127,6 +127,18 @@ func InitializeIngestionSource(ctx context.Context, tx *sql.Tx, binding, source,
 	if !errors.Is(err, sql.ErrNoRows) {
 		return storageCode(err)
 	}
+	// Verified events may have arrived before initialization. Their immutable
+	// source/edges must stay reachable from the initial cursor.
+	var otherSource bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM ingestion_evidence WHERE binding_id=? AND classification='pending' AND source_id!=?)", binding, source).Scan(&otherSource); err != nil {
+		return storageCode(err)
+	}
+	if otherSource {
+		return EventConflict
+	}
+	if err := pendingAfterResume(ctx, tx, binding, source, cursor); err != nil {
+		return err
+	}
 	_, err = tx.ExecContext(ctx, "INSERT INTO ingestion_cursors(binding_id,source_id,cursor) VALUES(?,?,?)", binding, source, cursor)
 	if err != nil {
 		return storageCode(err)

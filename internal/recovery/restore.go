@@ -87,7 +87,7 @@ func (a *RestoreAdministration) Complete(ctx context.Context, p store.CommandPri
 			}
 			return store.CommandResult{}, evidenceErr
 		}
-		if len(disposition.ClockIncidents) > 99 || len(disposition.PendingWork) > 1000 {
+		if len(disposition.PendingWork) > 1000 {
 			return store.CommandResult{}, store.CapacityExceeded
 		}
 		if disposition.ClockFloor == nil && len(disposition.ClockIncidents) != 0 {

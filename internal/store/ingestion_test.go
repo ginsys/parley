@@ -290,3 +290,61 @@ func TestResumePendingEvidenceMaterializationBound(t *testing.T) {
 		})
 	}
 }
+
+func TestInitializationCannotStrandRetainedPendingEvidence(t *testing.T) {
+	for _, variant := range []string{"past-event", "different-source", "at-first-edge"} {
+		t.Run(variant, func(t *testing.T) {
+			db, b, _, _ := retainedWorkFixture(t)
+			ctx := context.Background()
+			event := SourceEvent{BindingID: b.ID, EventID: "early-event", SourceID: "70000000-0000-4000-8000-000000000001", Revision: "one", Digest: sha256.Sum256([]byte("synthetic")), Before: "start", After: "next"}
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := StageEvent(ctx, tx, event); err != nil {
+				t.Fatal(err)
+			}
+			if err := EventAtCursor(ctx, tx, event); err != HostUnverified {
+				t.Fatalf("uninitialized event=%v", err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			source, cursor := event.SourceID, event.Before
+			want := Code("")
+			switch variant {
+			case "past-event":
+				cursor = event.After
+				want = EventConflict
+			case "different-source":
+				source = "70000000-0000-4000-8000-000000000002"
+				want = EventConflict
+			}
+			tx, err = db.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			err = InitializeIngestionSource(ctx, tx, b.ID, source, cursor)
+			if want != "" {
+				if err != want {
+					t.Fatalf("initialization bypass=%v want %v", err, want)
+				}
+				var count int
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM ingestion_cursors").Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if count != 0 {
+					t.Fatal("rejected initialization inserted cursor")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := FinishEvent(ctx, tx, event, EventResult{Classification: "no_marker"}, 0); err != nil {
+					t.Fatalf("retained event unreachable=%v", err)
+				}
+			}
+		})
+	}
+}
