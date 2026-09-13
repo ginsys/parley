@@ -491,6 +491,12 @@ func TestConnectionRuntimeOldSnapshotCannotReplayLostEffects(t *testing.T) {
 	if err := f.markers.Put(ctx, recovery.Marker{IncidentID: incident, ServerID: f.server, Kind: "restore"}); err != nil {
 		t.Fatal(err)
 	}
+	// Never mix the older main database with post-snapshot WAL or shared memory.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if _, err := os.Lstat(f.path + suffix); !os.IsNotExist(err) {
+			t.Fatalf("fixture restore requires absent %s sidecar: %v", suffix, err)
+		}
+	}
 	if err := os.WriteFile(f.path, snapshot, 0600); err != nil {
 		t.Fatal(err)
 	}
