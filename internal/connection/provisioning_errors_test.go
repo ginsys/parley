@@ -28,7 +28,7 @@ func provisioningCounts(t *testing.T, db *store.DB) [5]int {
 }
 
 func TestTargetResolutionFailureSemantics(t *testing.T) {
-	for _, kind := range []string{"register", "rotate"} {
+	for _, kind := range []string{"register", "rotate", "reenroll"} {
 		for name, tc := range map[string]struct {
 			failure  error
 			code     store.Code
@@ -58,6 +58,13 @@ func TestTargetResolutionFailureSemantics(t *testing.T) {
 					invoke = func() (ProvisioningResult, error) { return p.Rotate(ctx, actor, request) }
 					publications = 0
 				}
+				if kind == "reenroll" {
+					var request ReenrollRequest
+					p, request = revokedProvisioner(t)
+					db = p.config.Store
+					p.config.ReenrollEvidence = func(context.Context, string, NativeTuple) error { return nil }
+					invoke = func() (ProvisioningResult, error) { return p.Reenroll(ctx, actor, request) }
+				}
 				p.config.Invalidate = func(string) { invalidations++ }
 				p.config.Target = func(string, uint32) (Publisher, error) { lookups++; return nil, tc.failure }
 				before := provisioningCounts(t, db)
@@ -83,7 +90,7 @@ func TestTargetResolutionFailureSemantics(t *testing.T) {
 					return
 				}
 				wantInvalidations := 0
-				if kind == "rotate" {
+				if kind != "register" {
 					wantInvalidations = 1
 				}
 				if err != nil || retry.Receipt.Result.Code != "" || retry.Receipt.Replayed || retry.Publication != "published" || lookups != 2 || publications != 1 || invalidations != wantInvalidations {

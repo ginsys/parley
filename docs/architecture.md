@@ -223,6 +223,9 @@ Re-enrollment requires new reviewed host evidence and a fresh credential for the
 it does not clear holds, quarantine, the earliest paused cursor or barrier incident history.
 Unavailable evidence and other provider errors leave reenrollment uncommitted, allowing the same
 operation ID to retry after recovery without altering the revoked binding, credential or barrier.
+Target resolution preserves terminal versus transient errors just as registration and rotation do;
+a missing publisher remains forbidden. A missing binding is retained as an authorized terminal
+rejection without consulting host evidence or a publication target, and replay reauthorizes it.
 Only an explicit `host_unverified` mismatch/unsupported result, or a missing evidence provider,
 is retained as a terminal host-verification rejection. Replays never reverify or republish.
 

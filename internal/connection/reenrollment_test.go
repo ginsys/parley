@@ -146,3 +146,30 @@ func TestReenrollmentRetainsHostMismatchRejection(t *testing.T) {
 		})
 	}
 }
+
+func TestMissingBindingReenrollmentRetainsRejection(t *testing.T) {
+	p, db := testProvisioner(t, PublisherFunc(func(context.Context, CredentialFile) error { t.Error("missing binding published"); return nil }))
+	p.config.ReenrollEvidence = func(context.Context, string, NativeTuple) error {
+		t.Error("missing binding consulted verifier")
+		return nil
+	}
+	p.config.Target = func(string, uint32) (Publisher, error) { t.Error("missing binding resolved target"); return nil, nil }
+	request := ReenrollRequest{RotateRequest: RotateRequest{OperationID: registerID, BindingID: adminID, ExpectedBindingVersion: 1, ExpectedCredentialVersion: 1, ExpiresAt: time.Unix(250, 0), TargetRef: targetID}, HostEvidenceRef: adminID}
+	actor := store.CommandPrincipal{ID: adminID}
+	result, err := p.Reenroll(context.Background(), actor, request)
+	if err != nil || result.Receipt.Result.Code != store.BindingUnavailable || result.Receipt.Replayed {
+		t.Errorf("missing result=%+v err=%v", result, err)
+	}
+	if got := provisioningCounts(t, db); got != [5]int{0, 0, 0, 1, 1} {
+		t.Errorf("rows=%v", got)
+	}
+	p.config.Guard = func(context.Context, *sql.Tx, string) error { t.Error("replay rechecked guard"); return nil }
+	replay, err := p.Reenroll(context.Background(), actor, request)
+	if err != nil || replay.Receipt.Result.Code != store.BindingUnavailable || !replay.Receipt.Replayed {
+		t.Errorf("replay=%+v err=%v", replay, err)
+	}
+	p.config.Authorize = func(context.Context, *sql.Tx, store.CommandPrincipal) error { return store.Forbidden }
+	if _, err := p.Reenroll(context.Background(), actor, request); err != store.Forbidden {
+		t.Fatalf("unauthorized replay=%v", err)
+	}
+}
