@@ -265,7 +265,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   serves the thread (captured: a live idle TUI within ~7 s; a `resume` at its start), so with
   mechanism `queue` a settle callback must have opened `attach(thread_id)` beforehand — a
   `codex --no-alt-screen -s <sandbox> -a <approval> -C <probe cwd> resume <thread_id>` client
-  under a PTY, held on the driver until the sweep closes it. With no client open, `submit()`
+  under a PTY, held on the driver until the sweep closes it. With no *live* client open — none
+  held, or every held one already exited — `submit()`
   raises `SubmissionUncaptured` before queueing anything, since the trial could only time out.
   With mechanism `queue-then-resume` (the restarted cell) `submit()` opens that client itself
   right after queueing and returns the time `codex queue` exited, so the resume client's startup
@@ -307,7 +308,11 @@ kernel pty buffer and stall the host (a Codex TUI blocked on stdout is the only 
 its thread's queue) or trip `PtyProcess`'s hard transcript cap mid-trial. Input goes through
 `os.write` directly, never `PtyProcess.send`, whose guard demands an observed idle state — a
 trial's state is the settle callback's precondition, not something read off the screen, and an
-attach to a busy or approval-parked session must still be able to type. The client is only ever
+attach to a busy or approval-parked session must still be able to type. Readiness is a property
+of a *live* client: a child that drew its composer and then exited returns `False` from
+`wait_for` even though the pattern matched, because it serves nothing — retaining such a client
+would let a nonempty client list stand in as proof that a queued Codex message has a serving
+process. The client is only ever
 exercised by controlled Python children in tests. Windows for a PTY-delivered submission include
 the client's own startup (captured: 3.2 s to Claude's composer), since `submitted_at` is stamped
 when `submit()` is called. Codex's resume client (captured: 15 s to ready while it drained queued

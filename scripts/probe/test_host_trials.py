@@ -568,12 +568,15 @@ class PtyClientTests(unittest.TestCase):
     def test_the_drain_thread_keeps_reading_past_the_process_transcript_cap(self):
         # A held client must not stall the child or trip PtyProcess's 1 MiB `_record` cap: the
         # child emits 2 MiB and the client keeps only its bounded window, latest bytes last.
+        # The trailing read keeps the child alive: `wait_for` refuses to call an exited client
+        # ready, so a child that printed and exited could never satisfy it.
         code = '''
 import sys
 for i in range(2048):
     sys.stdout.write('L%05d ' % i + 'x' * 1017 + '\\n')
     sys.stdout.flush()
 print('DONE', flush=True)
+sys.stdin.readline()
 '''
         client = self.spawn(code, window=64 * 1024)
         self.assertTrue(client.wait_for(r'DONE', quiet=0.2, timeout=20))
@@ -599,8 +602,18 @@ print('DONE', flush=True)
         self.assertLess(time.monotonic() - started, 8)
         self.assertTrue(client.eof)
 
+    def test_wait_for_refuses_a_composer_drawn_by_a_child_that_then_exited(self):
+        # Readiness is a property of a live client. A child that drew the composer and exited
+        # serves nothing: retaining it would let `CodexDriver.submit` read a nonempty client list
+        # as proof that a queued message has a serving process.
+        client = self.spawn("print('> Ask me anything', flush=True)")
+        self.assertFalse(client.wait_for(r'> Ask me anything', quiet=0.5, timeout=5))
+        self.assertTrue(client.eof)
+        self.assertIn('> Ask me anything', client.screen())  # it did appear; the exit is what refuses
+
     def test_env_carries_xterm_term_and_the_resolved_cwd(self):
-        code = "import os; print('TERM=' + os.environ['TERM'] + ' PWD=' + os.environ['PWD'], flush=True)"
+        code = ("import os, sys; print('TERM=' + os.environ['TERM'] + ' PWD=' + os.environ['PWD'], "
+                "flush=True); sys.stdin.readline()")  # stays alive: an exited client is never ready
         client = self.spawn(code)
         self.assertTrue(client.wait_for(r'TERM=xterm-256color PWD=' + re.escape(os.path.realpath(self.tmp.name)),
                                         quiet=0.1, timeout=5))
@@ -610,15 +623,17 @@ class FakePtyClient:
     """Scripted TUI. `ready` False means the composer never appears after startup (or, with
     `trust_prompt`, after the trust dialog is answered). `trust_prompt` starts on the captured
     escape-stripped dialog, words run together, with the composer placeholder already drawn
-    beneath it -- so a readiness match alone cannot tell the two screens apart."""
+    beneath it -- so a readiness match alone cannot tell the two screens apart. `eof` mirrors the
+    real client's: a client whose child exited is never ready and refuses every write."""
 
     launched = []
 
-    def __init__(self, argv, *, cwd, ready=True, trust_prompt=False):
+    def __init__(self, argv, *, cwd, ready=True, trust_prompt=False, eof=False):
         self.argv = argv
         self.cwd = cwd
         self.ready = ready
         self.trust_prompt = trust_prompt
+        self.eof = eof
         self.keys = []
         self.typed = []
         self.closed = False
@@ -636,14 +651,16 @@ class FakePtyClient:
         return self.text[-limit:]
 
     def wait_for(self, pattern, *, timeout, quiet=1.0, since=0):
+        if self.eof:
+            return False
         answered = b'\r' in self.keys
         if self.ready and (not self.trust_prompt or answered):
             self.text += '❯\xa0\n› Ask Codex to do anything\n'
         return bool(re.search(pattern, self.text[since:]))
 
     def send_keys(self, data):
-        if self.closed:
-            raise ValueError('closed')
+        if self.closed or self.eof:
+            raise ValueError('closed or exited session')
         self.keys.append(data)
         return len(data)
 
@@ -1094,6 +1111,21 @@ class CodexDriverTests(DriverTestCase):
                        (['codex', 'queue'], FakeResult(0))])
         driver = self.driver(run)
         driver.create('hello')
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(run.argv('codex', 'queue'), [])
+
+    def test_queue_submit_with_only_an_exited_resume_client_is_uncaptured(self):
+        # A resume client that exited serves nothing. Counting the retained handle as a serving
+        # process would queue an item nobody delivers and blame the host for the silence.
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'resume'], None),
+                       (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.attach(THREAD_ID)
+        client, = FakePtyClient.launched
+        client.eof = True
         with self.assertRaises(SubmissionUncaptured):
             driver.submit(THREAD_ID, 'msg')
         self.assertEqual(run.argv('codex', 'queue'), [])

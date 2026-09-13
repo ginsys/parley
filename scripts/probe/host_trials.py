@@ -442,19 +442,19 @@ class PtyClient:
         The quiet requirement is what distinguishes a composer that is ready from one whose
         placeholder is drawn while a turn or a dialog is still in progress: both captured TUIs
         render their prompt text early and keep redrawing (a spinner, a trust dialog) until
-        they are actually idle. A child that already exited can produce nothing more, so its
-        final output counts as quiet. Returns False on timeout or when the child exits without
-        ever matching.
+        they are actually idle. Readiness is a property of a live client: a child that exited
+        after drawing its composer serves nothing, so an exit returns False even when the pattern
+        had matched. Returns False on timeout or exit.
         """
         regex = re.compile(pattern)
         deadline = time.monotonic() + timeout
         while True:
-            eof = self.eof  # read before the text: the drain thread appends its last bytes first
-            text = self.text_since(since)
-            matched = regex.search(text) is not None
-            if matched and (eof or time.monotonic() - self.last_output >= quiet):
+            if self.eof:
+                return False
+            matched = regex.search(self.text_since(since)) is not None
+            if matched and time.monotonic() - self.last_output >= quiet:
                 return True
-            if eof or time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 return False
             time.sleep(0.1)
 
@@ -1215,9 +1215,9 @@ class CodexDriver(Driver):
         """
         self.registry.require_owned(self._key(thread_id))
         self.submission_note = None
-        if self.mechanism == 'queue' and not self.clients:
-            raise SubmissionUncaptured('mechanism=queue needs a resume client already serving the thread '
-                                       '(the settle callback opens one with attach()); nothing queued')
+        if self.mechanism == 'queue' and not any(not client.eof for client in self.clients):
+            raise SubmissionUncaptured('mechanism=queue needs a live resume client already serving the '
+                                       'thread (the settle callback opens one with attach()); nothing queued')
         try:
             result = self.run(['codex', 'queue', '--thread', thread_id, '--message', message],
                               capture_output=True, text=True, timeout=15)
