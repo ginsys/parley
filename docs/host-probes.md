@@ -346,7 +346,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `SubmissionUncaptured`, whichever way the exit surfaces: the drain thread's EOF flag refuses the
   write, or the write reaches `os.write` first and fails there. Both leave the line partly typed
   with no Enter guaranteed, so both are the same uncaptured submission — the second only looks
-  different because it arrives as an `OSError`. `resume` runs `claude --bg --resume <sessionId> '<msg>'` with no other
+  different because it arrives as an `OSError`. After typing succeeds, observation retains and
+  rechecks that exact client. Exit, removal, replacement or changed session binding makes missing
+  transcript outcomes unobservable even when the persisted transcript remains readable; positive
+  transcript evidence still stands. `resume` runs `claude --bg --resume <sessionId> '<msg>'` with no other
   flags against a *stopped* session (the captured restarted path); a running session (`pid` set)
   is refused as uncaptured, since with flags, or against a running session, the captured result
   is a copy under a new id — which, when stdout names one anyway, is minted whatever the exit

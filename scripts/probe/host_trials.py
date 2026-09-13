@@ -983,6 +983,7 @@ class ClaudeDriver(Driver):
         # the same clock the deadline reads (a real monotonic with a no-op sleep hot-spins).
         self.monotonic = monotonic
         self.sessions = {}  # short id -> full sessionId (None until the listing supplied it)
+        self.submission_clients = {}
 
     def _listing(self):
         result = self.run(['claude', 'agents', '--json', '--all', '--cwd', self.cwd],
@@ -1158,7 +1159,11 @@ class ClaudeDriver(Driver):
             return Observation(observable=False)
         events, unusable = parsed
         observation = detect_outcomes(events, marker, submitted_at=submitted_at)
-        if unusable:
+        client = self.submission_clients.get(session_id)
+        client_lost = client is not None and (
+            not any(held is client for held in self.clients) or client.eof
+            or getattr(client, 'serves', None) != session_id)
+        if unusable or client_lost:
             observation.observable = False
         return observation
 
@@ -1297,6 +1302,7 @@ class ClaudeDriver(Driver):
         client = self.live_client_for(session_id)
         if client is None:
             client = self.attach(session_id)
+        self.submission_clients[session_id] = client
         screen_at_type = client.screen(400)
         typed_at = _utc_now()
         try:

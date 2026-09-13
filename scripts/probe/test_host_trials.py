@@ -1340,6 +1340,44 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(driver.clients, [])
         self.assertGreaterEqual(self.clock.elapsed, 1.0)  # the detach was given the captured moment
 
+    def test_attach_client_loss_during_observation_invalidates_only_missing_evidence(self):
+        for loss in ('exit', 'remove', 'replace', 'rebind'):
+            with self.subTest(loss=loss):
+                self.registry = SessionRegistry()
+                driver, _ = self.create_live()
+                client = driver.attach('69aa52ed')
+                self.transcripts[SESSION_UUID] = self.write_lines('lost-attach.jsonl', [
+                    claude_record('user', MARKER, cwd=driver.cwd)])
+                self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
+                self.assertTrue(driver.observe('69aa52ed', marker=MARKER, submitted_at=0).observable)
+                if loss == 'exit':
+                    client.eof = True
+                elif loss == 'rebind':
+                    client.serves = '12345678'
+                else:
+                    driver.clients.remove(client)
+                    if loss == 'replace':
+                        driver.attach('69aa52ed')
+                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                self.assertFalse(observation.observable)
+                self.assertEqual(set(observation.outcomes), {'visible'})
+
+    def test_attach_client_exit_after_successful_write_invalidates_missing_evidence(self):
+        driver, _ = self.create_live()
+
+        class ExitAfterWrite(FakePtyClient):
+            def type_line(self, text, **kwargs):
+                super().type_line(text, **kwargs)
+                self.eof = True
+
+        driver.pty = ExitAfterWrite
+        self.transcripts[SESSION_UUID] = self.write_lines('exited-attach.jsonl', [
+            claude_record('user', 'initial prompt', cwd=driver.cwd)])
+        self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
+        observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+        self.assertFalse(observation.observable)
+        self.assertEqual(observation.outcomes, {})
+
     def test_busy_submit_reuses_the_client_that_established_the_state(self):
         driver, run = self.create_live()
         client = driver.attach('69aa52ed')
