@@ -1160,10 +1160,30 @@ class CodexDriver(Driver):
         return client
 
     def submit(self, thread_id, message):
+        """`codex queue --thread <id> --message <text>`, then the resume client if this is the
+        restarted cell.
+
+        Under `queue` a resume client must already be open on `clients` (the settle callback's
+        `attach()`): captured, a queued item is delivered only by a process serving the thread,
+        so queueing with none open would produce a guaranteed `not_observed` that says nothing
+        about the host -- refused as `SubmissionUncaptured` before anything is queued. Under
+        `queue-then-resume` a `codex queue` that times out is also uncaptured: whether the item
+        was queued is unknown and nothing serves the thread yet.
+        """
         self.registry.require_owned(self._key(thread_id))
         self.submission_note = None
-        result = self.run(['codex', 'queue', '--thread', thread_id, '--message', message],
-                          capture_output=True, text=True, timeout=15)
+        if self.mechanism == 'queue' and not self.clients:
+            raise SubmissionUncaptured('mechanism=queue needs a resume client already serving the thread '
+                                       '(the settle callback opens one with attach()); nothing queued')
+        try:
+            result = self.run(['codex', 'queue', '--thread', thread_id, '--message', message],
+                              capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired as error:
+            if self.mechanism == 'queue-then-resume':
+                raise SubmissionUncaptured('codex queue timed out before the resume client was opened; '
+                                           'whether the item was queued is unknown and nothing serves '
+                                           'the thread') from error
+            raise
         if result.returncode != 0:
             raise SubmissionRejected(result.returncode, result.stderr)
         if self.mechanism == 'queue-then-resume':

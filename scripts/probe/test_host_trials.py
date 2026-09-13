@@ -976,14 +976,44 @@ class CodexDriverTests(DriverTestCase):
                        (['codex', 'queue'], FakeResult(0, f'Queued message x for thread {THREAD_ID}.\n'))])
         driver = self.driver(run)
         driver.create('hello')
+        client = driver.attach(THREAD_ID)  # what a live-cell settle does before submission
         self.assertTrue(driver.submit(THREAD_ID, 'msg'))
         self.assertEqual(run.argv('codex', 'queue')[0],
                           ['codex', 'queue', '--thread', THREAD_ID, '--message', 'msg'])
-        self.assertEqual(FakePtyClient.launched, [])
+        self.assertEqual(FakePtyClient.launched, [client])  # submit opened no client of its own
         run.scripts.insert(0, (['codex', 'queue'], FakeResult(1, '', 'Error: No active session found')))
         with self.assertRaises(SubmissionRejected) as caught:
             driver.submit(THREAD_ID, 'msg')
         self.assertIn('No active session', caught.exception.stderr)
+
+    def test_queue_submit_with_no_resume_client_open_is_uncaptured_and_queues_nothing(self):
+        # Captured: a queued item is delivered only by a process serving the thread. With none
+        # open the trial would time out for certain, which is evidence about the runner, not
+        # the host.
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(run.argv('codex', 'queue'), [])
+
+    def test_queue_then_resume_treats_a_queue_timeout_as_uncaptured(self):
+        # Nothing serves the thread yet, so a `codex queue` whose exit status is unknown cannot
+        # be polled for: it is neither accepted nor a host rejection.
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], subprocess.TimeoutExpired(cmd=['codex', 'queue'], timeout=15))])
+        driver = self.driver(run, mechanism='queue-then-resume')
+        driver.create('hello')
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(FakePtyClient.launched, [])
+        # Under `queue` a live client may still have drained it: the timeout propagates raw and
+        # `run_trial` polls with `accepted` unobservable.
+        driver = self.driver(run)
+        driver.attach(THREAD_ID)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            driver.submit(THREAD_ID, 'msg')
 
     def test_submit_and_observe_refuse_a_foreign_thread(self):
         driver = self.driver(FakeRun([]))
@@ -995,8 +1025,12 @@ class CodexDriverTests(DriverTestCase):
                 call()
 
     def test_queue_then_resume_opens_the_resume_client_after_queueing_and_keeps_it(self):
+        def queue(argv):
+            self.assertEqual(FakePtyClient.launched, [])  # queued first: a resume drains at start
+            return FakeResult(0)
+
         run = FakeRun([(['codex', 'exec'], self.exec_output()),
-                       (['codex', 'queue'], FakeResult(0))])
+                       (['codex', 'queue'], queue)])
         driver = self.driver(run, mechanism='queue-then-resume')
         driver.create('hello')
         self.assertTrue(driver.submit(THREAD_ID, 'msg'))
