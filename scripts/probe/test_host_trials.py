@@ -1234,6 +1234,17 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(caught.exception.returncode, 1)
         self.assertIn('No conversation found', caught.exception.stderr)
 
+    def test_resume_nonzero_after_backgrounding_the_original_remains_pollable(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'],
+                        FakeResult(1, 'backgrounded · 69aa52ed\n', 'then failed')),
+                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        self.assertIsNone(driver.submit('69aa52ed', 'msg'))
+        self.assertIn('acceptance is ambiguous', driver.submission_note)
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
     def test_resume_submit_nonzero_exit_still_mints_a_copy_named_on_stdout(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], FakeResult(1, 'backgrounded · 0badc0de\n', 'then failed')),

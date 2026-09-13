@@ -1159,6 +1159,11 @@ class ClaudeDriver(Driver):
         if started and started != session_id:
             self._mint(started)  # a copy named on stdout is live whatever the exit status says
         if result.returncode != 0:
+            if started == session_id:
+                self.submission_note = (f'--bg --resume backgrounded the original session but '
+                                        f'exited {result.returncode}; acceptance is ambiguous, '
+                                        'continuing transcript observation')
+                return None
             raise SubmissionRejected(result.returncode, result.stderr)
         if started is None:
             raise SubmissionUncaptured(f'--bg --resume exited 0 without a backgrounded line: '

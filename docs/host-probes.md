@@ -316,7 +316,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   flags against a *stopped* session (the captured restarted path); a running session (`pid` set)
   is refused as uncaptured, since with flags, or against a running session, the captured result
   is a copy under a new id — which, when stdout names one anyway, is minted whatever the exit
-  status so the sweep removes it, and reported as a rejection. A copy named in the partial output
+  status so the sweep removes it, and reported as a rejection. If the original ID is backgrounded
+  before a nonzero exit, acceptance is ambiguous: it is unobservable and transcript polling
+  continues, since that daemon may already have received the marker. A copy named in the partial output
   of a *timed-out* resume is uncaptured rather than a plain timeout: the message went to the copy,
   so polling the trial's own session would turn its absent marker into `not_observed` for a
   session that was never asked. `stop(id)` runs `claude stop` and
