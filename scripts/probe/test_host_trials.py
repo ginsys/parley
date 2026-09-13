@@ -941,12 +941,32 @@ def listing(entries):
     return FakeResult(0, json.dumps(entries))
 
 
-def claude_entry(short='69aa52ed', *, pid=4242, status='idle', state='done', cwd='/x'):
+def claude_entry(short='69aa52ed', *, cwd, pid=4242, status='idle', state='done'):
     return {'pid': pid, 'id': short, 'cwd': cwd, 'kind': 'background', 'startedAt': 1757754000000,
             'sessionId': short + SESSION_UUID[8:], 'name': None, 'status': status, 'state': state}
 
 
 class ClaudeDriverTests(DriverTestCase):
+    def entry(self, short='69aa52ed', **kwargs):
+        kwargs.setdefault('cwd', self.cwd)
+        return claude_entry(short, **kwargs)
+
+    def test_listing_cwd_must_match_before_binding_or_driving(self):
+        for cwd in (None, '', '/foreign'):
+            with self.subTest(cwd=cwd):
+                self.registry = SessionRegistry()
+                entry = self.entry(cwd=cwd)
+                if cwd is None:
+                    del entry['cwd']
+                run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', 'agents'], listing([entry]))])
+                driver = self.driver(run)
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.create('hello')
+                self.assertIsNone(driver.sessions['69aa52ed'])
+                self.assertEqual(driver.clients, [])
+                self.assertEqual(run.argv('claude', '--bg', '--resume'), [])
+
     def test_uncaptured_claude_models_are_rejected_before_host_calls(self):
         for model in (None, '', 'opus', 'sonnet'):
             with self.subTest(model=model):
@@ -956,7 +976,7 @@ class ClaudeDriverTests(DriverTestCase):
                 self.assertEqual(run.calls, [])
 
     def test_listing_cannot_bind_a_short_id_to_an_unrelated_uuid(self):
-        entry = claude_entry()
+        entry = self.entry()
         entry['sessionId'] = 'deadbeef' + SESSION_UUID[8:]
         driver = self.driver(FakeRun([(['claude', 'agents'], listing([entry]))]))
         driver._mint('69aa52ed')
@@ -965,7 +985,7 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertIsNone(driver.sessions['69aa52ed'])
 
     def test_listing_cannot_change_an_already_bound_full_uuid(self):
-        entry = claude_entry()
+        entry = self.entry()
         run = FakeRun([(['claude', 'agents'], lambda argv: listing([entry]))])
         driver = self.driver(run)
         driver._mint('69aa52ed')
@@ -976,7 +996,7 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(driver.sessions['69aa52ed'], SESSION_UUID)
 
     def test_interrupted_claude_creation_reports_candidates_without_adopting_them(self):
-        candidates = [claude_entry(), claude_entry('deadbeef')]
+        candidates = [self.entry(), self.entry('deadbeef')]
         run = FakeRun([(['claude', '--bg'], KeyboardInterrupt()),
                        (['claude', 'agents'], listing(candidates))])
         driver = self.driver(run)
@@ -1006,7 +1026,7 @@ class ClaudeDriverTests(DriverTestCase):
             with self.subTest(result=type(result).__name__):
                 self.registry = SessionRegistry()
                 run = FakeRun([(['claude', '--bg'], result),
-                               (['claude', 'agents'], listing([claude_entry()]))])
+                               (['claude', 'agents'], listing([self.entry()]))])
                 driver = self.driver(run)
                 with self.assertRaises((RuntimeError, subprocess.TimeoutExpired)) as caught:
                     run_trial_with_cleanup(driver, prompt='hello')
@@ -1030,9 +1050,9 @@ class ClaudeDriverTests(DriverTestCase):
             with self.subTest(unknown=unknown):
                 self.registry = SessionRegistry()
                 sibling, _ = self.create_live()
-                entries = [claude_entry()]
+                entries = [self.entry()]
                 if unknown:
-                    entries.append(claude_entry('deadbeef'))
+                    entries.append(self.entry('deadbeef'))
                     # Another host's key cannot hide an unowned Claude candidate.
                     self.registry.mint('codex:deadbeef', object())
                 run = FakeRun([(['claude', '--bg'], FakeResult(0, 'changed output')),
@@ -1049,7 +1069,7 @@ class ClaudeDriverTests(DriverTestCase):
     def test_claude_transcript_removed_between_discovery_and_stat_is_unobservable(self):
         driver = self.driver(FakeRun([
             (['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-            (['claude', 'agents'], listing([claude_entry()]))]),
+            (['claude', 'agents'], listing([self.entry()]))]),
             transcript_path_for=host_trials.default_claude_transcript_path)
         driver.create('hello')
         with unittest.mock.patch.object(host_trials.glob, 'glob', return_value=['synthetic-transcript']), \
@@ -1242,7 +1262,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def test_create_mints_from_stdout_line_one_then_confirms_via_the_listing(self):
         run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n  claude attach 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry()]))])
+                       (['claude', 'agents'], listing([self.entry()]))])
         driver = self.driver(run)
         self.assertEqual(driver.create('hello'), '69aa52ed')
         self.assertEqual(driver.owned(), {'69aa52ed'})
@@ -1257,7 +1277,7 @@ class ClaudeDriverTests(DriverTestCase):
         states = ['working', 'working', 'done']
         run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', 'agents'],
-                        lambda argv: listing([claude_entry(state=states.pop(0) if len(states) > 1
+                        lambda argv: listing([self.entry(state=states.pop(0) if len(states) > 1
                                                            else states[0])]))])
         driver = self.driver(run)
         self.assertEqual(driver.create('hello'), '69aa52ed')
@@ -1266,7 +1286,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def test_create_fails_when_the_creation_turn_never_finishes(self):
         run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry(state='working')]))])
+                       (['claude', 'agents'], listing([self.entry(state='working')]))])
         driver = self.driver(run)
         with self.assertRaises(RuntimeError) as caught:
             driver.create('hello')
@@ -1308,7 +1328,7 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(driver.owned(), {'69aa52ed'})
 
     def test_status_and_teardown_refuse_a_foreign_id(self):
-        driver = self.driver(FakeRun([(['claude', 'agents'], listing([claude_entry('deadbeef')]))]))
+        driver = self.driver(FakeRun([(['claude', 'agents'], listing([self.entry('deadbeef')]))]))
         for method in (driver.status, driver.stop, driver.teardown, driver.version):
             with self.assertRaises(ForeignSessionError):
                 method('deadbeef')
@@ -1319,7 +1339,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def test_observe_reads_the_owned_transcript_and_marks_unusable_reads_unobservable(self):
         run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry()]))])
+                       (['claude', 'agents'], listing([self.entry()]))])
         driver = self.driver(run)
         driver.create('hello')
         self.transcripts[SESSION_UUID] = self.write_lines('t.jsonl', [
@@ -1339,7 +1359,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def test_version_comes_from_the_transcript_never_the_binary(self):
         run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry()]))])
+                       (['claude', 'agents'], listing([self.entry()]))])
         driver = self.driver(run)
         driver.create('hello')
         self.transcripts[SESSION_UUID] = self.write_lines('v.jsonl', [claude_record('user', 'x', cwd=driver.cwd)])
@@ -1374,7 +1394,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def create_live(self, extra_scripts=(), **kwargs):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry()])), *extra_scripts])
+                       (['claude', 'agents'], listing([self.entry()])), *extra_scripts])
         driver = self.driver(run, **kwargs)
         driver.create('hello')
         return driver, run
@@ -1445,7 +1465,7 @@ class ClaudeDriverTests(DriverTestCase):
         client = driver.attach('69aa52ed')
         client.type_line('synthetic prior turn')
         run.scripts.insert(0, (['claude', 'agents'],
-                               listing([claude_entry(status='busy', state='working')])))
+                               listing([self.entry(status='busy', state='working')])))
         with unittest.mock.patch.object(client, 'wait_for', side_effect=AssertionError('idle wait')):
             self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
         self.assertEqual(FakePtyClient.launched, [client])
@@ -1470,7 +1490,7 @@ class ClaudeDriverTests(DriverTestCase):
     def test_busy_submit_without_an_established_client_refuses_mid_turn_attach(self):
         driver, run = self.create_live()
         run.scripts.insert(0, (['claude', 'agents'],
-                               listing([claude_entry(status='busy', state='working')])))
+                               listing([self.entry(status='busy', state='working')])))
         with self.assertRaises(SubmissionUncaptured):
             driver.submit('69aa52ed', marker_message(MARKER))
         self.assertEqual(FakePtyClient.launched, [])
@@ -1550,7 +1570,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def test_attach_to_a_stopped_session_is_uncaptured(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
         driver = self.driver(run)
         driver.create('hello')
         with self.assertRaises(SubmissionUncaptured):
@@ -1560,7 +1580,7 @@ class ClaudeDriverTests(DriverTestCase):
     def test_resume_submit_continues_a_stopped_session_with_no_other_flags(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
         driver = self.driver(run, mechanism='resume')
         driver.create('hello')
         self.assertTrue(driver.submit('69aa52ed', 'msg'))
@@ -1576,7 +1596,7 @@ class ClaudeDriverTests(DriverTestCase):
     def test_resume_submit_that_starts_a_copy_mints_it_and_reports_a_rejection(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 0badc0de\n')),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
         driver = self.driver(run, mechanism='resume')
         driver.create('hello')
         with self.assertRaises(SubmissionRejected):
@@ -1586,7 +1606,7 @@ class ClaudeDriverTests(DriverTestCase):
     def test_resume_submit_nonzero_exit_is_a_rejection_with_its_stderr(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], FakeResult(1, '', 'No conversation found')),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
         driver = self.driver(run, mechanism='resume')
         driver.create('hello')
         with self.assertRaises(SubmissionRejected) as caught:
@@ -1598,7 +1618,7 @@ class ClaudeDriverTests(DriverTestCase):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'],
                         FakeResult(1, 'backgrounded · 69aa52ed\n', 'then failed')),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
         driver = self.driver(run, mechanism='resume')
         driver.create('hello')
         self.assertIsNone(driver.submit('69aa52ed', 'msg'))
@@ -1608,7 +1628,7 @@ class ClaudeDriverTests(DriverTestCase):
     def test_resume_submit_nonzero_exit_still_mints_a_copy_named_on_stdout(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], FakeResult(1, 'backgrounded · 0badc0de\n', 'then failed')),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
         driver = self.driver(run, mechanism='resume')
         driver.create('hello')
         with self.assertRaises(SubmissionRejected):
@@ -1621,7 +1641,7 @@ class ClaudeDriverTests(DriverTestCase):
         error = subprocess.TimeoutExpired(cmd=['claude'], timeout=60, output=b'backgrounded \xc2\xb7 0badc0de\n')
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], error),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
         driver = self.driver(run, mechanism='resume')
         driver.create('hello')
         with self.assertRaises(SubmissionUncaptured) as caught:
@@ -1634,7 +1654,7 @@ class ClaudeDriverTests(DriverTestCase):
         error = subprocess.TimeoutExpired(cmd=['claude'], timeout=60, output=b'')
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], error),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)]))])
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
         driver = self.driver(run, mechanism='resume')
         driver.create('hello')
         with self.assertRaises(subprocess.TimeoutExpired):
@@ -1642,7 +1662,7 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(driver.owned(), {'69aa52ed'})
 
     def test_teardown_stops_confirms_the_pid_is_gone_then_removes(self):
-        listings = iter([listing([claude_entry()]), listing([claude_entry(pid=None, status=None)])])
+        listings = iter([listing([self.entry()]), listing([self.entry(pid=None, status=None)])])
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', 'agents'], lambda argv: next(listings)),
                        (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n')),
@@ -1655,7 +1675,7 @@ class ClaudeDriverTests(DriverTestCase):
                           [['claude', 'stop'], ['claude', 'agents'], ['claude', 'rm']])
 
     def test_stop_confirms_through_the_listing_and_keeps_the_session_owned(self):
-        listings = iter([listing([claude_entry()]), listing([claude_entry(pid=None, status=None)])])
+        listings = iter([listing([self.entry()]), listing([self.entry(pid=None, status=None)])])
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', 'agents'], lambda argv: next(listings)),
                        (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
@@ -1669,7 +1689,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def test_stop_is_an_error_when_the_pid_survives_whatever_the_exit_status(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry()])),
+                       (['claude', 'agents'], listing([self.entry()])),
                        (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
         driver = self.driver(run)
         driver.create('hello')
@@ -1678,10 +1698,10 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(driver.owned(), {'69aa52ed'})
 
     def test_the_restarted_cell_is_stop_then_a_flagless_resume(self):
-        listings = iter([listing([claude_entry()]), listing([claude_entry(pid=None, status=None)])])
+        listings = iter([listing([self.entry()]), listing([self.entry(pid=None, status=None)])])
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], lambda argv: next(listings, listing([claude_entry(pid=None, status=None)]))),
+                       (['claude', 'agents'], lambda argv: next(listings, listing([self.entry(pid=None, status=None)]))),
                        (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
         driver = self.driver(run, mechanism='resume')
         driver.create('hello')
@@ -1696,7 +1716,7 @@ class ClaudeDriverTests(DriverTestCase):
         # The restarted cell's session is stopped before the sweep reaches it; the listing, not
         # `stop`'s exit status, is what gates `rm`.
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)])),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)])),
                        (['claude', 'stop'], FakeResult(1, '', 'not running')),
                        (['claude', 'rm'], FakeResult(0, 'removed 69aa52ed\n'))])
         driver = self.driver(run)
@@ -1707,7 +1727,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def test_teardown_never_runs_rm_while_the_daemon_still_has_a_pid(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
-                       (['claude', 'agents'], listing([claude_entry()])),
+                       (['claude', 'agents'], listing([self.entry()])),
                        (['claude', 'stop'], FakeResult(1, '', 'not stopped')),
                        (['claude', 'rm'], FakeResult(0))])
         driver = self.driver(run)
@@ -1718,13 +1738,13 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(driver.owned(), {'69aa52ed'})  # retained for a human to find
 
     def test_malformed_claude_listings_never_authorize_rm_after_a_failed_stop(self):
-        missing_pid = claude_entry(pid=None, status=None)
+        missing_pid = self.entry(pid=None, status=None)
         missing_pid.pop('pid')
-        missing_id = claude_entry(pid=None, status=None)
+        missing_id = self.entry(pid=None, status=None)
         missing_id.pop('id')
         for entries in ([missing_pid], [None], [missing_id],
-                        [claude_entry(pid=False)], [claude_entry(pid='unknown')],
-                        [claude_entry(pid=None), claude_entry(pid=None)]):
+                        [self.entry(pid=False)], [self.entry(pid='unknown')],
+                        [self.entry(pid=None), self.entry(pid=None)]):
             with self.subTest(entries=entries):
                 self.registry = SessionRegistry()
                 run = FakeRun([(['claude', 'agents'], listing(entries)),

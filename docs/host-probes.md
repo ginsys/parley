@@ -290,6 +290,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   probe directory, mints the short id from stdout line 1 (`backgrounded · <id>`) before checking
   the exit status or running the confirming `claude agents --json --all --cwd <probe cwd>`
   listing, and on a `subprocess.TimeoutExpired` mints from the partial output before re-raising.
+  Every listing row must carry the exact validated probe cwd before session binding or further
+  driving; the command's `--cwd` filter alone is not provenance evidence.
   If creation supplies no recognized ID, a bounded cwd-filtered listing reports candidates for
   manual investigation without adoption, excluding Claude sessions already owned by any driver
   in the shared registry. Another host's namespaced key does not suppress an unowned Claude

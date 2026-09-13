@@ -1006,6 +1006,7 @@ class ClaudeDriver(Driver):
                     re.fullmatch(r'[0-9a-f]{8}', entry['id']) is None or
                     not is_session_uuid(entry['sessionId']) or
                     entry['sessionId'][:8] != entry['id'] or
+                    entry.get('cwd') != self.cwd or
                     entry['kind'] != 'background' or entry['id'] in seen or
                     (entry['pid'] is not None and
                      (type(entry['pid']) is not int or entry['pid'] <= 0))):
@@ -1017,7 +1018,7 @@ class ClaudeDriver(Driver):
         """The `claude agents --json --all --cwd <cwd>` entry for an owned id, or None if absent.
 
         Captured fields: `pid` (None once stopped), `status` (`idle`/`busy`, None once stopped),
-        `state` (`working`/`done`), `sessionId`. Settle callbacks use it to establish or check a
+        `state` (`working`/`done`), `sessionId`, exact `cwd`. Settle callbacks use it to establish or check a
         precondition; what an approval-parked session shows, and how reliable `busy` is, are
         uncaptured. Only this driver's own `--cwd`-filtered listing is ever read.
         """
