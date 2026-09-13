@@ -1708,6 +1708,24 @@ class OpenCodeDriverTests(DriverTestCase):
             driver.serve()
         self.assertEqual(self.servers, [])
 
+    def test_an_http_error_response_still_proves_a_foreign_listener_exists(self):
+        self.patch_killpg()
+        driver = self.driver(FakeRun([]), port=4096, http_get=host_trials.http_status)
+        error = urllib.error.HTTPError('http://127.0.0.1:4096/session', 401, 'synthetic', {}, None)
+        with unittest.mock.patch('urllib.request.urlopen', side_effect=error):
+            with self.assertRaisesRegex(RuntimeError, 'already answers'):
+                driver.serve(timeout=0)
+        self.assertEqual(self.servers, [])
+
+    def test_an_error_status_is_not_our_servers_captured_readiness_response(self):
+        killed = self.patch_killpg()
+        driver = self.driver(FakeRun([]), port=4096,
+                             http_get=unittest.mock.Mock(side_effect=[urllib.error.URLError('refused'), 500]))
+        with self.assertRaises(RuntimeError):
+            driver.serve(timeout=0)
+        self.assertEqual(killed, [(4321, 15)])
+        self.assertIsNone(driver.server)
+
     def test_serve_starts_our_own_child_in_its_own_session_and_waits_for_it_to_answer(self):
         driver = self.driver(FakeRun([]), port=4096)
         server = driver.serve()

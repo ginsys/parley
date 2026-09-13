@@ -365,8 +365,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   seen on any event before checking for an `error` event or a nonzero exit — a failing turn
   still creates the session. `submit()` needs `serve()` open: `opencode serve --pure --port <p>`
   on a free loopback port chosen per call, refused if the port already answered (the session
-  store is global, so a stranger's server would look identical), ready once `GET /session`
-  answers while the child is still alive; the password variable is uncaptured, so the server is
+  store is global, so a stranger's server would look identical). Any HTTP response, including
+  4xx/5xx, proves a listener exists and prevents spawning. Our child is ready only once
+  `GET /session` returns the captured 200 while it is still alive; other statuses fail startup.
+  The password variable is uncaptured, so the server is
   the captured unsecured loopback listener for the trial's duration. The child is spawned and
   held in one statement inside the handler that closes it, so any failure or Ctrl-C during that
   wait closes it before re-raising — and, as in `close_servers()`, the handle is dropped only

@@ -1682,8 +1682,13 @@ def free_port():
 
 def http_status(url):
     """HTTP status of a GET, raising `urllib.error.URLError` when nothing answers."""
-    with urllib.request.urlopen(url, timeout=2) as response:
-        return response.status
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        # HTTPError subclasses URLError, but a 401/500 is still a response from a listener.
+        error.close()
+        return error.code
 
 
 class Server:
@@ -1838,7 +1843,10 @@ class OpenCodeDriver(Driver):
                     raise RuntimeError(f'opencode serve exited {self.server.process.returncode} '
                                        'before answering')
                 try:
-                    self.http_get(f'{url}/session')
+                    status = self.http_get(f'{url}/session')
+                    if status != 200:
+                        raise RuntimeError(f'opencode serve returned HTTP {status}; '
+                                           'the captured readiness response is 200')
                     break
                 except urllib.error.URLError:
                     if time.monotonic() >= deadline:
