@@ -163,6 +163,7 @@ func (m *Manager) Accept(ctx context.Context, conn *net.UnixConn) (*Socket, erro
 	stopLifetime := context.AfterFunc(life, stopWait)
 	defer stopLifetime()
 	uid, err := peerUID(conn)
+	var rejected bool
 	if err == nil {
 		s.uid = uid
 		_, err = m.store.Coordinator().Transition(waitCtx, func(context.Context, *sql.Tx, store.CommitView) (store.TransitionResult, error) {
@@ -171,10 +172,22 @@ func (m *Manager) Accept(ctx context.Context, conn *net.UnixConn) (*Socket, erro
 			}
 			return store.TransitionResult{Changed: true}, nil
 		}, func(store.CommitView) {
-			m.prune()
+			now := m.now()
+			m.prune(now)
+			if s.ctx.Err() != nil || m.expired(s, now) {
+				rejected = true
+				return
+			}
 			m.sockets[s] = struct{}{}
-			s.arm(store.AuthenticationDeadline - m.now().Sub(s.accepted))
+			s.arm(store.AuthenticationDeadline - now.Sub(s.accepted))
+			if s.ctx.Err() != nil {
+				m.remove(s)
+				rejected = true
+			}
 		})
+	}
+	if err == nil && rejected {
+		err = store.AuthenticationFailed
 	}
 	if err != nil {
 		cancel()
@@ -210,9 +223,9 @@ func (m *Manager) hasDueSockets() bool {
 	}
 	return false
 }
-func (m *Manager) prune() {
+func (m *Manager) prune(now time.Time) {
 	for s := range m.sockets {
-		if s.ctx.Err() != nil || m.expired(s, m.now()) {
+		if s.ctx.Err() != nil || m.expired(s, now) {
 			m.remove(s)
 		}
 	}
@@ -344,13 +357,13 @@ func (m *Manager) authenticate(ctx context.Context, tx *sql.Tx, s *Socket, a Aut
 	}
 	return b, c, false, nil
 }
-func (m *Manager) bind(s *Socket, b store.BindingRecord, c store.CredentialRecord) {
+func (m *Manager) bind(s *Socket, b store.BindingRecord, c store.CredentialRecord, now time.Time) {
 	if s.credentialID == "" {
 		s.authenticated.Store(true)
 		s.credentialID = c.ID
 		s.bindingID = b.ID
 		s.native = NativeTuple{b.HostKind, b.NamespaceID, b.SessionID}
-		s.lastHeartbeat = m.now()
+		s.lastHeartbeat = now
 		s.arm(store.LivenessDeadline)
 	}
 }
@@ -397,7 +410,8 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 		snapshot = Snapshot{view.Epoch, b.Generation, m.active(b.ID)}
 		return store.TransitionResult{Changed: s.credentialID == "" || m.hasDueSockets()}, nil
 	}, func(store.CommitView) {
-		if !expired && !rejected && m.observeCredentialExpiry(c, m.now()) {
+		now := m.now()
+		if !expired && !rejected && m.observeCredentialExpiry(c, now) {
 			expired = true
 		}
 		if expired {
@@ -405,12 +419,16 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 		} else if rejected {
 			m.remove(s)
 		} else {
-			m.prune()
+			m.prune(now)
 			if !m.owned(s) {
 				rejected = true
 				return
 			}
-			m.bind(s, b, c)
+			m.bind(s, b, c, now)
+			if !m.owned(s) {
+				m.remove(s)
+				rejected = true
+			}
 		}
 	})
 	if expired {
@@ -492,7 +510,8 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 		result = &Session{socket: s, token: Token{b.ID, b.PeerID, view.Epoch, c.Version, next, s.uid}}
 		return store.TransitionResult{Changed: true}, nil
 	}, func(store.CommitView) {
-		if !expired && !rejected && m.observeCredentialExpiry(c, m.now()) {
+		now := m.now()
+		if !expired && !rejected && m.observeCredentialExpiry(c, now) {
 			expired = true
 		}
 		if expired {
@@ -500,12 +519,17 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 		} else if rejected {
 			m.remove(s)
 		} else {
-			m.prune()
+			m.prune(now)
 			if !m.owned(s) {
 				rejected = true
 				return
 			}
-			m.bind(s, b, c)
+			m.bind(s, b, c, now)
+			if !m.owned(s) {
+				m.remove(s)
+				rejected = true
+				return
+			}
 			if result != nil {
 				s.releaseCapacity()
 				s.session = result
