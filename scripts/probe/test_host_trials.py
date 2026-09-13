@@ -918,13 +918,16 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(run.argv('claude', 'rm'), [])
 
     def test_interrupted_creation_preserves_cancellation_when_discovery_fails(self):
-        run = FakeRun([(['claude', '--bg'], KeyboardInterrupt()),
-                       (['claude', 'agents'], subprocess.TimeoutExpired(['claude'], 15))])
-        driver = self.driver(run)
-        with self.assertRaises(KeyboardInterrupt) as caught:
-            run_trial_with_cleanup(driver, prompt='hello')
-        self.assertIn('discovery failed', ' '.join(caught.exception.__notes__))
-        self.assertEqual(driver.owned(), set())
+        for recovery_error in (subprocess.TimeoutExpired(['claude'], 15), KeyboardInterrupt()):
+            with self.subTest(recovery_error=type(recovery_error).__name__):
+                original = KeyboardInterrupt()
+                run = FakeRun([(['claude', '--bg'], original), (['claude', 'agents'], recovery_error)])
+                driver = self.driver(run)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    run_trial_with_cleanup(driver, prompt='hello')
+                self.assertIs(caught.exception, original)
+                self.assertIn('discovery failed', ' '.join(caught.exception.__notes__))
+                self.assertEqual(driver.owned(), set())
 
     def test_claude_transcript_removed_between_discovery_and_stat_is_unobservable(self):
         driver = self.driver(FakeRun([

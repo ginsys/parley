@@ -1078,7 +1078,7 @@ class ClaudeDriver(Driver):
         except KeyboardInterrupt as error:
             try:
                 candidates = {entry['id'] for entry in self._listing()} - self.owned()
-            except Exception:
+            except BaseException:
                 error.add_note('Claude creation interrupted; bounded candidate discovery failed; '
                                'manual investigation required in the probe cwd')
             else:

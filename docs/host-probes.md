@@ -288,6 +288,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   probe directory, mints the short id from stdout line 1 (`backgrounded · <id>`) before checking
   the exit status or running the confirming `claude agents --json --all --cwd <probe cwd>`
   listing, and on a `subprocess.TimeoutExpired` mints from the partial output before re-raising.
+  Cancellation preserves the original interrupt and its manual-investigation note even if a
+  second interrupt aborts the bounded recovery listing.
   It then waits for that listing to report the creation turn finished (`state: "done"`) before
   returning: `claude --bg` returns while the turn is still working — the captured listing taken
   immediately afterwards reads `state: "working"` and the creation reply landed 12 s later — so a
