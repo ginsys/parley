@@ -234,7 +234,9 @@ without trusting repository settings that could execute commands.
 
 Cleanup is part of the module, not left to a caller: `run_trial_with_cleanup()` is the entry
 point real trials use. Its protected return runs `sweep()` in `finally`, including interruption
-between a successful trial's return and the cleanup handoff. On every exit path it sweeps:
+between a successful trial's return and the cleanup handoff. It tracks only exceptions raised
+inside that protected operation; an unrelated outer exception handler cannot hide a cleanup
+failure or receive its diagnostics. On every exit path it sweeps:
 close open PTY clients, tear down every id in `owned()` (a copy `claude --bg --resume` started by
 accident included), then close any server the driver runs. A failed trial propagates its own
 exception with a note naming the sweep's failures and whatever is still owned; a completed trial

@@ -3299,6 +3299,17 @@ class SweepTests(unittest.TestCase):
 
 
 class RunTrialWithCleanupTests(unittest.TestCase):
+    def test_cleanup_failure_is_not_hidden_by_an_outer_exception_handler(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock, teardown_errors={'sid': RuntimeError('cleanup failed')})
+        try:
+            raise ValueError('unrelated outer exception')
+        except ValueError as outer:
+            with self.assertRaises(CleanupFailed) as caught:
+                self.run_one(driver, clock)
+            self.assertEqual(caught.exception.run.session_id, 'sid')
+            self.assertFalse(hasattr(outer, '__notes__'))
+
     def test_interrupt_after_successful_trial_return_still_sweeps(self):
         clock = FakeClock()
         driver = FakeDriver(clock=clock)

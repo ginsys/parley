@@ -55,7 +55,6 @@ import signal
 import socket
 import stat
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -2537,11 +2536,15 @@ def run_trial_with_cleanup(driver, **kwargs):
     `CleanupFailed` carrying the `TrialRun`, since the evidence is valid even though a session
     remains for a human to remove.
     """
+    error = None
     try:
-        run = run_trial(driver, **kwargs)
-        return run
+        try:
+            run = run_trial(driver, **kwargs)
+            return run
+        except BaseException as caught:
+            error = caught
+            raise
     finally:
-        error = sys.exception()
         failures = sweep(driver)
         if error is not None and (failures or driver.owned()):
             error.add_note(f'cleanup after the failed trial: failures={failures!r}; '
