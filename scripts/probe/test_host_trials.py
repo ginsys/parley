@@ -1906,6 +1906,19 @@ def rollout_lines(*, cli_version='0.154.0', cwd='/synthetic', messages=()):
 
 
 class CodexDriverTests(DriverTestCase):
+    def test_creation_rejects_missing_malformed_or_uncaptured_event_types(self):
+        for kind in (None, 1, [], {}, '', ' ', 'future.event', 'missing'):
+            with self.subTest(kind=kind):
+                self.registry = SessionRegistry()
+                event = {'type': kind, 'error': 'synthetic failure'}
+                if kind == 'missing':
+                    del event['type']
+                output = self.exec_output().stdout + json.dumps(event) + '\n'
+                driver = self.driver(FakeRun([(['codex', 'exec'], FakeResult(0, output))]))
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), {THREAD_ID})
+
     def test_codex_creation_never_mints_a_non_uuid_thread_id(self):
         for thread_id in ('*', '../*', '--help', 'not-a-uuid'):
             with self.subTest(thread_id=thread_id):

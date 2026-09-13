@@ -1427,6 +1427,8 @@ def codex_thread_ids(stdout):
             continue
         if not isinstance(record, dict):
             unusable += 1
+        elif record.get('type') not in ('thread.started', 'turn.started', 'item.completed', 'turn.completed'):
+            unusable += 1
         elif record.get('type') == 'thread.started':
             if isinstance(record.get('thread_id'), str) and record['thread_id']:
                 thread_ids[record['thread_id']] = None

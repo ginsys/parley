@@ -396,7 +396,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   timeout output, and returns once the turn ends. Multiple distinct creation IDs grant no
   ownership; every candidate is reported for investigation without deletion authority. Malformed
   JSON, non-object records and unusable `thread.started` records fail creation even if another
-  event names a valid thread; its unique creation ID remains owned for cleanup. Codex creation IDs
+  event names a valid thread. Event types are limited to captured `thread.started`, `turn.started`,
+  `item.completed` and `turn.completed`; missing, malformed and unknown discriminators fail too.
+  A unique creation ID remains owned for cleanup. Codex creation IDs
   must have the captured lowercase hyphenated UUID shape before any ownership is granted. Both
   Codex and Claude transcript lookups reject non-UUID IDs and escape literal home/ID components
   before globbing, so metacharacters cannot select another session's transcript. The thread is
