@@ -1590,7 +1590,9 @@ class OpenCodeDriver(Driver):
         closes it: from that point every exit from the readiness wait -- timeout, an early child
         exit, a Ctrl-C, a failing probe -- closes and disowns the child. `self.server` is set
         before the wait rather than after, so a `close_servers()` racing the wait finds the
-        child instead of leaving it running.
+        child instead of leaving it running, and it is cleared only once `close()` has actually
+        succeeded, exactly as `close_servers()` does: a startup cleanup that could not stop the
+        child must leave the handle behind for the sweep to retry and report.
         """
         if self.server is not None:
             if self.server.process.poll() is not None:
@@ -1623,9 +1625,9 @@ class OpenCodeDriver(Driver):
                         raise RuntimeError(f'opencode serve did not answer on {url} within {timeout}s') from None
                     self.sleep(0.25)
         except BaseException:
-            server, self.server = self.server, None
-            if server is not None:
-                server.close()
+            if self.server is not None:
+                self.server.close()  # a failure here keeps the handle for `close_servers()`
+                self.server = None
             raise
         return self.server
 

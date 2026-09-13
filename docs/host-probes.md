@@ -320,8 +320,11 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   on a free loopback port chosen per call, refused if the port already answered (the session
   store is global, so a stranger's server would look identical), ready once `GET /session`
   answers while the child is still alive; the password variable is uncaptured, so the server is
-  the captured unsecured loopback listener for the trial's duration. Any failure or Ctrl-C during
-  that wait closes the child before re-raising. Submission is
+  the captured unsecured loopback listener for the trial's duration. The child is spawned and
+  held in one statement inside the handler that closes it, so any failure or Ctrl-C during that
+  wait closes it before re-raising — and, as in `close_servers()`, the handle is dropped only
+  once the close succeeded, so a child that survived SIGKILL stays held for the sweep to retry
+  and report. Submission is
   `opencode run --pure --format json --attach http://127.0.0.1:<p> --session <id> -m <model>
   '<msg>'`, judged on both the exit status and the event stream. A structured `error` event is
   `SubmissionUncaptured` even on exit 0 — that exit-zero-with-an-error shape is the one `create()`

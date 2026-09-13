@@ -1575,6 +1575,19 @@ class OpenCodeDriverTests(DriverTestCase):
                 self.assertEqual(killed, [(4321, 15)])
                 self.assertIsNone(driver.server)
 
+    def test_serve_keeps_the_handle_when_its_own_cleanup_cannot_stop_the_child(self):
+        # A child that survived SIGTERM and SIGKILL is still running: dropping the handle would
+        # leave `close_servers()` and the sweep with nothing to retry or report.
+        unstoppable = unittest.mock.patch('os.killpg', lambda pid, signum: None)
+        unstoppable.start()
+        self.addCleanup(unstoppable.stop)
+        driver = self.driver(FakeRun([]), popen=self.silent_popen, port=4096)
+        with self.assertRaises(RuntimeError) as caught:
+            driver.serve(timeout=0.0)
+        self.assertIn('survived SIGTERM and SIGKILL', str(caught.exception))
+        self.assertIsNotNone(driver.server)
+        self.assertIs(driver.server.process, self.servers[0])
+
     def test_serve_refuses_to_reuse_a_held_server_whose_child_has_exited(self):
         driver = self.driver(FakeRun([]), port=4096)
         server = driver.serve()
