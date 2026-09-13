@@ -2219,6 +2219,15 @@ class OpenCodeDriverTests(DriverTestCase):
             events.append({'type': 'error', 'sessionID': session_id, 'error': error})
         return FakeResult(0, '\n'.join(json.dumps(e) for e in events) + '\n')
 
+    def test_uncaptured_opencode_models_are_rejected_before_host_calls(self):
+        for model in (None, '', 'synthetic-provider/uncaptured-model'):
+            with self.subTest(model=model):
+                run = FakeRun([])
+                with self.assertRaisesRegex(ValueError, 'uncaptured'):
+                    self.driver(run, model=model)
+                self.assertEqual(run.calls, [])
+                self.assertEqual(self.servers, [])
+
     def test_create_runs_pure_json_with_the_free_model_and_mints_the_session(self):
         run = FakeRun([(['opencode', 'run'], self.run_output())])
         driver = self.driver(run)

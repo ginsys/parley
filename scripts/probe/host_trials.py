@@ -2004,6 +2004,8 @@ class OpenCodeDriver(Driver):
     def __init__(self, registry, *, run=subprocess.run, popen=subprocess.Popen, http_get=http_status,
                  cwd, model=OPENCODE_FREE_MODEL, port=None, sleep=time.sleep,
                  output_reader=ServerOutput):
+        if model != OPENCODE_FREE_MODEL:
+            raise ValueError('OpenCode model override is uncaptured; only the captured free model is supported')
         super().__init__(registry, cwd=cwd)
         self.run = run
         self.popen = popen

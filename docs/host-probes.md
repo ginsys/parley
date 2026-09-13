@@ -418,7 +418,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   creating `exec`'s, not necessarily the resume client's — and never `codex --version`, which
   has disagreed with a rollout on the same day. Explicit Codex model overrides are refused at
   driver construction: only the default-model command has been captured, so no `-m` path is emitted.
-- **OpenCode** (`OpenCodeDriver`). `create()` runs `opencode run --pure --format json --dir
+- **OpenCode** (`OpenCodeDriver`). Construction rejects every model except the captured
+  `opencode/ling-3.0-flash-fin-free` before any host call. `create()` runs `opencode run --pure --format json --dir
   <probe cwd> --title <t> -m opencode/ling-3.0-flash-fin-free '<prompt>'` (the captured
   zero-cost model; the default one failed on a stale credential) and mints a unique `sessionID`
   from the events before checking for an `error` event or a nonzero exit — a failing turn
