@@ -35,6 +35,7 @@ from host_trials import (
     Observation,
     OpenCodeDriver,
     PtyClient,
+    PtyNotReady,
     SessionRegistry,
     SubmissionRejected,
     SubmissionUncaptured,
@@ -601,13 +602,15 @@ print('DONE', flush=True)
     def test_env_carries_xterm_term_and_the_resolved_cwd(self):
         code = "import os; print('TERM=' + os.environ['TERM'] + ' PWD=' + os.environ['PWD'], flush=True)"
         client = self.spawn(code)
-        self.assertTrue(client.wait_for(r'TERM=xterm-256color PWD=' + os.path.realpath(self.tmp.name),
+        self.assertTrue(client.wait_for(r'TERM=xterm-256color PWD=' + re.escape(os.path.realpath(self.tmp.name)),
                                         quiet=0.1, timeout=5))
 
 
 class FakePtyClient:
-    """Scripted TUI: `screens` are appended as the driver waits; `seen_after_type` says whether
-    the transcript shows the typed line. `ready` False means the composer never appears."""
+    """Scripted TUI. `ready` False means the composer never appears after startup (or, with
+    `trust_prompt`, after the trust dialog is answered). `trust_prompt` starts on the captured
+    escape-stripped dialog, words run together, with the composer placeholder already drawn
+    beneath it -- so a readiness match alone cannot tell the two screens apart."""
 
     launched = []
 
@@ -619,7 +622,8 @@ class FakePtyClient:
         self.keys = []
         self.typed = []
         self.closed = False
-        self.text = '' if not trust_prompt else 'Do you trust the contents of this directory?\n'
+        self.text = ('Doyoutrustthecontentsofthisdirectory?\n› Ask Codex to do anything\n'
+                     if trust_prompt else '')
         FakePtyClient.launched.append(self)
 
     def mark(self):
@@ -632,10 +636,9 @@ class FakePtyClient:
         return self.text[-limit:]
 
     def wait_for(self, pattern, *, timeout, quiet=1.0, since=0):
-        if self.ready and not (self.trust_prompt and not any(k == b'\r' for k in self.keys)):
+        answered = b'\r' in self.keys
+        if self.ready and (not self.trust_prompt or answered):
             self.text += '❯\xa0\n› Ask Codex to do anything\n'
-        elif self.ready:
-            return True  # the trust prompt is on screen; the driver answers it
         return bool(re.search(pattern, self.text[since:]))
 
     def send_keys(self, data):
@@ -658,6 +661,10 @@ class DriverTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.cwd = self.tmp.name
+        # Fixture files live in their own private directory: the probe cwd must stay empty, and
+        # its parent is the shared temp root where fixed names would collide across runs.
+        self.fixtures = tempfile.TemporaryDirectory()
+        self.addCleanup(self.fixtures.cleanup)
         self.registry = SessionRegistry()
         FakePtyClient.launched = []
         self.transcripts = {}
@@ -666,11 +673,9 @@ class DriverTestCase(unittest.TestCase):
         return self.transcripts.get(session_uuid)
 
     def write_lines(self, name, lines):
-        path = os.path.join(self.cwd, '..', name)  # outside the (must-be-empty) probe cwd
-        path = os.path.realpath(path)
+        path = os.path.join(self.fixtures.name, name)
         with open(path, 'w', encoding='utf-8') as handle:
             handle.write('\n'.join(lines) + '\n')
-        self.addCleanup(os.unlink, path)
         return path
 
 
@@ -1156,6 +1161,20 @@ class CodexDriverTests(DriverTestCase):
         client = driver.attach(THREAD_ID)
         self.assertEqual(client.keys, [b'\r'])
         self.assertEqual(driver.clients, [client])
+
+    def test_attach_is_not_ready_when_the_composer_never_follows_the_answered_trust_dialog(self):
+        # The placeholder drawn beneath the dialog must not count: only output after the Enter does.
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run, pty=lambda argv, *, cwd: FakePtyClient(argv, cwd=cwd, trust_prompt=True,
+                                                                          ready=False))
+        driver.create('hello')
+        with self.assertRaises(PtyNotReady) as caught:
+            driver.attach(THREAD_ID)
+        client, = FakePtyClient.launched
+        self.assertEqual(client.keys, [b'\r'])
+        self.assertTrue(client.closed)
+        self.assertEqual(driver.clients, [])
+        self.assertIn('Doyoutrustthecontentsofthisdirectory', str(caught.exception))
 
     def test_attach_accepts_other_sandbox_and_approval_flags(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])
@@ -1644,6 +1663,15 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(run.observable['ack'])
         self.assertTrue(run.interrupted)
 
+    def test_a_keyboardinterrupt_inside_the_first_observe_still_finalizes(self):
+        clock = FakeClock()
+        driver = FakeDriver(observe_error=KeyboardInterrupt(), clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertTrue(run.interrupted)
+        self.assertEqual(run.outcomes, {'accepted': 1012.0})
+        self.assertFalse(any(run.observable[name] for name in ('visible', 'turn_start', 'ack')))
+        self.assertFalse(run.turn_end_observable)
+
     def test_the_result_carries_the_driver_version_captured_at_trial_time(self):
         clock = FakeClock()
         driver = FakeDriver(version_value='2.1.270', clock=clock)
@@ -1892,6 +1920,19 @@ class RunTrialTests(unittest.TestCase):
                       turn_end=run.turn_end, turn_end_observable=run.turn_end_observable)
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['ack'], 'observed')
+
+    def test_an_early_turn_end_collapses_the_busy_deadline_to_its_own_window(self):
+        # Submitted at wall 1000; the slow submit returns at +12s, when the first poll reports a
+        # turn end at wall 1030. The deadline becomes LAST_WINDOW past that turn end: at the poll
+        # that is 120 - (1012 - 1030) = 138s away, so polling stops at +150s.
+        clock = FakeClock()
+        seen = Observation(outcomes={'visible': 1012.0, 'turn_start': 1040.0}, turn_end=1030.0,
+                           turn_stream=True)
+        driver = FakeDriver(observations=[seen], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
+        self.assertEqual(run.turn_end, 1030.0)
+        self.assertEqual(clock.elapsed, 150.0)  # not BUSY_CAP, and not cut short either
 
     def test_a_turn_ending_close_to_the_cap_extends_the_wait_past_it(self):
         clock = FakeClock()
