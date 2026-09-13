@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -18,6 +19,9 @@ import (
 	"github.com/ginsys/parley/internal/store"
 	"github.com/google/uuid"
 )
+
+// ErrInvalidPeer distinguishes fixture setup rejection from production wire errors.
+var ErrInvalidPeer = errors.New("synthetic session requires a compatible peer identifier")
 
 type Fixture struct {
 	DB      *store.DB
@@ -49,6 +53,9 @@ func For(t testing.TB, db *store.DB) *Fixture {
 	return f
 }
 func (f *Fixture) Session(peer string) (*connection.Session, error) {
+	if len(peer) > store.MaxIdentityBytes || bridgetext.ValidateMetadata(peer) != nil {
+		return nil, ErrInvalidPeer
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if s := f.peers[peer]; s != nil {
