@@ -388,7 +388,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   instead, since a dead server says nothing about the host. The timeout case matters because the
   export is readable without the server: a bare `TimeoutExpired` would be polled as a submission
   that may have delivered and turn the absent marker into `not_observed`. An exit-zero stream
-  must also name the session it was aimed at — the captured attach emitted a `step_start` event
+  must also name the session it was aimed at on every event carrying an ID, including later
+  events in a partial timeout stream — the captured attach emitted a `step_start` event
   carrying its `sessionID` — so a stream naming a different id, or none at all, is
   `SubmissionUncaptured` too: polling the requested session would otherwise read the missing
   marker as `not_observed` for a host that was never asked. A different id is recorded before the

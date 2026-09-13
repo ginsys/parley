@@ -1570,7 +1570,13 @@ def opencode_session_id(stdout):
     `error` event, or None. Captured: a failing turn still creates and lists its session, so the
     id must be minted even when an error follows.
     """
-    session_id = None
+    session_ids, error = opencode_session_ids(stdout)
+    return next(iter(session_ids), None), error
+
+
+def opencode_session_ids(stdout):
+    """Every distinct session ID in stream order, plus the first error event."""
+    session_ids = {}
     error = None
     for line in stdout.splitlines():
         line = line.strip()
@@ -1582,11 +1588,11 @@ def opencode_session_id(stdout):
             continue
         if not isinstance(event, dict):
             continue
-        if session_id is None and isinstance(event.get('sessionID'), str) and event['sessionID']:
-            session_id = event['sessionID']
+        if isinstance(event.get('sessionID'), str) and event['sessionID']:
+            session_ids[event['sessionID']] = None
         if error is None and event.get('type') == 'error':
             error = json.dumps(event.get('error'))
-    return session_id, error
+    return session_ids, error
 
 
 def opencode_export_events(raw):
@@ -1856,14 +1862,19 @@ class OpenCodeDriver(Driver):
                 self.server = None
         return failures
 
-    def _record_stray(self, attached_id, session_id):
-        """Report a mismatched attach id without treating it as creation evidence.
+    def _attach_events(self, stdout, session_id):
+        """Check every attach id without treating any as creation evidence.
 
         It may name a pre-existing human session. Only a human can investigate it; recording
         the id must never grant submit, observe or teardown authority.
         """
-        if attached_id is not None and attached_id != session_id:
-            self.strays.add(attached_id)
+        session_ids, error = opencode_session_ids(stdout)
+        unexpected = set(session_ids) - {session_id}
+        self.strays.update(unexpected)
+        if unexpected:
+            raise SubmissionUncaptured(f'run --attach named unexpected sessions {sorted(unexpected)!r}; '
+                                       'where the marker landed is uncaptured')
+        return next(iter(session_ids), None), error
 
     def submit(self, session_id, message):
         """`opencode run --pure --format json --attach <url> --session <id>`; exit 0 is acceptance.
@@ -1902,8 +1913,7 @@ class OpenCodeDriver(Driver):
             result = self.run(argv, capture_output=True, text=True, timeout=60, cwd=self.cwd,
                               stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as error:
-            partial_id, partial_error = opencode_session_id(_partial_stdout(error))
-            self._record_stray(partial_id, session_id)
+            partial_id, partial_error = self._attach_events(_partial_stdout(error), session_id)
             if self.server.process.poll() is not None:
                 raise SubmissionUncaptured(
                     f'run --attach timed out against a serve child that had exited '
@@ -1911,13 +1921,8 @@ class OpenCodeDriver(Driver):
             if partial_error is not None:
                 raise SubmissionUncaptured(f'run --attach reported an error event before timing '
                                            f'out: {partial_error}') from error
-            if partial_id is not None and partial_id != session_id:
-                raise SubmissionUncaptured(
-                    f'run --attach named {partial_id!r} before timing out, not {session_id}; '
-                    f'where the marker landed is uncaptured') from error
             raise
-        attached_id, event_error = opencode_session_id(result.stdout)
-        self._record_stray(attached_id, session_id)
+        attached_id, event_error = self._attach_events(result.stdout, session_id)
         if result.returncode != 0:
             if self.server.process.poll() is not None:
                 # A dead server is this runner's failure, not the host refusing the message.

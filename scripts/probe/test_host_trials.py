@@ -1982,6 +1982,26 @@ class OpenCodeDriverTests(DriverTestCase):
             driver.submit('ses_1', 'msg')
         self.assertIn('ProviderAuthError', str(caught.exception))
 
+    def test_later_attach_events_cannot_redirect_an_apparently_matching_stream(self):
+        output = self.run_output().stdout + '\n' + self.run_output(session_id='ses_human').stdout
+        for result in (FakeResult(0, output),
+                       subprocess.TimeoutExpired(cmd=['opencode'], timeout=60, output=output.encode())):
+            with self.subTest(result=result):
+                self.registry = SessionRegistry()
+                self.answering = False
+                run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'],
+                                self.run_output()),
+                               (['opencode', 'run', '--pure', '--format', 'json', '--attach'], result)])
+                driver = self.driver(run, port=4096)
+                driver.create('hello')
+                driver.serve()
+                with self.assertRaises(SubmissionUncaptured):
+                    driver.submit('ses_1', 'msg')
+                self.assertEqual(driver.owned(), {'ses_1'})
+                self.assertEqual(driver.strays, {'ses_human'})
+                with self.assertRaises(ForeignSessionError):
+                    driver.teardown('ses_human')
+
     def test_a_nonzero_attach_reports_its_error_event_alongside_stderr(self):
         error_event = json.dumps({'type': 'error', 'error': {'name': 'UnknownModel'}})
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
