@@ -533,13 +533,17 @@ class CodexParsingTests(unittest.TestCase):
         self.assertEqual(codex_session_version(lines), '0.154.0')
 
 
-def opencode_export(messages, *, version='1.18.30'):
-    return json.dumps({'info': {'id': 'ses_x', 'version': version,
+def opencode_export(messages, *, version='1.18.30', session_id='ses_1'):
+    return json.dumps({'info': {'id': session_id, 'version': version,
                                 'time': {'created': 1, 'updated': 2}},
                        'messages': messages})
 
 
 def opencode_message(role, parts, created_ms, **info):
+    info = {'id': f'msg_{role}_{created_ms}', 'sessionID': 'ses_1', **info}
+    if isinstance(parts, list):
+        parts = [{'sessionID': info['sessionID'], 'messageID': info['id'], **part}
+                 if isinstance(part, dict) else part for part in parts]
     return {'info': {'role': role, 'time': {'created': created_ms}, **info}, 'parts': parts}
 
 
@@ -1999,6 +2003,33 @@ class FakePopen:
 
 
 class OpenCodeDriverTests(DriverTestCase):
+    def test_foreign_or_missing_export_bindings_never_supply_outcomes_model_or_version(self):
+        for target in ('top', 'message', 'part-session', 'part-message'):
+            for missing in (False, True):
+                with self.subTest(target=target, missing=missing):
+                    self.registry = SessionRegistry()
+                    document = json.loads(opencode_export([
+                        opencode_message('assistant', [{'type': 'text', 'text': MARKER}],
+                                         1_757_754_001_000, providerID='foreign', modelID='model')]))
+                    message = document['messages'][0]
+                    owner, field = {'top': (document['info'], 'id'),
+                                    'message': (message['info'], 'sessionID'),
+                                    'part-session': (message['parts'][0], 'sessionID'),
+                                    'part-message': (message['parts'][0], 'messageID')}[target]
+                    if missing:
+                        del owner[field]
+                    else:
+                        owner[field] = 'foreign'
+                    driver = self.driver(FakeRun([(['opencode', '--pure', 'export'],
+                                                  FakeResult(0, json.dumps(document)))]))
+                    driver.mint('ses_1')
+                    observation = driver.observe('ses_1', marker=MARKER, submitted_at=1_757_754_000)
+                    self.assertFalse(observation.observable)
+                    self.assertEqual(observation.outcomes, {})
+                    self.assertIsNone(observation.model)
+                    self.assertIsNone(driver.version('ses_1'))
+                    driver.release('ses_1')
+
     def test_foreign_http_after_spawn_cannot_replace_child_readiness(self):
         def popen(argv, **kwargs):
             process = self.popen(argv, **kwargs)

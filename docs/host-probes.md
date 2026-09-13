@@ -467,7 +467,11 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `version()` read
   `opencode --pure export <id>`: `messages[].info.role`/`info.time.created` (ms epoch, used for
   both roles so turn_start is the earliest assistant activity as on the other hosts) and the
-  `text` parts; only the captured `text`, `step-start`, `reasoning` and `step-finish` part types
+  `text` parts. Before observation or version extraction, the captured top-level `info.id`,
+  each message's `sessionID`, and each part's `sessionID` must name the owned session; each
+  part's `messageID` must name its enclosing message, whose ID must be nonempty and unique.
+  A missing or inconsistent binding makes the whole export unreadable, with no outcomes,
+  model or version taken from it. Only the captured `text`, `step-start`, `reasoning` and `step-finish` part types
   are accepted. Untyped, malformed and unknown parts make their message unusable; an unparseable
   or malformed document is unobservable. `teardown()` is
   `opencode --pure session delete <id>`. The server is closed by the sweep after teardown.

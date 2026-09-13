@@ -2190,7 +2190,29 @@ class OpenCodeDriver(Driver):
                               text=True, timeout=30)
         except subprocess.TimeoutExpired:
             return None
-        return result.stdout if result.returncode == 0 else None
+        if result.returncode != 0:
+            return None
+        try:
+            document = json.loads(result.stdout)
+        except ValueError:
+            return None
+        if (not isinstance(document, dict) or not isinstance(document.get('info'), dict) or
+                document['info'].get('id') != session_id or
+                not isinstance(document.get('messages'), list)):
+            return None
+        seen = set()
+        for message in document['messages']:
+            info = message.get('info') if isinstance(message, dict) else None
+            if (not isinstance(info, dict) or info.get('sessionID') != session_id or
+                    not isinstance(info.get('id'), str) or not info['id'] or info['id'] in seen or
+                    not isinstance(message.get('parts'), list)):
+                return None
+            seen.add(info['id'])
+            for part in message['parts']:
+                if (not isinstance(part, dict) or part.get('sessionID') != session_id or
+                        part.get('messageID') != info['id']):
+                    return None
+        return result.stdout
 
     def observe(self, session_id, *, marker, submitted_at):
         """Read `opencode --pure export <id>`; a failed or malformed export is unobservable.

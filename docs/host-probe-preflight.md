@@ -161,6 +161,11 @@ version. All timestamps are UTC.
 | `opencode run --pure --format json --attach http://127.0.0.1:43117 --session <id> -m opencode/ling-3.0-flash-fin-free '<marker msg>'` | Exit 0; the attached client's own stdout carried only a `step_start` event. The export afterwards listed the new user message and an assistant reply whose `time.completed` was about 3 s after the user message's `time.created`. **This is the captured submission path into a live server-held session** |
 | `opencode --pure session delete <id>` | Exit 0, stderr (ANSI-coloured) `Session <id> deleted`; `export <id>` afterwards fails with `Error: Session not found: <id>`. Storage is `$HOME/.local/share/opencode/opencode.db` |
 
+The captured OpenCode export also binds every user and assistant message through `info.sessionID`
+to the top-level `info.id`. Every part carries that same `sessionID` and a `messageID` equal to
+its enclosing message's `info.id`, including `step-start`, `reasoning`, `text` and `step-finish`.
+These fields were checked directly in the saved export; they are not inferred from the CLI argument.
+
 Side effects left behind, reported rather than reverted: the Codex trust entry for the probe
 directory in `$CODEX_HOME/config.toml`, and the three Claude transcript files under
 `$HOME/.claude/projects/<cwd-slug>/` (`claude rm` does not delete them). Both Codex rollouts and
