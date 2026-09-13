@@ -356,3 +356,30 @@ func TestRollbackObservationSurvivesFailedDedupLookup(t *testing.T) {
 		t.Fatalf("lookup failure lost detected rollback: %+v %v", markers, err)
 	}
 }
+
+func TestSameRollbackDuringReconciledCleanupGetsNewIncident(t *testing.T) {
+	s, now, _ := recoveryFixture(t)
+	ctx := context.Background()
+	*now = time.Unix(100, 0)
+	if err := rejectOrdinary(t, s); err != store.RecoveryRequired {
+		t.Fatal(err)
+	}
+	original, err := s.config.Markers.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.maintenance.Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		_, err := store.ReconcileRecovery(ctx, tx, original[0].IncidentID, 1, recoveryEvidence)
+		return store.TransitionResult{Changed: true}, err
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.InspectRecovery(ctx, s.config.Store); err != nil {
+		t.Fatal(err)
+	}
+	markers, err := s.config.Markers.List(ctx)
+	if err != nil || len(markers) != 2 {
+		t.Fatalf("reconciled incident swallowed new rollback: %+v %v", markers, err)
+	}
+}
