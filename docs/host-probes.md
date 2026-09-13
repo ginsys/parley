@@ -451,7 +451,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   creation ID remains available for cleanup after malformed output fails the command.
   `submit()` needs `serve()` open: `opencode serve --pure --port <p>`
   on a free loopback port chosen per call, refused if the port already answered (the session
-  store is global, so a stranger's server would look identical). Any HTTP response, including
+  store is global, so a stranger's server would look identical). Readiness requests disable
+  inherited HTTP proxy handling. Any HTTP response, including
   4xx/5xx, proves a listener exists and prevents spawning. Our child must first emit the captured
   complete stdout line `opencode server listening on http://127.0.0.1:<p>` for its own URL;
   only then can `GET /session` returning the captured 200 while it is still alive prove readiness.

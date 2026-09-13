@@ -19,6 +19,7 @@ import unittest
 import unittest.mock
 import urllib.error
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import host_trials
 from host_trials import (
@@ -2584,10 +2585,48 @@ class OpenCodeDriverTests(DriverTestCase):
         self.patch_killpg()
         driver = self.driver(FakeRun([]), port=4096, http_get=host_trials.http_status)
         error = urllib.error.HTTPError('http://127.0.0.1:4096/session', 401, 'synthetic', {}, None)
-        with unittest.mock.patch('urllib.request.urlopen', side_effect=error):
+        with unittest.mock.patch('urllib.request.OpenerDirector.open', side_effect=error):
             with self.assertRaisesRegex(RuntimeError, 'already answers'):
                 driver.serve(timeout=0)
         self.assertEqual(self.servers, [])
+
+    def test_loopback_readiness_bypasses_inherited_http_proxies(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.server.paths.append(self.path)
+                self.send_response(self.server.status)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        servers = []
+        threads = []
+        try:
+            for status in (200, 418):
+                server = HTTPServer(('127.0.0.1', 0), Handler)
+                servers.append(server)
+                server.paths = []
+                server.status = status
+                thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01},
+                                          daemon=True)
+                thread.start()
+                threads.append(thread)
+            target, proxy = servers
+            proxy_url = f'http://127.0.0.1:{proxy.server_port}'
+            with unittest.mock.patch.dict(os.environ, {'HTTP_PROXY': proxy_url, 'http_proxy': proxy_url,
+                                                       'NO_PROXY': '', 'no_proxy': ''}), \
+                    unittest.mock.patch('urllib.request._opener', None):
+                self.assertEqual(host_trials.http_status(f'http://127.0.0.1:{target.server_port}/session'), 200)
+            self.assertEqual(target.paths, ['/session'])
+            self.assertEqual(proxy.paths, [])
+        finally:
+            for server in servers[:len(threads)]:
+                server.shutdown()
+            for thread in threads:
+                thread.join(timeout=2)
+            for server in servers:
+                server.server_close()
 
     def test_an_error_status_is_not_our_servers_captured_readiness_response(self):
         killed = self.patch_killpg()

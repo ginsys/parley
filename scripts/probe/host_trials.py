@@ -1909,9 +1909,10 @@ def free_port():
 
 
 def http_status(url):
-    """HTTP status of a GET, raising `urllib.error.URLError` when nothing answers."""
+    """Direct loopback GET status, independent of inherited HTTP proxy configuration."""
     try:
-        with urllib.request.urlopen(url, timeout=2) as response:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=2) as response:
             return response.status
     except urllib.error.HTTPError as error:
         # HTTPError subclasses URLError, but a 401/500 is still a response from a listener.
