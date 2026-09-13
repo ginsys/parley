@@ -331,8 +331,10 @@ func (s *Service) Guard(ctx context.Context, tx *sql.Tx, principal string) error
 	return nil
 }
 
-// InspectRecovery is the runtime.Config inspector. It never starts workers or
-// clears holds and rejects use with any writer other than this service's owner.
+// InspectRecovery is called by runtime.Config.InspectRecovery after that
+// callback constructs New with the writer runtime.Start supplied. Do not bind a
+// preconstructed service from another DB. It never starts workers or clears
+// holds and rejects use with any writer other than this service's owner.
 func (s *Service) InspectRecovery(ctx context.Context, db *store.DB) (runtimeowner.RecoveryMode, error) {
 	if db != s.config.Store {
 		return 0, store.InvalidRequest
