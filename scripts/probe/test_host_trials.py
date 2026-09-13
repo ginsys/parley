@@ -21,9 +21,11 @@ from dataclasses import dataclass
 import host_trials
 from host_trials import (
     CLAUDE_READY_PATTERN,
+    CLOCK_DRIFT_TOLERANCE,
     CODEX_READY_PATTERN,
     CODEX_TRUST_PATTERN,
     MARKER_PATTERN,
+    OUTCOME_NAMES,
     SIGNAL_ASSISTANT_MESSAGE,
     SIGNAL_SUBMIT_EXIT_STATUS,
     SIGNAL_TURN_BOUNDARY_EVENT,
@@ -1862,7 +1864,7 @@ class FakeDriver(Driver):
 
     def __init__(self, *, observations=None, accepted=True, submit_error=None,
                  observe_error=None, version_value=None, version_error=None, clock=None,
-                 teardown_errors=None, submission_note=None, registry=None):
+                 teardown_errors=None, submission_note=None, registry=None, on_observe=None):
         self.registry = registry or SessionRegistry()
         self.clients = []
         self.observations = list(observations or [Observation()])
@@ -1874,6 +1876,7 @@ class FakeDriver(Driver):
         self.clock = clock
         self.teardown_errors = dict(teardown_errors or {})
         self.submission_note = submission_note
+        self.on_observe = on_observe
         self.order = []
         self.torn_down = []
         self.server_closes = 0
@@ -1902,6 +1905,8 @@ class FakeDriver(Driver):
 
     def observe(self, session_id, *, marker, submitted_at):
         self.order.append('observe')
+        if self.on_observe is not None:
+            self.on_observe()
         if self.observe_error is not None:
             raise self.observe_error
         return self.observations.pop(0) if len(self.observations) > 1 else self.observations[0]
@@ -2001,6 +2006,56 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.outcomes, {'accepted': 1012.0})
         self.assertFalse(any(run.observable[name] for name in ('visible', 'turn_start', 'ack')))
         self.assertFalse(run.turn_end_observable)
+
+    def test_a_wall_clock_correction_during_polling_makes_the_whole_trial_unobservable(self):
+        # Every compared stamp is wall time, so a correction moves host events relative to their
+        # windows -- a +60s step alone turns a reply 2s after submission into one 62s after it,
+        # outside the 30s visibility window. Nothing can rebase a stamp another process wrote.
+        for step in (60.0, -60.0):
+            with self.subTest(step=step):
+                clock = FakeClock()
+                driver = FakeDriver(
+                    observations=[Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0},
+                                              signals={'visible': SIGNAL_USER_MESSAGE},
+                                              turn_end=1005.0)],
+                    clock=clock, on_observe=lambda clock=clock: setattr(clock, 'wall',
+                                                                        clock.wall + step))
+                run = self.run_one(driver, clock, state='busy', settle=lambda session_id: None)
+                self.assertAlmostEqual(run.clock_step, step)
+                self.assertEqual(run.outcomes, {})
+                self.assertEqual(run.signals, {})
+                self.assertIsNone(run.accepted_at)
+                self.assertIsNone(run.turn_end)
+                self.assertFalse(run.turn_end_observable)
+                self.assertFalse(any(run.observable.values()))
+                trial = Trial(submitted=run.submitted_at, state=run.state, turn_end=run.turn_end,
+                              turn_end_observable=run.turn_end_observable, outcomes=run.outcomes)
+                if step > 0:
+                    self.assertEqual(classify_trial(trial, clock.time(), supported=run.supported,
+                                                    observable=run.observable),
+                                     {name: 'unobservable' for name in OUTCOME_NAMES})
+                else:
+                    # The documented residual: a step backwards past the trial's own duration
+                    # puts the caller's `now` before submission, and `Trial.result` refuses the
+                    # run outright rather than classifying it -- fail-closed the same way.
+                    with self.assertRaises(ValueError):
+                        classify_trial(trial, clock.time(), supported=run.supported,
+                                       observable=run.observable)
+
+    def test_slew_within_tolerance_leaves_an_ordinary_trial_alone(self):
+        # NTP slew is bounded at 500 ppm, well under a second across even the 900s busy cap; a
+        # tolerance that fired on it would make every long cell unobservable.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'visible': 1000.0,
+                                                                'turn_start': 1001.0,
+                                                                'ack': 1002.0})],
+                            clock=clock,
+                            on_observe=lambda: setattr(clock, 'wall',
+                                                       clock.wall + CLOCK_DRIFT_TOLERANCE / 2))
+        run = self.run_one(driver, clock)
+        self.assertIsNone(run.clock_step)
+        self.assertEqual(run.outcomes['visible'], 1000.0)
+        self.assertTrue(all(run.observable.values()))
 
     def test_the_result_carries_the_driver_version_captured_at_trial_time(self):
         clock = FakeClock()

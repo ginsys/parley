@@ -471,9 +471,19 @@ exists to convert them. Every *compared* value therefore comes from `time.time()
 `Trial.result()` only requires one consistent clock across `submitted`/`outcomes`/`now`, not
 monotonicity, so this is safe as long as every value on a given `Trial` uses the same clock.
 The local polling deadline is the exception and uses `time.monotonic()`, because an elapsed
-interval measured inside this process must not move when NTP steps the clock. A wall-clock step
-mid-trial still distorts the recorded timestamps themselves; that is a known limitation of
-cross-process evidence, not something the runner can correct.
+interval measured inside this process must not move when NTP steps the clock.
+
+A wall-clock step mid-trial still distorts the recorded timestamps themselves, and no rebasing
+can undo it: the host wrote those stamps from another process, on the clock as it then read. So
+the runner detects the step instead of correcting it. Every poll compares elapsed wall time
+against elapsed monotonic time, and a divergence past one second — far above the 500 ppm NTP
+slew ceiling, which is 0.45 s across the whole 900 s busy cap, and far below the smallest 10 s
+window — ends the trial: every outcome `unobservable`, every timestamp dropped rather than
+published on a timeline that shifted under it, and the divergence recorded on `TrialRun` as
+`clock_step` for the cell to cite in their place. One case stays outside that: a step backwards
+large enough to put the caller's later `now` before submission, which `Trial.result()` refuses
+outright as an invalid observation clock. That is a refusal, not a classification, so it fails
+closed in the same direction.
 
 ## Real-host evidence still required
 

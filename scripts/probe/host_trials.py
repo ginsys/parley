@@ -74,6 +74,13 @@ TRIAL_STATES = frozenset({'idle', 'busy', 'approval', 'disconnected', 'restarted
 # must last that long or the cell is unclassifiable; the constant is wake_probe's, restated here
 # because it is inline there.
 BUSY_CAP = 900
+# How far wall time may move against `monotonic` across one trial before its timestamps stop
+# meaning anything. Every compared stamp is wall time -- host transcripts carry nothing else --
+# so `wake_probe.Trial`'s monotonic contract is honoured by detection rather than by conversion:
+# a stamp another process already wrote on a stepped clock cannot be rebased afterwards. One
+# second is far above ordinary NTP slew (500 ppm, the kernel's ceiling, is 0.45s across the 900s
+# busy cap) and far below the smallest window (10s), so it fires on a step and never on slew.
+CLOCK_DRIFT_TOLERANCE = 1.0
 
 
 class ForeignSessionError(ValueError):
@@ -1845,6 +1852,10 @@ class TrialRun:
     # True when an operator Ctrl-C ended the polling loop early. Every other field is then
     # fail-closed exactly like an unreadable run; only this tells them apart.
     interrupted: bool = False
+    # Set to the observed wall-vs-monotonic divergence, in seconds, when the wall clock was
+    # corrected during the trial. Every outcome is then unobservable and every timestamp dropped
+    # (`run_trial`); this is what the cell cites instead of them.
+    clock_step: float | None = None
 
 
 def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
@@ -1897,7 +1908,14 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     Compared timestamps (`submitted_at`, `accepted_at`, every `Event.time`) come from `clock`
     (wall time), because host transcripts carry only wall-clock stamps; the local polling
     deadline uses `monotonic`. `Trial.result()` needs one consistent clock across its inputs,
-    not monotonicity, so a caller passes `time.time()` for `now`.
+    not monotonicity, so a caller passes `time.time()` for `now`. Wall time is adjustable, and
+    `Trial` documents a monotonic contract this cannot honour: a correction mid-trial moves host
+    events relative to their windows, and nothing in a transcript another process already wrote
+    can undo it. So every poll compares elapsed wall time against elapsed `monotonic` time, and
+    a divergence past `CLOCK_DRIFT_TOLERANCE` ends the trial as `clock_step`: every outcome
+    unobservable, every timestamp dropped rather than published on a broken timeline. What
+    remains uncovered is a step large enough to put the caller's later `now` before
+    `submitted_at`, which `Trial.result()` refuses outright -- fail-closed in the same direction.
     """
     if state not in TRIAL_STATES:
         raise ValueError(f'unknown trial state: {state}')
@@ -1921,6 +1939,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
         version = None
     settle(session_id)
     submitted_at = clock()
+    submitted_mono = monotonic()
     deadline = monotonic() + (BUSY_CAP if state == 'busy' else LAST_WINDOW)
     accepted_unobservable = False
     submission_diagnostic = None
@@ -1971,6 +1990,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     turn_stream_capable = False
     interrupted = False
     model = None
+    clock_step = None
     try:
         while True:
             observation = driver.observe(session_id, marker=marker, submitted_at=submitted_at)
@@ -1988,6 +2008,10 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
                 # `inconclusive` regardless of how much longer polling would wait.
                 if turn_end - submitted_at <= BUSY_CAP:
                     deadline = monotonic() + max(0.0, LAST_WINDOW - (clock() - turn_end))
+            drift = (clock() - submitted_at) - (monotonic() - submitted_mono)
+            if abs(drift) > CLOCK_DRIFT_TOLERANCE:
+                clock_step = drift
+                break
             remaining = deadline - monotonic()
             if remaining <= 0 or all(name in outcomes for name in TRANSCRIPT_OUTCOMES):
                 break
@@ -2019,11 +2043,19 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
         # unknown, so it goes with the outcomes it came from.
         model = None
     turn_end_observable = turn_end is not None or (channel_readable and not interrupted)
+    if clock_step is not None:
+        # The wall clock moved against `monotonic` mid-trial, so every stamp compared against a
+        # window -- this run's own and the host's -- is on a timeline that shifted under it. The
+        # timestamps are dropped rather than reported: a stamp on a broken timeline invites
+        # exactly the reasoning it cannot support, and `clock_step` is the evidence a cell cites.
+        outcomes, signals, accepted_at, turn_end = {}, {}, None, None
+        observable = {name: False for name in OUTCOME_NAMES}
+        turn_end_observable = False
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
                     outcomes=outcomes, state=state, marker=marker, version=version, model=model,
                     supported=supported, observable=observable, signals=signals, turn_end=turn_end,
                     turn_end_observable=turn_end_observable, interrupted=interrupted,
-                    submission_diagnostic=submission_diagnostic)
+                    clock_step=clock_step, submission_diagnostic=submission_diagnostic)
 
 
 def sweep(driver):
