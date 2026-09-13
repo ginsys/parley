@@ -463,12 +463,17 @@ measure an unauthenticated session rather than a wake. The alternative considere
 the HOME level, matching every ordinary test — was rejected for exactly that reason: it cannot
 authenticate against a real host, so it cannot measure what the matrix exists to measure.
 Isolation is instead at the *session* level: each trial runs against a throwaway host session
-tracked in a `SessionRegistry` that refuses to touch any id it did not itself mint or adopt,
-torn down after the trial where a teardown mechanism is captured (Claude). Codex has no captured
-create or teardown path: the caller creates the thread, `run_trial(existing_session=...)` adopts
-it, `teardown()` raises `TeardownUnsupported` and keeps ownership so the id stays reportable, and
-the caller disposes of the thread it created. Every matrix cell this produces therefore carries the developer's real
-credentials and configuration and must be sanitized before publication — see
+the runner itself created in a fresh, private probe directory, tracked in a `SessionRegistry`
+that refuses to touch any id it did not itself mint — ownership comes only from the runner's own
+creation output, never from a listing or a rollout directory, and no driver adopts a session. The
+2026-09-13 captures established a create, submit, observe and teardown path for all three hosts
+(Claude `--bg`, `attach`, no-flag `--resume`, `stop` then `rm`; Codex `exec --json`, `queue`,
+`resume`, `delete --force`; OpenCode `run`, `serve` plus `run --attach`, `export`,
+`session delete`), so the earlier arrangement in which a caller made a Codex thread and the
+runner adopted it is gone. Cleanup is the module's own `run_trial_with_cleanup`: its sweep runs
+on every exit path, and a session it could not remove stays owned and reported rather than
+released. Every matrix cell this produces therefore carries the developer's real credentials and
+configuration and must be sanitized before publication — see
 [host probes](host-probes.md#matrix-runner) for the driver contract and outcome detectors.
 
 ## Evidence and limits

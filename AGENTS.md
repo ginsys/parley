@@ -119,17 +119,20 @@ Host-probe matrix trials are not ordinary tests and carry an owner decision of 2
 run against an installed host CLI under the operator's **real HOME**
 (`scripts/probe/wake_probe.py --home inherit`), because a disposable HOME holds no host
 credentials and would measure an unauthenticated session rather than a wake. Isolation is at the
-*session* level, never at the HOME level: a throwaway host session, torn down after the trial
-where a teardown mechanism is captured (Claude, `claude rm`). Where none is (Codex: `create()`
-and `teardown()` both refuse, and the caller adopts a thread it just made via
-`existing_session=`), the runner retains registry ownership, raises `TeardownUnsupported`, and
-disposing of that thread is the caller's job, symmetric with its creation. The runner's drivers
-inherit the environment through `subprocess.run`; `--home inherit` is the PTY recorder's
-equivalent. Every matrix cell is therefore produced with real credentials and configuration and
-must be sanitized before it is published. The PTY fixtures keep `--home disposable`, except the coverage for
+*session* level, never at the HOME level: a throwaway host session in a fresh, empty probe
+directory, created by the runner's own command (`claude --bg`, `codex exec --json`,
+`opencode run`) and torn down by it afterwards (`claude stop` then `rm`, `codex delete --force`,
+`opencode session delete`) through `run_trial_with_cleanup`, whose sweep runs on every exit path
+and reports any session it could not remove instead of releasing it. No driver adopts a session
+it did not create. The runner's drivers inherit the environment through `subprocess.run` and its
+PTY clients through `PtyClient`; `--home inherit` is the PTY recorder's equivalent. Every matrix
+cell is therefore produced with real credentials and configuration and must be sanitized before
+it is published. The PTY fixtures keep `--home disposable`, except the coverage for
 `--home inherit` itself, which exercises that mode's real environment-passing behavior against a
-controlled synthetic child process, never an installed host CLI. No ordinary test may launch an
-installed host CLI, regardless of HOME mode. See [host probes](docs/host-probes.md#matrix-runner).
+controlled synthetic child process, never an installed host CLI. The runner's own tests inject
+every process-creating call (`run`, `popen`, `pty`) and drive `PtyClient` only with controlled
+Python children. No ordinary test may launch an installed host CLI, regardless of HOME mode. See
+[host probes](docs/host-probes.md#matrix-runner).
 
 ## Transactions and schema upgrades
 
