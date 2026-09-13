@@ -313,8 +313,11 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   version read remains unknown. Identity-binding/listing failures remain fatal lifecycle errors.
   `observe()` reads the session's own transcript
   (`$HOME/.claude/projects/*/<sessionId>.jsonl`): `user` records carry a string `content`,
-  `assistant` records a list of typed parts, both a UTC ISO `timestamp`. Those shapes are
-  enforced per role — an assistant string or a user part list is a changed transcript and counts
+  `assistant` records a list of typed parts, both a UTC ISO `timestamp`. Every message record is
+  bound to the owned full UUID and exact probe cwd by its captured `sessionId`
+  and `cwd`. Missing or conflicting bindings invalidate the entire snapshot before outcomes,
+  serving model or version can be extracted; a matching filename alone supplies no evidence.
+  Content shapes are enforced per role — an assistant string or a user part list is a changed transcript and counts
   unusable, rather than letting a marker in the wrong shape establish an acknowledgement.
   Bookkeeping record types are skipped, a malformed message record makes the read unobservable.
   `submit()` reads

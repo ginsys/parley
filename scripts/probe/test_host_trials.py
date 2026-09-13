@@ -1193,8 +1193,9 @@ class ClaudeDriverTests(DriverTestCase):
         driver = self.driver(run)
         driver.create('hello')
         self.transcripts[SESSION_UUID] = self.write_lines('t.jsonl', [
-            claude_record('user', marker_message(MARKER), stamp='2026-09-13T09:00:01.000Z'),
-            claude_record('assistant', [{'type': 'text', 'text': MARKER}], stamp='2026-09-13T09:00:03.000Z'),
+            claude_record('user', marker_message(MARKER), stamp='2026-09-13T09:00:01.000Z', cwd=driver.cwd),
+            claude_record('assistant', [{'type': 'text', 'text': MARKER}],
+                          stamp='2026-09-13T09:00:03.000Z', cwd=driver.cwd),
         ])
         submitted_at = 1_789_290_000.0  # 2026-09-13T09:00:00Z
         observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at)
@@ -1211,12 +1212,35 @@ class ClaudeDriverTests(DriverTestCase):
                        (['claude', 'agents'], listing([claude_entry()]))])
         driver = self.driver(run)
         driver.create('hello')
-        self.transcripts[SESSION_UUID] = self.write_lines('v.jsonl', [claude_record('user', 'x')])
+        self.transcripts[SESSION_UUID] = self.write_lines('v.jsonl', [claude_record('user', 'x', cwd=driver.cwd)])
         self.assertEqual(driver.version('69aa52ed'), '2.1.270')
         self.assertEqual(run.argv('claude', '--version'), [])
         self.transcripts.pop(SESSION_UUID)
         self.assertIsNone(driver.version('69aa52ed'))
         self.assertGreaterEqual(self.clock.elapsed, 5.0)  # waited out its bound on the fake clock
+
+    def test_transcript_record_binding_gates_all_evidence(self):
+        driver, _ = self.create_live()
+        original = [claude_record('user', MARKER, cwd=driver.cwd),
+                    claude_record('assistant', [{'type': 'text', 'text': MARKER}],
+                                  cwd=driver.cwd, model='synthetic-model')]
+        for index in (0, 1):
+            for key in ('sessionId', 'cwd'):
+                for value in (None, '', 'foreign'):
+                    with self.subTest(index=index, key=key, value=value):
+                        record = json.loads(original[index])
+                        if value is None:
+                            del record[key]
+                        else:
+                            record[key] = value
+                        lines = list(original)
+                        lines[index] = json.dumps(record)
+                        self.transcripts[SESSION_UUID] = self.write_lines('foreign-transcript.jsonl', lines)
+                        observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                        self.assertFalse(observation.observable)
+                        self.assertEqual(observation.outcomes, {})
+                        self.assertIsNone(observation.model)
+                        self.assertIsNone(driver.version('69aa52ed'))
 
     def create_live(self, extra_scripts=(), **kwargs):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),

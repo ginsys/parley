@@ -130,6 +130,11 @@ version. All timestamps are UTC.
 | `claude rm <id>` (after `stop`) | Exit 0, stdout `removed <id>`; the entry leaves the listing. The transcript files persist under `$HOME/.claude/projects/<cwd-slug>/` (three files, one per session started, still present afterwards) |
 | Background daemon socket | `/tmp/cc-daemon-<uid>/<hash>/control.sock` while the session lives |
 
+The retained owned Claude transcript was rechecked for record provenance: all seven user and
+assistant records, including thinking-only assistant records and the later attach/resume turns,
+carry the same full `sessionId` and exact `cwd`. Both fields apply to assistant records as well
+as the user-record example above. A filename match alone is insufficient to bind a read.
+
 ### codex-cli 0.154.0
 
 | Command/check | Observed result |

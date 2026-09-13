@@ -1112,9 +1112,21 @@ class ClaudeDriver(Driver):
             return None
         try:
             with open(path, encoding='utf-8') as handle:
-                return parse(handle)
+                lines = handle.readlines()
         except (OSError, UnicodeDecodeError):
             return None
+        found = False
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue  # The event parser still rejects malformed records.
+            if not isinstance(record, dict) or record.get('type') not in ('user', 'assistant'):
+                continue
+            if record.get('sessionId') != self.sessions[session_id] or record.get('cwd') != self.cwd:
+                return None
+            found = True
+        return parse(lines) if found else None
 
     def observe(self, session_id, *, marker, submitted_at):
         """Read the session's JSONL transcript; unreadable or undatable content is unobservable.
