@@ -1335,7 +1335,11 @@ class Server:
         self.url = url
 
     def close(self):
-        """SIGTERM the server's own process group, then SIGKILL if it lingers."""
+        """SIGTERM the server's own process group, then SIGKILL if it lingers.
+
+        A process still alive after both is an error, so the sweep reports a server it could
+        not stop instead of forgetting it.
+        """
         if self.process.poll() is None:
             for signum, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
                 try:
@@ -1347,6 +1351,8 @@ class Server:
                     break
                 except subprocess.TimeoutExpired:
                     continue
+        if self.process.poll() is None:
+            raise RuntimeError(f'opencode serve (pid {self.process.pid}) survived SIGTERM and SIGKILL')
 
 
 class OpenCodeDriver(Driver):
@@ -1409,6 +1415,9 @@ class OpenCodeDriver(Driver):
         signal the whole group.
         """
         if self.server is not None:
+            if self.server.process.poll() is not None:
+                raise RuntimeError(f'the held opencode serve exited {self.server.process.returncode}; '
+                                   'close_servers() before serving again')
             return self.server
         port = self.port or free_port()
         url = f'http://127.0.0.1:{port}'
@@ -1423,17 +1432,23 @@ class OpenCodeDriver(Driver):
                              stderr=subprocess.DEVNULL, start_new_session=True)
         server = Server(process, url)
         deadline = time.monotonic() + timeout
-        while True:
-            if process.poll() is not None:
-                raise RuntimeError(f'opencode serve exited {process.returncode} before answering')
-            try:
-                self.http_get(f'{url}/session')
-                break
-            except urllib.error.URLError:
-                if time.monotonic() >= deadline:
-                    server.close()
-                    raise RuntimeError(f'opencode serve did not answer on {url} within {timeout}s') from None
-                self.sleep(0.25)
+        # Until the server is held on `self.server` nothing else can close it, so every exit
+        # from the readiness wait -- timeout, an early child exit, a Ctrl-C, a failing probe --
+        # closes it here.
+        try:
+            while True:
+                if process.poll() is not None:
+                    raise RuntimeError(f'opencode serve exited {process.returncode} before answering')
+                try:
+                    self.http_get(f'{url}/session')
+                    break
+                except urllib.error.URLError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f'opencode serve did not answer on {url} within {timeout}s') from None
+                    self.sleep(0.25)
+        except BaseException:
+            server.close()
+            raise
         self.server = server
         return server
 
@@ -1444,7 +1459,8 @@ class OpenCodeDriver(Driver):
                 self.server.close()
             except Exception as error:
                 failures.append(('server', error))
-            self.server = None
+            else:
+                self.server = None
         return failures
 
     def submit(self, session_id, message):
@@ -1452,11 +1468,18 @@ class OpenCodeDriver(Driver):
         self.submission_note = None
         if self.server is None:
             raise SubmissionUncaptured('only `run --attach` into a live `serve` is captured; call serve() first')
+        if self.server.process.poll() is not None:
+            raise SubmissionUncaptured(f'the serve child exited {self.server.process.returncode} before '
+                                       'submission; nothing sent')
         argv = ['opencode', 'run', '--pure', '--format', 'json', '--attach', self.server.url,
                 '--session', session_id, '-m', self.model, message]
         result = self.run(argv, capture_output=True, text=True, timeout=60, cwd=self.cwd,
                           stdin=subprocess.DEVNULL)
         if result.returncode != 0:
+            if self.server.process.poll() is not None:
+                # A dead server is this runner's failure, not the host refusing the message.
+                raise SubmissionUncaptured(f'run --attach exited {result.returncode} against a serve child '
+                                           f'that had exited {self.server.process.returncode}: {result.stderr}')
             raise SubmissionRejected(result.returncode, result.stderr)
         return True
 

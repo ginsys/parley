@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.error
 from dataclasses import dataclass
 
@@ -1200,6 +1201,83 @@ class OpenCodeDriverTests(DriverTestCase):
             driver.serve()
         self.assertIsNone(driver.server)
 
+    def silent_popen(self, argv, **kwargs):
+        # Our child starts but never answers: `answering` stays False.
+        process = FakePopen(argv, **kwargs)
+        self.servers.append(process)
+        return process
+
+    def patch_killpg(self):
+        killed = []
+
+        def killpg(pid, signum):
+            killed.append((pid, signum))
+            for process in self.servers:
+                if process.pid == pid:
+                    process.returncode = -signum
+
+        patcher = unittest.mock.patch('os.killpg', killpg)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return killed
+
+    def test_serve_timeout_closes_the_child_it_started(self):
+        killed = self.patch_killpg()
+        driver = self.driver(FakeRun([]), popen=self.silent_popen, port=4096)
+        with self.assertRaises(RuntimeError):
+            driver.serve(timeout=0.0)
+        self.assertEqual(killed, [(4321, 15)])
+        self.assertIsNone(driver.server)
+
+    def test_serve_closes_the_child_when_the_readiness_wait_is_interrupted(self):
+        # A Ctrl-C (or any failing probe) between popen and `self.server = server` used to leave
+        # the child running with no handle to it: `close_servers()` had nothing to close.
+        for error in (KeyboardInterrupt(), TimeoutError('probe hung')):
+            with self.subTest(error=type(error).__name__):
+                self.servers = []
+                killed = self.patch_killpg()
+
+                def http_get(url, error=error):
+                    if self.servers:
+                        raise error
+                    raise urllib.error.URLError('refused')
+
+                driver = self.driver(FakeRun([]), popen=self.silent_popen, http_get=http_get, port=4096)
+                with self.assertRaises(type(error)):
+                    driver.serve()
+                self.assertEqual(killed, [(4321, 15)])
+                self.assertIsNone(driver.server)
+
+    def test_serve_refuses_to_reuse_a_held_server_whose_child_has_exited(self):
+        driver = self.driver(FakeRun([]), port=4096)
+        server = driver.serve()
+        server.process.returncode = 1
+        with self.assertRaises(RuntimeError):
+            driver.serve()
+        self.assertEqual(len(self.servers), 1)  # no second child behind the caller's back
+
+    def test_submit_is_uncaptured_rather_than_rejected_once_the_serve_child_is_gone(self):
+        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'],
+                        FakeResult(1, '', 'connect ECONNREFUSED'))])
+        driver = self.driver(run, port=4096)
+        driver.create('hello')
+        server = driver.serve()
+        server.process.returncode = -9
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('ses_1', 'msg')
+        self.assertEqual(run.argv('opencode', 'run', '--pure', '--format', 'json', '--attach'), [])
+        # The child dying during the attach call: a nonzero exit is then not host evidence either.
+        server.process.returncode = None
+
+        def dying_attach(argv):
+            server.process.returncode = -9
+            return FakeResult(1, '', 'connect ECONNREFUSED')
+
+        run.scripts.insert(0, (['opencode', 'run', '--pure', '--format', 'json', '--attach'], dying_attach))
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('ses_1', 'msg')
+
     def test_submit_attaches_to_our_server_and_reports_exit_status(self):
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
                        (['opencode', 'run', '--pure', '--format', 'json', '--attach'], FakeResult(0))])
@@ -1245,24 +1323,25 @@ class OpenCodeDriverTests(DriverTestCase):
         self.assertEqual(driver.owned(), set())
 
     def test_close_servers_signals_the_group_and_forgets_the_server(self):
+        killed = self.patch_killpg()
         driver = self.driver(FakeRun([]), port=4096)
         driver.serve()
-        process, = self.servers
-        killed = []
-
-        def killpg(pid, signum):
-            killed.append((pid, signum))
-            process.returncode = -signum
-
-        import host_trials
-        original = host_trials.os.killpg
-        host_trials.os.killpg = killpg
-        try:
-            self.assertEqual(driver.close_servers(), [])
-        finally:
-            host_trials.os.killpg = original
+        self.assertEqual(driver.close_servers(), [])
         self.assertEqual(killed, [(4321, 15)])
         self.assertIsNone(driver.server)
+
+    def test_close_servers_reports_a_child_that_survives_sigkill_and_keeps_holding_it(self):
+        signals = []
+        patcher = unittest.mock.patch('os.killpg', lambda pid, signum: signals.append(signum))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        driver = self.driver(FakeRun([]), port=4096)
+        driver.serve()
+        failures = driver.close_servers()
+        self.assertEqual([label for label, _ in failures], ['server'])
+        self.assertIsInstance(failures[0][1], RuntimeError)
+        self.assertEqual(signals, [15, 9])
+        self.assertIsNotNone(driver.server)  # still ours to report, never silently forgotten
 
     def test_foreign_ids_are_refused_everywhere(self):
         driver = self.driver(FakeRun([]))
