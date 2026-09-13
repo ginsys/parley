@@ -603,9 +603,16 @@ def unfresh_git_reason(path):
             if os.path.islink(candidate):
                 return (f'`{os.path.relpath(candidate, path)}` is a symlink: `git init` leaves '
                         f'none, and reading through it would leave the probe directory')
-            if not (stat.S_ISDIR(os.lstat(candidate).st_mode) or
-                    stat.S_ISREG(os.lstat(candidate).st_mode)):
+            metadata = os.lstat(candidate)
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
                 return f'`{os.path.relpath(candidate, path)}` is not a regular file or directory'
+            if stat.S_ISREG(metadata.st_mode):
+                if metadata.st_nlink != 1:
+                    return f'`{os.path.relpath(candidate, path)}` is hard-linked outside its unique path'
+                if metadata.st_uid != os.geteuid():
+                    return f'`{os.path.relpath(candidate, path)}` is not operator-owned'
+                if metadata.st_mode & 0o022:
+                    return f'`{os.path.relpath(candidate, path)}` is writable by group or others'
     for root, _directories, files in os.walk(os.path.join(git, 'refs')):
         if files:
             return f'`{os.path.join(root, sorted(files)[0])}` exists'

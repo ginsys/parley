@@ -1180,6 +1180,45 @@ class ClaudeDriverTests(DriverTestCase):
         self.driver(FakeRun([]))  # does not raise
         self.driver(FakeRun([]))  # validation never changes the shared probe directory
 
+    def test_fresh_git_files_cannot_have_external_hard_links_or_shared_writes(self):
+        self.git('init', '--quiet', self.cwd)
+        for name in ('HEAD', 'config', 'hooks/pre-commit.sample'):
+            path = os.path.join(self.cwd, '.git', name)
+            alias = os.path.join(self.fixtures.name, 'external-alias')
+            with self.subTest(name=name, kind='hard-link'):
+                os.link(path, alias)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'hard.link'):
+                        self.driver(FakeRun([]))
+                finally:
+                    os.unlink(alias)
+            with self.subTest(name=name, kind='shared-write'):
+                mode = os.stat(path).st_mode
+                os.chmod(path, mode | 0o022)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'writable'):
+                        self.driver(FakeRun([]))
+                finally:
+                    os.chmod(path, mode)
+        self.driver(FakeRun([]))
+
+    def test_fresh_git_files_must_be_operator_owned(self):
+        self.git('init', '--quiet', self.cwd)
+        config = os.path.join(self.cwd, '.git', 'config')
+        original = os.lstat
+
+        def different_owner(path, *args, **kwargs):
+            result = original(path, *args, **kwargs)
+            if path == config:
+                fields = list(result)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return result
+
+        with unittest.mock.patch('os.lstat', side_effect=different_owner):
+            with self.assertRaisesRegex(ValueError, 'owned'):
+                self.driver(FakeRun([]))
+
     def test_git_fixtures_ignore_inherited_repository_and_template_settings(self):
         foreign = os.path.join(self.fixtures.name, 'foreign.git')
         with unittest.mock.patch.dict(os.environ, {'GIT_DIR': foreign,
