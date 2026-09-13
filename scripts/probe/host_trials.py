@@ -1484,7 +1484,7 @@ class CodexDriver(Driver):
         """
         self.require_owned(thread_id)
         self.submission_note = None
-        if self.mechanism == 'queue' and not any(not client.eof for client in self.clients):
+        if self.mechanism == 'queue' and self.live_client_for(thread_id) is None:
             raise SubmissionUncaptured('mechanism=queue needs a live resume client already serving the '
                                        'thread (the settle callback opens one with attach()); nothing queued')
         try:

@@ -346,7 +346,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   With mechanism `queue-then-resume` (the restarted cell) `submit()` opens that client itself
   right after queueing and returns the time `codex queue` exited, so the resume client's startup
   is not counted against the 10 s acceptance window; a `codex queue` that times out there is
-  `SubmissionUncaptured`, since nothing serves the thread yet. `attach()` answers the captured
+  `SubmissionUncaptured`, since nothing serves the thread yet. Ordinary queue submission requires
+  a successfully readied live client for the exact owned thread: another owned thread's client
+  or a held client whose readiness was never established cannot authorize queueing.
+  `attach()` answers the captured
   first-run trust dialog with Enter (which persists a trust entry for the probe directory in
   `$CODEX_HOME/config.toml`), waits for the composer placeholder `› Ask Codex to do anything`
   drawn after that answer plus 3 s of quiet — the placeholder is drawn while a turn or the dialog

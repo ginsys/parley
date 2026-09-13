@@ -1424,6 +1424,26 @@ class CodexDriverTests(DriverTestCase):
             driver.submit(THREAD_ID, 'msg')
         self.assertEqual(run.argv('codex', 'queue'), [])
 
+    def test_queue_submit_requires_a_ready_client_for_the_exact_owned_thread(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()), (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.attach(THREAD_ID)
+        other = '01a09a24-ff1d-7360-9385-722d230ef92c'
+        driver.mint(other)
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(other, 'msg')
+        self.assertEqual(run.argv('codex', 'queue'), [])
+
+    def test_a_held_unready_codex_client_cannot_authorize_queue_submission(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()), (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.open_client(['codex', 'resume', THREAD_ID])
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(run.argv('codex', 'queue'), [])
+
     def test_queue_submit_with_only_an_exited_resume_client_is_uncaptured(self):
         # A resume client that exited serves nothing. Counting the retained handle as a serving
         # process would queue an item nobody delivers and blame the host for the silence.
