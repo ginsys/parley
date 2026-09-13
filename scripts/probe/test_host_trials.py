@@ -610,7 +610,7 @@ class OpenCodeParsingTests(unittest.TestCase):
         self.assertIn('ProviderAuthError', error)
         self.assertEqual(unusable, 2)
         self.assertEqual(opencode_session_ids(''), ({}, None, 0))
-        self.assertEqual(opencode_session_ids(json.dumps({'type': 'text', 'sessionID': ''})), ({}, None, 0))
+        self.assertEqual(opencode_session_ids(json.dumps({'type': 'text', 'sessionID': ''})), ({}, None, 1))
 
     def test_export_extracts_text_parts_with_millisecond_creation_times(self):
         raw = opencode_export([
@@ -2217,7 +2217,9 @@ class OpenCodeDriverTests(DriverTestCase):
         self.assertTrue(self.servers[0].stdout.closed)
 
     def test_malformed_creation_stream_is_never_successful(self):
-        for suffix in ('{"type":', '[1]', 'null', '"text"'):
+        for suffix in ('{"type":', '[1]', 'null', '"text"', '{"type":"text"}',
+                       '{"type":"text","sessionID":""}', '{"type":"text","sessionID":null}',
+                       '{"type":"text","sessionID":7}'):
             with self.subTest(suffix=suffix):
                 self.registry = SessionRegistry()
                 run = FakeRun([(['opencode', 'run'],
@@ -2229,7 +2231,9 @@ class OpenCodeDriverTests(DriverTestCase):
                 self.assertEqual(driver.owned(), {'ses_1'})
 
     def test_malformed_attach_stream_is_uncaptured_even_with_a_matching_id(self):
-        for suffix in ('{"type":', '[1]', 'null', '"text"'):
+        for suffix in ('{"type":', '[1]', 'null', '"text"', '{"type":"text"}',
+                       '{"type":"text","sessionID":""}', '{"type":"text","sessionID":null}',
+                       '{"type":"text","sessionID":7}'):
             for returncode in (0, 1, 'timeout'):
                 with self.subTest(suffix=suffix, returncode=returncode):
                     self.registry = SessionRegistry()

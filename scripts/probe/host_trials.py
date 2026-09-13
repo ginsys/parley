@@ -1767,6 +1767,8 @@ def opencode_session_ids(stdout):
             continue
         if isinstance(event.get('sessionID'), str) and event['sessionID']:
             session_ids[event['sessionID']] = None
+        else:
+            unusable += 1
         if error is None and event.get('type') == 'error':
             error = json.dumps(event.get('error'))
     return session_ids, error, unusable

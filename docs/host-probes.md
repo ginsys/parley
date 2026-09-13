@@ -426,6 +426,7 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   still creates the session. Creation requires one consistent ID throughout the stream. Multiple
   distinct IDs, including in timeout output, grant no ownership: all candidates are reported by
   cleanup for manual investigation. Nonempty malformed JSON or non-object event lines fail
+  validation, as does any parsed event without a nonempty string `sessionID`. These fail
   creation and make attach submission `SubmissionUncaptured`, regardless of exit status or
   timeout; a matching ID elsewhere cannot make an unreadable stream trustworthy. A unique
   creation ID remains available for cleanup after malformed output fails the command.
