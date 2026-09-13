@@ -598,7 +598,10 @@ def claude_transcript_events(lines):
     `unusable` counts what should have been readable and was not: a line that is not JSON, a
     record that is not an object or whose `type` is not a string, or a user/assistant record
     whose timestamp is missing/naive, whose `message.role` disagrees with its type, or whose
-    content is neither a string nor a list of typed parts. The caller reports such a read
+    content does not carry its own role's captured shape. The shapes are role-specific and
+    checked as such: an assistant string or a user part list is a changed or malformed
+    transcript, and promoting one would let a marker in the wrong shape establish an
+    acknowledgement instead of making the read unobservable. The caller reports such a read
     unobservable rather than letting absent outcomes become negative evidence.
     """
     events = []
@@ -624,9 +627,9 @@ def claude_transcript_events(lines):
             unusable += 1
             continue
         content = message.get('content')
-        if isinstance(content, str):
+        if kind == 'user' and isinstance(content, str):
             text = content
-        elif isinstance(content, list):
+        elif kind == 'assistant' and isinstance(content, list):
             texts = []
             for part in content:
                 if not isinstance(part, dict):

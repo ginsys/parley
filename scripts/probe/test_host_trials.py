@@ -266,6 +266,15 @@ class ClaudeParsingTests(unittest.TestCase):
         ]
         self.assertEqual(claude_transcript_events(lines), ([], 8))
 
+    def test_cross_role_content_shapes_are_unusable_rather_than_promoted(self):
+        # The captured contract is role-specific: a string only on user records, a typed-part
+        # list only on assistant records. An assistant string carrying the marker must not become
+        # an acknowledgement, and a user part list must not establish visibility -- a changed or
+        # malformed transcript makes the read unobservable instead.
+        lines = [claude_record('assistant', f'ack {MARKER}'),
+                 claude_record('user', [{'type': 'text', 'text': MARKER}])]
+        self.assertEqual(claude_transcript_events(lines), ([], 2))
+
     def test_session_version_reads_the_single_recorded_version(self):
         lines = [json.dumps({'type': 'mode', 'mode': 'x'}),
                  claude_record('user', 'hi', version='2.1.270'),

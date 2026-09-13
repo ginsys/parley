@@ -230,8 +230,11 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   returns the owned entry from that listing (`pid`, `status`, `state`, `sessionId`) for settle
   callbacks. `observe()` reads the session's own transcript
   (`$HOME/.claude/projects/*/<sessionId>.jsonl`): `user` records carry a string `content`,
-  `assistant` records a list of typed parts, both a UTC ISO `timestamp`; bookkeeping record
-  types are skipped, a malformed message record makes the read unobservable. `submit()` reads
+  `assistant` records a list of typed parts, both a UTC ISO `timestamp`. Those shapes are
+  enforced per role — an assistant string or a user part list is a changed transcript and counts
+  unusable, rather than letting a marker in the wrong shape establish an acknowledgement.
+  Bookkeeping record types are skipped, a malformed message record makes the read unobservable.
+  `submit()` reads
   the listing first; a listing that times out is `SubmissionUncaptured`, since nothing was sent.
   It has two mechanisms. `attach` opens `claude attach <id>` under a PTY, waits for the composer
   (a line holding only `❯` and a no-break space, the captured ready screen) to appear and the
