@@ -1082,28 +1082,37 @@ class ClaudeDriver(Driver):
             short = backgrounded_id(_partial_stdout(error))
             if short:
                 self._mint(short)
+            else:
+                self._report_unbound_creation(error)
             raise
         except KeyboardInterrupt as error:
-            try:
-                candidates = {entry['id'] for entry in self._listing()} - self.owned()
-            except BaseException:
-                error.add_note('Claude creation interrupted; bounded candidate discovery failed; '
-                               'manual investigation required in the probe cwd')
-            else:
-                self.strays.update(candidates)
-                error.add_note(f'Claude creation interrupted; candidate IDs {sorted(candidates)!r}; '
-                               'no ownership granted, manual investigation required; '
-                               'the bounded snapshot cannot exclude later arrivals')
+            self._report_unbound_creation(error)
             raise
         short = backgrounded_id(result.stdout)
         if short:
             self._mint(short)  # before the exit check: a nonzero exit after the line is still a session
-        if result.returncode != 0:
-            raise RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}')
-        if short is None:
-            raise RuntimeError(f'claude --bg printed no backgrounded line: {result.stdout!r}')
+        if result.returncode != 0 or short is None:
+            error = RuntimeError(f'claude --bg exited {result.returncode}: {result.stderr}'
+                                 if result.returncode != 0 else
+                                 f'claude --bg printed no backgrounded line: {result.stdout!r}')
+            if short is None:
+                self._report_unbound_creation(error)
+            raise error
         self._settle_creation_turn(short)
         return short
+
+    def _report_unbound_creation(self, error):
+        """One bounded snapshot reports candidates; it never supplies creation authority."""
+        try:
+            candidates = {entry['id'] for entry in self._listing()} - self.owned()
+        except BaseException:
+            error.add_note('Claude creation has no usable ID; bounded candidate discovery failed; '
+                           'manual investigation required in the probe cwd')
+        else:
+            self.strays.update(candidates)
+            error.add_note(f'Claude creation has no usable ID; candidate IDs {sorted(candidates)!r}; '
+                           'no ownership granted, manual investigation required; '
+                           'the bounded snapshot cannot exclude later arrivals')
 
     def _session_uuid(self, session_id):
         if self.sessions.get(session_id) is None:

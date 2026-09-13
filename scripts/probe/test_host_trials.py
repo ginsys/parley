@@ -972,6 +972,31 @@ class ClaudeDriverTests(DriverTestCase):
                 self.assertIn('discovery failed', ' '.join(caught.exception.__notes__))
                 self.assertEqual(driver.owned(), set())
 
+    def test_unrecognized_creation_output_reports_candidates_without_adoption(self):
+        for result in (FakeResult(0, 'changed output'), FakeResult(1, 'changed output'),
+                       subprocess.TimeoutExpired(['claude'], 60, output='changed output')):
+            with self.subTest(result=type(result).__name__):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['claude', '--bg'], result),
+                               (['claude', 'agents'], listing([claude_entry()]))])
+                driver = self.driver(run)
+                with self.assertRaises((RuntimeError, subprocess.TimeoutExpired)) as caught:
+                    run_trial_with_cleanup(driver, prompt='hello')
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual(driver.strays, {'69aa52ed'})
+                self.assertIn('manual investigation', ' '.join(caught.exception.__notes__))
+                self.assertEqual(run.argv('claude', 'stop'), [])
+                self.assertEqual(run.argv('claude', 'rm'), [])
+
+    def test_failed_candidate_discovery_preserves_the_creation_error(self):
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'changed output')),
+                       (['claude', 'agents'], KeyboardInterrupt())])
+        driver = self.driver(run)
+        with self.assertRaisesRegex(RuntimeError, 'no backgrounded line') as caught:
+            run_trial_with_cleanup(driver, prompt='hello')
+        self.assertIn('discovery failed', ' '.join(caught.exception.__notes__))
+        self.assertEqual(driver.owned(), set())
+
     def test_claude_transcript_removed_between_discovery_and_stat_is_unobservable(self):
         driver = self.driver(FakeRun([
             (['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
