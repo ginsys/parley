@@ -803,13 +803,13 @@ class DriverTestCase(unittest.TestCase):
         a wrong predicate. `git` is not a host CLI and creates no session; the AGENTS.md rule it
         must not break is launching an installed Claude/Codex/OpenCode, which this does not.
         """
-        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+        env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
                    GIT_CONFIG_NOSYSTEM='1', GIT_AUTHOR_NAME='probe', GIT_AUTHOR_EMAIL='probe@invalid',
                    GIT_COMMITTER_NAME='probe', GIT_COMMITTER_EMAIL='probe@invalid')
-        try:
-            subprocess.run(['git', *args], check=True, env=env, capture_output=True)
-        except (OSError, subprocess.CalledProcessError) as error:
-            self.skipTest(f'git unavailable or failed: {error}')
+        # Installed Git is required evidence, so an unavailable/failed command must fail the
+        # fixture rather than silently skipping the freshness check.
+        subprocess.run(['git', *args], check=True, env=env, capture_output=True)
 
     def transcript_path_for(self, session_uuid):
         return self.transcripts.get(session_uuid)
@@ -867,6 +867,20 @@ class ClaudeDriverTests(DriverTestCase):
         self.git('init', '--quiet', self.cwd)
         self.driver(FakeRun([]))  # does not raise
         self.driver(FakeRun([]))  # validation never changes the shared probe directory
+
+    def test_git_fixtures_ignore_inherited_repository_and_template_settings(self):
+        foreign = os.path.join(self.fixtures.name, 'foreign.git')
+        with unittest.mock.patch.dict(os.environ, {'GIT_DIR': foreign,
+                                                   'GIT_WORK_TREE': self.fixtures.name,
+                                                   'GIT_OBJECT_DIRECTORY': foreign + '/objects',
+                                                   'GIT_TEMPLATE_DIR': foreign + '/template'}):
+            try:
+                self.git('init', '--quiet', self.cwd)
+            except unittest.SkipTest as error:
+                self.fail(f'inherited Git configuration caused a skipped fixture: {error}')
+        self.assertTrue(os.path.isdir(os.path.join(self.cwd, '.git')))
+        self.assertFalse(os.path.exists(foreign))
+        self.driver(FakeRun([]))
 
     def test_fresh_git_can_use_a_non_default_initial_branch(self):
         self.git('init', '--quiet', '--initial-branch=probe/initial', self.cwd)

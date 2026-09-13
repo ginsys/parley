@@ -476,6 +476,11 @@ released. Every matrix cell this produces therefore carries the developer's real
 configuration and must be sanitized before publication — see
 [host probes](host-probes.md#matrix-runner) for the driver contract and outcome detectors.
 
+Ordinary probe tests inject host processes and use controlled Python children. The fresh-repository
+check is a deliberate exception for installed Git, using synthetic directories and neutral Git
+configuration. Comparing against actual `git init` output is owner-required evidence; replacing
+both sides with a fabricated Git tree would only test that two assumptions agree.
+
 ## Evidence and limits
 
 The normal verification gate is `mise run verify`; its contents are described in

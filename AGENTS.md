@@ -130,8 +130,12 @@ cell is therefore produced with real credentials and configuration and must be s
 it is published. The PTY fixtures keep `--home disposable`, except the coverage for
 `--home inherit` itself, which exercises that mode's real environment-passing behavior against a
 controlled synthetic child process, never an installed host CLI. The runner's own tests inject
-every process-creating call (`run`, `popen`, `pty`) and drive `PtyClient` only with controlled
-Python children. No ordinary test may launch an installed host CLI, regardless of HOME mode. See
+every host process-creating call (`run`, `popen`, `pty`) and drive `PtyClient` only with controlled
+Python children. Fresh-Git validation and its fixtures intentionally run installed Git against
+synthetic directories with neutral Git configuration: the owner requires comparison against real
+`git init` output, not an invented fixture that could agree with a wrong validator. This exception
+does not launch an agent or a host session. No ordinary test may launch an installed host CLI,
+regardless of HOME mode. See
 [host probes](docs/host-probes.md#matrix-runner).
 
 ## Transactions and schema upgrades
