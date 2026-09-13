@@ -51,7 +51,7 @@ from host_trials import (
     claude_transcript_events,
     codex_rollout_events,
     codex_session_version,
-    codex_thread_id,
+    codex_thread_ids,
     detect_outcomes,
     marker_message,
     marker_token,
@@ -346,14 +346,14 @@ class ClaudeParsingTests(unittest.TestCase):
 
 
 class CodexParsingTests(unittest.TestCase):
-    def test_thread_id_comes_from_the_thread_started_event(self):
+    def test_thread_ids_come_from_thread_started_events(self):
         stdout = '\n'.join([json.dumps({'type': 'thread.started', 'thread_id': THREAD_ID}),
                             json.dumps({'type': 'turn.started'}), 'not json'])
-        self.assertEqual(codex_thread_id(stdout), THREAD_ID)
-        self.assertIsNone(codex_thread_id(json.dumps({'type': 'turn.started'})))
-        self.assertIsNone(codex_thread_id(json.dumps({'type': 'thread.started', 'thread_id': ''})))
-        self.assertIsNone(codex_thread_id(json.dumps({'type': 'thread.started', 'thread_id': 5})))
-        self.assertIsNone(codex_thread_id(''))
+        self.assertEqual(list(codex_thread_ids(stdout)), [THREAD_ID])
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'turn.started'})), {})
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'thread.started', 'thread_id': ''})), {})
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'thread.started', 'thread_id': 5})), {})
+        self.assertEqual(codex_thread_ids(''), {})
 
     def test_rollout_extracts_user_and_assistant_skips_developer_and_other_types(self):
         lines = [
@@ -1400,6 +1400,24 @@ class CodexDriverTests(DriverTestCase):
                 with self.assertRaisesRegex(ValueError, 'uncaptured'):
                     self.driver(run, model=model)
                 self.assertEqual(run.calls, [])
+
+    def test_ambiguous_codex_creation_reports_all_candidates_without_ownership(self):
+        other = '01a09a24-ff1d-7360-9385-722d230ef92c'
+        output = self.exec_output().stdout + '\n' + json.dumps(
+            {'type': 'thread.started', 'thread_id': other})
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout):
+                self.registry = SessionRegistry()
+                result = (subprocess.TimeoutExpired(['codex'], 300, output=output)
+                          if timeout else FakeResult(0, output))
+                driver = self.driver(FakeRun([(['codex', 'exec'], result)]))
+                with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual({label for label, _ in sweep(driver)}, {THREAD_ID, other})
+                for candidate in (THREAD_ID, other):
+                    with self.assertRaises(ForeignSessionError):
+                        driver.teardown(candidate)
 
     def test_create_mints_before_checking_the_exit_status_and_from_partial_output(self):
         run = FakeRun([(['codex', 'exec'], FakeResult(2, self.exec_output().stdout, 'quota'))])

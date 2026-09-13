@@ -1280,8 +1280,9 @@ CODEX_TRUST_PATTERN = re.compile(r'Do\s*you\s*trust\s*the\s*contents\s*of\s*this
 CODEX_MECHANISMS = ('queue', 'queue-then-resume')
 
 
-def codex_thread_id(stdout):
-    """`thread_id` of the first `thread.started` event in `codex exec --json` output, or None."""
+def codex_thread_ids(stdout):
+    """Distinct `thread.started.thread_id` values in stream order."""
+    thread_ids = {}
     for line in stdout.splitlines():
         line = line.strip()
         if not line:
@@ -1292,8 +1293,8 @@ def codex_thread_id(stdout):
             continue
         if isinstance(record, dict) and record.get('type') == 'thread.started' \
                 and isinstance(record.get('thread_id'), str) and record['thread_id']:
-            return record['thread_id']
-    return None
+            thread_ids[record['thread_id']] = None
+    return thread_ids
 
 
 def codex_session_version(lines):
@@ -1459,12 +1460,24 @@ class CodexDriver(Driver):
         self.pty = pty
         self.clock = clock
 
+    def _created_thread(self, stdout):
+        thread_ids = codex_thread_ids(stdout)
+        if len(thread_ids) > 1:
+            self.strays.update(thread_ids)
+            raise RuntimeError(f'ambiguous Codex creation IDs {list(thread_ids)!r}; '
+                               'manual investigation required, no ownership granted')
+        thread_id = next(iter(thread_ids), None)
+        if thread_id:
+            self.mint(thread_id)
+        return thread_id
+
     def create(self, prompt):
         """`codex exec --json -s read-only --skip-git-repo-check -C <cwd> '<prompt>'`.
 
-        The thread id is minted as soon as `thread.started` is seen, before the exit status is
-        checked and from partial output on a timeout, so a thread the host created is always in
-        `owned()`. `exec` returns after its turn: the thread is idle with no live process. Passing
+        A unique `thread.started` id is minted before the exit status is checked, including
+        partial timeout output. Multiple distinct IDs grant no ownership and every candidate
+        is reported for investigation. `exec` returns after its turn: the thread is idle with no
+        live process. Passing
         stdin as `/dev/null` is inferred from the captured stderr `Reading additional input from
         stdin...`. `-m` is uncaptured (the default model was used), so construction rejects
         any explicit model override before a host can be launched.
@@ -1474,13 +1487,9 @@ class CodexDriver(Driver):
         try:
             result = self.run(argv, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as error:
-            thread_id = codex_thread_id(_partial_stdout(error))
-            if thread_id:
-                self.mint(thread_id)
+            self._created_thread(_partial_stdout(error))
             raise
-        thread_id = codex_thread_id(result.stdout)
-        if thread_id:
-            self.mint(thread_id)
+        thread_id = self._created_thread(result.stdout)
         if result.returncode != 0:
             raise RuntimeError(f'codex exec exited {result.returncode}: {result.stderr}')
         if thread_id is None:
@@ -2334,7 +2343,7 @@ def sweep(driver):
             except Exception as error:
                 failures.append((session_id, error))
     failures.extend(driver.close_servers())
-    failures.extend((session_id, RuntimeError('unexpected attach session; manual investigation '
+    failures.extend((session_id, RuntimeError('unexpected or ambiguous session; manual investigation '
                                               'required, no cleanup authority granted'))
                     for session_id in sorted(driver.strays))
     return failures
