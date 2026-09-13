@@ -470,12 +470,19 @@ func TestAuthenticationExpiryObservationSurvivesWriteFailure(t *testing.T) {
 					return err
 				}
 			}
-			if err := attempt(); err != store.TemporarilyUnavailable {
+			want := store.TemporarilyUnavailable
+			if method == "attach" {
+				want = store.AuthenticationFailed
+			}
+			if err := attempt(); err != want {
 				t.Fatalf("failed expiry=%v", err)
 			}
 			*now = time.Unix(199, 0)
-			if err := attempt(); err != store.TemporarilyUnavailable {
-				t.Fatalf("observation lost after earlier time=%v", err)
+			if err := attempt(); err != store.AuthenticationFailed {
+				t.Fatalf("closed socket revived after earlier time=%v", err)
+			}
+			if !m.store.CredentialExpiryObserved(auth.credentialID) {
+				t.Fatal("failed persistence lost exact-credential denial")
 			}
 			_, err = m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
 				_, err := tx.ExecContext(ctx, "DROP TRIGGER fail_expiry")
@@ -484,7 +491,9 @@ func TestAuthenticationExpiryObservationSurvivesWriteFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := attempt(); err != store.AuthenticationFailed {
+			// The original socket is terminal. A new authentication observes the
+			// retained denial after rollback and persists it once storage recovers.
+			if _, err := m.Inspect(ctx, acceptSocket(t, m), auth); err != store.AuthenticationFailed {
 				t.Fatalf("terminal expiry=%v", err)
 			}
 			if m.store.CredentialExpiryObserved(auth.credentialID) {
@@ -562,7 +571,7 @@ func TestIngestionInitializationPersistsExpiryObservedDuringAuthorization(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ingestor.Initialize(context.Background(), recipient, "70000000-0000-4000-8000-000000000001", "start"); err != store.BindingUnavailable {
+	if err := ingestor.Initialize(context.Background(), recipient, "70000000-0000-4000-8000-000000000001", "start"); err != store.AuthenticationFailed {
 		t.Fatalf("initialization=%v", err)
 	}
 	if err := m.store.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {

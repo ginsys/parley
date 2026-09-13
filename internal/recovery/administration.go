@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/ginsys/parley/internal/store"
@@ -104,7 +105,7 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 			}
 		}
 		if evidenceCtx.Err() != nil {
-			evidenceErr = store.HostUnverified
+			evidenceErr = evidenceCtx.Err()
 		}
 		cancel()
 	}
@@ -126,7 +127,10 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 			return rejection(store.RequestTerminal)
 		}
 		if evidenceErr != nil {
-			return rejection(store.HostUnverified)
+			if errors.Is(evidenceErr, store.HostUnverified) {
+				return rejection(store.HostUnverified)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
 		now, err := store.InstantNanos(store.AuthorityTime(ctx, a.config.Service.config.Now))
 		if err != nil {
