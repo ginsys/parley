@@ -927,6 +927,14 @@ def claude_entry(short='69aa52ed', *, pid=4242, status='idle', state='done', cwd
 
 
 class ClaudeDriverTests(DriverTestCase):
+    def test_uncaptured_claude_models_are_rejected_before_host_calls(self):
+        for model in (None, '', 'opus', 'sonnet'):
+            with self.subTest(model=model):
+                run = FakeRun([])
+                with self.assertRaisesRegex(ValueError, 'uncaptured'):
+                    self.driver(run, model=model)
+                self.assertEqual(run.calls, [])
+
     def test_listing_cannot_bind_a_short_id_to_an_unrelated_uuid(self):
         entry = claude_entry()
         entry['sessionId'] = 'deadbeef' + SESSION_UUID[8:]

@@ -366,6 +366,7 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   never `claude --version`: the binary drifted 2.1.267 → 2.1.270 over three days of captures
   and a daemon started before an upgrade keeps its code. No spend bound exists for Claude cells:
   `--max-budget-usd` needs `--print`, which conflicts with `--bg`, and `--model haiku` was
+  the only captured model argument; other values are rejected before any host call. That argument was
   captured *not* being honoured (the assistant records name `claude-sonnet-5`); the matrix reads
   the serving model from those records' `message.model`, carried onto `TrialRun.model` (below).
   The session also runs under the operator's default

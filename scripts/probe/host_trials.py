@@ -972,6 +972,8 @@ class ClaudeDriver(Driver):
                  monotonic=time.monotonic):
         if mechanism not in CLAUDE_MECHANISMS:
             raise ValueError(f'unknown submission mechanism: {mechanism!r}')
+        if model != 'haiku':
+            raise ValueError('Claude model overrides are uncaptured; only haiku is supported')
         super().__init__(registry, cwd=cwd)
         self.run = run
         self.model = model
