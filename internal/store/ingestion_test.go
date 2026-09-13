@@ -392,3 +392,37 @@ func TestEmptyResumeCannotInitializePastPendingEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestResumeCannotReopenConflictingPendingSourcesOrBranches(t *testing.T) {
+	for _, kind := range []string{"foreign-source", "branch"} {
+		t.Run(kind, func(t *testing.T) {
+			db, e := sourceFixture(t)
+			ctx := context.Background()
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			other := e
+			other.EventID = "other-event"
+			other.After = "other-tail"
+			if kind == "foreign-source" {
+				other.SourceID = "70000000-0000-4000-8000-000000000002"
+			} else {
+				if _, err := StageEvent(ctx, tx, e); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := StageEvent(ctx, tx, other); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.ExecContext(ctx, "INSERT INTO ingestion_barriers(binding_id,barrier_version,status,paused_cursor) VALUES(?,1,'held',?)", e.BindingID, e.Before); err != nil {
+				t.Fatal(err)
+			}
+			_, err = ResumeIngestion(ctx, tx, ResumeIngestionRequest{BindingID: e.BindingID, ExpectedBindingVersion: 1, ExpectedBarrierVersion: 1, EvidenceRef: "80000000-0000-4000-8000-000000000010", PrincipalID: testPrincipal, OperationID: testOperation, Interval: ReviewedInterval{SourceID: e.SourceID, Before: e.Before, After: e.Before}})
+			if err != EventConflict {
+				t.Fatalf("conflicting pending evidence reopened=%v", err)
+			}
+		})
+	}
+}

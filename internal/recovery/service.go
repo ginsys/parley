@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
 	"time"
 
@@ -238,7 +239,7 @@ func (s *Service) prepare(ctx context.Context) error {
 	if err := s.flush(ctx); err != nil {
 		return err
 	}
-	markers, err := s.config.Markers.List(ctx)
+	markers, err := s.listMarkers(ctx)
 	if err != nil {
 		s.stateMu.Lock()
 		s.held = true
@@ -351,4 +352,13 @@ func (s *Service) authorizationFloor(ctx context.Context, tx *sql.Tx) (store.Clo
 	}
 	s.stateMu.Unlock()
 	return checkpoint, nil
+}
+
+func (s *Service) listMarkers(ctx context.Context) ([]Marker, error) {
+	markers, err := s.config.Markers.List(ctx)
+	var publication markerPublicationFailure
+	if errors.As(err, &publication) {
+		s.config.FailStop()
+	}
+	return markers, err
 }
