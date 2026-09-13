@@ -310,7 +310,7 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
     model = None
     for event in events:
         if event.role == 'assistant' and event.created_at is not None and event.created_at >= submitted_at:
-            outcomes.setdefault('turn_start', event.created_at)
+            outcomes['turn_start'] = min(outcomes.get('turn_start', event.created_at), event.created_at)
             signals.setdefault('turn_start', SIGNAL_ASSISTANT_MESSAGE)
         if event.time is None:
             undated = True
@@ -318,16 +318,14 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
         if event.time < submitted_at:
             continue
         if event.role == 'turn_start':
-            if started is None:
-                started = event.time
+            started = event.time if started is None else min(started, event.time)
             continue
         if event.role == 'turn_end':
-            if turn_end is None:
-                turn_end = event.time
+            turn_end = event.time if turn_end is None else min(turn_end, event.time)
             continue
         if event.role == 'user':
             if marker in event.text:
-                outcomes.setdefault('visible', event.time)
+                outcomes['visible'] = min(outcomes.get('visible', event.time), event.time)
                 signals.setdefault('visible', SIGNAL_USER_MESSAGE)
             continue
         if event.role != 'assistant':
@@ -335,7 +333,7 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
         if model is None:
             model = event.model
         if event.created_at is None:
-            outcomes.setdefault('turn_start', event.time)
+            outcomes['turn_start'] = min(outcomes.get('turn_start', event.time), event.time)
             signals.setdefault('turn_start', SIGNAL_ASSISTANT_MESSAGE)
         if marker in event.text:
             outcomes['ack'] = min(outcomes.get('ack', event.time), event.time)
@@ -2409,7 +2407,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     every outcome `unobservable` (this runner could not vouch for the attempt).
 
     Observation polls until every transcript outcome is seen or the longest window (120s) has
-    elapsed, merging each poll's evidence and keeping the first timestamp per outcome; a single
+    elapsed, merging each poll's evidence and keeping the earliest timestamp per outcome; a single
     snapshot would report `not_observed` for events that arrive inside their window. The final
     poll decides observability: a transcript is cumulative, so a late successful read covers
     earlier gaps, but a failed last read leaves the tail of the window unseen. A `busy` trial
@@ -2534,9 +2532,11 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
             turn_stream_capable = turn_stream_capable or observation.turn_stream
             model = model or observation.model
             for name, when in observation.outcomes.items():
-                outcomes.setdefault(name, when)
-                signals.setdefault(name, observation.signals.get(name))
-            if state == 'busy' and turn_end is None and observation.turn_end is not None:
+                if name not in outcomes or when < outcomes[name]:
+                    outcomes[name] = when
+                    signals[name] = observation.signals.get(name)
+            if (state == 'busy' and observation.turn_end is not None
+                    and (turn_end is None or observation.turn_end < turn_end)):
                 # Only a busy trial has a turn "already running at submission"; for every other
                 # state the first boundary after submission ends this trial's own marker turn.
                 turn_end = observation.turn_end

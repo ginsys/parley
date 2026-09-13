@@ -189,6 +189,26 @@ class DetectOutcomesTests(unittest.TestCase):
         self.assertEqual(detect_outcomes(events, MARKER, submitted_at=9.0).outcomes,
                           {'turn_start': 11.0, 'ack': 12.0})
 
+    def test_reordered_assistant_activity_uses_the_earliest_timestamp(self):
+        for separate_creation in (False, True):
+            with self.subTest(separate_creation=separate_creation):
+                events = [Event(role='assistant', text=MARKER, time=1121,
+                                created_at=1070 if separate_creation else None),
+                          Event(role='assistant', text=MARKER, time=1003,
+                                created_at=1001 if separate_creation else None)]
+                observation = detect_outcomes(events, MARKER, submitted_at=1000)
+                self.assertEqual(observation.outcomes,
+                                 {'turn_start': 1001 if separate_creation else 1003, 'ack': 1003})
+                self.assertEqual(Trial(submitted=1000, outcomes=observation.outcomes)
+                                 .result('turn_start', 1121), 'observed')
+
+    def test_reordered_user_and_boundary_events_use_the_earliest_timestamp(self):
+        events = [Event(role=role, text=MARKER, time=when)
+                  for when in (1070, 1001) for role in ('user', 'turn_start', 'turn_end')]
+        observation = detect_outcomes(events, MARKER, submitted_at=1000, turn_stream=True)
+        self.assertEqual(observation.outcomes, {'visible': 1001, 'turn_start': 1001})
+        self.assertEqual(observation.turn_end, 1001)
+
     def test_untimed_events_are_never_promoted_into_the_window(self):
         # An undated entry cannot be ordered against submission: counting it would let a
         # pre-submission turn (a creation prompt's own reply, an old rollout record) fabricate
@@ -3014,6 +3034,16 @@ class RunTrialTests(unittest.TestCase):
     def run_one(self, driver, clock, **kwargs):
         return run_trial(driver, prompt='hi', marker=MARKER, clock=clock.time,
                           monotonic=clock.monotonic, sleep=clock.sleep, **kwargs)
+
+    def test_later_snapshots_can_supply_earlier_outcomes_and_turn_completion(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock, observations=[
+            Observation(outcomes={'visible': 1008}, turn_end=1008, turn_stream=True),
+            Observation(outcomes={'visible': 1001, 'turn_start': 1002, 'ack': 1016},
+                        turn_end=1001, turn_stream=True)])
+        run = self.run_one(driver, clock, state='busy', settle=lambda session_id: None)
+        self.assertEqual(run.outcomes['visible'], 1001)
+        self.assertEqual(run.turn_end, 1001)
 
     def test_submission_asks_the_host_to_echo_the_marker_rather_than_sending_it_bare(self):
         clock = FakeClock()

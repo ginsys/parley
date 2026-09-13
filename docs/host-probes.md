@@ -544,6 +544,10 @@ timestamp is never placed in the window and makes the read unobservable: an unda
 be ordered against submission, and counting it would let the creation prompt's own reply stand in
 as this trial's `turn_start`.
 
+Each signal uses its earliest eligible timestamp, independent of record order. Later snapshots
+can supply an earlier timestamp too; merging observations preserves that earlier evidence,
+including the prior turn's completion that sets busy-trial windows.
+
 `submit()`'s result drives acceptance. `True` is accepted, stamped when `submit` *returns* (a
 submission that blocks for seconds is not backdated into its 10 s window). A number is the wall
 time at which the driver itself saw acceptance, for a `submit()` that keeps working afterwards
