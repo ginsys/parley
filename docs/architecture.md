@@ -665,6 +665,8 @@ restart cannot clear it. Restore detection requires the operator to establish a 
 Internal human `clock.reconcile` verifies reviewed source evidence and nondecreasing samples at
 least one monotonic second apart outside the writer, then rechecks the current floor/version. The
 reconciled record, receipt and audit commit before exact marker removal and a final durable clear.
+Recording an existing reconciled incident is idempotent because its global hold remains active;
+the storage primitive rejects reuse of a cleared incident without changing its terminal evidence.
 Retries reauthorize before looking up the receipt and may finish only that committed cleanup. Other
 incidents keep the global gate closed. `recovery.complete` follows the same two-phase protocol.
 Its implemented restore policy is conservative: every restored binding must be permanently retired,
