@@ -193,7 +193,10 @@ print(f'SIZE {{size.columns}} {{size.lines}}', flush=True)
         for state in ('shell', 'pager', 'editor', 'approval', 'busy', 'unknown'):
             with self.subTest(state=state):
                 child = self.spawn()
-                self.until(child, b'READY')
+                # Wait for the whole line: the PTY's ONLCR emits READY and its \r\n as one
+                # write, but under load the two can arrive in separate reads, and the
+                # empty-read assertion below then sees the line ending instead of silence.
+                self.until(child, b'READY\r\n')
                 with self.assertRaises(ValueError):
                     child.send(b'approve\n', generation='session-1', state=state)
                 self.assertFalse(any(e['kind'] == 'input' for e in child.events))
