@@ -88,6 +88,7 @@ func (l *Lifecycle) disable(ctx context.Context, p store.CommandPrincipal, r Bin
 			{Kind: "binding", ID: r.BindingID, Before: r.ExpectedBindingVersion, After: change.BindingVersion},
 			{Kind: "revocation_incident", ID: change.IncidentID, After: 1},
 			{Kind: "ingestion_barrier", ID: r.BindingID, Before: change.BarrierVersion - 1, After: change.BarrierVersion},
+			{Kind: "credential", ID: change.CredentialID, Before: change.CredentialVersion, After: change.CredentialVersion},
 		}}, nil
 	}, func(store.CommitView) {
 		if changed {

@@ -16,7 +16,7 @@ CREATE TRIGGER quarantine_transition BEFORE UPDATE ON migration_quarantine
  WHEN OLD.status='cancelled' OR (OLD.status='released' AND NEW.status='held') OR
  OLD.quarantine_version=9223372036854775807 OR NEW.quarantine_version!=OLD.quarantine_version+1
  BEGIN SELECT RAISE(ABORT,'invalid quarantine transition'); END;
-CREATE TRIGGER hold_identity BEFORE UPDATE OF hold_id,work_kind,work_id,incident_id,revocation_incident_id,recovery_incident_id ON security_holds
+CREATE TRIGGER hold_identity BEFORE UPDATE OF hold_id,work_kind,work_id,incident_id,revocation_incident_id,recovery_incident_id,created_at_ns ON security_holds
  BEGIN SELECT RAISE(ABORT,'immutable hold identity'); END;
 CREATE TRIGGER hold_transition BEFORE UPDATE ON security_holds
  WHEN OLD.status='cancelled' OR (OLD.status='released' AND NEW.status='held') OR
