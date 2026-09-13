@@ -134,6 +134,10 @@ attachment or readiness. Inspected sockets remain within the nonattached bound. 
 attachment rechecks credential hash, native tuple, kernel UID, lifecycle and server-time expiry.
 Credential expiry is checked again after guards and at post-commit publication. An expiry first
 observed after commit prevents installation and is persisted with an independent bounded context.
+Publication uses one validated instant for credential checks, socket pruning and initial liveness;
+housekeeping cannot substitute a later, unchecked time when installing the attachment. Admission
+also rechecks its deadline and socket cancellation after commit, and cancellation during timer
+installation releases the registry entry and capacity instead of returning a dead socket.
 An exact-credential denial remains in the store coordinator if persistence fails, so an earlier
 clock cannot revive that identity. Persistence compares the immutable identity/deadline and cannot
 expire a rotated successor. This shared denial primitive is introduced with attachment and is also

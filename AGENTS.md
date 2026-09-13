@@ -260,6 +260,9 @@ I/O outside callbacks. Cancellation may fail closed immediately when a transacti
 cleanup. Subsequent housekeeping removes cancelled records. View-revision overflow stops ordinary
 service. Deadline-crossing authorization cannot return a usable expired attachment.
 Recheck credential/liveness deadlines after guards and after commit before installing process state.
+Carry that validated publication instant through pruning and initial liveness; do not substitute
+later unchecked clock samples. Admission must also reject post-commit expiry/cancellation, including
+cancellation during timer installation, releasing the socket registry entry and capacity.
 Observed expiry is denial evidence, not a successful publication: remember the exact credential
 before a fallible expiry write, and persist it independently of caller cancellation. Failed storage
 must retain that denial through clock rollback; a rotated successor has a different identity.

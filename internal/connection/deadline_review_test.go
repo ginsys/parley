@@ -225,3 +225,104 @@ func TestFailedExpiryPersistenceRetainsDenialAcrossClockRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestAttachmentPublicationUsesValidatedInstant(t *testing.T) {
+	for _, operation := range []string{"inspect", "attach"} {
+		t.Run(operation, func(t *testing.T) {
+			m, auth, now := attachmentFixture(t)
+			*now = time.Unix(199, 0)
+			socket := acceptSocket(t, m)
+			var transaction *sql.Tx
+			m.guard = func(_ context.Context, tx *sql.Tx, _ string) error { transaction = tx; return nil }
+			publicationTime := *now
+			m.now = func() time.Time {
+				if transaction == nil {
+					return *now
+				}
+				_, err := transaction.ExecContext(context.Background(), "SELECT 1")
+				if errors.Is(err, sql.ErrTxDone) {
+					// Time advances on every post-commit sample. A later sample
+					// must not silently replace the instant used for authorization.
+					result := publicationTime
+					publicationTime = publicationTime.Add(time.Second)
+					return result
+				}
+				if err != nil {
+					t.Errorf("clock boundary probe: %v", err)
+				}
+				return *now
+			}
+			var err error
+			if operation == "inspect" {
+				_, err = m.Inspect(context.Background(), socket, auth)
+			} else {
+				_, err = m.Attach(context.Background(), socket, auth, 0)
+			}
+			if err == nil && !socket.lastHeartbeat.Before(time.Unix(200, 0)) {
+				t.Errorf("published authentication at expired instant %v", socket.lastHeartbeat)
+			}
+			if err != nil && err != store.AuthenticationFailed {
+				t.Errorf("unexpected publication failure: %v", err)
+			}
+			if err != nil && (socket.Context().Err() == nil || len(m.slots) != 0) {
+				t.Errorf("rejected publication retained socket/slot: %v", err)
+			}
+		})
+	}
+}
+
+func TestAdmissionPublicationRejectsExpiredOrCancelledSocket(t *testing.T) {
+	for _, failure := range []string{"deadline", "cancelled", "cancelled-during-arm"} {
+		t.Run(failure, func(t *testing.T) {
+			m, _, now := attachmentFixture(t)
+			server, client := socketPair(t)
+			var initialTimer func()
+			m.afterFunc = func(_ time.Duration, f func()) func() {
+				if initialTimer == nil {
+					initialTimer = f
+				} else if failure == "cancelled-during-arm" {
+					done := make(chan struct{})
+					go func() { initialTimer(); close(done) }()
+					<-done
+				}
+				return func() {}
+			}
+			samples := 0
+			m.now = func() time.Time {
+				samples++
+				// Accept samples admission start and pre-commit validation.
+				// Subsequent publication samples see the expired/cancelled
+				// transport; no wall-clock sleeps or real timer race is needed.
+				if samples > 2 {
+					if failure == "cancelled" {
+						initialTimer()
+					} else if failure == "deadline" {
+						return now.Add(store.AuthenticationDeadline)
+					}
+				}
+				return *now
+			}
+			socket, err := m.Accept(context.Background(), server)
+			if socket != nil {
+				t.Cleanup(socket.Close)
+			}
+			if socket != nil || err != store.AuthenticationFailed {
+				t.Errorf("failed admission returned socket=%v err=%v", socket != nil, err)
+			}
+			if len(m.sockets) != 0 || len(m.pending) != 0 {
+				t.Errorf("failed admission retained sockets=%d capacity=%d", len(m.sockets), len(m.pending))
+			}
+			if err == nil {
+				return
+			}
+			if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Read(make([]byte, 1)); err == nil {
+				t.Error("failed admission left transport open")
+			} else if timeout, ok := err.(interface{ Timeout() bool }); ok && timeout.Timeout() {
+				t.Error("failed admission did not close transport")
+			}
+		})
+	}
+}
