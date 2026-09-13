@@ -1107,7 +1107,8 @@ class ClaudeDriver(Driver):
     def _report_unbound_creation(self, error):
         """One bounded snapshot reports candidates; it never supplies creation authority."""
         try:
-            candidates = {entry['id'] for entry in self._listing()} - self.owned()
+            candidates = {entry['id'] for entry in self._listing()
+                          if self._key(entry['id']) not in self.registry.created}
         except BaseException:
             error.add_note('Claude creation has no usable ID; bounded candidate discovery failed; '
                            'manual investigation required in the probe cwd')

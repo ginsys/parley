@@ -289,8 +289,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   the exit status or running the confirming `claude agents --json --all --cwd <probe cwd>`
   listing, and on a `subprocess.TimeoutExpired` mints from the partial output before re-raising.
   If creation supplies no recognized ID, a bounded cwd-filtered listing reports candidates for
-  manual investigation without adoption. This covers changed output on either exit status,
-  timeout output lacking an ID, and interruption. Failed recovery preserves the original error.
+  manual investigation without adoption, excluding Claude sessions already owned by any driver
+  in the shared registry. Another host's namespaced key does not suppress an unowned Claude
+  candidate. This covers changed output on either exit status, timeout output lacking an ID,
+  and interruption. Failed recovery preserves the original error.
   Cancellation preserves the original interrupt and its manual-investigation note even if a
   second interrupt aborts the bounded recovery listing.
   It then waits for that listing to report the creation turn finished (`state: "done"`) before

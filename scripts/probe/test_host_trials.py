@@ -1005,6 +1005,27 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertIn('discovery failed', ' '.join(caught.exception.__notes__))
         self.assertEqual(driver.owned(), set())
 
+    def test_candidate_discovery_excludes_other_claude_owners_in_the_shared_registry(self):
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown):
+                self.registry = SessionRegistry()
+                sibling, _ = self.create_live()
+                entries = [claude_entry()]
+                if unknown:
+                    entries.append(claude_entry('deadbeef'))
+                    # Another host's key cannot hide an unowned Claude candidate.
+                    self.registry.mint('codex:deadbeef', object())
+                run = FakeRun([(['claude', '--bg'], FakeResult(0, 'changed output')),
+                               (['claude', 'agents'], listing(entries))])
+                driver = self.driver(run)
+                with self.assertRaisesRegex(RuntimeError, 'no backgrounded line'):
+                    run_trial_with_cleanup(driver, prompt='hello')
+                self.assertEqual(driver.strays, {'deadbeef'} if unknown else set())
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual(sibling.owned(), {'69aa52ed'})
+                self.assertEqual(run.argv('claude', 'stop'), [])
+                self.assertEqual(run.argv('claude', 'rm'), [])
+
     def test_claude_transcript_removed_between_discovery_and_stat_is_unobservable(self):
         driver = self.driver(FakeRun([
             (['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
