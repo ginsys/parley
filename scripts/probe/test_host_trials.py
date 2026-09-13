@@ -205,9 +205,28 @@ class DetectOutcomesTests(unittest.TestCase):
         self.assertNotIn('turn_start', observation.outcomes)
         self.assertNotIn('turn_start', observation.signals)
 
+    def test_the_model_comes_from_the_first_in_window_assistant_event(self):
+        # A session can change model between turns (captured: creation under `claude-sonnet-5`,
+        # the no-flag resume reply under `claude-opus-5`), so a cell must cite the model that
+        # served this trial, not whichever one the session started under.
+        events = [Event(role='assistant', text='before', time=1.0, model='claude-sonnet-5'),
+                  Event(role='user', text=MARKER, time=10.0),
+                  Event(role='assistant', text=f'ok {MARKER}', time=11.0, model='claude-opus-5'),
+                  Event(role='assistant', text='more', time=12.0, model='claude-sonnet-5')]
+        self.assertEqual(detect_outcomes(events, MARKER, submitted_at=9.0).model, 'claude-opus-5')
 
-def claude_record(kind, content, *, stamp='2026-09-13T09:00:00.000Z', version='2.1.270', **extra):
-    record = {'type': kind, 'timestamp': stamp, 'message': {'role': kind, 'content': content},
+    def test_the_model_is_none_when_no_in_window_assistant_event_names_one(self):
+        events = [Event(role='user', text=MARKER, time=10.0),
+                  Event(role='assistant', text='reply', time=11.0)]
+        self.assertIsNone(detect_outcomes(events, MARKER, submitted_at=9.0).model)
+
+
+def claude_record(kind, content, *, stamp='2026-09-13T09:00:00.000Z', version='2.1.270',
+                  model=None, **extra):
+    message = {'role': kind, 'content': content}
+    if model is not None:
+        message['model'] = model
+    record = {'type': kind, 'timestamp': stamp, 'message': message,
               'sessionId': SESSION_UUID, 'version': version, 'uuid': 'u', 'parentUuid': None}
     record.update(extra)
     return json.dumps(record)
@@ -274,6 +293,21 @@ class ClaudeParsingTests(unittest.TestCase):
         lines = [claude_record('assistant', f'ack {MARKER}'),
                  claude_record('user', [{'type': 'text', 'text': MARKER}])]
         self.assertEqual(claude_transcript_events(lines), ([], 2))
+
+    def test_the_assistant_records_model_is_carried_and_never_inferred(self):
+        # Captured at 2.1.270: `message.model` names the serving model, and it is not the one
+        # `--model` asked for. Nothing else on a record supplies it, so anything but a string on
+        # an assistant record reads as None rather than as evidence.
+        lines = [claude_record('user', MARKER, model='claude-haiku-ignored'),
+                 claude_record('assistant', [{'type': 'text', 'text': 'a'}],
+                               model='claude-sonnet-5', stamp='2026-09-13T09:00:02.000Z'),
+                 claude_record('assistant', [{'type': 'text', 'text': 'b'}],
+                               model=7, stamp='2026-09-13T09:00:03.000Z'),
+                 claude_record('assistant', [{'type': 'text', 'text': 'c'}],
+                               stamp='2026-09-13T09:00:04.000Z')]
+        events, unusable = claude_transcript_events(lines)
+        self.assertEqual([event.model for event in events], [None, 'claude-sonnet-5', None, None])
+        self.assertEqual(unusable, 0)  # a missing model is not a failed read
 
     def test_session_version_reads_the_single_recorded_version(self):
         lines = [json.dumps({'type': 'mode', 'mode': 'x'}),
@@ -455,8 +489,8 @@ def opencode_export(messages, *, version='1.18.30'):
                        'messages': messages})
 
 
-def opencode_message(role, parts, created_ms):
-    return {'info': {'role': role, 'time': {'created': created_ms}}, 'parts': parts}
+def opencode_message(role, parts, created_ms, **info):
+    return {'info': {'role': role, 'time': {'created': created_ms}, **info}, 'parts': parts}
 
 
 class OpenCodeParsingTests(unittest.TestCase):
@@ -501,6 +535,22 @@ class OpenCodeParsingTests(unittest.TestCase):
             {'info': {'role': 'user', 'time': {'created': 1}}, 'parts': [{'type': 'text', 'text': 2}]},
         ]
         self.assertEqual(opencode_export_events(opencode_export(messages)), ([], len(messages)))
+
+    def test_export_carries_the_assistant_provider_and_model_only(self):
+        raw = opencode_export([
+            opencode_message('user', [{'type': 'text', 'text': MARKER}], 1_757_754_001_000,
+                             providerID='opencode', modelID='ling-3.0-flash-fin-free'),
+            opencode_message('assistant', [{'type': 'text', 'text': 'a'}], 1_757_754_002_000,
+                             providerID='opencode', modelID='ling-3.0-flash-fin-free'),
+            opencode_message('assistant', [{'type': 'text', 'text': 'b'}], 1_757_754_003_000,
+                             modelID='ling-3.0-flash-fin-free'),  # provider absent: report it bare
+            opencode_message('assistant', [{'type': 'text', 'text': 'c'}], 1_757_754_004_000,
+                             providerID='opencode', modelID=7),
+        ])
+        events, unusable = opencode_export_events(raw)
+        self.assertEqual([event.model for event in events],
+                          [None, 'opencode/ling-3.0-flash-fin-free', 'ling-3.0-flash-fin-free', None])
+        self.assertEqual(unusable, 0)  # the model is evidence, never a reason to fail the read
 
     def test_export_version_reads_info_version(self):
         self.assertEqual(opencode_export_version(opencode_export([])), '1.18.30')
@@ -1761,6 +1811,22 @@ class RunTrialTests(unittest.TestCase):
         driver = FakeDriver(version_value='2.1.270', clock=clock)
         run = self.run_one(driver, clock)
         self.assertEqual(run.version, '2.1.270')
+
+    def test_the_result_carries_the_serving_model_the_first_poll_that_saw_one_read(self):
+        # `run_trial_with_cleanup` deletes the session, so this is the caller's only chance to
+        # record the model -- and the requested one is not it (`--model haiku` was captured not
+        # being honoured). A poll that names none must not overwrite one already read.
+        clock = FakeClock()
+        observations = [Observation(),
+                        Observation(outcomes={'visible': 1000.0}, model='claude-sonnet-5'),
+                        Observation(outcomes={'turn_start': 1002.0, 'ack': 1002.0})]
+        run = self.run_one(FakeDriver(observations=observations, clock=clock), clock)
+        self.assertEqual(run.model, 'claude-sonnet-5')
+
+    def test_the_result_model_is_none_when_no_poll_ever_named_one(self):
+        clock = FakeClock()
+        run = self.run_one(FakeDriver(clock=clock), clock)
+        self.assertIsNone(run.model)
 
     def test_a_version_read_failure_records_none_rather_than_losing_the_trial(self):
         clock = FakeClock()

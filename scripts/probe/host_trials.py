@@ -207,6 +207,12 @@ class Event:
     role: str
     text: str
     time: float | None = None
+    # The model the host recorded as producing an assistant message, or None on any other event
+    # and on a host whose transcript does not name one. Best-effort evidence, never an outcome:
+    # a matrix cell that cannot cite a model must say so rather than repeat what was requested,
+    # since the requested model is not necessarily the serving one (Claude `--model haiku` was
+    # captured *not* being honoured).
+    model: str | None = None
 
 
 @dataclass
@@ -235,6 +241,9 @@ class Observation:
     # and any assistant text after submission is indistinguishable from the tail of a turn that
     # was already running -- `run_trial` must not trust it either.
     turn_stream: bool = False
+    # The model named by the first in-window assistant message that names one, or None. See
+    # `Event.model`; `run_trial` carries the first non-None reading onto the `TrialRun`.
+    model: str | None = None
 
 
 SIGNAL_USER_MESSAGE = 'user_message'
@@ -253,6 +262,8 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
     counts as `ack`, so an unrelated assistant reply cannot be mistaken for acknowledging this
     trial's message. The marker is searched for, never matched whole: a Codex user record wraps
     the prompt in the host's own injected text (docs/host-probe-preflight.md, 2026-09-13).
+    `Observation.model` is the first in-window assistant event's model, so a trial reports the
+    model that served *it* rather than whichever one the session started under.
 
     An event with `time=None` cannot be ordered against `submitted_at`, so it is skipped and the
     whole read is reported unobservable. Promoting undated entries into the window would
@@ -269,6 +280,7 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
     undated = False
     turn_end = None
     started = None
+    model = None
     for event in events:
         if event.time is None:
             undated = True
@@ -290,6 +302,8 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
             continue
         if event.role != 'assistant':
             continue
+        if model is None:
+            model = event.model
         outcomes.setdefault('turn_start', event.time)
         signals.setdefault('turn_start', SIGNAL_ASSISTANT_MESSAGE)
         if marker in event.text:
@@ -303,7 +317,7 @@ def detect_outcomes(events, marker, *, submitted_at, turn_stream=False):
         else:
             signals.pop('turn_start', None)
     return Observation(outcomes=outcomes, signals=signals, observable=not undated, turn_end=turn_end,
-                       turn_stream=turn_stream)
+                       turn_stream=turn_stream, model=model)
 
 
 def record_time(record):
@@ -648,7 +662,13 @@ def claude_transcript_events(lines):
         else:
             unusable += 1
             continue
-        events.append(Event(role=kind, text=text, time=when))
+        # `message.model` (captured: `claude-sonnet-5` on the creation and attach turns, and
+        # `claude-opus-5` on the no-flag resume turn, from a session created with
+        # `--model haiku`). Best-effort: absent or non-string reads as None rather than making
+        # the whole transcript unobservable, since no outcome depends on it.
+        model = message.get('model') if kind == 'assistant' else None
+        events.append(Event(role=kind, text=text, time=when,
+                            model=model if isinstance(model, str) else None))
     return events, unusable
 
 
@@ -692,8 +712,8 @@ class ClaudeDriver(Driver):
     captured restarted path). No spend bound is established: `--max-budget-usd` is a `--print`
     option and `--print` conflicts with `--bg`, and the `--model haiku` passed at creation was
     not honoured (captured: the session's assistant records name `claude-sonnet-5`, and the
-    no-flag resume reply `claude-opus-5`). A matrix cell must therefore read the serving model
-    from the transcript's assistant records, never from this argument. The session runs under
+    no-flag resume reply `claude-opus-5`). A matrix cell must therefore cite `TrialRun.model`,
+    read from the transcript's assistant records, never this argument. The session runs under
     the operator's default permission mode, since combining `--bg` with
     `--permission-mode`/`--disallowedTools` is uncaptured -- a wider authority surface than the
     Codex cells' `-s read-only -a never`.
@@ -1051,6 +1071,9 @@ def codex_rollout_events(lines):
     that is not the list of role-typed text parts every captured shape carries. None of those can
     be ordered against submission; the caller reports the read unobservable rather than letting
     absent outcomes become negative evidence.
+
+    Every `Event.model` stays None: no captured rollout record names the model serving a turn, so
+    a Codex cell cites no model rather than an assumed one.
     """
     events = []
     unusable = 0
@@ -1333,6 +1356,8 @@ def opencode_export_events(raw):
     earliest assistant activity, as on the other hosts; only `text` parts contribute text.
     Unparseable output, a non-object top level, a non-list `messages`, a non-object message/info,
     a non-string role, a non-numeric creation time or a malformed part all count as unusable.
+    An assistant message's `providerID`/`modelID` become `Event.model` (see
+    `opencode_message_model`), best-effort and never a reason to fail the read.
     """
     try:
         document = json.loads(raw)
@@ -1371,8 +1396,23 @@ def opencode_export_events(raw):
         if texts is None:
             unusable += 1
             continue
-        events.append(Event(role=role, text=''.join(texts), time=created / 1000.0))
+        events.append(Event(role=role, text=''.join(texts), time=created / 1000.0,
+                            model=opencode_message_model(info) if role == 'assistant' else None))
     return events, unusable
+
+
+def opencode_message_model(info):
+    """`<providerID>/<modelID>` from an assistant message's `info`, or None.
+
+    Captured on every assistant message of an export; the provider qualifies the id the same way
+    `-m` takes it. Best-effort like every `Event.model`: either field absent or non-string reads
+    as None, and a `modelID` without a provider is reported bare rather than guessed at.
+    """
+    provider = info.get('providerID')
+    model = info.get('modelID')
+    if not isinstance(model, str):
+        return None
+    return f'{provider}/{model}' if isinstance(provider, str) else model
 
 
 def opencode_export_version(raw):
@@ -1641,6 +1681,12 @@ class TrialRun:
     turn_end_observable: bool = True
     # The session's own version at trial time (transcript/rollout/export-recorded), or None.
     version: str | None = None
+    # The model the host recorded as serving this trial's own turn, or None when the trial saw no
+    # assistant message or the host names none (every Codex cell). The requested model is not it:
+    # `--model haiku` was captured not being honoured, so a cell whose model is None must say the
+    # model is unknown rather than repeat what was asked for. `run_trial_with_cleanup` deletes the
+    # session, so this is the caller's only chance to record it.
+    model: str | None = None
     # Free-text evidence about the submission: a `SubmissionRejected`'s exit status and stderr, a
     # `SubmissionUncaptured`'s reason and screen, or a driver's own note about a mechanism with no
     # exit status of its own (the attach path: when the line was typed, what was on screen).
@@ -1693,6 +1739,9 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     A `KeyboardInterrupt` inside the polling loop finalizes what was gathered with `interrupted`
     set and every still-missing outcome unobservable, rather than discarding minutes of evidence;
     anywhere else it propagates, and the cleanup sweep runs from the caller's `finally`.
+
+    `model` is the first serving model any poll read (`Observation.model`), carried onto the
+    `TrialRun` because the session is deleted before a caller could go back for it.
 
     Compared timestamps (`submitted_at`, `accepted_at`, every `Event.time`) come from `clock`
     (wall time), because host transcripts carry only wall-clock stamps; the local polling
@@ -1770,11 +1819,13 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     channel_readable = False
     turn_stream_capable = False
     interrupted = False
+    model = None
     try:
         while True:
             observation = driver.observe(session_id, marker=marker, submitted_at=submitted_at)
             channel_readable = observation.observable
             turn_stream_capable = turn_stream_capable or observation.turn_stream
+            model = model or observation.model
             for name, when in observation.outcomes.items():
                 outcomes.setdefault(name, when)
                 signals.setdefault(name, observation.signals.get(name))
@@ -1813,8 +1864,8 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
             observable[name] = False
     turn_end_observable = turn_end is not None or (channel_readable and not interrupted)
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
-                    outcomes=outcomes, state=state, marker=marker, version=version, supported=supported,
-                    observable=observable, signals=signals, turn_end=turn_end,
+                    outcomes=outcomes, state=state, marker=marker, version=version, model=model,
+                    supported=supported, observable=observable, signals=signals, turn_end=turn_end,
                     turn_end_observable=turn_end_observable, interrupted=interrupted,
                     submission_diagnostic=submission_diagnostic)
 

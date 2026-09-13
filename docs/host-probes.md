@@ -258,8 +258,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   never `claude --version`: the binary drifted 2.1.267 → 2.1.270 over three days of captures
   and a daemon started before an upgrade keeps its code. No spend bound exists for Claude cells:
   `--max-budget-usd` needs `--print`, which conflicts with `--bg`, and `--model haiku` was
-  captured *not* being honoured (the assistant records name `claude-sonnet-5`); the matrix
-  reads the serving model from those records. The session also runs under the operator's default
+  captured *not* being honoured (the assistant records name `claude-sonnet-5`); the matrix reads
+  the serving model from those records' `message.model`, carried onto `TrialRun.model` (below).
+  The session also runs under the operator's default
   permission mode, a wider authority surface than the Codex cells' `-s read-only -a never`.
 - **Codex** (`CodexDriver`). `create()` runs
   `codex exec --json -s read-only --skip-git-repo-check -C <probe cwd> '<prompt>'` with stdin
@@ -400,10 +401,16 @@ classifies the cell `inconclusive` instead: the channel was readable the whole t
 never resolved, a different, positive fact from an unavailable channel.
 
 It returns a named `TrialRun` carrying what `Trial`/`classify_trial` need plus the evidence a
-matrix cell must cite alongside them — `session_id`, `marker`, `version`, `signals` (what
+matrix cell must cite alongside them — `session_id`, `marker`, `version`, `model`, `signals` (what
 established each positive result: a user-role transcript match, an assistant-role match, the
 host's own turn-boundary event, or the submit command's exit status), `submission_diagnostic`,
-`interrupted` (the full field list is the dataclass in `host_trials.py`). The requested `state`
+`interrupted` (the full field list is the dataclass in `host_trials.py`). `model` is the model
+the host itself recorded as serving *this trial's* turn — Claude's `message.model`, OpenCode's
+`<providerID>/<modelID>`, and `None` on Codex, whose rollout names none. It is read from the
+first in-window assistant message and carried on the result because
+`run_trial_with_cleanup()` deletes the session before a caller could go back for it. A cell whose
+`model` is `None` says the model is unknown; it never repeats what `-m`/`--model` asked for,
+since `--model haiku` was captured not being honoured. The requested `state`
 is validated and carried into the result, but establishing a busy/approval/disconnected/restarted
 precondition is the caller's `settle` callable — omitting `settle` for any non-`idle` state
 raises `ValueError` immediately rather than silently exercising an idle host under that label.
