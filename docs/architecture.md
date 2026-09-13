@@ -808,3 +808,15 @@ identity and edge reachability; no-advance replay of an existing cursor remains 
 Clock rollback observations enter the held pending queue before incident-ID generation. If that
 generation fails, fail-stop still applies and the original floor/observed pair remains available
 for supervised retry; corrected wall time cannot erase the pending observation.
+
+Legacy controller transactions also inspect durable recovery ownership: an initialized clock
+checkpoint or any recorded recovery incident rejects direct grant/revoke/renew writes from a
+freshly opened handle. A process-local hook check alone cannot protect the human's separate
+controller process. Healthy legacy fixtures establish grants before recovery ownership.
+Late dispatch settlement runs recovery detection under the coordinator while remaining available
+for exact already-claimed outcomes during a hold. Rollback retains its observed marker/incident;
+the settlement timestamp uses the trusted floor when the observed clock is below it. Exact attempt
+matching and single refunds remain unchanged, and this path cannot authorize a new claim.
+Ingestion and source-origin verification retain the authenticated immutable credential before
+host I/O and revalidate on every outcome. Expiry is independently persisted before reporting the
+verifier result, including after socket removal or caller cancellation; expiry takes precedence.

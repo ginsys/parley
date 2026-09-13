@@ -43,14 +43,24 @@ func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor st
 		}
 	}()
 	m := i.config.Manager
+	var credential store.CredentialRecord
 	if err := m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
-		return store.TransitionResult{}, m.AuthorizeWork(ctx, tx, s, false)
+		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
+			return store.TransitionResult{}, err
+		}
+		var err error
+		credential, err = store.ReadCredential(ctx, tx, s.socket.credentialID)
+		return store.TransitionResult{}, err
 	}, nil); err != nil {
 		return err
 	}
 	verifyCtx, stop := s.hostEvidenceContext(ctx)
 	defer stop()
-	if err := i.config.Origin(verifyCtx, s.socket.native, s.token, source, cursor); err != nil || verifyCtx.Err() != nil {
+	evidenceErr := i.config.Origin(verifyCtx, s.socket.native, s.token, source, cursor)
+	if err := m.recheckIngestionEvidence(ctx, s, credential); err != nil {
+		return err
+	}
+	if evidenceErr != nil || verifyCtx.Err() != nil {
 		return store.HostUnverified
 	}
 	return m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
@@ -70,6 +80,7 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		}
 	}()
 	m := i.config.Manager
+	var credential store.CredentialRecord
 	if !utf8.ValidString(r.Text) {
 		return store.EventResult{}, store.InvalidRequest
 	}
@@ -79,7 +90,12 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		}
 	}
 	if err := m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
-		return store.TransitionResult{}, m.AuthorizeWork(ctx, tx, s, false)
+		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
+			return store.TransitionResult{}, err
+		}
+		var err error
+		credential, err = store.ReadCredential(ctx, tx, s.socket.credentialID)
+		return store.TransitionResult{}, err
 	}, nil); err != nil {
 		return store.EventResult{}, err
 	}
@@ -110,7 +126,11 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 	}
 	verifyCtx, stop := s.hostEvidenceContext(ctx)
 	defer stop()
-	if err := i.config.Verify(verifyCtx, s.socket.native, s.token, r); err != nil || verifyCtx.Err() != nil {
+	evidenceErr := i.config.Verify(verifyCtx, s.socket.native, s.token, r)
+	if err := m.recheckIngestionEvidence(ctx, s, credential); err != nil {
+		return store.EventResult{}, err
+	}
+	if evidenceErr != nil || verifyCtx.Err() != nil {
 		return store.EventResult{}, store.HostUnverified
 	}
 	marker, parseErr := replymarker.Extract(r.Text)
@@ -230,4 +250,16 @@ func (s *Session) hostEvidenceContext(ctx context.Context) (context.Context, fun
 		cancel()
 	}
 	return verified, func() { stop(); cancel() }
+}
+
+func (m *Manager) recheckIngestionEvidence(ctx context.Context, s *Session, credential store.CredentialRecord) error {
+	if m.observeCredentialExpiry(credential, m.now()) {
+		s.socket.cancel()
+		defer s.socket.Close()
+		if err := m.persistCredentialExpiry(credential); err != nil {
+			return err
+		}
+		return store.AuthenticationFailed
+	}
+	return m.sessionTransition(context.WithoutCancel(ctx), s, func(context.Context, *sql.Tx) (store.TransitionResult, error) { return store.TransitionResult{}, nil }, nil)
 }

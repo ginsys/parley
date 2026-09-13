@@ -14,6 +14,7 @@ import (
 
 	"github.com/ginsys/parley/internal/connection"
 	"github.com/ginsys/parley/internal/controller"
+	"github.com/ginsys/parley/internal/recovery"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -26,6 +27,9 @@ type authenticatedFixture struct {
 }
 
 func authenticatedSetup(t *testing.T) *authenticatedFixture {
+	return authenticatedSetupBeforeManager(t, nil)
+}
+func authenticatedSetupBeforeManager(t *testing.T, setup func(*store.DB)) *authenticatedFixture {
 	t.Helper()
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "auth.db"))
@@ -60,6 +64,12 @@ func authenticatedSetup(t *testing.T) *authenticatedFixture {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := controller.New(db).Grant(ctx, controller.GrantParams{Conversation: "work", PeerAID: "author", PeerBID: "recipient", Direction: store.Bidirectional, MaxExchanges: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if setup != nil {
+		setup(db)
+	}
 	m, err := connection.NewManager(connection.ManagerConfig{Store: db, MaxNonattached: 4, Now: func() time.Time { return time.Unix(110, 0) }, AfterFunc: func(time.Duration, func()) func() { return func() {} }, Guard: func(context.Context, *sql.Tx, string) error { return nil }, Verify: func(context.Context, connection.NativeTuple, connection.Token) error { return nil }})
 	if err != nil {
 		t.Fatal(err)
@@ -68,9 +78,6 @@ func authenticatedSetup(t *testing.T) *authenticatedFixture {
 	f.author, _ = f.attach(t, auths[0], 0, true)
 	f.recipient, f.recipientSocket = f.attach(t, auths[1], 0, false)
 	f.auth = auths[1]
-	if _, err := controller.New(db).Grant(ctx, controller.GrantParams{Conversation: "work", PeerAID: "author", PeerBID: "recipient", Direction: store.Bidirectional, MaxExchanges: 5}); err != nil {
-		t.Fatal(err)
-	}
 	return f
 }
 func (f *authenticatedFixture) attach(t *testing.T, auth connection.Authentication, generation int64, ready bool) (*connection.Session, *connection.Socket) {
@@ -308,6 +315,63 @@ func TestAuthenticatedBudgetExhaustionHasUnattemptedDiagnostic(t *testing.T) {
 		after, err := store.GetByID(ctx, tx, id)
 		if err == nil && !reflect.DeepEqual(before, after) {
 			t.Error("budget wait changed queued work")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLateSettlementRecordsRollbackAndRefundsOnlyOnce(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(110, 0)
+	var markers *recovery.Directory
+	f := authenticatedSetupBeforeManager(t, func(db *store.DB) {
+		path, tempErr := os.MkdirTemp("/tmp", "parley-settlement-")
+		if tempErr != nil {
+			t.Fatal(tempErr)
+		}
+		t.Cleanup(func() { os.RemoveAll(path) })
+		var err error
+		markers, err = recovery.NewDirectory(path, uint32(os.Geteuid()), 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = recovery.New(ctx, recovery.Config{Store: db, Markers: markers, Now: func() time.Time { return now }, FailStop: func() { t.Error("unexpected fail-stop") }})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	makeReady(t, f.manager, f.recipient)
+	id := f.send(t)
+	var claim store.Envelope
+	bridge, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport {
+		return authenticatedTransport(func(_ context.Context, e store.Envelope) error {
+			claim = e
+			now = time.Unix(100, 0)
+			return ErrNoAttempt
+		})
+	}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := bridge.DispatchOutcome(ctx, id)
+	if err != nil || out.State != store.Queued || out.Attempted {
+		t.Fatalf("late settlement=%+v %v", out, err)
+	}
+	saved, err := markers.List(ctx)
+	if err != nil || len(saved) != 1 {
+		t.Fatalf("settlement missed rollback marker=%+v %v", saved, err)
+	}
+	f.assertBudget(t, 0)
+	if _, err := bridge.bridge.settle(ctx, &claim, ErrNoAttempt); err != nil {
+		t.Fatal(err)
+	}
+	f.assertBudget(t, 0)
+	if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		e, err := store.GetByID(ctx, tx, id)
+		if err == nil && (e.UpdatedAt != time.Unix(110, 0).UTC().Format(time.RFC3339Nano) || e.DispatchAttempt != 1) {
+			t.Errorf("untrusted settlement=%+v", e)
 		}
 		return err
 	}); err != nil {

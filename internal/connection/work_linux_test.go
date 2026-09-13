@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -348,7 +349,7 @@ func TestIngestionVerifierCancelledWithSession(t *testing.T) {
 	recipient.socket.Close()
 	select {
 	case err := <-done:
-		if err != store.HostUnverified {
+		if err != store.AuthenticationFailed {
 			t.Fatalf("cancelled verifier=%v", err)
 		}
 	case <-time.After(time.Second):
@@ -668,5 +669,43 @@ func TestRepeatedSourceInitializationPreservesCoordinatorRevision(t *testing.T) 
 	}
 	if after := view(); after != before {
 		t.Fatalf("repeated initialization changed view: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestFailedIngestionEvidenceStillPersistsExpiry(t *testing.T) {
+	for _, method := range []string{"initialize", "ingest"} {
+		for _, disconnect := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/disconnect=%v", method, disconnect), func(t *testing.T) {
+				m, _, recipient, ingestor, request, _ := readyIngestion(t)
+				fail := func() error {
+					m.now = func() time.Time { return time.Unix(131, 0) }
+					if disconnect {
+						recipient.socket.Close()
+					}
+					return errors.New("synthetic unavailable evidence")
+				}
+				ingestor.config.Origin = func(context.Context, NativeTuple, Token, string, string) error { return fail() }
+				ingestor.config.Verify = func(context.Context, NativeTuple, Token, IngestRequest) error { return fail() }
+				var err error
+				if method == "initialize" {
+					err = ingestor.Initialize(context.Background(), recipient, request.Event.SourceID, request.Event.Before)
+				} else {
+					_, err = ingestor.Ingest(context.Background(), recipient, request)
+				}
+				if err != store.AuthenticationFailed {
+					t.Fatalf("expired verifier result=%v", err)
+				}
+				m.now = func() time.Time { return time.Unix(110, 0) }
+				if err := m.store.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+					c, err := store.ReadCredential(ctx, tx, recipient.socket.credentialID)
+					if err == nil && c.Status != "expired" {
+						t.Errorf("failed verifier lost terminal expiry=%+v", c)
+					}
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
 	}
 }

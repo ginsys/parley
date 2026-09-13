@@ -92,7 +92,17 @@ func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r Command
 	}
 	return c.execute(ctx, p, r, authorize, mutate, publish)
 }
-func (c *Coordinator) Transition(ctx context.Context, change func(context.Context, *sql.Tx, CommitView) (TransitionResult, error), publish func(CommitView)) (code Code, err error) {
+func (c *Coordinator) Transition(ctx context.Context, change func(context.Context, *sql.Tx, CommitView) (TransitionResult, error), publish func(CommitView)) (Code, error) {
+	return c.transitionWithHooks(ctx, "connection", change, publish)
+}
+
+// Settle records only exact already-claimed dispatch outcomes and refunds. It
+// runs recovery detection but remains available during a hold; callers must not
+// introduce new authority or work through this trusted internal path.
+func (c *Coordinator) Settle(ctx context.Context, change func(context.Context, *sql.Tx, CommitView) (TransitionResult, error)) (Code, error) {
+	return c.transitionWithHooks(ctx, "dispatch.settle", change, nil)
+}
+func (c *Coordinator) transitionWithHooks(ctx context.Context, kind string, change func(context.Context, *sql.Tx, CommitView) (TransitionResult, error), publish func(CommitView)) (code Code, err error) {
 	h := c.operationHooks(ctx)
 	if h != nil {
 		defer func() {
@@ -101,11 +111,11 @@ func (c *Coordinator) Transition(ctx context.Context, change func(context.Contex
 				err = storageCode(afterErr)
 			}
 		}()
-		if err := h.Before(ctx, "connection"); err != nil {
+		if err := h.Before(ctx, kind); err != nil {
 			return "", storageCode(err)
 		}
 	}
-	return c.transition(ctx, change, publish)
+	return c.transition(ctx, kind, change, publish)
 }
 func (c *Coordinator) Inspect(ctx context.Context, read func(context.Context, *sql.Tx) error) (err error) {
 	h := c.operationHooks(ctx)

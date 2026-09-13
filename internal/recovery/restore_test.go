@@ -431,3 +431,50 @@ func TestFloorResetCanCoverMoreThanNinetyNineClockIncidents(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestFreshControllerHandleCannotBypassRecoveryOwner(t *testing.T) {
+	for _, operation := range []string{"grant", "revoke", "renew"} {
+		t.Run(operation, func(t *testing.T) {
+			s, _, path := recoveryFixture(t)
+			seedRestoredWork(t, s)
+			other, openErr := store.Open(context.Background(), path)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			defer other.Close()
+			c := controller.New(other)
+			ctx := context.Background()
+			var err error
+			switch operation {
+			case "grant":
+				_, err = c.Grant(ctx, controller.GrantParams{Conversation: "new", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 1})
+			case "revoke":
+				_, err = c.Revoke(ctx, "restore")
+			case "renew":
+				_, err = c.Renew(ctx, controller.RenewParams{Conversation: "restore", MaxExchanges: 20})
+			}
+			if err != store.RecoveryRequired {
+				t.Fatalf("legacy %s bypass=%v", operation, err)
+			}
+			if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+				var grants, conversations int
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM grants").Scan(&grants); err != nil {
+					return err
+				}
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM conversations").Scan(&conversations); err != nil {
+					return err
+				}
+				g, err := store.CurrentGrant(ctx, tx, "restore")
+				if err != nil {
+					return err
+				}
+				if grants != 1 || conversations != 1 || g.GrantVersion != 1 || g.MaxExchanges != 10 {
+					t.Errorf("mutated grants=%d conversations=%d grant=%+v", grants, conversations, g)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
