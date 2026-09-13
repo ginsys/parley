@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -869,5 +870,34 @@ func TestIngestionRetainsVerifiedFork(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInitializeRejectsMalformedCoordinatesBeforeOrigin(t *testing.T) {
+	for _, kind := range []string{"source", "nil-source", "noncanonical-source", "cursor-utf8", "cursor-size"} {
+		t.Run(kind, func(t *testing.T) {
+			_, _, recipient, ingestor, request, _ := readyIngestion(t)
+			source, cursor := request.Event.SourceID, request.Event.Before
+			switch kind {
+			case "source":
+				source = "not-a-source"
+			case "nil-source":
+				source = "00000000-0000-0000-0000-000000000000"
+			case "noncanonical-source":
+				source = "{70000000-0000-4000-8000-000000000001}"
+			case "cursor-utf8":
+				cursor = "bad\xff"
+			case "cursor-size":
+				cursor = strings.Repeat("x", store.MaxLocatorBytes+1)
+			}
+			calls := 0
+			ingestor.config.Origin = func(context.Context, NativeTuple, Token, string, string) error { calls++; return store.HostUnverified }
+			if err := ingestor.Initialize(context.Background(), recipient, source, cursor); err != store.InvalidRequest {
+				t.Errorf("malformed coordinates=%v", err)
+			}
+			if calls != 0 {
+				t.Errorf("malformed coordinates called origin %d times", calls)
+			}
+		})
 	}
 }

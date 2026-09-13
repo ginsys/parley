@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -222,7 +223,7 @@ func TestAuthenticatedClaimHonorsAuthoredRevocationHold(t *testing.T) {
 }
 
 func TestAuthenticatedCompatibilityDiagnosticPreservesHistory(t *testing.T) {
-	for _, bad := range []string{"caf\u00e9", "a\xff", "a\x7f"} {
+	for _, bad := range []string{"caf\u00e9", "a\xff", "a\x7f", strings.Repeat("x", store.MaxIdentityBytes+1)} {
 		for _, field := range []string{"conversation", "from_peer", "to_peer"} {
 			t.Run(fmt.Sprintf("%s/%x", field, bad), func(t *testing.T) {
 				f := authenticatedSetup(t)

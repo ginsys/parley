@@ -36,6 +36,9 @@ func NewIngestor(c IngestorConfig) (*Ingestor, error) {
 	return &Ingestor{c}, nil
 }
 func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor string) (err error) {
+	if !canonicalID(source) || !utf8.ValidString(cursor) || len(cursor) > store.MaxLocatorBytes {
+		return store.InvalidRequest
+	}
 	ctx, expiry := store.ObserveExpiries(ctx, i.config.Manager.store)
 	defer func() {
 		if persistErr := expiry.Persist(i.config.Manager.store, i.config.Manager.Invalidate); persistErr != nil {

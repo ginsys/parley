@@ -54,7 +54,7 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 			return store.TransitionResult{}, nil
 		}
 		for _, key := range []string{e.Conversation, e.FromPeer, e.ToPeer} {
-			if bridgetext.ValidateMetadata(key) != nil {
+			if len(key) > store.MaxIdentityBytes || bridgetext.ValidateMetadata(key) != nil {
 				incompatible = true
 				return store.TransitionResult{}, store.InvalidRequest
 			}
