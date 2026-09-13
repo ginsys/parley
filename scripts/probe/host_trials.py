@@ -1761,7 +1761,9 @@ class TrialRun:
     # The session's own version at trial time (transcript/rollout/export-recorded), or None.
     version: str | None = None
     # The model the host recorded as serving this trial's own turn, or None when the trial saw no
-    # assistant message or the host names none (every Codex cell). The requested model is not it:
+    # assistant message, the host names none (every Codex cell), or the reading could not be
+    # attributed to this trial (a busy trial on a host with no turn-boundary stream, whose
+    # turn_start/ack are unobservable for the same reason). The requested model is not it:
     # `--model haiku` was captured not being honoured, so a cell whose model is None must say the
     # model is unknown rather than repeat what was asked for. `run_trial_with_cleanup` deletes the
     # session, so this is the caller's only chance to record it.
@@ -1941,6 +1943,11 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
         # running turn's tail, so it is ambiguity rather than evidence either way.
         for name in ('turn_start', 'ack'):
             observable[name] = False
+        # The model was read off that same unattributable assistant record -- on Claude, the
+        # first one after submission, which here may belong to the turn that was already
+        # running. A cell naming the prior turn's model is worse than one saying the model is
+        # unknown, so it goes with the outcomes it came from.
+        model = None
     turn_end_observable = turn_end is not None or (channel_readable and not interrupted)
     return TrialRun(session_id=session_id, submitted_at=submitted_at, accepted_at=accepted_at,
                     outcomes=outcomes, state=state, marker=marker, version=version, model=model,

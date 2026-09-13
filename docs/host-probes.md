@@ -432,7 +432,10 @@ host's own turn-boundary event, or the submit command's exit status), `submissio
 the host itself recorded as serving *this trial's* turn — Claude's `message.model`, OpenCode's
 `<providerID>/<modelID>`, and `None` on Codex, whose rollout names none. It is read from the
 first in-window assistant message and carried on the result because
-`run_trial_with_cleanup()` deletes the session before a caller could go back for it. A cell whose
+`run_trial_with_cleanup()` deletes the session before a caller could go back for it. A busy trial
+on a host with no turn-boundary stream records `None` instead: the reading came off the same
+assistant record whose `turn_start` and `ack` are unobservable there, and it may belong to the
+turn that was already running. A cell whose
 `model` is `None` says the model is unknown; it never repeats what `-m`/`--model` asked for,
 since `--model haiku` was captured not being honoured. The requested `state`
 is validated and carried into the result, but establishing a busy/approval/disconnected/restarted

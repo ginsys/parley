@@ -2155,6 +2155,26 @@ class RunTrialTests(unittest.TestCase):
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['turn_start'], 'unobservable')
 
+    def test_a_busy_trial_without_turn_stream_records_no_model(self):
+        # The model comes off the same assistant record whose turn_start cannot be attributed;
+        # it may be the turn that was already running.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'turn_start': 1005.0},
+                                                      model='claude-opus-5')], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
+        self.assertIsNone(run.model)
+
+    def test_a_busy_trial_on_a_turn_stream_host_keeps_its_model(self):
+        # The host's own boundary attributes the turn, so the reading stands.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'turn_start': 1005.0},
+                                                      turn_stream=True, model='gpt-5')],
+                            clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
+        self.assertEqual(run.model, 'gpt-5')
+
     def test_a_turn_stream_hosts_readable_busy_timeout_stays_inconclusive(self):
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(turn_stream=True)], clock=clock)
