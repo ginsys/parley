@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -88,6 +89,84 @@ func TestRegistrationPublicationAndReplay(t *testing.T) {
 	}
 	if bytesContainSecret(data, credential.secret) {
 		t.Fatal("ordinary result disclosed secret")
+	}
+}
+
+func TestRegistrationRetriesUnavailableHostEvidence(t *testing.T) {
+	for name, failure := range map[string]error{
+		"unavailable":         store.TemporarilyUnavailable,
+		"wrapped unavailable": fmt.Errorf("synthetic verifier: %w", store.TemporarilyUnavailable),
+		"canceled":            context.Canceled,
+		"deadline":            context.DeadlineExceeded,
+		"provider failure":    errors.New("synthetic private evidence source unavailable"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			publications, verifications := 0, 0
+			p, db := testProvisioner(t, PublisherFunc(func(context.Context, CredentialFile) error {
+				publications++
+				return nil
+			}))
+			p.config.Verify = func(context.Context, NativeTuple) error {
+				verifications++
+				if verifications == 1 {
+					return failure
+				}
+				return nil
+			}
+			actor := store.CommandPrincipal{ID: adminID}
+			ctx := context.Background()
+			result, err := p.Register(ctx, actor, testRegistration())
+			if err != store.TemporarilyUnavailable || result.Receipt.Result.Code != "" || publications != 0 {
+				t.Errorf("unavailable result=%+v err=%v publications=%d", result, err, publications)
+			}
+			if err := db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+				for _, table := range []string{"bindings", "credentials", "credential_publications", "operation_results", "command_audit"} {
+					var n int
+					if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+						return err
+					}
+					if n != 0 {
+						t.Errorf("unavailable host evidence persisted %d rows in %s", n, table)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			result, err = p.Register(ctx, actor, testRegistration())
+			if err != nil || result.Receipt.Result.Code != "" || result.Receipt.Replayed || result.Publication != "published" || publications != 1 || verifications != 2 {
+				t.Fatalf("retry result=%+v err=%v publications=%d verifications=%d", result, err, publications, verifications)
+			}
+			replay, err := p.Register(ctx, actor, testRegistration())
+			if err != nil || !replay.Receipt.Replayed || replay.CredentialID != result.CredentialID || publications != 1 || verifications != 2 {
+				t.Fatalf("replay result=%+v err=%v publications=%d verifications=%d", replay, err, publications, verifications)
+			}
+		})
+	}
+}
+
+func TestRegistrationRetainsHostMismatchRejection(t *testing.T) {
+	for _, failure := range []error{store.HostUnverified, fmt.Errorf("synthetic mismatch: %w", store.HostUnverified)} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			p, _ := testProvisioner(t, PublisherFunc(func(context.Context, CredentialFile) error {
+				t.Error("unverified host published a credential")
+				return nil
+			}))
+			p.config.Verify = func(context.Context, NativeTuple) error { return failure }
+			actor := store.CommandPrincipal{ID: adminID}
+			result, err := p.Register(context.Background(), actor, testRegistration())
+			if err != nil || result.Receipt.Result.Code != store.HostUnverified || result.Receipt.Replayed {
+				t.Fatalf("mismatch result=%+v err=%v", result, err)
+			}
+			p.config.Verify = func(context.Context, NativeTuple) error {
+				t.Error("terminal rejection replay consulted host verifier")
+				return nil
+			}
+			replay, err := p.Register(context.Background(), actor, testRegistration())
+			if err != nil || replay.Receipt.Result.Code != store.HostUnverified || !replay.Receipt.Replayed {
+				t.Fatalf("replay result=%+v err=%v", replay, err)
+			}
+		})
 	}
 }
 func TestPublicationAmbiguityAndRotationNeverRepublishes(t *testing.T) {
