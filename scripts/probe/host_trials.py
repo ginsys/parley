@@ -1786,6 +1786,8 @@ def opencode_session_ids(stdout):
         if not isinstance(event, dict):
             unusable += 1
             continue
+        if event.get('type') not in ('step_start', 'text', 'step_finish', 'error'):
+            unusable += 1
         session_id = event.get('sessionID')
         valid_id = isinstance(session_id, str) and bool(session_id)
         if valid_id:

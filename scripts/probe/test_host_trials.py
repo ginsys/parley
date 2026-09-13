@@ -2398,6 +2398,30 @@ class OpenCodeDriverTests(DriverTestCase):
                 # The one proven creation ID remains available for cleanup after failure.
                 self.assertEqual(driver.owned(), {'ses_1'})
 
+    def test_uncaptured_event_discriminators_cannot_accept_creation_or_attach(self):
+        for kind in (None, 7, [], {}, '', ' ', 'future-event'):
+            for operation in ('create', 'attach'):
+                with self.subTest(kind=kind, operation=operation):
+                    self.registry = SessionRegistry()
+                    self.answering = False
+                    event = {'sessionID': 'ses_1', 'error': {'name': 'synthetic-failure'}}
+                    if kind is not None:
+                        event['type'] = kind
+                    result = FakeResult(0, json.dumps(event))
+                    if operation == 'create':
+                        driver = self.driver(FakeRun([(['opencode', 'run'], result)]))
+                        with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                            driver.create('hello')
+                    else:
+                        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'],
+                                        self.run_output()),
+                                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'], result)])
+                        driver = self.driver(run, port=4096)
+                        driver.create('hello')
+                        driver.serve()
+                        with self.assertRaisesRegex(SubmissionUncaptured, 'malformed'):
+                            driver.submit('ses_1', 'msg')
+
     def test_malformed_attach_stream_is_uncaptured_even_with_a_matching_id(self):
         for suffix in ('{"type":', '[1]', 'null', '"text"', '{"type":"text"}',
                        '{"type":"text","sessionID":""}', '{"type":"text","sessionID":null}',
