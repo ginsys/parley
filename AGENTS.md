@@ -272,7 +272,10 @@ must retain that denial through clock rollback; a rotated successor has a differ
 Host verification is a mandatory trusted capability and runs with the exact native tuple/token,
 outside the gate and cancelled by socket lifetime. Failed verification must still revalidate the
 session and persist observed credential expiry using a bounded context independent of caller
-cancellation; expiry takes precedence over the verifier outcome. Readiness requires a fresh nonce per explicit
+cancellation; expiry takes precedence over the verifier outcome. Retain the attempt's authenticated
+immutable credential evidence so socket cancellation/removal cannot skip that expiry observation.
+A failed coordinator rejects connection-manager ownership without consuming the claim.
+Readiness requires a fresh nonce per explicit
 thirty-second attempt. Heartbeats only extend liveness; adapters send every ten seconds, close after
 thirty seconds without one. Stale timers, ACKs, disconnects and retained command results cannot
 alter a successor slot. Internal callbacks and synthetic Unix socket tests do not establish a

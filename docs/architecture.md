@@ -165,6 +165,10 @@ return a sanitized `temporarily_unavailable`. Socket cancellation returns `authe
 Failed verification still revalidates the session with a bounded context independent of caller
 cancellation. Observed credential expiry takes precedence and is persisted even when socket
 liveness also elapsed; a verifier failure cannot leave that credential current for clock rollback.
+The attempt retains its authenticated immutable credential record and checks that expiry before
+handling socket cancellation, since disconnect may already have removed its slot. Persistence
+matches that exact identity and cannot expire or disconnect a rotated successor. A failed
+coordinator also rejects a new connection-manager ownership claim without consuming it.
 The trusted adapter ACK must match the verified native tuple, exact token and current nonce.
 Verifier completion and ACK publication recheck the attempt deadline after commit. Heartbeats
 recheck socket and credential deadlines there too, using the validated instant for deadline renewal;

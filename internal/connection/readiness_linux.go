@@ -131,7 +131,15 @@ func (m *Manager) BeginReadiness(ctx context.Context, s *Session) (Probe, error)
 		return Probe{}, store.TemporarilyUnavailable
 	}
 	var probe Probe
-	err = m.sessionTransition(ctx, s, func(context.Context, *sql.Tx) (store.TransitionResult, error) {
+	var credential store.CredentialRecord
+	err = m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
+		// Retain immutable expiry evidence while the session is authenticated.
+		// A later disconnect may remove the slot before the verifier returns.
+		var err error
+		credential, err = store.ReadCredential(ctx, tx, s.socket.credentialID)
+		if err != nil {
+			return store.TransitionResult{}, err
+		}
 		probe = Probe{s.token, s.socket.native, id.String()}
 		return store.TransitionResult{Changed: true}, nil
 	}, func(now time.Time) store.Code {
@@ -149,6 +157,14 @@ func (m *Manager) BeginReadiness(ctx context.Context, s *Session) (Probe, error)
 	stopLifetime := context.AfterFunc(s.socket.Context(), cancel)
 	defer stopLifetime()
 	verifyErr := m.verify(verifyCtx, probe.Native, probe.Token)
+	if m.observeCredentialExpiry(credential, m.now()) {
+		s.socket.cancel()
+		defer s.socket.Close()
+		if err := m.persistCredentialExpiry(credential); err != nil {
+			return Probe{}, err
+		}
+		return Probe{}, store.AuthenticationFailed
+	}
 	if s.socket.Context().Err() != nil {
 		return Probe{}, store.AuthenticationFailed
 	}
