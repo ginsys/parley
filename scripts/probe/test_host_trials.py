@@ -1600,6 +1600,15 @@ class CodexDriverTests(DriverTestCase):
         self.transcripts.pop(THREAD_ID)
         self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0.0).observable)
 
+    def test_rollout_removed_between_discovery_and_stat_is_unobservable(self):
+        driver = self.driver(FakeRun([(['codex', 'exec'], self.exec_output())]),
+                             rollout_path_for=host_trials.default_codex_rollout_path)
+        driver.create('hello')
+        with unittest.mock.patch.object(host_trials.glob, 'glob', return_value=['synthetic-rollout']), \
+                unittest.mock.patch.object(os.path, 'getmtime', side_effect=FileNotFoundError):
+            self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
+            self.assertIsNone(driver.version(THREAD_ID))
+
     def test_version_reads_the_rollouts_cli_version_never_the_binary(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])
         driver = self.driver(run)

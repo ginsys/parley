@@ -335,7 +335,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `codex exec --json -s read-only --skip-git-repo-check -C <probe cwd> '<prompt>'` with stdin
   closed, mints `thread.started.thread_id` as soon as it is seen (before the exit status is
   checked, and from partial output on a timeout), and returns once the turn ends — the thread is
-  then idle with no live process. `observe()` reads the rollout
+  then idle with no live process. A rollout that disappears between discovery and its metadata
+  read makes that poll unobservable and its version unknown; later polls retry discovery.
+  `observe()` reads the rollout
   (`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<thread_id>.jsonl`): `response_item`/`message`
   records with roles `user`/`assistant` (`developer` carries fixed instructions and is skipped),
   and `event_msg` `task_started`/`task_complete`/`turn_aborted` records as `turn_start`/`turn_end`

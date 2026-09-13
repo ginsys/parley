@@ -1426,7 +1426,12 @@ def default_codex_rollout_path(thread_id):
     """Newest `$CODEX_HOME/sessions/*/*/*/rollout-*-<thread_id>.jsonl` (`~/.codex` by default)."""
     home = os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')
     matches = glob.glob(os.path.join(home, 'sessions', '*', '*', '*', f'rollout-*-{thread_id}.jsonl'))
-    return max(matches, key=os.path.getmtime) if matches else None
+    try:
+        return max(matches, key=os.path.getmtime) if matches else None
+    except OSError:
+        # Discovery and stat are separate reads. A vanished/replaced candidate makes this
+        # poll unreadable; the next poll can discover again without aborting the whole trial.
+        return None
 
 
 class CodexDriver(Driver):
