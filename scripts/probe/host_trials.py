@@ -2257,6 +2257,7 @@ class OpenCodeDriver(Driver):
             return None
         if (not isinstance(document, dict) or not isinstance(document.get('info'), dict) or
                 document['info'].get('id') != session_id or
+                document['info'].get('directory') != self.cwd or
                 not isinstance(document.get('messages'), list)):
             return None
         seen = set()

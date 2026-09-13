@@ -493,6 +493,7 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   its window remains late even when its message was created inside the window.
   If multiple matching replies complete out of creation order, the earliest completion wins.
   Before observation or version extraction, the captured top-level `info.id`,
+  together with `info.directory`, must bind the owned session and exact validated probe cwd;
   each message's `sessionID`, and each part's `sessionID` must name the owned session; each
   part's `messageID` must name its enclosing message, whose ID must be nonempty and unique.
   A missing or inconsistent binding makes the whole export unreadable, with no outcomes,

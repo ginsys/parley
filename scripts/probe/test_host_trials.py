@@ -533,8 +533,8 @@ class CodexParsingTests(unittest.TestCase):
         self.assertEqual(codex_session_version(lines), '0.154.0')
 
 
-def opencode_export(messages, *, version='1.18.30', session_id='ses_1'):
-    return json.dumps({'info': {'id': session_id, 'version': version,
+def opencode_export(messages, *, version='1.18.30', session_id='ses_1', directory='/synthetic'):
+    return json.dumps({'info': {'id': session_id, 'version': version, 'directory': directory,
                                 'time': {'created': 1, 'updated': 2}},
                        'messages': messages})
 
@@ -2146,6 +2146,27 @@ class FakePopen:
 
 
 class OpenCodeDriverTests(DriverTestCase):
+    def test_export_directory_must_match_the_private_probe_cwd(self):
+        for directory in (None, '', '/foreign'):
+            with self.subTest(directory=directory):
+                self.registry = SessionRegistry()
+                document = json.loads(opencode_export([
+                    opencode_message('user', [{'type': 'text', 'text': MARKER}], 1000),
+                    opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 2000,
+                                     providerID='synthetic', modelID='model')], directory=self.cwd))
+                if directory is None:
+                    del document['info']['directory']
+                else:
+                    document['info']['directory'] = directory
+                run = FakeRun([(['opencode', 'run'], self.run_output()),
+                               (['opencode', '--pure', 'export'], FakeResult(0, json.dumps(document)))])
+                driver = self.driver(run)
+                driver.create('hello')
+                observation = driver.observe('ses_1', marker=MARKER, submitted_at=0)
+                self.assertFalse(observation.observable)
+                self.assertEqual(observation.outcomes, {})
+                self.assertIsNone(observation.model)
+                self.assertIsNone(driver.version('ses_1'))
     def test_foreign_or_missing_export_bindings_never_supply_outcomes_model_or_version(self):
         for target in ('top', 'message', 'part-session', 'part-message'):
             for missing in (False, True):
@@ -2153,7 +2174,8 @@ class OpenCodeDriverTests(DriverTestCase):
                     self.registry = SessionRegistry()
                     document = json.loads(opencode_export([
                         opencode_message('assistant', [{'type': 'text', 'text': MARKER}],
-                                         1_757_754_001_000, providerID='foreign', modelID='model')]))
+                                         1_757_754_001_000, providerID='foreign', modelID='model')],
+                                                          directory=self.cwd))
                     message = document['messages'][0]
                     owner, field = {'top': (document['info'], 'id'),
                                     'message': (message['info'], 'sessionID'),
@@ -2679,7 +2701,8 @@ class OpenCodeDriverTests(DriverTestCase):
     def test_observe_and_version_read_the_export_and_fail_closed(self):
         export = opencode_export([
             opencode_message('user', [{'type': 'text', 'text': MARKER}], 1_757_754_001_000),
-            opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1_757_754_002_000)])
+            opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1_757_754_002_000)],
+                                 directory=self.cwd)
         run = FakeRun([(['opencode', 'run'], self.run_output()),
                        (['opencode', '--pure', 'export'], FakeResult(0, export))])
         driver = self.driver(run)
@@ -2699,7 +2722,8 @@ class OpenCodeDriverTests(DriverTestCase):
             with self.subTest(loss=loss):
                 self.registry = SessionRegistry()
                 self.answering = False
-                export = opencode_export([opencode_message('user', [{'type': 'text', 'text': MARKER}], 1000)])
+                export = opencode_export([opencode_message('user', [{'type': 'text', 'text': MARKER}], 1000)],
+                                         directory=self.cwd)
                 run = FakeRun([(['opencode', 'run'], self.run_output()),
                                (['opencode', '--pure', 'export'], FakeResult(0, export))])
                 driver = self.driver(run)
