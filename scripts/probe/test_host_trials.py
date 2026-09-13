@@ -687,7 +687,11 @@ class ClaudeDriverTests(DriverTestCase):
     def driver(self, run, **kwargs):
         kwargs.setdefault('transcript_path_for', self.transcript_path_for)
         kwargs.setdefault('pty', FakePtyClient)
-        kwargs.setdefault('sleep', lambda seconds: None)
+        # One fake clock drives both the sleeps and the deadlines they wait out, so a bounded
+        # wait (the 5s version read, the 10s pre-detach check) ends without real time passing.
+        self.clock = FakeClock()
+        kwargs.setdefault('sleep', self.clock.sleep)
+        kwargs.setdefault('monotonic', self.clock.monotonic)
         kwargs.setdefault('cwd', self.cwd)
         return ClaudeDriver(self.registry, run=run, **kwargs)
 
@@ -767,7 +771,7 @@ class ClaudeDriverTests(DriverTestCase):
             claude_record('user', marker_message(MARKER), stamp='2026-09-13T09:00:01.000Z'),
             claude_record('assistant', [{'type': 'text', 'text': MARKER}], stamp='2026-09-13T09:00:03.000Z'),
         ])
-        submitted_at = 1_757_754_000.0  # 2026-09-13T09:00:00Z
+        submitted_at = 1_789_290_000.0  # 2026-09-13T09:00:00Z
         observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at)
         self.assertEqual(set(observation.outcomes), {'visible', 'turn_start', 'ack'})
         self.assertTrue(observation.observable)
@@ -787,6 +791,7 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(run.argv('claude', '--version'), [])
         self.transcripts.pop(SESSION_UUID)
         self.assertIsNone(driver.version('69aa52ed'))
+        self.assertGreaterEqual(self.clock.elapsed, 5.0)  # waited out its bound on the fake clock
 
     def create_live(self, extra_scripts=(), **kwargs):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
@@ -796,7 +801,7 @@ class ClaudeDriverTests(DriverTestCase):
         return driver, run
 
     def test_attach_submit_types_the_message_waits_for_the_transcript_and_detaches(self):
-        driver, run = self.create_live(clock=lambda: 1_757_754_000.0)
+        driver, run = self.create_live(clock=lambda: 1_789_290_000.0)
         self.transcripts[SESSION_UUID] = self.write_lines('a.jsonl', [
             claude_record('user', marker_message(MARKER), stamp='2026-09-13T09:00:01.000Z')])
         self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
@@ -809,11 +814,33 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertIn('user record seen before detach: True', driver.submission_note)
 
     def test_attach_submit_still_detaches_and_notes_when_the_transcript_never_shows_the_line(self):
-        driver, run = self.create_live(clock=lambda: 1_757_754_000.0)
+        driver, run = self.create_live(clock=lambda: 1_789_290_000.0)
         self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
         client, = FakePtyClient.launched
         self.assertEqual(client.keys[-1], b'\x1a')
         self.assertIn('user record seen before detach: False', driver.submission_note)
+        self.assertGreaterEqual(self.clock.elapsed, 10.0)  # the bounded wait ran to its end
+
+    def test_attach_client_exiting_while_typing_is_uncaptured(self):
+        driver, run = self.create_live()
+
+        class ExitingClient(FakePtyClient):
+            def type_line(self, text, **kwargs):
+                self.closed = True
+                self.send_keys(text.encode())
+
+        driver.pty = ExitingClient
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertTrue(FakePtyClient.launched[0].closed)
+        self.assertEqual(driver.clients, [])
+
+    def test_a_listing_timeout_before_submission_is_uncaptured_and_sends_nothing(self):
+        driver, run = self.create_live()
+        run.scripts.insert(0, (['claude', 'agents'], subprocess.TimeoutExpired(cmd=['claude'], timeout=15)))
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertEqual(FakePtyClient.launched, [])
 
     def test_attach_submit_with_no_composer_is_uncaptured_never_rejected(self):
         driver, run = self.create_live()
@@ -1144,7 +1171,7 @@ class CodexDriverTests(DriverTestCase):
         self.transcripts[THREAD_ID] = self.write_lines('r.jsonl', rollout_lines(messages=[
             ('2026-09-13T09:42:01.000Z', 'user', f'injected host text {MARKER}'),
             ('2026-09-13T09:42:03.000Z', 'assistant', MARKER)]))
-        observation = driver.observe(THREAD_ID, marker=MARKER, submitted_at=1_757_756_520.0)
+        observation = driver.observe(THREAD_ID, marker=MARKER, submitted_at=1_789_292_520.0)  # 09:42:00Z
         self.assertEqual(set(observation.outcomes), {'visible', 'ack'})  # turn_start needs task_started
         self.assertTrue(observation.turn_stream)
         self.assertTrue(observation.observable)

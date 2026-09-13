@@ -371,8 +371,7 @@ class PtyClient:
 
     Tested only against controlled Python children (AGENTS.md, Test isolation), never an
     installed host CLI. `TERM` is `xterm-256color` and `PWD` the resolved cwd, matching the
-    Claude attach capture (docs/host-probe-preflight.md, 2026-09-13); the Codex capture recorded
-    no `TERM`, so the same value is an assumption there.
+    Claude attach and Codex TUI captures (docs/host-probe-preflight.md, 2026-09-13).
     """
 
     def __init__(self, argv, *, cwd, env=None, window=256 * 1024, generation='inherit'):
@@ -444,11 +443,12 @@ class PtyClient:
         regex = re.compile(pattern)
         deadline = time.monotonic() + timeout
         while True:
+            eof = self.eof  # read before the text: the drain thread appends its last bytes first
             text = self.text_since(since)
             matched = regex.search(text) is not None
-            if matched and (self.eof or time.monotonic() - self.last_output >= quiet):
+            if matched and (eof or time.monotonic() - self.last_output >= quiet):
                 return True
-            if self.eof or time.monotonic() >= deadline:
+            if eof or time.monotonic() >= deadline:
                 return False
             time.sleep(0.1)
 
@@ -686,7 +686,7 @@ class ClaudeDriver(Driver):
 
     def __init__(self, registry, *, run=subprocess.run, cwd, model='haiku', mechanism='attach',
                  transcript_path_for=default_claude_transcript_path, pty=PtyClient, sleep=time.sleep,
-                 clock=time.time):
+                 clock=time.time, monotonic=time.monotonic):
         if mechanism not in CLAUDE_MECHANISMS:
             raise ValueError(f'unknown submission mechanism: {mechanism!r}')
         super().__init__(registry, cwd=cwd)
@@ -697,6 +697,9 @@ class ClaudeDriver(Driver):
         self.pty = pty
         self.sleep = sleep
         self.clock = clock
+        # The bounded local waits use this, injected with `sleep` so a test's fake sleep advances
+        # the same clock the deadline reads (a real monotonic with a no-op sleep hot-spins).
+        self.monotonic = monotonic
         self.sessions = {}  # short id -> full sessionId (None until the listing supplied it)
 
     def _listing(self):
@@ -803,19 +806,24 @@ class ClaudeDriver(Driver):
         uncaptured. The transcript, not the PTY, is what says the host took the text -- and it
         also shows whether a long typed line survived verbatim rather than as a paste placeholder.
         """
-        deadline = time.monotonic() + timeout
+        deadline = self.monotonic() + timeout
         while True:
             observation = self.observe(session_id, marker=message, submitted_at=since)
             if 'visible' in observation.outcomes:
                 return True
-            if time.monotonic() >= deadline:
+            if self.monotonic() >= deadline:
                 return False
             self.sleep(0.5)
 
     def submit(self, session_id, message):
         self.registry.require_owned(self._key(session_id))
         self.submission_note = None
-        entry = self.status(session_id)
+        try:
+            entry = self.status(session_id)
+        except subprocess.TimeoutExpired as error:
+            # Raised before anything was sent: letting it reach `run_trial` would read as a
+            # submission that may have delivered and poll a marker the host never received.
+            raise SubmissionUncaptured('claude agents timed out before submission; nothing sent') from error
         if entry is None:
             raise RuntimeError(f'session not listed under {self.cwd}: {session_id}')
         if self.mechanism == 'resume':
@@ -876,19 +884,30 @@ class ClaudeDriver(Driver):
         client = self.pty(['claude', 'attach', session_id], cwd=self.cwd)
         self.clients.append(client)
         try:
-            if not client.wait_for(CLAUDE_READY_PATTERN, quiet=1.0, timeout=30):
+            # quiet=3.0 is the capture's own readiness criterion (3 s of output silence).
+            if not client.wait_for(CLAUDE_READY_PATTERN, quiet=3.0, timeout=30):
                 raise SubmissionUncaptured(f'attach never showed the composer: {client.screen()!r}')
             screen_at_type = client.screen(400)
             typed_at = _utc_now()
-            client.type_line(message)
+            try:
+                client.type_line(message)
+            except ValueError as error:
+                # The client exited between readiness and typing: some, all or none of the line
+                # may have reached the composer, and no Enter is guaranteed.
+                raise SubmissionUncaptured(f'attach client exited while typing ({error}): '
+                                           f'{client.screen()!r}') from error
             seen = self._visible_before_detach(session_id, message, since)
-            client.send_keys(b'\x1a')  # Ctrl-Z: captured to detach (exit 0), session keeps running
+            try:
+                client.send_keys(b'\x1a')  # Ctrl-Z: captured to detach (exit 0), session keeps running
+                detach = 'Ctrl-Z sent'
+            except ValueError:
+                detach = 'client had already exited'  # close() below reaps it
             self.sleep(1.0)
         finally:
             client.close()
             self.clients.remove(client)
         self.submission_note = (f'attach: typed at {typed_at}; user record seen before detach: '
-                                f'{seen}; screen at type time: {screen_at_type!r}')
+                                f'{seen}; detach: {detach}; screen at type time: {screen_at_type!r}')
         return None
 
     def stop(self, session_id):
@@ -929,10 +948,10 @@ class ClaudeDriver(Driver):
         the listing's `startedAt` (captured), so a short bounded wait covers the race.
         """
         self.registry.require_owned(self._key(session_id))
-        deadline = time.monotonic() + 5.0
+        deadline = self.monotonic() + 5.0
         while True:
             version = self._read_transcript(session_id, claude_session_version)
-            if version is not None or time.monotonic() >= deadline:
+            if version is not None or self.monotonic() >= deadline:
                 return version
             self.sleep(0.5)
 
@@ -1162,11 +1181,12 @@ class CodexDriver(Driver):
                 'resume', thread_id]
         client = self.pty(argv, cwd=self.cwd)
         self.clients.append(client)
-        ready = client.wait_for(CODEX_READY_PATTERN, quiet=2.0, timeout=60)
+        # quiet=3.0 is the capture's own readiness criterion (3 s of output silence).
+        ready = client.wait_for(CODEX_READY_PATTERN, quiet=3.0, timeout=60)
         if ready and CODEX_TRUST_PATTERN.search(client.text_since(0)):
             since = client.mark()
             client.send_keys(b'\r')
-            ready = client.wait_for(CODEX_READY_PATTERN, quiet=2.0, timeout=60, since=since)
+            ready = client.wait_for(CODEX_READY_PATTERN, quiet=3.0, timeout=60, since=since)
         if not ready:
             screen = client.screen()
             client.close()
