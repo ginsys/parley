@@ -24,6 +24,10 @@ shell with success/failure/cancellation results for PR, main-push and merge-grou
 mise with the real verify dependency list, successful unrelated stubs and a failing Python task.
 These tests establish failure propagation locally; an actual CI run remains separate evidence.
 
+OpenCode server and driver fixtures live in `scripts/probe/test_opencode_driver.py`; shared
+controlled helpers and the other host fixtures live in `scripts/probe/test_host_trials.py`.
+Both modules run through the same unittest discovery command.
+
 The PTY fixtures supply controlled observations for shell/pager/editor replacement, approval
 prompts, unknown/busy state and stale generations after restart. They verify rejection before
 writing. The no-ack fixture receives bytes but supplies no acknowledgement signal. These are
