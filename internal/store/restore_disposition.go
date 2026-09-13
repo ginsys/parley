@@ -18,12 +18,16 @@ func RetireRecoveryNamespace(ctx context.Context, tx *sql.Tx, incident string, r
 	if !validUUID(incident) || !validUUID(r.PrincipalID) {
 		return InvalidRequest
 	}
-	var exists bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM retired_namespaces WHERE principal_id=?)", r.PrincipalID).Scan(&exists); err != nil {
-		return storageCode(err)
-	}
-	if exists {
+	var retiredIncident string
+	err := tx.QueryRowContext(ctx, "SELECT incident_id FROM retired_namespaces WHERE principal_id=?", r.PrincipalID).Scan(&retiredIncident)
+	if err == nil {
+		if retiredIncident != incident {
+			return VersionConflict
+		}
 		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return storageCode(err)
 	}
 	binding, err := ReadBinding(ctx, tx, r.PrincipalID)
 	var bindingID any
