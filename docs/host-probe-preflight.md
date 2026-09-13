@@ -93,3 +93,92 @@ format, and because an untimestamped entry cannot be ordered against a submissio
 classifies such a read `unobservable` rather than negative. Both the format and the absence of
 timestamps remain **hypotheses to reproduce against a running background session**, not
 observations; the fail-closed handling is what makes acting on an unconfirmed format safe.
+
+## 2026-09-13 — live captures at Claude 2.1.270 / codex-cli 0.154.0 / OpenCode 1.18.30
+
+Unlike the two sections above, these are live captures: each host was actually driven through
+session creation, a second message into that session, observation and teardown, under the
+operator's real HOME per the 2026-09-11 decision. Every session was created by the capture
+itself in a private, empty probe directory (`<probe-cwd>` below; the Codex one was `git init`ed)
+and torn down afterwards; no human session was touched. They fill no matrix cell — one run each,
+no trial windows, synthetic prompts only — but they replace the 2026-09-11 hypotheses with
+observed shapes, and several of those hypotheses were wrong. `claude --version` had drifted again,
+to `2.1.270`; `codex --version` now prints `codex-cli 0.154.0`, matching the rollout-recorded
+version. All timestamps are UTC.
+
+### Claude Code 2.1.270
+
+| Command/check | Observed result |
+| --- | --- |
+| `claude --bg --print --model haiku --max-budget-usd 0.05 --session-id <uuid> '<prompt>'` | Exit 1, stdout empty, stderr: ``--bg and --print conflict: --print never starts the interactive session that `claude agents` attaches to, so the job would be unattachable. The prompt is the positional — drop --print: `claude --bg '<task>'`.`` — the stage-1 `create()` argv was wrong. `--max-budget-usd` is a `--print` option, so it is unusable with `--bg`; spend is bounded by `--model haiku` instead |
+| `claude --bg --model haiku --session-id <uuid> '<prompt>'` from `<probe-cwd>` | Exit 0. Stdout, 5 lines: `backgrounded · 69aa52ed` then four indented hint lines (`claude agents`, `claude attach 69aa52ed`, `claude logs 69aa52ed`, `claude stop 69aa52ed`). Stderr: `warning: --bg manages the session id; ignoring --session-id (use --resume <id> to continue an existing session)` and `Starting background service…`. The 2026-09-11 idea of correlating by a caller-chosen `--session-id` is dead: `--bg` ignores it |
+| `claude agents --json --all --cwd <probe-cwd>` immediately after | One entry: `{"pid": <n>, "id": "69aa52ed", "cwd": "<probe-cwd>", "kind": "background", "startedAt": 1789292510115, "sessionId": "69aa52ed-1356-4737-afaa-5d03d8e437b9", "name": "<prompt>", "status": "idle", "state": "working"}`. The short `id` is the first 8 hex digits of `sessionId`, so stdout line 1 identifies the session directly and the listing confirms it. Both `status` and `state` are present on a background entry (2026-09-11 saw only `state`, on a finished one); values seen: `status` `idle`/`busy`, `state` `working`/`done`. After the turn: `state: "done"`, `status: "idle"`, `pid` still set — the session stays alive. After `claude stop`: `pid: null`, `status: null`, `state: "done"`. After `claude rm`: the entry is gone |
+| `claude logs 69aa52ed`, while `working` and again after `done` | Exit 0 both times, ~7 KB: a raw ANSI terminal screen dump (banner, the prompt line, the reply, the status bar), no timestamps, no record structure. Readable while the daemon lives — the 2026-09-11 ENOENT was a stopped session — but it is not a transcript and this runner does not parse it |
+| Session transcript on disk | `$HOME/.claude/projects/<cwd-slug>/<sessionId>.jsonl`, where `<cwd-slug>` is the probe directory's absolute path with every `/` replaced by `-`. One JSON object per line. A prompt is `{"type": "user", "timestamp": "2026-09-13T09:41:50.296Z", "message": {"role": "user", "content": "<prompt>"}, "sessionId": ..., "cwd": ..., "version": "2.1.270", "uuid": ..., "parentUuid": ...}`; a reply is `{"type": "assistant", "timestamp": "2026-09-13T09:42:02.186Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "PONG"}]}, ...}` — `content` is a string on user records and a list of typed parts on assistant records (a preceding assistant record carried only a `thinking` part). Other `type` values seen: `attachment`, `system` (timestamped) and `file-history-snapshot`, `last-prompt`, `mode`, `permission-mode`, `ai-title`, `agent-name`, `custom-title`, `atis-latch`, `bridge-session`, `cost-state` (no `timestamp` key at all). The creation prompt's user record landed 0.18 s after the listing's `startedAt`; the reply 12 s later |
+| `claude --bg --resume <sessionId> --model haiku '<msg>'` while the session is running | Exit 0, stdout `backgrounded · e1c973b9` (+hints), stderr: ``note: session 69aa52ed is already running in the background, so this started a copy as e1c973b9. `claude attach 69aa52ed` opens the original.`` — a new session with its own transcript file; nothing reached the original |
+| `claude --print --resume <sessionId> --model haiku --max-budget-usd 0.05 '<msg>'` while running | Exit 1, stdout empty, stderr: ``Error: Session 69aa52ed-1356-4737-afaa-5d03d8e437b9 is running as a background session (69aa52ed). Run `claude attach 69aa52ed` to open it, or `claude stop 69aa52ed` first to resume it here. Add --fork-session to branch off a copy instead.`` |
+| `claude attach 69aa52ed` under a PTY (24×80, `TERM=xterm-256color`), then a typed line | Prompt ready 3.2 s after launch. Typed `Reply with exactly PARLEY-PROBE-c3c and nothing else.` then Enter (sent separately, 0.5 s later) at 09:50:16.085; the transcript file gained the user record at 09:50:16.099 (seen by the poller +0.27 s) and the assistant text record at 09:50:17.458 (+2.6 s); the screen showed the reply. Ctrl-Z detached (exit 0) and the session stayed listed and running. **This is the only captured path that delivers a message to a live background session** |
+| `claude stop 69aa52ed` | Exit 0, stdout `stopped 69aa52ed`; the daemon pid is gone and the listing shows `pid: null, status: null, state: "done"` |
+| `claude --bg --resume <sessionId> --model haiku '<msg>'` after `stop` | Exit 0 but again a copy (`backgrounded · e0b268ff`); stderr: `note: background session 69aa52ed keeps its own saved options, so the flags you passed started a copy as e0b268ff. Without flags, the same command continues 69aa52ed itself.` |
+| `claude --bg --resume <sessionId> '<msg>'` after `stop`, **no other flags** | Exit 0, stdout `backgrounded · 69aa52ed` — the same short id and `sessionId`; stderr only `Starting background service…`. The original transcript file gained the user record at 09:59:13.546 and the assistant reply at 09:59:14.923; the saved model (Haiku) was kept. **This is the captured "restarted" path** |
+| `claude rm <id>` (after `stop`) | Exit 0, stdout `removed <id>`; the entry leaves the listing. The transcript files persist under `$HOME/.claude/projects/<cwd-slug>/` (three files, one per session started, still present afterwards) |
+| Background daemon socket | `/tmp/cc-daemon-<uid>/<hash>/control.sock` while the session lives |
+
+### codex-cli 0.154.0
+
+| Command/check | Observed result |
+| --- | --- |
+| `codex exec --json -s read-only --skip-git-repo-check -C <probe-cwd> '<prompt>'` | Exit 0. Stdout, JSONL: `{"type":"thread.started","thread_id":"01a09a24-ff1d-7360-9385-722d230ef92b"}`, `{"type":"turn.started"}`, `{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"PONG"}}`, `{"type":"turn.completed","usage":{...}}`. Stderr: `Reading additional input from stdin...` (stdin was inherited; close it). **A non-interactive creation path with the thread id on stdout exists** — the 2026-09-11 refusal in `CodexDriver.create()` no longer applies |
+| Its rollout file | `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<local-time>-<thread_id>.jsonl`; `session_meta.payload` is `{"id", "session_id", "cwd", "cli_version": "0.154.0", "originator": "codex_exec", "source": "exec", "thread_source", "timestamp"}`. Record types seen: `session_meta`, `turn_context`, `world_state`, `token_usage_record`, `event_msg` (`task_started`, `item_completed`, `token_count`, `task_complete`, `turn_aborted`), `response_item` (`message` with roles `developer`/`user`/`assistant`). A `user` message record also carries the host's own injected text (project instructions, plugin preamble) around the prompt, so the marker must be searched for, never matched whole |
+| `codex queue --thread <exec thread> --message 'PARLEY-PROBE-x2 queue test'` with no live session | Exit 0, stdout `Queued message 01a09a25-0f9e-7d52-ad8b-31441d35f687 for thread 01a09a24-ff1d-7360-9385-722d230ef92b.`; nothing delivered. The item is persisted in `$CODEX_HOME/queue_1.sqlite`, table `queued_items(id, thread_id, payload_json, queue_order, created_at_ms, updated_at_ms)` with `payload_json` `{"UserInput": ...}` |
+| `codex queue --thread '' --message '...'` | Exit 1, stderr `Error: No active session found matching ''.` — the thread argument is checked against known sessions; acceptance is not unconditional |
+| `codex --no-alt-screen -s read-only -a never -C <probe-cwd>` (TUI) under a PTY, first run in that directory | Prompt `Do you trust the contents of this directory?`; Enter accepted it and **persisted** `[projects."<probe-cwd>"]` / `trust_level = "trusted"` into `$CODEX_HOME/config.toml` — a side effect of any first TUI run in a new probe directory. Composer ready ~5 s after launch; default model `gpt-6-astra high`. The TUI's rollout file (`originator: "codex-tui"`, `source: "cli"`) is created only at its first turn, not at launch, so a typed first prompt is needed before the thread id exists on disk. Pasted text stays in the composer: send the text, pause, then Enter separately |
+| `codex queue --thread <TUI thread> --message '<marker msg>'` while that TUI sits idle | Exit 0 at 09:59:33.336 (`Queued message ... for thread ...`). Rollout records: `event_msg/task_started` 09:59:40.036, `response_item/message` role `user` 09:59:40.072 (+6.7 s), `response_item/message` role `assistant` 09:59:41.994 (+8.7 s); the screen showed the reply. Queue delivery into a live idle session takes several seconds, not milliseconds |
+| `codex queue --thread <exec thread>` while an *unrelated* TUI is live | Exit 0; nothing appeared in the exec thread's rollout within 120 s — the queue is per thread, and a live session only drains its own |
+| `codex --no-alt-screen ... -C <probe-cwd> resume <exec thread>` under a PTY | Both earlier queued items (x2 and the mis-targeted x3) were delivered at start, before the composer became ready (15 s), each producing a user record, a turn and an assistant reply appended to the *same* rollout file; `queued_items` was empty afterwards. A queued message is therefore delivered by whichever process next serves the thread |
+| `codex exec resume <thread> '<msg>'` | Not exercised: the workstation's command policy refused it. Not evidence either way |
+| `codex delete <uuid>` non-interactive | Exit 1, stderr `Error: cannot confirm session deletion without an interactive terminal; rerun with --force and a session UUID` |
+| `codex delete --force <uuid>` | Exit 0, stdout `Deleted session <uuid>.`; the rollout file is removed. **This is the captured teardown path** |
+| `$CODEX_HOME/ipc/` | Does not exist |
+
+### OpenCode 1.18.30
+
+| Command/check | Observed result |
+| --- | --- |
+| `opencode run --pure --format json --dir <probe-cwd> --title parley-probe-o1 '<prompt>'` (default model) | Stdout one event: `{"type":"error","timestamp":1789292519764,"sessionID":"ses_...","error":{"name":"UnknownError","data":{"message":"Token refresh failed: 401"}}}`; the default model was `openai/gpt-5.6-terra-fast` and its stored credential is stale. A session was still created and listed |
+| `opencode models` | No `anthropic` provider is configured (`Error: Provider not found: anthropic` when filtered); providers listed: `google` (43 models), `openai` (21), `opencode` (7). `opencode/ling-3.0-flash-fin-free` is a zero-cost model that works without any stored credential |
+| `opencode run --pure --format json --dir <probe-cwd> --title parley-probe-o1b -m opencode/ling-3.0-flash-fin-free '<prompt>'` | Exit 0. Stdout events `step_start`, `text`, `step_finish`, each `{"type", "timestamp": <ms epoch>, "sessionID", "part": {"id", "messageID", "sessionID", "type", ...}}`; the `text` part carries `"text": "PONG"` and `"time": {"start", "end"}`; `step_finish` carries `tokens` and `"cost": 0` |
+| `opencode --pure export <sessionID>` | Stderr `Exporting session: <id>`; stdout JSON `{"info": {"id", "slug", "projectID": "global", "directory", "path", "title", "agent", "model": {"id", "providerID", "variant"}, "version": "1.18.30", "summary", "cost", "tokens", "permission", "time": {"created", "updated"}}, "messages": [{"info": {"role": "user", "time": {"created": 1789292850249}, "id", "sessionID", ...}, "parts": [{"type": "text", "text": "<prompt>", ...}]}, {"info": {"role": "assistant", "time": {"created": 1789292850601, "completed": 1789292852828}, "modelID", "providerID", "finish": "stop", ...}, "parts": [{"type": "step-start"}, {"type": "reasoning", "text", "time"}, {"type": "text", "text": "PONG", "time": {"start", "end"}}, {"type": "step-finish", "reason", "tokens", "cost"}]}]}`. All times are millisecond epochs |
+| `opencode --pure session list` | A table (`Session ID`, `Title`, `Updated`) over every session on the workstation regardless of directory — a global listing, so ownership must come from the id `run` printed, never from this list |
+| `opencode serve --pure --port 43117` | Stdout `Warning: OPENCODE_SERVER_PASSWORD is not set; server is unsecured.` then `opencode server listening on http://127.0.0.1:43117`; `GET /session`, `GET /session/<id>` and `GET /session/<id>/message` return the same JSON shapes as `export` |
+| `opencode run --pure --format json --attach http://127.0.0.1:43117 --session <id> -m opencode/ling-3.0-flash-fin-free '<marker msg>'` | Exit 0; the attached client's own stdout carried only a `step_start` event. The export afterwards listed the new user message and an assistant reply whose `time.completed` was about 3 s after the user message's `time.created`. **This is the captured submission path into a live server-held session** |
+| `opencode --pure session delete <id>` | Exit 0, stderr (ANSI-coloured) `Session <id> deleted`; `export <id>` afterwards fails with `Error: Session not found: <id>`. Storage is `$HOME/.local/share/opencode/opencode.db` |
+
+Side effects left behind, reported rather than reverted: the Codex trust entry for the probe
+directory in `$CODEX_HOME/config.toml`, and the three Claude transcript files under
+`$HOME/.claude/projects/<cwd-slug>/` (`claude rm` does not delete them). Both Codex rollouts and
+both OpenCode sessions were deleted; the Codex queue table was empty at the end.
+
+Conclusions enabled, each reversing a stage-1 assumption:
+- Claude: create with `claude --bg --model <m> '<prompt>'` and take the id from stdout line 1
+  (`backgrounded · <id>`), confirmed against `claude agents --json --all --cwd <probe-cwd>`;
+  observe the session's own JSONL transcript by `sessionId`, which is timestamped; submit to a
+  live session through `claude attach <id>` under a PTY, or to a stopped one through
+  `claude stop <id>` then `claude --bg --resume <sessionId> '<msg>'` with no other flags; tear
+  down with `claude stop <id>` then `claude rm <id>`. `claude logs` and `--session-id` play no
+  part. The listing-diff and `AmbiguousSessionCreation` machinery built for an uncaptured stdout
+  shape is unnecessary.
+- Codex: create a thread with `codex exec --json` and read `thread.started.thread_id`; adopt a
+  TUI thread from the newest rollout whose `session_meta.cwd` is the probe directory; submit
+  with `codex queue`; observe the rollout; tear down with `codex delete --force <uuid>`. The
+  provenance walk over every rollout under `$CODEX_HOME/sessions` is replaced by creation
+  binding: the runner only ever owns a thread whose id it read from its own `codex exec`
+  output or whose rollout names its own private probe directory.
+- OpenCode: a free model exists, so the row is runnable at zero cost; `serve` plus
+  `run --attach --session` is the live-session submission path, `export` the observation
+  channel, `session delete` the teardown. The `OpenCodeDriver` placeholder can be implemented.
+
+Still uncaptured, and therefore still fail-closed in the runner: what a Claude listing shows while
+a session is parked on a permission prompt (`approval`), whether `status: "busy"` is reliable for
+`busy`, and whether a queued Codex message is delivered mid-turn or only after the running turn
+ends. Those are established by the stage-2 trial runs themselves, not assumed here.
