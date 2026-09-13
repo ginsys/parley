@@ -2319,6 +2319,30 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.outcomes['visible'], 1000.0)
         self.assertTrue(all(run.observable.values()))
 
+    def test_descheduling_during_clock_sampling_is_not_a_clock_step(self):
+        for sample in (1, 3):  # baseline and first poll (sample 2 records acceptance)
+            for side in ('before', 'after'):
+                with self.subTest(sample=sample, side=side):
+                    clock = FakeClock()
+                    calls = 0
+
+                    def wall_time():
+                        nonlocal calls
+                        calls += 1
+                        if calls == sample and side == 'before':
+                            clock.elapsed += 3.0
+                        value = clock.time()
+                        if calls == sample and side == 'after':
+                            clock.elapsed += 3.0
+                        return value
+
+                    driver = FakeDriver(observations=[Observation(outcomes={
+                        'visible': 1015.0, 'turn_start': 1016.0, 'ack': 1017.0})], clock=clock)
+                    run = run_trial(driver, prompt='hi', marker=MARKER, clock=wall_time,
+                                    monotonic=clock.monotonic, sleep=clock.sleep)
+                    self.assertIsNone(run.clock_step)
+                    self.assertEqual(run.outcomes['ack'], 1017.0)
+
     def test_the_result_carries_the_driver_version_captured_at_trial_time(self):
         clock = FakeClock()
         driver = FakeDriver(version_value='2.1.270', clock=clock)

@@ -523,12 +523,16 @@ interval measured inside this process must not move when NTP steps the clock.
 
 A wall-clock step mid-trial still distorts the recorded timestamps themselves, and no rebasing
 can undo it: the host wrote those stamps from another process, on the clock as it then read. So
-the runner detects the step instead of correcting it. Every poll compares elapsed wall time
-against elapsed monotonic time, and a divergence past one second — far above the 500 ppm NTP
+the runner detects the step instead of correcting it. Both the baseline and each poll bracket
+the wall-clock read with monotonic reads. Those brackets bound the possible elapsed-time
+difference, so descheduling between reads widens uncertainty instead of declaring a clock step.
+The trial ends only when that entire interval diverges past one second — far above the 500 ppm NTP
 slew ceiling, which is 0.45 s across the whole 900 s busy cap, and far below the smallest 10 s
-window — ends the trial: every outcome `unobservable`, every timestamp dropped rather than
+window: every outcome `unobservable`, every timestamp dropped rather than
 published on a timeline that shifted under it, and the divergence recorded on `TrialRun` as
-`clock_step` for the cell to cite in their place. One case stays outside that: a step backwards
+`clock_step` as the minimum proven divergence for the cell to cite in their place. A correction
+inside a sampling bracket's uncertainty cannot be distinguished from scheduling delay. One case
+stays outside that: a step backwards
 large enough to put the caller's later `now` before submission, which `Trial.result()` refuses
 outright as an invalid observation clock. That is a refusal, not a classification, so it fails
 closed in the same direction.

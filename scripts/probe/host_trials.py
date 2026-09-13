@@ -2113,8 +2113,9 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     except Exception:
         version = None
     settle(session_id)
+    submitted_mono_before = monotonic()
     submitted_at = clock()
-    submitted_mono = monotonic()
+    submitted_mono_after = monotonic()
     deadline = monotonic() + (BUSY_CAP if state == 'busy' else LAST_WINDOW)
     accepted_unobservable = False
     submission_diagnostic = None
@@ -2183,9 +2184,16 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
                 # `inconclusive` regardless of how much longer polling would wait.
                 if turn_end - submitted_at <= BUSY_CAP:
                     deadline = monotonic() + max(0.0, LAST_WINDOW - (clock() - turn_end))
-            drift = (clock() - submitted_at) - (monotonic() - submitted_mono)
-            if abs(drift) > CLOCK_DRIFT_TOLERANCE:
-                clock_step = drift
+            mono_before = monotonic()
+            wall_delta = clock() - submitted_at
+            mono_after = monotonic()
+            # Each wall reading happened somewhere inside its monotonic bracket. Descheduling
+            # widens that uncertainty; it is not evidence that either clock stepped. Declare a
+            # correction only when every possible elapsed-time comparison exceeds tolerance.
+            drift_low = wall_delta - (mono_after - submitted_mono_before)
+            drift_high = wall_delta - (mono_before - submitted_mono_after)
+            if drift_low > CLOCK_DRIFT_TOLERANCE or drift_high < -CLOCK_DRIFT_TOLERANCE:
+                clock_step = drift_low if drift_low > CLOCK_DRIFT_TOLERANCE else drift_high
                 break
             remaining = deadline - monotonic()
             if remaining <= 0 or all(name in outcomes for name in TRANSCRIPT_OUTCOMES):
