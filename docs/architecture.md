@@ -676,3 +676,5 @@ identities cannot use them to authorize new work. A reviewed bad-floor dispositi
 retires affected authority, matches the exact checkpoint version and all held clock incidents, and
 records the floor change against the same audit. Ordinary reconciliation never lowers the floor.
 Recovery does not clear individual security holds, ingestion barriers or persisted expiry.
+Trusted writer authorization helpers enforce remembered exact-credential expiry denials even
+when their caller has not installed an expiry observation collector.
