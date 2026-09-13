@@ -895,3 +895,13 @@ takes and publishes each sample under the same coordinator gate. Verification an
 one-second wait hold neither gate nor transaction. Valid samples raise the remembered floor;
 rollback samples latch exact evidence, flushed independently of caller cancellation. Later normal
 checkpoint advancement cannot retrospectively invalidate an earlier legitimate sample.
+
+
+The [controlled connection fixture handoff](connection-fixtures.md) maps the accepted C01–C19
+requirements to synthetic tests and named deferrals. Composition tests install recovery through the
+runtime inspector before constructing a connection manager, then exercise private-session dispatch
+and retained ingestion across independent conversations. Cancellation after a controlled child has
+started remains uncertain and consumes its original budget; runtime shutdown retains the writer
+lease until independent settlement drains. Marked restore startup skips ordinary services, and
+external clock-persistence failure signals a synthetic supervisor outside the writer callback.
+These are integration fixtures, not a production supervisor or runnable bridge.
