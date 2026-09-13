@@ -3083,6 +3083,30 @@ class RunTrialTests(unittest.TestCase):
                 self.assertIsNotNone(run.clock_step)
                 self.assertIsNone(run.model)
 
+    def test_rejection_checks_clock_drift_without_polling(self):
+        for step in (60.0, -60.0):
+            for raises in (False, True):
+                with self.subTest(step=step, raises=raises):
+                    clock = FakeClock()
+
+                    class RejectedAfterStep(FakeDriver):
+                        def submit(self, session_id, message):
+                            clock.wall += step
+                            return super().submit(session_id, message)
+
+                    driver = RejectedAfterStep(accepted=False, clock=clock,
+                                               submit_error=SubmissionRejected(1, 'rejected') if raises else None)
+                    run = self.run_one(driver, clock)
+                    self.assertAlmostEqual(run.clock_step, step)
+                    self.assertFalse(any(run.observable.values()))
+                    self.assertEqual(run.outcomes, {})
+                    self.assertNotIn('observe', driver.order)
+                    if step > 0:
+                        trial = Trial(submitted=run.submitted_at, outcomes=run.outcomes)
+                        self.assertEqual(classify_trial(trial, clock.time(), supported=run.supported,
+                                                        observable=run.observable),
+                                         dict.fromkeys(OUTCOME_NAMES, 'unobservable'))
+
     def test_a_wall_clock_correction_during_polling_makes_the_whole_trial_unobservable(self):
         # Every compared stamp is wall time, so a correction moves host events relative to their
         # windows -- a +60s step alone turns a reply 2s after submission into one 62s after it,
