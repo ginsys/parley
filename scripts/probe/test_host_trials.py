@@ -831,6 +831,17 @@ def claude_entry(short='69aa52ed', *, pid=4242, status='idle', state='done', cwd
 
 
 class ClaudeDriverTests(DriverTestCase):
+    def test_claude_transcript_removed_between_discovery_and_stat_is_unobservable(self):
+        driver = self.driver(FakeRun([
+            (['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+            (['claude', 'agents'], listing([claude_entry()]))]),
+            transcript_path_for=host_trials.default_claude_transcript_path)
+        driver.create('hello')
+        with unittest.mock.patch.object(host_trials.glob, 'glob', return_value=['synthetic-transcript']), \
+                unittest.mock.patch.object(os.path, 'getmtime', side_effect=FileNotFoundError):
+            self.assertFalse(driver.observe('69aa52ed', marker=MARKER, submitted_at=0).observable)
+            self.assertIsNone(driver.version('69aa52ed'))
+
     def driver(self, run, **kwargs):
         kwargs.setdefault('transcript_path_for', self.transcript_path_for)
         kwargs.setdefault('pty', FakePtyClient)

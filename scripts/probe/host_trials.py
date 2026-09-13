@@ -909,7 +909,11 @@ def default_claude_transcript_path(session_uuid):
     """Newest `$HOME/.claude/projects/*/<sessionId>.jsonl`; the directory slug is not relied on."""
     matches = glob.glob(os.path.join(os.path.expanduser('~'), '.claude', 'projects', '*',
                                      f'{session_uuid}.jsonl'))
-    return max(matches, key=os.path.getmtime) if matches else None
+    try:
+        return max(matches, key=os.path.getmtime) if matches else None
+    except OSError:
+        # A candidate can disappear between discovery and stat; retry on a later poll.
+        return None
 
 
 class ClaudeDriver(Driver):

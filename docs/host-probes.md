@@ -286,7 +286,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   callbacks. Every listing row must be a background-session object with nonempty string
   identity/state fields and an explicit `pid` that is null or a positive integer. Malformed rows,
   duplicate IDs and missing PIDs fail the listing; they never prove that a session is absent or
-  stopped and cannot authorize `rm` after a failed `stop`. `observe()` reads the session's own transcript
+  stopped and cannot authorize `rm` after a failed `stop`. A transcript candidate disappearing
+  between discovery and stat makes that read unobservable; later polls retry discovery and a
+  version read remains unknown. Identity-binding/listing failures remain fatal lifecycle errors.
+  `observe()` reads the session's own transcript
   (`$HOME/.claude/projects/*/<sessionId>.jsonl`): `user` records carry a string `content`,
   `assistant` records a list of typed parts, both a UTC ISO `timestamp`. Those shapes are
   enforced per role — an assistant string or a user part list is a changed transcript and counts
