@@ -3217,6 +3217,34 @@ class SweepTests(unittest.TestCase):
 
 
 class RunTrialWithCleanupTests(unittest.TestCase):
+    def test_interrupt_after_successful_trial_return_still_sweeps(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock)
+        returned = False
+        original_run = host_trials.run_trial
+
+        def completed(*args, **kwargs):
+            nonlocal returned
+            result = original_run(*args, **kwargs)
+            returned = True
+            return result
+
+        def interrupt_handoff(frame, event, arg):
+            if returned and event == 'line' and frame.f_code is run_trial_with_cleanup.__code__:
+                raise KeyboardInterrupt
+            return interrupt_handoff
+
+        previous_trace = sys.gettrace()
+        try:
+            with unittest.mock.patch.object(host_trials, 'run_trial', completed):
+                sys.settrace(interrupt_handoff)
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_one(driver, clock)
+        finally:
+            sys.settrace(previous_trace)
+        self.assertEqual(driver.torn_down, ['sid'])
+        self.assertEqual(driver.owned(), set())
+
     def run_one(self, driver, clock, **kwargs):
         return run_trial_with_cleanup(driver, prompt='hi', marker=MARKER, clock=clock.time,
                                       monotonic=clock.monotonic, sleep=clock.sleep, **kwargs)

@@ -55,6 +55,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -2506,16 +2507,15 @@ def run_trial_with_cleanup(driver, **kwargs):
     """
     try:
         run = run_trial(driver, **kwargs)
-    except BaseException as error:
+        return run
+    finally:
+        error = sys.exception()
         failures = sweep(driver)
-        if failures or driver.owned():
+        if error is not None and (failures or driver.owned()):
             error.add_note(f'cleanup after the failed trial: failures={failures!r}; '
                            f'still owned: {sorted(driver.owned())}')
-        raise
-    failures = sweep(driver)
-    if failures:
-        raise CleanupFailed(run, failures, sorted(driver.owned()))
-    return run
+        elif error is None and failures:
+            raise CleanupFailed(run, failures, sorted(driver.owned()))
 
 
 def classify_trial(trial, now, *, supported=None, observable=None):
