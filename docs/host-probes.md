@@ -211,7 +211,13 @@ symlink, at `.git` itself or at any path beneath it: a link is followed by the v
 read the directory, so the freshness checks would describe a store the probe directory does not
 hold, and `git init` leaves none for a legitimate one to be mistaken for. All three are
 refused, because each would hand the authenticated hosts real history and configuration under
-a directory whose emptiness is the whole precondition.
+a directory whose emptiness is the whole precondition. Hooks must be regular `.sample` files;
+active hooks are refused. Configuration must contain only the fresh Linux `[core]` baseline:
+`repositoryformatversion = 0`, boolean `filemode`, `bare = false`, and `logallrefupdates = true`,
+each once. Includes, extra sections or keys and modified values are refused. A fixture runs real
+`git init` to check that this baseline still matches the installed Git. Drivers validate the same
+directory independently; they do not initialize it themselves. This keeps repeated driver
+construction compatible without trusting repository settings that could execute commands.
 
 Cleanup is part of the module, not left to a caller: `run_trial_with_cleanup()` is the entry
 point real trials use. It runs `run_trial()` and, on every exit path, `sweep()`s the driver:

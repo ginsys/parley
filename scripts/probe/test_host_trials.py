@@ -863,6 +863,29 @@ class ClaudeDriverTests(DriverTestCase):
         with self.assertRaises(ValueError):
             self.driver(FakeRun([]))
 
+    def test_a_git_directory_with_non_initial_configuration_is_refused(self):
+        self.git('init', '--quiet', self.cwd)
+        config = os.path.join(self.cwd, '.git', 'config')
+        with open(config) as handle:
+            baseline = handle.read()
+        for extra in ('\tfsmonitor = synthetic-command\n', '\thooksPath = elsewhere\n',
+                      '\tpager = synthetic-command\n', '[include]\n\tpath = elsewhere\n',
+                      '[alias]\n\tx = !synthetic-command\n',
+                      '[filter "x"]\n\tclean = synthetic-command\n',
+                      '\tbare = true\n', '\trepositoryformatversion = 1\n'):
+            with self.subTest(extra=extra):
+                with open(config, 'w') as handle:
+                    handle.write(baseline + extra)
+                with self.assertRaises(ValueError):
+                    self.driver(FakeRun([]))
+
+    def test_a_git_directory_with_an_active_hook_is_refused(self):
+        self.git('init', '--quiet', self.cwd)
+        with open(os.path.join(self.cwd, '.git', 'hooks', 'pre-commit'), 'w') as handle:
+            handle.write('#!/bin/sh\nexit 0\n')
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
+
     def test_a_git_file_pointing_at_another_store_is_refused(self):
         # A linked worktree or a submodule: the store, and everything in it, lives elsewhere.
         with open(os.path.join(self.cwd, '.git'), 'w') as handle:

@@ -542,6 +542,31 @@ class PtyClient:
 
 # --- Driver base --------------------------------------------------------------------------------
 
+def initial_git_config(text):
+    """Accept only the plain core settings written by a fresh Linux `git init`.
+
+    This deliberately recognizes a narrow baseline, not the Git configuration language: no
+    includes, subsections, continuations or executable settings. A real-git fixture checks the
+    baseline rather than assuming the installed Git still produces it.
+    """
+    lines = text.strip().splitlines()
+    if not lines or lines.pop(0).strip() != '[core]':
+        return False
+    allowed = {'repositoryformatversion': {'0'}, 'filemode': {'true', 'false'},
+               'bare': {'false'}, 'logallrefupdates': {'true'}}
+    seen = set()
+    for line in lines:
+        match = re.fullmatch(r'[ \t]*([a-zA-Z]+)[ \t]*=[ \t]*([a-z0-9]+)[ \t]*', line)
+        if match is None:
+            return False
+        key, value = match.groups()
+        key = key.lower()
+        if key in seen or value not in allowed.get(key, set()):
+            return False
+        seen.add(key)
+    return seen == allowed.keys()
+
+
 def unfresh_git_reason(path):
     """Why `<path>/.git` is not the history-free repository `git init` leaves, or None.
 
@@ -572,6 +597,22 @@ def unfresh_git_reason(path):
     for root, _directories, files in os.walk(os.path.join(git, 'refs')):
         if files:
             return f'`{os.path.join(root, sorted(files)[0])}` exists'
+    hooks = os.path.join(git, 'hooks')
+    if os.path.exists(hooks):
+        if not os.path.isdir(hooks):
+            return '`.git/hooks` is not a directory'
+        for entry in sorted(os.listdir(hooks)):
+            if not entry.endswith('.sample') or not os.path.isfile(os.path.join(hooks, entry)):
+                return f'`.git/hooks/{entry}` is not a sample hook'
+    config = os.path.join(git, 'config')
+    if not os.path.isfile(config):
+        return '`.git/config` is not a regular file'
+    try:
+        with open(config, encoding='ascii') as handle:
+            if not initial_git_config(handle.read()):
+                return '`.git/config` differs from the fresh core configuration'
+    except (OSError, UnicodeError):
+        return '`.git/config` could not be read as fresh core configuration'
     objects = os.path.join(git, 'objects')
     for entry in sorted(os.listdir(objects)) if os.path.isdir(objects) else ():
         if entry not in ('info', 'pack'):
