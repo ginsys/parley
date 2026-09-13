@@ -346,6 +346,25 @@ class ClaudeParsingTests(unittest.TestCase):
 
 
 class CodexParsingTests(unittest.TestCase):
+    def test_transcript_discovery_rejects_non_uuid_ids_before_globbing(self):
+        for lookup in (host_trials.default_codex_rollout_path, host_trials.default_claude_transcript_path):
+            for session_id in ('*', '../*', '--help', THREAD_ID + '[ab]'):
+                with self.subTest(lookup=lookup.__name__, session_id=session_id):
+                    with unittest.mock.patch.object(host_trials.glob, 'glob', return_value=['foreign-path']) as globber, \
+                            unittest.mock.patch.object(os.path, 'getmtime', return_value=1):
+                        self.assertIsNone(lookup(session_id))
+                        globber.assert_not_called()
+
+    def test_codex_home_metacharacters_remain_literal_during_discovery(self):
+        with tempfile.TemporaryDirectory(prefix='parley[owned]-') as home:
+            directory = os.path.join(home, 'sessions', '2026', '09', '13')
+            os.makedirs(directory)
+            path = os.path.join(directory, f'rollout-synthetic-{THREAD_ID}.jsonl')
+            with open(path, 'w') as handle:
+                handle.write('{}\n')
+            with unittest.mock.patch.dict(os.environ, {'CODEX_HOME': home}):
+                self.assertEqual(host_trials.default_codex_rollout_path(THREAD_ID), path)
+
     def test_thread_ids_come_from_thread_started_events(self):
         stdout = '\n'.join([json.dumps({'type': 'thread.started', 'thread_id': THREAD_ID}),
                             json.dumps({'type': 'turn.started'}), 'not json'])
@@ -1443,6 +1462,16 @@ def rollout_lines(*, cli_version='0.154.0', messages=()):
 
 
 class CodexDriverTests(DriverTestCase):
+    def test_codex_creation_never_mints_a_non_uuid_thread_id(self):
+        for thread_id in ('*', '../*', '--help', 'not-a-uuid'):
+            with self.subTest(thread_id=thread_id):
+                self.registry = SessionRegistry()
+                output = json.dumps({'type': 'thread.started', 'thread_id': thread_id})
+                driver = self.driver(FakeRun([(['codex', 'exec'], FakeResult(0, output))]))
+                with self.assertRaisesRegex(RuntimeError, 'UUID'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), set())
+
     def driver(self, run, **kwargs):
         kwargs.setdefault('rollout_path_for', self.transcript_path_for)
         kwargs.setdefault('pty', FakePtyClient)

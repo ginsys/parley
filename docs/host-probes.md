@@ -285,7 +285,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   error, with the session left owned for the sweep. `status(id)`
   returns the owned entry from that listing (`pid`, `status`, `state`, `sessionId`) for settle
   callbacks. Every listing row must be a background-session object with nonempty string
-  identity/state fields and an explicit `pid` that is null or a positive integer. Malformed rows,
+  identity/state fields and an explicit `pid` that is null or a positive integer. Short IDs must
+  have the captured eight-hex-digit shape and full IDs the lowercase hyphenated UUID shape. Malformed rows,
   duplicate IDs and missing PIDs fail the listing; they never prove that a session is absent or
   stopped and cannot authorize `rm` after a failed `stop`. A transcript candidate disappearing
   between discovery and stat makes that read unobservable; later polls retry discovery and a
@@ -346,7 +347,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   timeout output, and returns once the turn ends. Multiple distinct creation IDs grant no
   ownership; every candidate is reported for investigation without deletion authority. Malformed
   JSON, non-object records and unusable `thread.started` records fail creation even if another
-  event names a valid thread; its unique creation ID remains owned for cleanup. The thread is
+  event names a valid thread; its unique creation ID remains owned for cleanup. Codex creation IDs
+  must have the captured lowercase hyphenated UUID shape before any ownership is granted. Both
+  Codex and Claude transcript lookups reject non-UUID IDs and escape literal home/ID components
+  before globbing, so metacharacters cannot select another session's transcript. The thread is
   then idle with no live process. A rollout that disappears between discovery and its metadata
   read makes that poll unobservable and its version unknown; later polls retry discovery.
   `observe()` reads the rollout

@@ -910,10 +910,18 @@ def claude_session_version(lines):
     return versions.pop() if len(versions) == 1 else None
 
 
+def is_session_uuid(value):
+    """The lowercase hyphenated UUID shape captured for Claude and Codex session IDs."""
+    return isinstance(value, str) and re.fullmatch(
+        r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', value) is not None
+
+
 def default_claude_transcript_path(session_uuid):
     """Newest `$HOME/.claude/projects/*/<sessionId>.jsonl`; the directory slug is not relied on."""
-    matches = glob.glob(os.path.join(os.path.expanduser('~'), '.claude', 'projects', '*',
-                                     f'{session_uuid}.jsonl'))
+    if not is_session_uuid(session_uuid):
+        return None
+    root = glob.escape(os.path.join(os.path.expanduser('~'), '.claude', 'projects'))
+    matches = glob.glob(os.path.join(root, '*', f'{glob.escape(session_uuid)}.jsonl'))
     try:
         return max(matches, key=os.path.getmtime) if matches else None
     except OSError:
@@ -972,6 +980,8 @@ class ClaudeDriver(Driver):
             if (not isinstance(entry, dict) or 'pid' not in entry or
                     any(not isinstance(entry.get(key), str) or not entry[key]
                         for key in ('id', 'kind', 'sessionId', 'state')) or
+                    re.fullmatch(r'[0-9a-f]{8}', entry['id']) is None or
+                    not is_session_uuid(entry['sessionId']) or
                     entry['kind'] != 'background' or entry['id'] in seen or
                     (entry['pid'] is not None and
                      (type(entry['pid']) is not int or entry['pid'] <= 0))):
@@ -1455,8 +1465,11 @@ def codex_rollout_events(lines):
 
 def default_codex_rollout_path(thread_id):
     """Newest `$CODEX_HOME/sessions/*/*/*/rollout-*-<thread_id>.jsonl` (`~/.codex` by default)."""
+    if not is_session_uuid(thread_id):
+        return None
     home = os.environ.get('CODEX_HOME') or os.path.join(os.path.expanduser('~'), '.codex')
-    matches = glob.glob(os.path.join(home, 'sessions', '*', '*', '*', f'rollout-*-{thread_id}.jsonl'))
+    root = glob.escape(os.path.join(home, 'sessions'))
+    matches = glob.glob(os.path.join(root, '*', '*', '*', f'rollout-*-{glob.escape(thread_id)}.jsonl'))
     try:
         return max(matches, key=os.path.getmtime) if matches else None
     except OSError:
@@ -1492,6 +1505,9 @@ class CodexDriver(Driver):
 
     def _created_thread(self, stdout):
         thread_ids, unusable = codex_thread_ids(stdout)
+        if any(not is_session_uuid(thread_id) for thread_id in thread_ids):
+            self.strays.update(thread_ids)
+            raise RuntimeError('Codex creation named an invalid UUID; no ownership granted')
         if len(thread_ids) > 1:
             self.strays.update(thread_ids)
             raise RuntimeError(f'ambiguous Codex creation IDs {list(thread_ids)!r}; '
