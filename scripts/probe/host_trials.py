@@ -1843,9 +1843,10 @@ def opencode_export_events(raw):
             unusable += 1
             continue
         texts = []
+        part_types = ('text',) if role == 'user' else ('text', 'step-start', 'reasoning', 'step-finish')
         for part in parts:
             if (not isinstance(part, dict) or
-                    part.get('type') not in ('text', 'step-start', 'reasoning', 'step-finish')):
+                    part.get('type') not in part_types):
                 texts = None
                 break
             if part.get('type') != 'text':

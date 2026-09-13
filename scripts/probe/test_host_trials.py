@@ -571,6 +571,15 @@ def opencode_message(role, parts, created_ms, **info):
 
 
 class OpenCodeParsingTests(unittest.TestCase):
+    def test_assistant_only_parts_cannot_make_user_messages_observable(self):
+        for kind in ('reasoning', 'step-start', 'step-finish'):
+            for role in ('user', 'assistant'):
+                with self.subTest(kind=kind, role=role):
+                    raw = opencode_export([opencode_message(role, [{'type': kind, 'text': MARKER}], 1000000)])
+                    events, unusable = opencode_export_events(raw)
+                    self.assertEqual(unusable, 1 if role == 'user' else 0)
+                    self.assertEqual(len(events), 0 if role == 'user' else 1)
+
     def test_present_event_parts_require_a_usable_matching_session_identity(self):
         for part in (None, [], {}, {'sessionID': None}, {'sessionID': ''}, {'sessionID': 7}):
             with self.subTest(part=part):

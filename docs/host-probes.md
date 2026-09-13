@@ -514,8 +514,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   each message's `sessionID`, and each part's `sessionID` must name the owned session; each
   part's `messageID` must name its enclosing message, whose ID must be nonempty and unique.
   A missing or inconsistent binding makes the whole export unreadable, with no outcomes,
-  model or version taken from it. Only the captured `text`, `step-start`, `reasoning` and `step-finish` part types
-  are accepted. Untyped, malformed and unknown parts make their message unusable; an unparseable
+  model or version taken from it. User messages accept only captured `text` parts; assistant
+  messages also accept `step-start`, `reasoning` and `step-finish`. Untyped, malformed,
+  role-incompatible and unknown parts make their message unusable; an unparseable
   or malformed document is unobservable. `teardown()` is
   `opencode --pure session delete <id>`. The server is closed by the sweep after teardown.
 
