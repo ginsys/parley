@@ -750,8 +750,7 @@ class ClaudeDriverTests(DriverTestCase):
 
     def test_status_and_teardown_refuse_a_foreign_id(self):
         driver = self.driver(FakeRun([(['claude', 'agents'], listing([claude_entry('deadbeef')]))]))
-        for method in (driver.status, driver.teardown, driver.version, driver.attach
-                       if hasattr(driver, 'attach') else driver.status):
+        for method in (driver.status, driver.stop, driver.teardown, driver.version):
             with self.assertRaises(ForeignSessionError):
                 method('deadbeef')
         with self.assertRaises(ForeignSessionError):
@@ -903,6 +902,57 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(driver.owned(), set())
         self.assertEqual([call[:2] for call, _ in run.calls[2:]],
                           [['claude', 'stop'], ['claude', 'agents'], ['claude', 'rm']])
+
+    def test_stop_confirms_through_the_listing_and_keeps_the_session_owned(self):
+        listings = iter([listing([claude_entry()]), listing([claude_entry(pid=None, status=None)])])
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], lambda argv: next(listings)),
+                       (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        entry = driver.stop('69aa52ed')
+        self.assertIsNone(entry['pid'])
+        self.assertEqual(run.argv('claude', 'stop'), [['claude', 'stop', '69aa52ed']])
+        self.assertEqual(run.argv('claude', 'rm'), [])
+        self.assertEqual(driver.owned(), {'69aa52ed'})  # the restarted cell resumes it next
+
+    def test_stop_is_an_error_when_the_pid_survives_whatever_the_exit_status(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([claude_entry()])),
+                       (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        with self.assertRaises(RuntimeError):
+            driver.stop('69aa52ed')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_the_restarted_cell_is_stop_then_a_flagless_resume(self):
+        listings = iter([listing([claude_entry()]), listing([claude_entry(pid=None, status=None)])])
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], lambda argv: next(listings, listing([claude_entry(pid=None, status=None)]))),
+                       (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        driver.stop('69aa52ed')  # the settle callback
+        self.assertTrue(driver.submit('69aa52ed', 'msg'))
+        self.assertEqual([call[:3] for call, _ in run.calls],
+                          [['claude', '--bg', '--model'], ['claude', 'agents', '--json'],
+                           ['claude', 'stop', '69aa52ed'], ['claude', 'agents', '--json'],
+                           ['claude', 'agents', '--json'], ['claude', '--bg', '--resume']])
+
+    def test_teardown_tolerates_a_nonzero_stop_against_an_already_stopped_session(self):
+        # The restarted cell's session is stopped before the sweep reaches it; the listing, not
+        # `stop`'s exit status, is what gates `rm`.
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([claude_entry(pid=None, status=None)])),
+                       (['claude', 'stop'], FakeResult(1, '', 'not running')),
+                       (['claude', 'rm'], FakeResult(0, 'removed 69aa52ed\n'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.teardown('69aa52ed')
+        self.assertEqual(run.argv('claude', 'rm'), [['claude', 'rm', '69aa52ed']])
+        self.assertEqual(driver.owned(), set())
 
     def test_teardown_never_runs_rm_while_the_daemon_still_has_a_pid(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),

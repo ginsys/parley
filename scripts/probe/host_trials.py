@@ -891,19 +891,31 @@ class ClaudeDriver(Driver):
                                 f'{seen}; screen at type time: {screen_at_type!r}')
         return None
 
-    def teardown(self, session_id):
-        """`claude stop <id>` then `claude rm <id>`; release only after a confirmed removal.
+    def stop(self, session_id):
+        """`claude stop <id>` for an owned id, confirmed through the listing; no `rm`, no release.
 
-        Every captured `rm` followed a successful `stop`; `rm` against a running daemon is
-        uncaptured, so after `stop` the listing must show the entry gone or `pid` null before
-        `rm` runs -- otherwise ownership is retained and the live daemon reported. `stop`'s own
-        nonzero exit is tolerated (a restarted-cell session is already stopped).
+        The settle step of the restarted cell (captured: exit 0, `stopped <id>`, then the listing
+        shows `pid: null, status: null, state: "done"`), and the first half of `teardown`. The
+        listing, not the exit status, decides: a nonzero exit against an already-stopped session
+        is tolerated, a surviving `pid` is an error whatever the exit status said. Returns the
+        listing entry afterwards (None once removed).
         """
         self.registry.require_owned(self._key(session_id))
-        self.run(['claude', 'stop', session_id], capture_output=True, text=True, timeout=15)
+        result = self.run(['claude', 'stop', session_id], capture_output=True, text=True, timeout=15)
         entry = self.status(session_id)
         if entry is not None and entry.get('pid') is not None:
-            raise RuntimeError(f'claude stop left {session_id} running (pid {entry["pid"]}); retained')
+            raise RuntimeError(f'claude stop exited {result.returncode} and left {session_id} running '
+                               f'(pid {entry["pid"]}): {result.stderr}')
+        return entry
+
+    def teardown(self, session_id):
+        """`stop()` then `claude rm <id>`; release only after a confirmed removal.
+
+        Every captured `rm` followed a successful `stop`; `rm` against a running daemon is
+        uncaptured, so `stop()`'s listing check must pass before `rm` runs -- otherwise
+        ownership is retained and the live daemon reported.
+        """
+        self.stop(session_id)
         result = self.run(['claude', 'rm', session_id], capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             raise RuntimeError(f'claude rm exited {result.returncode} for {session_id}: {result.stderr}')
@@ -1601,9 +1613,9 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     caller-supplied value is validated for shape only.
 
     `settle` establishes the requested `state` (busy/approval/disconnected/restarted) before
-    submission, through the driver's own methods (`attach`, `status`, `submit`) so every session
-    it touches is owned -- a settle that runs `claude --bg --resume <flags>` itself would start a
-    copy nothing mints. It receives `session_id`; omitting it for any non-`idle` state raises
+    submission, through the driver's own methods (`attach`, `status`, `stop`, `submit`) so every
+    session it touches is owned -- a settle that runs `claude --bg --resume <flags>` itself would
+    start a copy nothing mints. It receives `session_id`; omitting it for any non-`idle` state raises
     `ValueError` before any session exists.
 
     `submit()`'s result drives acceptance: `True` is accepted, stamped when `submit` *returns*
