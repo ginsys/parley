@@ -756,7 +756,7 @@ incidents keep the global gate closed. `recovery.complete` follows the same two-
 After a reviewed ingestion advance, remaining pending events must form reachable edges from the
 new cursor boundary. Disconnected evidence rejects the interval rather than guessing the order of
 opaque cursors; up to 1000 remaining pending events are inspected, with capacity failure above it.
-An empty interval advances nothing and can leave pending evidence for ordinary retry.
+An empty interval advances nothing and can leave a single reachable pending chain for ordinary retry.
 For both operations and `ingestion.resume`, only an explicit host-verification mismatch retains
 a terminal evidence rejection. Provider failures, cancellation and evidence deadlines leave no
 receipt or business effect, so the same operation ID can retry after evidence becomes available.
@@ -803,8 +803,9 @@ Startup settlement of interrupted dispatch now uses the coordinator: it rechecks
 the initial runtime inspection and again at writer time, and records the trusted timestamp.
 A newly detected rollback or restore hold leaves the dispatching rows and attempt evidence intact.
 
-An audited empty resume that establishes the first cursor must also validate pending source
-identity and edge reachability; no-advance replay of an existing cursor remains unchanged.
+Every audited resume, including an empty interval at an existing cursor, validates pending
+source identity and edge reachability. Branching pending edges fail closed because ordinary
+ingestion cannot choose between events with the same predecessor.
 Clock rollback observations enter the held pending queue before incident-ID generation. If that
 generation fails, fail-stop still applies and the original floor/observed pair remains available
 for supervised retry; corrected wall time cannot erase the pending observation.
@@ -826,3 +827,14 @@ reference already exists; the successful no-op session fence still runs. New pen
 and terminal event classifications remain durable changes. Origin/ingestion verifier outages,
 unknown provider failures and cancellation return `temporarily_unavailable`; only an explicit
 host-verification mismatch returns `host_unverified`, after the independent expiry/session check.
+
+Marker listing can recover a fully encoded pending publication after a crash: it validates the
+private file and canonical marker contents, syncs the file, and promotes it without replacement.
+An existing destination must match exactly; incomplete, unsafe or conflicting files remain held.
+The directory is synced before successful listing, including retries after a failed promotion
+sync. No evidence is discarded and promotion alone never clears a recovery incident. Failure to make
+a promotion durable invokes the same supervisor fail-stop contract as ordinary marker publication.
+Missing incidents in `clock.reconcile` and `recovery.complete` retain audited terminal `not_found`
+results. Creating the incident later cannot change the same operation ID's result. An incident
+appearing between clock preflight and the mutation writer instead requires a fresh verification
+attempt without committing a receipt.

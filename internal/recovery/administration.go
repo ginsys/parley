@@ -69,19 +69,23 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 		return a.finish(prior, r.IncidentID, r.ExpectedClockVersion, r.TimeEvidenceRef)
 	}
 	var record store.RecoveryRecord
-	if err := coordinator.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	recordErr := coordinator.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		if err := a.config.Authorize(ctx, tx, p); err != nil {
 			return err
 		}
 		var err error
 		record, err = store.ReadRecovery(ctx, tx, r.IncidentID)
 		return err
-	}); err != nil {
-		return store.CommandReceipt{}, err
+	})
+	if recordErr != nil && !errors.Is(recordErr, store.NotFound) {
+		return store.CommandReceipt{}, recordErr
 	}
+	missing := errors.Is(recordErr, store.NotFound)
 	var evidenceErr error
 	var first, second int64
-	if record.Kind != "clock" {
+	if missing {
+		evidenceErr = store.NotFound
+	} else if record.Kind != "clock" {
 		evidenceErr = store.InvalidRequest
 	} else if record.Version != r.ExpectedClockVersion || record.Status != "held" {
 		evidenceErr = store.VersionConflict
@@ -114,8 +118,16 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 			return store.CommandResult{}, err
 		}
 		current, err := store.ReadRecovery(ctx, tx, r.IncidentID)
+		if errors.Is(err, store.NotFound) {
+			return rejection(store.NotFound)
+		}
 		if err != nil {
 			return store.CommandResult{}, err
+		}
+		// A concurrently appearing incident needs a fresh verification attempt;
+		// absence is terminal only when confirmed under the mutation writer.
+		if missing {
+			return store.CommandResult{}, store.TemporarilyUnavailable
 		}
 		if current.Version != r.ExpectedClockVersion {
 			return rejection(store.VersionConflict)
@@ -194,7 +206,7 @@ func (a *Administration) finish(receipt store.CommandReceipt, id string, origina
 	if !record.Evidence.Valid || record.Evidence.String != evidence || !((record.Status == "reconciled" && record.Version == reconciled) || (record.Status == "cleared" && record.Version == cleared)) {
 		return receipt, store.RecoveryRequired
 	}
-	markers, err := s.config.Markers.List(ctx)
+	markers, err := s.listMarkers(ctx)
 	if err != nil {
 		return receipt, store.RecoveryRequired
 	}
@@ -214,7 +226,7 @@ func (a *Administration) finish(receipt store.CommandReceipt, id string, origina
 	}, nil); err != nil {
 		return receipt, err
 	}
-	markers, err = s.config.Markers.List(ctx)
+	markers, err = s.listMarkers(ctx)
 	if err != nil {
 		return receipt, store.RecoveryRequired
 	}

@@ -69,6 +69,9 @@ func (a *RestoreAdministration) Complete(ctx context.Context, p store.CommandPri
 			return store.CommandResult{}, err
 		}
 		record, err := store.ReadRecovery(ctx, tx, r.IncidentID)
+		if errors.Is(err, store.NotFound) {
+			return rejection(store.NotFound)
+		}
 		if err != nil {
 			return store.CommandResult{}, err
 		}

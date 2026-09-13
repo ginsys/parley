@@ -96,10 +96,8 @@ func ResumeIngestion(ctx context.Context, tx *sql.Tx, r ResumeIngestionRequest) 
 	if cursor != r.Interval.After {
 		return ResourceChange{}, InvalidRequest
 	}
-	if len(r.Interval.Events) > 0 || initializing {
-		if err := pendingAfterResume(ctx, tx, b.ID, source, cursor); err != nil {
-			return ResourceChange{}, err
-		}
+	if err := pendingAfterResume(ctx, tx, b.ID, source, cursor); err != nil {
+		return ResourceChange{}, err
 	}
 	// Pending events at the resume boundary may be retried afterwards; events in
 	// the reviewed interval have permanent held results and cannot be accepted.
@@ -121,7 +119,7 @@ func ResumeIngestion(ctx context.Context, tx *sql.Tx, r ResumeIngestionRequest) 
 // Opaque cursors cannot be sorted. After a reviewed advance, every remaining
 // pending edge must be reachable from the new boundary; otherwise the interval
 // may have jumped over retained evidence. Disconnected evidence needs a fuller
-// reviewed interval. No-advance resumes do not cross any pending work.
+// reviewed interval. Even an empty resume must leave processable evidence.
 func pendingAfterResume(ctx context.Context, tx *sql.Tx, binding, source, cursor string) error {
 	var otherSource bool
 	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM ingestion_evidence WHERE binding_id=? AND classification='pending' AND source_id!=?)", binding, source).Scan(&otherSource); err != nil {
@@ -146,6 +144,9 @@ func pendingAfterResume(ctx context.Context, tx *sql.Tx, binding, source, cursor
 		count++
 		if count > 1000 {
 			return CapacityExceeded
+		}
+		if len(edges[before]) != 0 {
+			return EventConflict
 		}
 		edges[before] = append(edges[before], after)
 	}

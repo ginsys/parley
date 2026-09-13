@@ -60,3 +60,10 @@ type Markers interface {
 	Put(context.Context, Marker) error
 	Remove(context.Context, Marker) error
 }
+
+// markerPublicationFailure preserves the fixed public code while telling the
+// owning service that interrupted-publication recovery requires fail-stop.
+type markerPublicationFailure struct{}
+
+func (markerPublicationFailure) Error() string { return string(store.TemporarilyUnavailable) }
+func (markerPublicationFailure) Unwrap() error { return store.TemporarilyUnavailable }

@@ -62,6 +62,9 @@ func (d *Directory) open() (int, error) {
 	return fd, nil
 }
 func (d *Directory) read(fd int, id string) (Marker, error) {
+	return d.readFile(fd, id, id, false)
+}
+func (d *Directory) readFile(fd int, id, expected string, synchronize bool) (Marker, error) {
 	fileFD, err := unix.Openat(fd, id, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return Marker{}, store.NotFound
@@ -80,12 +83,39 @@ func (d *Directory) read(fd int, id string) (Marker, error) {
 		return Marker{}, store.RecoveryRequired
 	}
 	var marker Marker
-	if err := json.Unmarshal(data, &marker); err != nil || !marker.valid() || marker.IncidentID != id {
+	if err := json.Unmarshal(data, &marker); err != nil || !marker.valid() || (expected != "" && marker.IncidentID != expected) {
 		return Marker{}, store.RecoveryRequired
 	}
 	canonical, err := marker.encode()
 	if err != nil || !bytes.Equal(canonical, data) {
 		return Marker{}, store.RecoveryRequired
+	}
+	if synchronize {
+		if err := file.Sync(); err != nil {
+			return Marker{}, markerPublicationFailure{}
+		}
+	}
+	return marker, nil
+}
+
+// promotePending preserves complete interrupted publications. Invalid or
+// conflicting staging files remain untouched and keep recovery held.
+func (d *Directory) promotePending(fd int, name string) (Marker, error) {
+	marker, err := d.readFile(fd, name, "", true)
+	if err != nil {
+		return Marker{}, err
+	}
+	err = unix.Renameat2(fd, name, fd, marker.IncidentID, unix.RENAME_NOREPLACE)
+	if errors.Is(err, unix.EEXIST) {
+		existing, readErr := d.read(fd, marker.IncidentID)
+		if readErr != nil || !sameMarker(existing, marker) {
+			return Marker{}, store.RecoveryRequired
+		}
+		if err := unix.Unlinkat(fd, name, 0); err != nil {
+			return Marker{}, markerPublicationFailure{}
+		}
+	} else if err != nil {
+		return Marker{}, markerPublicationFailure{}
 	}
 	return marker, nil
 }
@@ -97,6 +127,7 @@ func (d *Directory) List(ctx context.Context) ([]Marker, error) {
 	file := os.NewFile(uintptr(fd), d.path)
 	defer file.Close()
 	var markers []Marker
+	seen := map[string]bool{}
 	for {
 		if ctx.Err() != nil {
 			return nil, store.TemporarilyUnavailable
@@ -106,21 +137,35 @@ func (d *Directory) List(ctx context.Context) ([]Marker, error) {
 			return nil, store.RecoveryRequired
 		}
 		for _, name := range names {
-			if !canonicalID(name) {
+			var marker Marker
+			var readErr error
+			if strings.HasPrefix(name, ".pending-") && canonicalID(strings.TrimPrefix(name, ".pending-")) {
+				marker, readErr = d.promotePending(fd, name)
+			} else if canonicalID(name) {
+				marker, readErr = d.read(fd, name)
+			} else {
 				return nil, store.RecoveryRequired
+			}
+			if readErr != nil {
+				return nil, readErr
+			}
+			if seen[marker.IncidentID] {
+				continue
 			}
 			if len(markers) >= d.capacity {
 				return nil, store.CapacityExceeded
 			}
-			marker, err := d.read(fd, name)
-			if err != nil {
-				return nil, err
-			}
+			seen[marker.IncidentID] = true
 			markers = append(markers, marker)
 		}
 		if err == io.EOF {
 			break
 		}
+	}
+	// Also retries a prior promotion whose rename succeeded but directory sync
+	// failed; the next listing may contain only its canonical name.
+	if err := d.syncDirectory(fd); err != nil {
+		return nil, markerPublicationFailure{}
 	}
 	sort.Slice(markers, func(i, j int) bool { return markers[i].IncidentID < markers[j].IncidentID })
 	return markers, nil
