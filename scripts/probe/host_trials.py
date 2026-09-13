@@ -1667,6 +1667,13 @@ class OpenCodeDriver(Driver):
         `SubmissionUncaptured` whatever the exit status said, and a nonzero exit against a serve
         child that has died is this runner's failure rather than a host rejection.
 
+        An exit-zero stream must also *name the session it was aimed at*. The captured attach
+        emitted a `step_start` event carrying its `sessionID`, so a stream naming a different id
+        -- or naming none at all -- is not evidence that this session received the marker: the
+        trial would poll the requested session, find no marker and record `not_observed` for a
+        host that was never asked. Either shape is `SubmissionUncaptured`, and a different id is
+        minted first so the sweep deletes whatever the run actually wrote to.
+
         A timeout is checked the same way. `run --attach` hanging until its own timeout is what a
         `serve` child dying under it looks like, and `run_trial` reads a bare `TimeoutExpired` as
         "may have delivered" -- it would poll the export, which is readable independently of the
@@ -1692,7 +1699,11 @@ class OpenCodeDriver(Driver):
                     f'run --attach timed out against a serve child that had exited '
                     f'{self.server.process.returncode}') from error
             raise
-        _, event_error = opencode_session_id(result.stdout)
+        attached_id, event_error = opencode_session_id(result.stdout)
+        if attached_id is not None and attached_id != session_id:
+            # Minted before anything is raised, exactly as `create()` does: a session this run
+            # caused to exist must be in `owned()` whatever happens next.
+            self.registry.mint(self._key(attached_id))
         if result.returncode != 0:
             if self.server.process.poll() is not None:
                 # A dead server is this runner's failure, not the host refusing the message.
@@ -1706,6 +1717,10 @@ class OpenCodeDriver(Driver):
             # alone would record that as accepted and later attribute the absent transcript
             # outcomes to the host. Whether the message reached the session at all is uncaptured.
             raise SubmissionUncaptured(f'run --attach exited 0 but reported an error event: {event_error}')
+        if attached_id != session_id:
+            raise SubmissionUncaptured(
+                f'run --attach exited 0 but its events named {attached_id!r}, not {session_id}; '
+                f'where the marker landed is uncaptured')
         return True
 
     def _export(self, session_id):

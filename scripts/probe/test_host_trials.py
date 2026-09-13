@@ -1672,7 +1672,7 @@ class OpenCodeDriverTests(DriverTestCase):
 
     def test_submit_attaches_to_our_server_and_reports_exit_status(self):
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
-                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'], FakeResult(0))])
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'], self.run_output())])
         driver = self.driver(run, port=4096)
         driver.create('hello')
         driver.serve()
@@ -1683,6 +1683,32 @@ class OpenCodeDriverTests(DriverTestCase):
                                FakeResult(1, '', 'session not found')))
         with self.assertRaises(SubmissionRejected):
             driver.submit('ses_1', 'msg')
+
+    def test_an_exit_zero_attach_naming_no_session_is_uncaptured(self):
+        # Captured: the attach client's own stdout carried a `step_start` event with its
+        # `sessionID`. Silence is not proof the marker reached the session polling will read.
+        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'], FakeResult(0))])
+        driver = self.driver(run, port=4096)
+        driver.create('hello')
+        driver.serve()
+        with self.assertRaises(SubmissionUncaptured) as caught:
+            driver.submit('ses_1', 'msg')
+        self.assertIn('None', str(caught.exception))
+        self.assertEqual(driver.owned(), {'ses_1'})
+
+    def test_an_exit_zero_attach_naming_another_session_is_uncaptured_and_mints_it(self):
+        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'],
+                        self.run_output(session_id='ses_2'))])
+        driver = self.driver(run, port=4096)
+        driver.create('hello')
+        driver.serve()
+        with self.assertRaises(SubmissionUncaptured) as caught:
+            driver.submit('ses_1', 'msg')
+        self.assertIn('ses_2', str(caught.exception))
+        # Whatever the run wrote to must be swept, not left behind under real credentials.
+        self.assertEqual(driver.owned(), {'ses_1', 'ses_2'})
 
     def test_an_error_event_on_an_exit_zero_attach_is_uncaptured_never_accepted(self):
         # Captured on `create()`: a provider/credential/model failure is a structured `error`

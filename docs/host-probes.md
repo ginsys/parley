@@ -339,7 +339,12 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   nonzero exit comes back, or by the time the call times out — it is `SubmissionUncaptured`
   instead, since a dead server says nothing about the host. The timeout case matters because the
   export is readable without the server: a bare `TimeoutExpired` would be polled as a submission
-  that may have delivered and turn the absent marker into `not_observed`. `observe()` and
+  that may have delivered and turn the absent marker into `not_observed`. An exit-zero stream
+  must also name the session it was aimed at — the captured attach emitted a `step_start` event
+  carrying its `sessionID` — so a stream naming a different id, or none at all, is
+  `SubmissionUncaptured` too: polling the requested session would otherwise read the missing
+  marker as `not_observed` for a host that was never asked. A different id is minted before the
+  refusal, so the sweep deletes whatever the run actually wrote to. `observe()` and
   `version()` read
   `opencode --pure export <id>`: `messages[].info.role`/`info.time.created` (ms epoch, used for
   both roles so turn_start is the earliest assistant activity as on the other hosts) and the
