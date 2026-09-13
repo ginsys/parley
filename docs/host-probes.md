@@ -479,7 +479,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   signals off whatever the stream had already printed before it fired: an error event, or an id
   that is not this session, makes it `SubmissionUncaptured` rather than a bare timeout, with any
   stray id recorded first. A partial stream naming nothing re-raises — silence in a truncated stream
-  is not evidence of misdirection, and the message may well have reached the session. `observe()` and
+  is not proof of misdirection, and the message may have reached the session.
+  After submission, observation retains the exact server used for
+  the attempt. Its exit, removal or replacement makes missing delivery outcomes unobservable,
+  even if the persistent export remains readable; positive export evidence still stands. `observe()` and
   `version()` read
   `opencode --pure export <id>`: `messages[].info.role`/`info.time.created` (ms epoch, used for
   both roles so turn_start is the earliest assistant activity as on the other hosts) and the

@@ -2013,6 +2013,7 @@ class OpenCodeDriver(Driver):
         self.sleep = sleep
         self.output_reader = output_reader
         self.server = None
+        self.submission_servers = {}
 
     def _created_session(self, stdout):
         session_ids, error, unusable = opencode_session_ids(stdout)
@@ -2187,6 +2188,7 @@ class OpenCodeDriver(Driver):
         if self.server.process.poll() is not None:
             raise SubmissionUncaptured(f'the serve child exited {self.server.process.returncode} before '
                                        'submission; nothing sent')
+        self.submission_servers[session_id] = self.server
         argv = ['opencode', 'run', '--pure', '--format', 'json', '--attach', self.server.url,
                 '--session', session_id, '-m', self.model, message]
         try:
@@ -2263,7 +2265,8 @@ class OpenCodeDriver(Driver):
             return Observation(observable=False)
         events, unusable = opencode_export_events(raw)
         observation = detect_outcomes(events, marker, submitted_at=submitted_at)
-        if unusable:
+        server = self.submission_servers.get(session_id)
+        if unusable or (server is not None and (server is not self.server or server.process.poll() is not None)):
             observation.observable = False
         return observation
 

@@ -2642,6 +2642,27 @@ class OpenCodeDriverTests(DriverTestCase):
         run.scripts.insert(0, (['opencode', '--pure', 'export'], FakeResult(0, 'garbage')))
         self.assertFalse(driver.observe('ses_1', marker=MARKER, submitted_at=0.0).observable)
 
+    def test_losing_the_submission_server_invalidates_only_missing_outcomes(self):
+        for loss in ('exit', 'remove', 'replace'):
+            with self.subTest(loss=loss):
+                self.registry = SessionRegistry()
+                self.answering = False
+                export = opencode_export([opencode_message('user', [{'type': 'text', 'text': MARKER}], 1000)])
+                run = FakeRun([(['opencode', 'run'], self.run_output()),
+                               (['opencode', '--pure', 'export'], FakeResult(0, export))])
+                driver = self.driver(run)
+                driver.create('hello')
+                server = driver.serve()
+                self.assertIs(driver.submit('ses_1', 'msg'), True)
+                self.assertTrue(driver.observe('ses_1', marker=MARKER, submitted_at=0).observable)
+                if loss == 'exit':
+                    server.process.returncode = 1
+                else:
+                    driver.server = None if loss == 'remove' else object()
+                observation = driver.observe('ses_1', marker=MARKER, submitted_at=0)
+                self.assertIn('visible', observation.outcomes)
+                self.assertFalse(observation.observable)
+
     def test_teardown_deletes_and_releases_only_on_exit_zero(self):
         run = FakeRun([(['opencode', 'run'], self.run_output()),
                        (['opencode', '--pure', 'session', 'delete'], FakeResult(1, '', 'nope'))])
