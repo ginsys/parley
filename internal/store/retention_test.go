@@ -114,11 +114,14 @@ func TestRetentionMigrationPreservesLegacyEvidenceAndReruns(t *testing.T) {
 			t.Fatalf("budget=%d %v", used, err)
 		}
 	}
-	for _, statement := range []string{
-		"UPDATE work_provenance SET provenance='authenticated'", "DELETE FROM work_provenance", "UPDATE migration_incidents SET incident_id='forged'", "DELETE FROM migration_quarantine",
+	for _, check := range []struct{ statement, message string }{
+		{"UPDATE work_provenance SET original_from_peer='another-valid-peer'", "immutable retained evidence"},
+		{"DELETE FROM work_provenance", "evidence retained"},
+		{"UPDATE migration_incidents SET incident_id='90000000-0000-4000-8000-000000000001'", "immutable retained evidence"},
+		{"DELETE FROM migration_quarantine", "evidence retained"},
 	} {
-		if _, err := seed.Exec(statement); err == nil {
-			t.Fatalf("immutable evidence changed: %s", statement)
+		if _, err := seed.Exec(check.statement); err == nil || !strings.Contains(err.Error(), check.message) {
+			t.Fatalf("expected retained-evidence guard for %s: %v", check.statement, err)
 		}
 	}
 }
