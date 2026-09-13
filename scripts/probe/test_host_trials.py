@@ -1357,6 +1357,26 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(run.argv('claude', 'rm'), [])
         self.assertEqual(driver.owned(), {'69aa52ed'})  # retained for a human to find
 
+    def test_malformed_claude_listings_never_authorize_rm_after_a_failed_stop(self):
+        missing_pid = claude_entry(pid=None, status=None)
+        missing_pid.pop('pid')
+        missing_id = claude_entry(pid=None, status=None)
+        missing_id.pop('id')
+        for entries in ([missing_pid], [None], [missing_id],
+                        [claude_entry(pid=False)], [claude_entry(pid='unknown')],
+                        [claude_entry(pid=None), claude_entry(pid=None)]):
+            with self.subTest(entries=entries):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['claude', 'agents'], listing(entries)),
+                               (['claude', 'stop'], FakeResult(1, '', 'not stopped')),
+                               (['claude', 'rm'], FakeResult(0))])
+                driver = self.driver(run)
+                driver._mint('69aa52ed')
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.teardown('69aa52ed')
+                self.assertEqual(run.argv('claude', 'rm'), [])
+                self.assertEqual(driver.owned(), {'69aa52ed'})
+
     def test_teardown_retains_ownership_when_rm_fails(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
                        (['claude', 'agents'], listing([])),

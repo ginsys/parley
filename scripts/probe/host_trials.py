@@ -958,7 +958,17 @@ class ClaudeDriver(Driver):
             raise RuntimeError(f'claude agents --json produced unparseable output: {error}') from error
         if not isinstance(entries, list):
             raise RuntimeError(f'claude agents --json produced a non-list top level: {result.stdout!r}')
-        return [entry for entry in entries if isinstance(entry, dict)]
+        seen = set()
+        for entry in entries:
+            if (not isinstance(entry, dict) or 'pid' not in entry or
+                    any(not isinstance(entry.get(key), str) or not entry[key]
+                        for key in ('id', 'kind', 'sessionId', 'state')) or
+                    entry['kind'] != 'background' or entry['id'] in seen or
+                    (entry['pid'] is not None and
+                     (type(entry['pid']) is not int or entry['pid'] <= 0))):
+                raise RuntimeError('claude agents --json produced a malformed listing entry')
+            seen.add(entry['id'])
+        return entries
 
     def status(self, session_id):
         """The `claude agents --json --all --cwd <cwd>` entry for an owned id, or None if absent.

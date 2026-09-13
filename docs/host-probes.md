@@ -283,7 +283,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   settles there rather than in a settle callback, and a turn still running at the 180 s cap is an
   error, with the session left owned for the sweep. `status(id)`
   returns the owned entry from that listing (`pid`, `status`, `state`, `sessionId`) for settle
-  callbacks. `observe()` reads the session's own transcript
+  callbacks. Every listing row must be a background-session object with nonempty string
+  identity/state fields and an explicit `pid` that is null or a positive integer. Malformed rows,
+  duplicate IDs and missing PIDs fail the listing; they never prove that a session is absent or
+  stopped and cannot authorize `rm` after a failed `stop`. `observe()` reads the session's own transcript
   (`$HOME/.claude/projects/*/<sessionId>.jsonl`): `user` records carry a string `content`,
   `assistant` records a list of typed parts, both a UTC ISO `timestamp`. Those shapes are
   enforced per role — an assistant string or a user part list is a changed transcript and counts
