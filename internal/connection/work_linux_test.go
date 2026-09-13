@@ -709,3 +709,99 @@ func TestFailedIngestionEvidenceStillPersistsExpiry(t *testing.T) {
 		}
 	}
 }
+
+func TestRepeatedPendingIngestionPreservesCoordinatorRevision(t *testing.T) {
+	m, _, recipient, ingestor, request, _ := readyIngestion(t)
+	request.Event.Before = "missing-predecessor"
+	request.Event.After = "future"
+	ctx := context.Background()
+	first, err := ingestor.Ingest(ctx, recipient, request)
+	if err != nil || first.Classification != "pending" {
+		t.Fatalf("first pending=%+v %v", first, err)
+	}
+	view := func() store.CommitView {
+		var got store.CommitView
+		_, err := m.store.Coordinator().Transition(ctx, func(_ context.Context, _ *sql.Tx, v store.CommitView) (store.TransitionResult, error) {
+			got = v
+			return store.TransitionResult{}, nil
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	before := view()
+	for n := 0; n < 3; n++ {
+		result, err := ingestor.Ingest(ctx, recipient, request)
+		if err != nil || result.Classification != "pending" {
+			t.Fatalf("pending retry=%+v %v", result, err)
+		}
+	}
+	if after := view(); after != before {
+		t.Fatalf("pending retry changed revision: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestIngestionEvidenceFailuresRemainRetryable(t *testing.T) {
+	for _, method := range []string{"initialize", "ingest"} {
+		for _, failure := range []string{"unavailable", "cancelled", "deadline", "unknown", "mismatch", "wrapped-mismatch", "caller-cancelled"} {
+			t.Run(method+"/"+failure, func(t *testing.T) {
+				m, _, recipient, ingestor, request, _ := readyIngestion(t)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				provider := func() error {
+					switch failure {
+					case "unavailable":
+						return store.TemporarilyUnavailable
+					case "cancelled":
+						return context.Canceled
+					case "deadline":
+						return context.DeadlineExceeded
+					case "unknown":
+						return errors.New("synthetic unavailable source")
+					case "mismatch":
+						return store.HostUnverified
+					case "wrapped-mismatch":
+						return fmt.Errorf("synthetic mismatch: %w", store.HostUnverified)
+					default:
+						cancel()
+						return nil
+					}
+				}
+				ingestor.config.Origin = func(context.Context, NativeTuple, Token, string, string) error { return provider() }
+				ingestor.config.Verify = func(context.Context, NativeTuple, Token, IngestRequest) error { return provider() }
+				call := func(ctx context.Context) error {
+					if method == "initialize" {
+						return ingestor.Initialize(ctx, recipient, request.Event.SourceID, request.Event.Before)
+					}
+					_, err := ingestor.Ingest(ctx, recipient, request)
+					return err
+				}
+				want := store.TemporarilyUnavailable
+				if failure == "mismatch" || failure == "wrapped-mismatch" {
+					want = store.HostUnverified
+				}
+				if err := call(ctx); err != want {
+					t.Fatalf("provider classification=%v want %v", err, want)
+				}
+				if err := m.store.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+					var count int
+					if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM ingestion_evidence").Scan(&count); err != nil {
+						return err
+					}
+					if count != 0 {
+						t.Errorf("failed provider retained %d events", count)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				ingestor.config.Origin = func(context.Context, NativeTuple, Token, string, string) error { return nil }
+				ingestor.config.Verify = func(context.Context, NativeTuple, Token, IngestRequest) error { return nil }
+				if err := call(context.Background()); err != nil {
+					t.Fatalf("same evidence retry=%v", err)
+				}
+			})
+		}
+	}
+}

@@ -820,3 +820,9 @@ matching and single refunds remain unchanged, and this path cannot authorize a n
 Ingestion and source-origin verification retain the authenticated immutable credential before
 host I/O and revalidate on every outcome. Expiry is independently persisted before reporting the
 verifier result, including after socket removal or caller cancellation; expiry takes precedence.
+
+Repeated verified events that remain pending do not advance the coordinator revision when their
+reference already exists; the successful no-op session fence still runs. New pending references
+and terminal event classifications remain durable changes. Origin/ingestion verifier outages,
+unknown provider failures and cancellation return `temporarily_unavailable`; only an explicit
+host-verification mismatch returns `host_unverified`, after the independent expiry/session check.

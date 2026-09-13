@@ -60,8 +60,8 @@ func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor st
 	if err := m.recheckIngestionEvidence(ctx, s, credential); err != nil {
 		return err
 	}
-	if evidenceErr != nil || verifyCtx.Err() != nil {
-		return store.HostUnverified
+	if err := ingestionEvidenceFailure(verifyCtx, evidenceErr); err != nil {
+		return err
 	}
 	return m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
 		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
@@ -130,8 +130,8 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 	if err := m.recheckIngestionEvidence(ctx, s, credential); err != nil {
 		return store.EventResult{}, err
 	}
-	if evidenceErr != nil || verifyCtx.Err() != nil {
-		return store.EventResult{}, store.HostUnverified
+	if err := ingestionEvidenceFailure(verifyCtx, evidenceErr); err != nil {
+		return store.EventResult{}, err
 	}
 	marker, parseErr := replymarker.Extract(r.Text)
 	var result store.EventResult
@@ -142,8 +142,12 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		if err := store.IngestionAllowed(ctx, tx, s.token.BindingID); err != nil {
 			return store.TransitionResult{}, err
 		}
+		var found bool
 		var err error
-		result, err = store.StageEvent(ctx, tx, e)
+		result, found, err = store.LookupEvent(ctx, tx, e)
+		if err == nil && !found {
+			result, err = store.StageEvent(ctx, tx, e)
+		}
 		if err != nil {
 			return store.TransitionResult{}, err
 		}
@@ -152,7 +156,7 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		}
 		pending := func(code store.Code) (store.TransitionResult, error) {
 			result = store.EventResult{Classification: "pending", Code: code}
-			return store.TransitionResult{Changed: true}, nil
+			return store.TransitionResult{Changed: !found}, nil
 		}
 		if err := store.EventAtCursor(ctx, tx, e); err != nil {
 			if err == store.TemporarilyUnavailable || err == store.HostUnverified {
@@ -262,4 +266,17 @@ func (m *Manager) recheckIngestionEvidence(ctx context.Context, s *Session, cred
 		return store.AuthenticationFailed
 	}
 	return m.sessionTransition(context.WithoutCancel(ctx), s, func(context.Context, *sql.Tx) (store.TransitionResult, error) { return store.TransitionResult{}, nil }, nil)
+}
+
+func ingestionEvidenceFailure(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return store.TemporarilyUnavailable
+	}
+	if errors.Is(err, store.HostUnverified) {
+		return store.HostUnverified
+	}
+	if err != nil {
+		return store.TemporarilyUnavailable
+	}
+	return nil
 }
