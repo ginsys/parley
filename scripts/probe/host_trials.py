@@ -703,7 +703,7 @@ class ClaudeDriver(Driver):
 
     def __init__(self, registry, *, run=subprocess.run, cwd, model='haiku', mechanism='attach',
                  transcript_path_for=default_claude_transcript_path, pty=PtyClient, sleep=time.sleep,
-                 clock=time.time, monotonic=time.monotonic):
+                 monotonic=time.monotonic):
         if mechanism not in CLAUDE_MECHANISMS:
             raise ValueError(f'unknown submission mechanism: {mechanism!r}')
         super().__init__(registry, cwd=cwd)
@@ -713,7 +713,6 @@ class ClaudeDriver(Driver):
         self.transcript_path_for = transcript_path_for
         self.pty = pty
         self.sleep = sleep
-        self.clock = clock
         # The bounded local waits use this, injected with `sleep` so a test's fake sleep advances
         # the same clock the deadline reads (a real monotonic with a no-op sleep hot-spins).
         self.monotonic = monotonic
@@ -816,21 +815,23 @@ class ClaudeDriver(Driver):
             observation.observable = False
         return observation
 
-    def _visible_before_detach(self, session_id, message, since, timeout=10.0):
-        """Wait, bounded, for the typed message to reach the transcript's user record.
+    def close_clients(self):
+        """Send the captured detach key to every held attach client, then close as the base does.
 
-        The captured attach detached only after the reply was on screen; detaching mid-turn is
-        uncaptured. The transcript, not the PTY, is what says the host took the text -- and it
-        also shows whether a long typed line survived verbatim rather than as a paste placeholder.
+        The captured attach detached with Ctrl-Z *after* the reply was on screen and the client
+        exited 0 with the session still listed. Holding the client until cleanup reproduces that;
+        an exited client is skipped (`close()` below reaps it) and the kill remains the backstop.
         """
-        deadline = self.monotonic() + timeout
-        while True:
-            observation = self.observe(session_id, marker=message, submitted_at=since)
-            if 'visible' in observation.outcomes:
-                return True
-            if self.monotonic() >= deadline:
-                return False
-            self.sleep(0.5)
+        detached = False
+        for client in self.clients:
+            try:
+                client.send_keys(b'\x1a')
+            except ValueError:
+                continue  # already exited; nothing to detach from
+            detached = True
+        if detached:
+            self.sleep(1.0)  # let the captured exit-0 detach complete before the kill backstop
+        return super().close_clients()
 
     def submit(self, session_id, message):
         self.registry.require_owned(self._key(session_id))
@@ -886,7 +887,7 @@ class ClaudeDriver(Driver):
         return True
 
     def _submit_attach(self, session_id, entry, message):
-        """Type into `claude attach <id>` under a PTY, wait for the transcript, Ctrl-Z, close.
+        """Type into `claude attach <id>` under a PTY and keep the client attached afterwards.
 
         Returns None: a PTY write is never host acceptance (docs/host-probes.md, Trial protocol),
         so `accepted` is unobservable and polling proceeds. A composer that never appears is
@@ -894,37 +895,31 @@ class ClaudeDriver(Driver):
         a host rejection. Attaching to a stopped session is uncaptured and refused the same way.
         Windows for this mechanism include the client's startup (captured 3.2s to the prompt),
         since `submitted_at` is stamped when `submit()` is called.
+
+        The client stays on `clients` through the whole observation and is detached by
+        `close_clients()` during the sweep. The capture only ever detached after the reply was
+        displayed (user record at +0.27 s, assistant reply at +2.6 s); detaching as soon as the
+        user record lands would make every trial run under an uncaptured mid-turn detach, so a
+        missing turn_start or ack could not be attributed to the host.
         """
         if entry.get('pid') is None:
             raise SubmissionUncaptured('attach to a stopped session is uncaptured; use mechanism=resume')
-        since = self.clock()
         client = self.pty(['claude', 'attach', session_id], cwd=self.cwd)
         self.clients.append(client)
+        # quiet=3.0 is the capture's own readiness criterion (3 s of output silence).
+        if not client.wait_for(CLAUDE_READY_PATTERN, quiet=3.0, timeout=30):
+            raise SubmissionUncaptured(f'attach never showed the composer: {client.screen()!r}')
+        screen_at_type = client.screen(400)
+        typed_at = _utc_now()
         try:
-            # quiet=3.0 is the capture's own readiness criterion (3 s of output silence).
-            if not client.wait_for(CLAUDE_READY_PATTERN, quiet=3.0, timeout=30):
-                raise SubmissionUncaptured(f'attach never showed the composer: {client.screen()!r}')
-            screen_at_type = client.screen(400)
-            typed_at = _utc_now()
-            try:
-                client.type_line(message)
-            except ValueError as error:
-                # The client exited between readiness and typing: some, all or none of the line
-                # may have reached the composer, and no Enter is guaranteed.
-                raise SubmissionUncaptured(f'attach client exited while typing ({error}): '
-                                           f'{client.screen()!r}') from error
-            seen = self._visible_before_detach(session_id, message, since)
-            try:
-                client.send_keys(b'\x1a')  # Ctrl-Z: captured to detach (exit 0), session keeps running
-                detach = 'Ctrl-Z sent'
-            except ValueError:
-                detach = 'client had already exited'  # close() below reaps it
-            self.sleep(1.0)
-        finally:
-            client.close()
-            self.clients.remove(client)
-        self.submission_note = (f'attach: typed at {typed_at}; user record seen before detach: '
-                                f'{seen}; detach: {detach}; screen at type time: {screen_at_type!r}')
+            client.type_line(message)
+        except ValueError as error:
+            # The client exited between readiness and typing: some, all or none of the line
+            # may have reached the composer, and no Enter is guaranteed.
+            raise SubmissionUncaptured(f'attach client exited while typing ({error}): '
+                                       f'{client.screen()!r}') from error
+        self.submission_note = (f'attach: typed at {typed_at}; client held attached until cleanup; '
+                                f'screen at type time: {screen_at_type!r}')
         return None
 
     def stop(self, session_id):

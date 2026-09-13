@@ -238,10 +238,14 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   the listing first; a listing that times out is `SubmissionUncaptured`, since nothing was sent.
   It has two mechanisms. `attach` opens `claude attach <id>` under a PTY, waits for the composer
   (a line holding only `❯` and a no-break space, the captured ready screen) to appear and the
-  output to stay quiet for 3 s, the capture's own criterion, types the message in short chunks
-  with a separate Enter, waits up to 10 s for the transcript's user record, sends Ctrl-Z
-  (captured to detach with the session still running) and closes the client; it returns `None`,
-  because a PTY write is never host acceptance. A client that exits while typing is
+  output to stay quiet for 3 s, the capture's own criterion, then types the message in short
+  chunks with a separate Enter and **keeps the client attached**; it returns `None`, because a
+  PTY write is never host acceptance. The detach is the sweep's job: `close_clients()` sends
+  Ctrl-Z (captured to detach with the session still running) to every held client. The capture
+  detached only after the reply was displayed — the user record landed at +0.27 s and the
+  assistant reply at +2.6 s — so detaching as soon as the user record appeared would run every
+  trial under an uncaptured mid-turn detach and make a missing `turn_start` or `ack`
+  unattributable. A client that exits while typing is
   `SubmissionUncaptured`. `resume` runs `claude --bg --resume <sessionId> '<msg>'` with no other
   flags against a *stopped* session (the captured restarted path); a running session (`pid` set)
   is refused as uncaptured, since with flags, or against a running session, the captured result
@@ -352,7 +356,7 @@ recorded without a live trial through `classify_trial(..., supported=...)`.
 a PTY that never showed its composer, a submission nothing can serve — and classifies every
 outcome `unobservable`, never `unsupported` and never `not_observed`. The diagnostic behind
 any of these (exit status and stderr, the stripped screen, the attach client's own note of when
-it typed and whether the transcript showed the line before detaching) lands in
+it typed and what was on screen then) lands in
 `TrialRun.submission_diagnostic`.
 
 `run_trial()` keeps observing until every transcript outcome is seen or the longest window

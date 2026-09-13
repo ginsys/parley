@@ -831,40 +831,53 @@ class ClaudeDriverTests(DriverTestCase):
         driver.create('hello')
         return driver, run
 
-    def test_attach_submit_types_the_message_waits_for_the_transcript_and_detaches(self):
-        driver, run = self.create_live(clock=lambda: 1_789_290_000.0)
-        self.transcripts[SESSION_UUID] = self.write_lines('a.jsonl', [
-            claude_record('user', marker_message(MARKER), stamp='2026-09-13T09:00:01.000Z')])
+    def test_attach_submit_types_the_message_and_holds_the_client_attached(self):
+        # The capture only ever detached after the reply was displayed, so the client must stay
+        # attached across the whole observation instead of leaving mid-turn.
+        driver, run = self.create_live()
         self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
         client, = FakePtyClient.launched
         self.assertEqual(client.argv, ['claude', 'attach', '69aa52ed'])
         self.assertEqual(client.typed, [marker_message(MARKER)])
-        self.assertEqual(client.keys[-1], b'\x1a')  # Ctrl-Z after the transcript showed the line
+        self.assertNotIn(b'\x1a', client.keys)  # no detach yet
+        self.assertFalse(client.closed)
+        self.assertEqual(driver.clients, [client])
+        self.assertIn('client held attached until cleanup', driver.submission_note)
+
+    def test_close_clients_detaches_the_held_attach_client_with_ctrl_z(self):
+        driver, run = self.create_live()
+        driver.submit('69aa52ed', marker_message(MARKER))
+        client, = FakePtyClient.launched
+        self.assertEqual(driver.close_clients(), [])
+        self.assertEqual(client.keys[-1], b'\x1a')  # captured detach: exit 0, session keeps running
         self.assertTrue(client.closed)
         self.assertEqual(driver.clients, [])
-        self.assertIn('user record seen before detach: True', driver.submission_note)
+        self.assertGreaterEqual(self.clock.elapsed, 1.0)  # the detach was given the captured moment
 
-    def test_attach_submit_still_detaches_and_notes_when_the_transcript_never_shows_the_line(self):
-        driver, run = self.create_live(clock=lambda: 1_789_290_000.0)
-        self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
+    def test_close_clients_skips_the_detach_for_a_client_that_already_exited(self):
+        driver, run = self.create_live()
+        driver.submit('69aa52ed', marker_message(MARKER))
         client, = FakePtyClient.launched
-        self.assertEqual(client.keys[-1], b'\x1a')
-        self.assertIn('user record seen before detach: False', driver.submission_note)
-        self.assertGreaterEqual(self.clock.elapsed, 10.0)  # the bounded wait ran to its end
+        client.eof = True  # the attach client died on its own; close() below still reaps it
+        self.assertEqual(driver.close_clients(), [])
+        self.assertNotIn(b'\x1a', client.keys)
+        self.assertTrue(client.closed)
+        self.assertEqual(driver.clients, [])
 
     def test_attach_client_exiting_while_typing_is_uncaptured(self):
         driver, run = self.create_live()
 
         class ExitingClient(FakePtyClient):
             def type_line(self, text, **kwargs):
-                self.closed = True
+                self.eof = True
                 self.send_keys(text.encode())
 
         driver.pty = ExitingClient
         with self.assertRaises(SubmissionUncaptured):
             driver.submit('69aa52ed', marker_message(MARKER))
-        self.assertTrue(FakePtyClient.launched[0].closed)
-        self.assertEqual(driver.clients, [])
+        # The client stays held: the sweep owns every close now, and a handle dropped here would
+        # be the only one to a child that may still be alive.
+        self.assertEqual(driver.clients, FakePtyClient.launched)
 
     def test_a_listing_timeout_before_submission_is_uncaptured_and_sends_nothing(self):
         driver, run = self.create_live()
@@ -878,8 +891,9 @@ class ClaudeDriverTests(DriverTestCase):
         driver.pty = lambda argv, *, cwd: FakePtyClient(argv, cwd=cwd, ready=False)
         with self.assertRaises(SubmissionUncaptured):
             driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertEqual(driver.clients, FakePtyClient.launched)  # the sweep closes it
+        self.assertEqual(driver.close_clients(), [])
         self.assertTrue(FakePtyClient.launched[0].closed)
-        self.assertEqual(driver.clients, [])
 
     def test_attach_to_a_stopped_session_is_uncaptured(self):
         run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
