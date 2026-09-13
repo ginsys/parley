@@ -166,13 +166,13 @@ three changes: stage 1 was the first version of this tooling, built before any h
 driven; the 2026-09-13 live captures (docs/host-probe-preflight.md) then replaced its guessed
 shapes and it was trimmed to what those captures support; stage 2 runs the Claude and Codex rows
 and lands `docs/host-wake-matrix.md`; stage 3 runs the OpenCode row and writes the synthesis #18
-asks for. "Stage N" elsewhere in this document and in `host_trials.py` refers to that list.
+asks for. The stage numbers in docs/host-probe-preflight.md refer to that list.
 
 ### Ownership and isolation
 
 Every session it creates is tracked in a `SessionRegistry` under a per-host namespace
-(`claude:<id>`, `codex:<id>`, `opencode:<id>`); `submit`/`observe`/`teardown`/`attach`/`status`
-refuse an id the registry did not itself mint (`ForeignSessionError`). This matters concretely:
+(`claude:<id>`, `codex:<id>`, `opencode:<id>`); `submit`/`observe`/`teardown`/`attach`/`status`/
+`stop`/`version` refuse an id the registry did not itself mint (`ForeignSessionError`). This matters concretely:
 `claude agents --json --all` lists every background session on the workstation and
 `codex queue --thread` reaches any thread, including ordinary human work, so a driver bug here
 could otherwise stop or message someone else's session. Ownership comes only from the runner's
@@ -201,38 +201,49 @@ exception with a note naming the sweep's failures and whatever is still owned; a
 whose sweep failed raises `CleanupFailed` carrying the `TrialRun`, since the evidence is valid
 even though a live, authenticated session remains for a human to remove. A teardown that cannot
 confirm removal retains ownership rather than releasing it — releasing on a no-op would read as a
-session having been cleaned up when it had not. One gap stays open by design: a Ctrl-C while
-`claude --bg` or `codex exec` is still running loses that command's output, and a session the
-host created in that instant is findable only by a human (`claude agents --json --all --cwd
-<probe cwd>`; the newest rollout under `$CODEX_HOME/sessions` naming the probe cwd).
+session having been cleaned up when it had not; likewise a server that survives SIGKILL stays
+held and is reported. A sweep covers the driver instance it is given: another instance over the
+same registry sees the same ids but not the first one's held clients, servers or cached Claude
+`sessionId`s, so sweep every instance that did work. One gap stays open by design: a Ctrl-C while
+`claude --bg`, `codex exec` or `opencode run` is still running loses that command's output, and a
+session the host created in that instant is findable only by a human (`claude agents --json
+--all --cwd <probe cwd>`; the newest rollout under `$CODEX_HOME/sessions` naming the probe cwd;
+the newest `parley-probe-*` row of the global `opencode --pure session list`, removed with
+`opencode --pure session delete <id>`).
 
 ### Drivers
 
 Every host-facing shape below was captured live on 2026-09-13 at Claude Code 2.1.270, codex-cli
-0.154.0 and OpenCode 1.18.30 (docs/host-probe-preflight.md, that section); what no capture
-established raises `SubmissionUncaptured` rather than being guessed.
+0.154.0 and OpenCode 1.18.30 (docs/host-probe-preflight.md, that section). A submission path no
+capture covers, or an attempt that never reached the host, raises `SubmissionUncaptured` rather
+than being guessed; the per-driver cases are listed below. Host behaviour the trials themselves
+measure (what an approval-parked session lists as, mid-turn queue delivery) is not refused.
 
 - **Claude** (`ClaudeDriver`). `create()` runs `claude --bg --model <m> '<prompt>'` from the
-  probe directory, mints the short id from stdout line 1 (`backgrounded · <id>`) before the
-  confirming `claude agents --json --all --cwd <probe cwd>` listing runs, and on a
-  `subprocess.TimeoutExpired` mints from the partial output before re-raising. `status(id)`
+  probe directory, mints the short id from stdout line 1 (`backgrounded · <id>`) before checking
+  the exit status or running the confirming `claude agents --json --all --cwd <probe cwd>`
+  listing, and on a `subprocess.TimeoutExpired` mints from the partial output before re-raising. `status(id)`
   returns the owned entry from that listing (`pid`, `status`, `state`, `sessionId`) for settle
   callbacks. `observe()` reads the session's own transcript
   (`$HOME/.claude/projects/*/<sessionId>.jsonl`): `user` records carry a string `content`,
   `assistant` records a list of typed parts, both a UTC ISO `timestamp`; bookkeeping record
-  types are skipped, a malformed message record makes the read unobservable. `submit()` has two
-  mechanisms. `attach` opens `claude attach <id>` under a PTY, waits for the composer (a line
-  holding only `❯` and a no-break space, the captured ready screen) to appear and the output to
-  go quiet, types the message in short chunks with a separate Enter, waits up to 10 s for the
-  transcript's user record, sends Ctrl-Z (captured to detach with the session still running)
-  and closes the client; it returns `None`, because a PTY write is never host acceptance.
-  `resume` runs `claude --bg --resume <sessionId> '<msg>'` with no other flags against a
-  *stopped* session (the captured restarted path); a running session (`pid` set) is refused as
-  uncaptured, since with flags, or against a running session, the captured result is a copy
-  under a new id — which, when it happens anyway, is minted so the sweep removes it, and reported
-  as a rejection. `teardown()` runs `claude stop`, tolerates its nonzero exit, then requires the
-  listing to show the entry gone or `pid` null before `claude rm` runs; otherwise it raises and
-  retains ownership. `version()` is the `version` field the session's own message records carry,
+  types are skipped, a malformed message record makes the read unobservable. `submit()` reads
+  the listing first; a listing that times out is `SubmissionUncaptured`, since nothing was sent.
+  It has two mechanisms. `attach` opens `claude attach <id>` under a PTY, waits for the composer
+  (a line holding only `❯` and a no-break space, the captured ready screen) to appear and the
+  output to stay quiet for 3 s, the capture's own criterion, types the message in short chunks
+  with a separate Enter, waits up to 10 s for the transcript's user record, sends Ctrl-Z
+  (captured to detach with the session still running) and closes the client; it returns `None`,
+  because a PTY write is never host acceptance. A client that exits while typing is
+  `SubmissionUncaptured`. `resume` runs `claude --bg --resume <sessionId> '<msg>'` with no other
+  flags against a *stopped* session (the captured restarted path); a running session (`pid` set)
+  is refused as uncaptured, since with flags, or against a running session, the captured result
+  is a copy under a new id — which, when stdout names one anyway, is minted whatever the exit
+  status so the sweep removes it, and reported as a rejection. `stop(id)` runs `claude stop` and
+  requires the listing to show the entry gone or `pid` null, whatever the exit status said, but
+  neither removes nor releases the session: it is the restarted cell's settle step before a
+  `resume` submission. `teardown()` is `stop()` followed by `claude rm`; a surviving `pid` raises
+  before `rm` runs and ownership is retained. `version()` is the `version` field the session's own message records carry,
   never `claude --version`: the binary drifted 2.1.267 → 2.1.270 over three days of captures
   and a daemon started before an upgrade keeps its code. No spend bound exists for Claude cells:
   `--max-budget-usd` needs `--print`, which conflicts with `--bg`, and `--model haiku` was
@@ -254,13 +265,17 @@ established raises `SubmissionUncaptured` rather than being guessed.
   serves the thread (captured: a live idle TUI within ~7 s; a `resume` at its start), so with
   mechanism `queue` a settle callback must have opened `attach(thread_id)` beforehand — a
   `codex --no-alt-screen -s <sandbox> -a <approval> -C <probe cwd> resume <thread_id>` client
-  under a PTY, held on the driver until the sweep closes it — and with mechanism
-  `queue-then-resume` (the restarted cell) `submit()` opens that client itself right after
-  queueing. `attach()` answers the captured first-run trust dialog with Enter (which persists a
-  trust entry for the probe directory in `$CODEX_HOME/config.toml`), waits for the composer
-  placeholder `› Ask Codex to do anything` plus 2 s of quiet — the placeholder is drawn while a
-  turn or the dialog is still up — and raises `PtyNotReady` with the stripped screen otherwise;
-  inside `submit()` that becomes `SubmissionUncaptured`. The default `-a never` cannot produce an
+  under a PTY, held on the driver until the sweep closes it. With no client open, `submit()`
+  raises `SubmissionUncaptured` before queueing anything, since the trial could only time out.
+  With mechanism `queue-then-resume` (the restarted cell) `submit()` opens that client itself
+  right after queueing and returns the time `codex queue` exited, so the resume client's startup
+  is not counted against the 10 s acceptance window; a `codex queue` that times out there is
+  `SubmissionUncaptured`, since nothing serves the thread yet. `attach()` answers the captured
+  first-run trust dialog with Enter (which persists a trust entry for the probe directory in
+  `$CODEX_HOME/config.toml`), waits for the composer placeholder `› Ask Codex to do anything`
+  drawn after that answer plus 3 s of quiet — the placeholder is drawn while a turn or the dialog
+  is still up — and raises `PtyNotReady` with the stripped screen otherwise; inside `submit()`
+  that becomes `SubmissionUncaptured`. The default `-a never` cannot produce an
   approval prompt, so an approval settle has to ask for other flags. `teardown()` runs
   `codex delete --force <id>` and releases only on exit 0; what it does to a still-queued item is
   uncaptured. `version()` is the rollout's first `session_meta.payload.cli_version` — the
@@ -274,9 +289,12 @@ established raises `SubmissionUncaptured` rather than being guessed.
   on a free loopback port chosen per call, refused if the port already answered (the session
   store is global, so a stranger's server would look identical), ready once `GET /session`
   answers while the child is still alive; the password variable is uncaptured, so the server is
-  the captured unsecured loopback listener for the trial's duration. Submission is
+  the captured unsecured loopback listener for the trial's duration. Any failure or Ctrl-C during
+  that wait closes the child before re-raising. Submission is
   `opencode run --pure --format json --attach http://127.0.0.1:<p> --session <id> -m <model>
-  '<msg>'`, exit status as acceptance. `observe()` and `version()` read
+  '<msg>'`, exit status as acceptance; if the `serve` child has exited, before the call or by the
+  time a nonzero exit comes back, it is `SubmissionUncaptured` instead, since a dead server says
+  nothing about the host. `observe()` and `version()` read
   `opencode --pure export <id>`: `messages[].info.role`/`info.time.created` (ms epoch, used for
   both roles so turn_start is the earliest assistant activity as on the other hosts) and the
   `text` parts; an unparseable or malformed document is unobservable. `teardown()` is
@@ -291,8 +309,9 @@ its thread's queue) or trip `PtyProcess`'s hard transcript cap mid-trial. Input 
 trial's state is the settle callback's precondition, not something read off the screen, and an
 attach to a busy or approval-parked session must still be able to type. The client is only ever
 exercised by controlled Python children in tests. Windows for a PTY-delivered submission include
-the client's own startup (captured: 3.2 s to Claude's composer, 4–5 s to Codex's, 15 s on a
-resume that drains queued items), since `submitted_at` is stamped when `submit()` is called.
+the client's own startup (captured: 3.2 s to Claude's composer), since `submitted_at` is stamped
+when `submit()` is called. Codex's resume client (captured: 15 s to ready while it drained queued
+items) is opened after acceptance is stamped, so only its transcript windows absorb that startup.
 
 ### One trial
 
@@ -305,17 +324,21 @@ be ordered against submission, and counting it would let the creation prompt's o
 as this trial's `turn_start`.
 
 `submit()`'s result drives acceptance. `True` is accepted, stamped when `submit` *returns* (a
-submission that blocks for seconds is not backdated into its 10 s window). `False` or
+submission that blocks for seconds is not backdated into its 10 s window). A number is the wall
+time at which the driver itself saw acceptance, for a `submit()` that keeps working afterwards
+(Codex `queue-then-resume`); any other value raises `TypeError`. `False` or
 `SubmissionRejected` is a real, observed rejection: `accepted` stays observable, but nothing was
 delivered, so no polling happens and the transcript outcomes are unobservable rather than polled
 to a `not_observed` that would be negative evidence for a marker the host never received.
 `None`, or a `subprocess.TimeoutExpired` from the call, means the message went through a channel
 with no acceptance signal — a PTY write, a command that may have delivered before its timeout —
 so `accepted` alone is unobservable and polling proceeds. `SubmissionUnsupported` says the *host*
-lacks the mechanism (Claude's `--channels`, absent from the help text and the plugin cache) and
-classifies every outcome `unsupported`; `SubmissionUncaptured` says *this runner* could not vouch
-for the attempt — an uncaptured path, or a PTY that never showed its composer — and classifies
-every outcome `unobservable`, never `unsupported` and never `not_observed`. The diagnostic behind
+lacks the mechanism and classifies every outcome `unsupported`; no driver raises it today, and a
+known absence such as Claude's `--channels` (missing from the help text and the plugin cache) is
+recorded without a live trial through `classify_trial(..., supported=...)`.
+`SubmissionUncaptured` says *this runner* could not vouch for the attempt — an uncaptured path,
+a PTY that never showed its composer, a submission nothing can serve — and classifies every
+outcome `unobservable`, never `unsupported` and never `not_observed`. The diagnostic behind
 any of these (exit status and stderr, the stripped screen, the attach client's own note of when
 it typed and whether the transcript showed the line before detaching) lands in
 `TrialRun.submission_diagnostic`.
@@ -329,15 +352,15 @@ late successful read covers earlier gaps, but if the last read failed then the t
 window was never seen and a missing outcome is `unobservable` rather than negative. An outcome
 already observed keeps its own evidence either way.
 
-A Ctrl-C inside the polling loop does not propagate: the trial finalizes with whatever it had
-gathered, every still-missing outcome marked unobservable, and `TrialRun.interrupted` set — a
-busy trial can spend minutes collecting evidence that a propagated exception would discard. A
-caller looping over trials must stop on `interrupted` and never pass such a run to
-`aggregate()`, since apart from that flag its fields are identical to an uncaptured or
-unreadable run's. Anywhere else — creation, version read, settle, submit, the first
-observation — an exception, Ctrl-C included, propagates raw and the cleanup sweep runs from
-`run_trial_with_cleanup`'s `finally`; the registry already names every live session, so no
-wrapper exception needs to carry the id.
+A Ctrl-C inside the polling loop, the first `observe()` call included, does not propagate: the
+trial finalizes with whatever it had gathered, every still-missing outcome marked unobservable,
+and `TrialRun.interrupted` set — a busy trial can spend minutes collecting evidence that a
+propagated exception would discard. A caller looping over trials must stop on `interrupted` and
+never pass such a run to `aggregate()`, since apart from that flag its fields are identical to
+an uncaptured or unreadable run's. Anywhere else a Ctrl-C propagates raw, and so does any other
+exception from creation, settle, submit or `observe()`; only a failed version read is recorded
+as `None` instead. The cleanup sweep then runs from `run_trial_with_cleanup`'s `finally`; the
+registry already names every live session, so no wrapper exception needs to carry the id.
 
 A `busy` trial is the exception to that 120 s ceiling. `wake_probe.py` refuses to rule on
 `turn_start` or `ack` for a busy host until the turn already running has ended or 900 s have
@@ -363,9 +386,10 @@ host's own turn-boundary event, or the submit command's exit status), `submissio
 is validated and carried into the result, but establishing a busy/approval/disconnected/restarted
 precondition is the caller's `settle` callable — omitting `settle` for any non-`idle` state
 raises `ValueError` immediately rather than silently exercising an idle host under that label.
-A settle callback works only through the driver's own methods (`attach`, `status`, `submit`),
-so every session it touches is owned: a settle that ran `claude --bg --resume <flags>` itself
-would start a copy nothing mints and nothing sweeps.
+A settle callback works only through the methods of the driver instance being swept (`attach`,
+`status`, `stop`, `submit`), so every session it touches is owned and every client it opens is
+held where the sweep finds it: a settle that ran `claude --bg --resume <flags>` itself would start
+a copy nothing mints and nothing sweeps.
 
 One documented deviation from `Trial`'s "same monotonic clock" contract: `wake_probe.py`'s own
 PTY capture stays in one process and can use `time.monotonic()`, but a real host's transcript

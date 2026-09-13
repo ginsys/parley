@@ -28,10 +28,14 @@ codex-cli 0.154.0 and OpenCode 1.18.30 (docs/host-probe-preflight.md, that secti
   `opencode --pure export <id>` is the observation channel; `opencode --pure session delete <id>`
   the teardown.
 
-What no capture established stays fail-closed rather than guessed: a `--bg --resume` against a
-*running* session, `claude attach` to a stopped one, what a permission-parked Claude session lists
-as, whether Codex delivers a queued item mid-turn, and any PTY readiness failure -- each raises
-`SubmissionUncaptured` (every outcome `unobservable`), never a host rejection.
+A submission this runner cannot vouch for raises `SubmissionUncaptured` (every outcome
+`unobservable`), never a host rejection: a `--bg --resume` against a *running* session,
+`claude attach` to a stopped one, a PTY that never showed its composer or exited while typing,
+a Codex `queue` with no process serving the thread, an OpenCode submit whose `serve` child is
+gone, and a listing or queue call that timed out before anything was sent. What a
+permission-parked Claude session lists as, how reliable `status: "busy"` is, and whether Codex
+delivers a queued item mid-turn are not refused here: they are what the trials measure, and the
+settle callback that establishes each state is responsible for checking its own precondition.
 
 Cleanup contract: every driver derives `owned()` from the shared `SessionRegistry`, so any id it
 minted -- including a copy `claude --bg --resume` started by accident -- is torn down by
@@ -80,7 +84,9 @@ class SubmissionUnsupported(NotImplementedError):
     """Raised when the *host* lacks the submission mechanism -- evidence about the host.
 
     Claude's absent `--channels` is the model case: missing from the help text and the plugin
-    cache, so its absence is a property of the product. Classifies the cell `unsupported`.
+    cache, so its absence is a property of the product. Classifies the cell `unsupported`. No
+    driver raises it today: a known absence like `--channels` is recorded without a live trial
+    through `classify_trial(..., supported=...)`; `run_trial` handles it for a driver that does.
     """
 
 
@@ -514,7 +520,9 @@ class Driver:
     """What every host driver shares: namespaced ownership, transient handles, a private cwd.
 
     `owned()` is derived from the registry by namespace prefix, so a copy minted inside
-    `submit()` and a second driver instance over the same registry are both swept.
+    `submit()` is swept with the session it copied. A second driver instance over the same
+    registry sees the same ids, but only the instance that minted one holds its transient state
+    (Claude's sessionId cache, a held PTY client or server), so sweep each instance that did work.
     `clients` holds open `PtyClient`s (closed by `sweep()` before any teardown, since a Codex
     resume client is what serves its thread); `close_servers()` is the hook for a driver that
     runs a server process (closed after teardown).
@@ -1441,7 +1449,10 @@ class OpenCodeDriver(Driver):
 
         The first `sessionID` on any event is minted before anything else is checked: a failing
         turn (captured: an `error` event for a stale credential) still creates the session.
-        Whether an error event or a nonzero exit takes precedence is uncaptured; both raise.
+        Whether an error event or a nonzero exit takes precedence is uncaptured; both raise. A
+        Ctrl-C mid-command loses the output: the session, if any, is then only findable by a
+        human as the newest `parley-probe-*` row of the global `opencode --pure session list`,
+        removed with `opencode --pure session delete <id>`.
         """
         title = f'parley-probe-{uuid.uuid4().hex[:12]}'
         argv = ['opencode', 'run', '--pure', '--format', 'json', '--dir', self.cwd, '--title', title,

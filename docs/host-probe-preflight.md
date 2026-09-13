@@ -74,9 +74,11 @@ Confirmed CLI surface beyond what #18 originally named, none of it yet exercised
 
 Conclusion enabled: Claude's `--channels` is a legitimate `unsupported` classification at
 `2.1.268` — the mechanism is absent, not merely undocumented — while `claude agents --json` and
-`claude logs` give a structured alternative for transcript-visibility and turn-start detection
-without PTY screen-scraping, *while the background session is still running*. See the [matrix
-runner](host-probes.md#matrix-runner) for how `scripts/probe/host_trials.py` uses this.
+`claude logs` looked like a structured alternative for transcript-visibility and turn-start
+detection without PTY screen-scraping, *while the background session is still running*. The
+stage-1 runner was built on that reading. Superseded 2026-09-13: the live captures below found
+`claude logs` to be a raw screen dump, and the trimmed runner reads the session's JSONL
+transcript instead (see the [matrix runner](host-probes.md#matrix-runner)).
 
 Two limits of that alternative, both observed here rather than assumed. Nothing in the surface
 above submits a message to an *already-running* background session: `--bg` carries its prompt at
@@ -86,13 +88,15 @@ actually captured. That is a gap in this runner's tooling, not a demonstrated ab
 capability: `--channels` is absent from the help text and the plugin cache, which is evidence
 about the mechanism, whereas "we captured no submission path" is evidence about us.
 
-Second, `claude logs` output has **never been read successfully here** — the one attempt failed
-with ENOENT against an already-exited daemon (table above). The parser in
-`scripts/probe/host_trials.py` therefore assumes an untimestamped `User:`/`Assistant:` line
+Second, `claude logs` output had **never been read successfully here** — the one attempt failed
+with ENOENT against an already-exited daemon (table above). The stage-1 parser in
+`scripts/probe/host_trials.py` therefore assumed an untimestamped `User:`/`Assistant:` line
 format, and because an untimestamped entry cannot be ordered against a submission instant, it
-classifies such a read `unobservable` rather than negative. Both the format and the absence of
-timestamps remain **hypotheses to reproduce against a running background session**, not
-observations; the fail-closed handling is what makes acting on an unconfirmed format safe.
+classified such a read `unobservable` rather than negative. Both the format and the absence of
+timestamps were **hypotheses to reproduce against a running background session**, not
+observations; the fail-closed handling was what made acting on an unconfirmed format safe.
+Superseded 2026-09-13: the section below read `claude logs` from a live session, found no record
+structure, and the parser was removed.
 
 ## 2026-09-13 — live captures at Claude 2.1.270 / codex-cli 0.154.0 / OpenCode 1.18.30
 
@@ -110,7 +114,7 @@ version. All timestamps are UTC.
 
 | Command/check | Observed result |
 | --- | --- |
-| `claude --bg --print --model haiku --max-budget-usd 0.05 --session-id <uuid> '<prompt>'` | Exit 1, stdout empty, stderr: ``--bg and --print conflict: --print never starts the interactive session that `claude agents` attaches to, so the job would be unattachable. The prompt is the positional — drop --print: `claude --bg '<task>'`.`` — the stage-1 `create()` argv was wrong. `--max-budget-usd` is a `--print` option, so it is unusable with `--bg`; spend is bounded by `--model haiku` instead |
+| `claude --bg --print --model haiku --max-budget-usd 0.05 --session-id <uuid> '<prompt>'` | Exit 1, stdout empty, stderr: ``--bg and --print conflict: --print never starts the interactive session that `claude agents` attaches to, so the job would be unattachable. The prompt is the positional — drop --print: `claude --bg '<task>'`.`` — the stage-1 `create()` argv was wrong. `--max-budget-usd` is a `--print` option, so it is unusable with `--bg`. `--model haiku` was passed instead, but the model row below shows it was not honoured, so no spend bound exists for Claude cells |
 | `claude --bg --model haiku --session-id <uuid> '<prompt>'` from `<probe-cwd>` | Exit 0. Stdout, 5 lines: `backgrounded · 69aa52ed` then four indented hint lines (`claude agents`, `claude attach 69aa52ed`, `claude logs 69aa52ed`, `claude stop 69aa52ed`). Stderr: `warning: --bg manages the session id; ignoring --session-id (use --resume <id> to continue an existing session)` and `Starting background service…`. The 2026-09-11 idea of correlating by a caller-chosen `--session-id` is dead: `--bg` ignores it |
 | `claude agents --json --all --cwd <probe-cwd>` immediately after | One entry: `{"pid": <n>, "id": "69aa52ed", "cwd": "<probe-cwd>", "kind": "background", "startedAt": 1789292510115, "sessionId": "69aa52ed-1356-4737-afaa-5d03d8e437b9", "name": "<prompt>", "status": "idle", "state": "working"}`. The short `id` is the first 8 hex digits of `sessionId`, so stdout line 1 identifies the session directly and the listing confirms it. Both `status` and `state` are present on a background entry (2026-09-11 saw only `state`, on a finished one); values seen: `status` `idle`/`busy`, `state` `working`/`done`. After the turn: `state: "done"`, `status: "idle"`, `pid` still set — the session stays alive. After `claude stop`: `pid: null`, `status: null`, `state: "done"`. After `claude rm`: the entry is gone |
 | `claude logs 69aa52ed`, while `working` and again after `done` | Exit 0 both times, ~7 KB: a raw ANSI terminal screen dump (banner, the prompt line, the reply, the status bar), no timestamps, no record structure. Readable while the daemon lives — the 2026-09-11 ENOENT was a stopped session — but it is not a transcript and this runner does not parse it |
@@ -118,7 +122,7 @@ version. All timestamps are UTC.
 | `claude --bg --resume <sessionId> --model haiku '<msg>'` while the session is running | Exit 0, stdout `backgrounded · e1c973b9` (+hints), stderr: ``note: session 69aa52ed is already running in the background, so this started a copy as e1c973b9. `claude attach 69aa52ed` opens the original.`` — a new session with its own transcript file; nothing reached the original |
 | `claude --print --resume <sessionId> --model haiku --max-budget-usd 0.05 '<msg>'` while running | Exit 1, stdout empty, stderr: ``Error: Session 69aa52ed-1356-4737-afaa-5d03d8e437b9 is running as a background session (69aa52ed). Run `claude attach 69aa52ed` to open it, or `claude stop 69aa52ed` first to resume it here. Add --fork-session to branch off a copy instead.`` |
 | `claude attach 69aa52ed` under a PTY (24×80, `TERM=xterm-256color`, `PWD=<probe-cwd>`), then a typed line | Prompt ready 3.2 s after launch, judged by 3 s of output silence. Typed `Reply with exactly PARLEY-PROBE-c3c and nothing else.` (45 characters in one write) then Enter (sent separately, 0.5 s later) at 09:50:16.085; the transcript file gained the user record at 09:50:16.099 (seen by the poller +0.27 s) and the assistant text record at 09:50:17.458 (+2.6 s); the screen showed the reply. Ctrl-Z detached (exit 0) and the session stayed listed and running. **This is the only captured path that delivers a message to a live background session** |
-| The ready screen of `claude attach`, escapes stripped | The composer is a line holding only `❯` followed by U+00A0 (no-break space), between two full-width rules of `─`; the previous prompt is echoed above it as `❯ <text>` and the reply as `● <text>`. Below: a status bar `[Sonnet 5] │ <last prompt> │ ⌂ claude-…`, `Context █░░ … │ Usage …`, `pid:<n>`, `session:<first 6 hex of the id>`, `⏸ plan mode on (shift+tab to cycle)`. The stage-2 runner's readiness regex is the bare-`❯` line; the status bar's `[Sonnet 5]` names the model the attach client shows, not what `--model haiku` asked for (next row) |
+| The ready screen of `claude attach`, escapes stripped | The composer is a line holding only `❯` followed by U+00A0 (no-break space), between two full-width rules of `─`; the previous prompt is echoed above it as `❯ <text>` and the reply as `● <text>`. Below: a status bar `[Sonnet 5] │ <last prompt> │ ⌂ claude-…`, `Context █░░ … │ Usage …`, `pid:<n>`, `session:<first 6 hex of the id>`, `⏸ plan mode on (shift+tab to cycle)`. The trimmed runner's readiness regex is the bare-`❯` line; the status bar's `[Sonnet 5]` names the model the attach client shows, not what `--model haiku` asked for (next row) |
 | Model actually serving the session created with `--bg --model haiku` | Not Haiku. Every `assistant` transcript record carries `"message": {"model": ...}`: the creation turn and the attach-delivered turn both say `claude-sonnet-5`; the no-flag `--bg --resume` turn (below) says `claude-opus-5`. Whether `--bg` ignores `--model`, or `haiku` is not a resolvable alias, was not established — either way **no spend bound is captured for Claude cells**, and a matrix cell must take its model from the assistant records, not from the creation argv |
 | `claude stop 69aa52ed` | Exit 0, stdout `stopped 69aa52ed`; the daemon pid is gone and the listing shows `pid: null, status: null, state: "done"` |
 | `claude --bg --resume <sessionId> --model haiku '<msg>'` after `stop` | Exit 0 but again a copy (`backgrounded · e0b268ff`); stderr: `note: background session 69aa52ed keeps its own saved options, so the flags you passed started a copy as e0b268ff. Without flags, the same command continues 69aa52ed itself.` |
@@ -135,7 +139,7 @@ version. All timestamps are UTC.
 | `codex queue --thread <exec thread> --message 'PARLEY-PROBE-x2 queue test'` with no live session | Exit 0, stdout `Queued message 01a09a25-0f9e-7d52-ad8b-31441d35f687 for thread 01a09a24-ff1d-7360-9385-722d230ef92b.`; nothing delivered. The item is persisted in `$CODEX_HOME/queue_1.sqlite`, table `queued_items(id, thread_id, payload_json, queue_order, created_at_ms, updated_at_ms)` with `payload_json` `{"UserInput": ...}` |
 | `codex queue --thread '' --message '...'` | Exit 1, stderr `Error: No active session found matching ''.` — the thread argument is checked against known sessions; acceptance is not unconditional |
 | `codex --no-alt-screen -s read-only -a never -C <probe-cwd>` (TUI) under a PTY (24×80, `TERM=xterm-256color`), first run in that directory | Prompt `Do you trust the contents of this directory?`; Enter accepted it and **persisted** `[projects."<probe-cwd>"]` / `trust_level = "trusted"` into `$CODEX_HOME/config.toml` — a side effect of any first TUI run in a new probe directory. Composer ready 4.3–5.4 s after launch (3 s of output silence as the criterion); default model `gpt-6-astra high`. The TUI's rollout file (`originator: "codex-tui"`, `source: "cli"`) is created only at its first turn, not at launch, so a typed first prompt is needed before the thread id exists on disk. Pasted text stays in the composer: send the text, pause, then Enter separately |
-| The TUI screens, escapes stripped | Trust dialog: `You are in <probe-cwd>` then `Doyoutrustthecontentsofthisdirectory?Workingwithuntrustedcontents…` then `› 1. Yes, continue2.No,quitPress enter to continue` — the words are placed with cursor moves, so they run together once escapes are removed, and the composer placeholder is *already drawn* beneath the dialog. Ready: a box `>_ OpenAI Codex (v0.154.0)` / `model:     gpt-6-astra high   /model to change` / `directory: <probe-cwd>`, then the composer line `› Ask Codex to do anything   ? for shortcuts` (spaces intact) with `gpt-6-astra high · <probe-cwd>` to its right. The stage-2 runner's regexes are whitespace-tolerant forms of `Ask Codex to do anything` and `Do you trust the contents of this directory` |
+| The TUI screens, escapes stripped | Trust dialog: `You are in <probe-cwd>` then `Doyoutrustthecontentsofthisdirectory?Workingwithuntrustedcontents…` then `› 1. Yes, continue2.No,quitPress enter to continue` — the words are placed with cursor moves, so they run together once escapes are removed, and the composer placeholder is *already drawn* beneath the dialog. Ready: a box `>_ OpenAI Codex (v0.154.0)` / `model:     gpt-6-astra high   /model to change` / `directory: <probe-cwd>`, then the composer line `› Ask Codex to do anything   ? for shortcuts` (spaces intact) with `gpt-6-astra high · <probe-cwd>` to its right. The trimmed runner's regexes are whitespace-tolerant forms of `Ask Codex to do anything` and `Do you trust the contents of this directory` |
 | `codex queue --thread <TUI thread> --message '<marker msg>'` while that TUI sits idle | Exit 0 at 09:59:33.336 (`Queued message ... for thread ...`). Rollout records: `event_msg/task_started` 09:59:40.036, `response_item/message` role `user` 09:59:40.072 (+6.7 s), `response_item/message` role `assistant` 09:59:41.994 (+8.7 s); the screen showed the reply. Queue delivery into a live idle session takes several seconds, not milliseconds |
 | `codex queue --thread <exec thread>` while an *unrelated* TUI is live | Exit 0; nothing appeared in the exec thread's rollout within 120 s — the queue is per thread, and a live session only drains its own |
 | `codex --no-alt-screen ... -C <probe-cwd> resume <exec thread>` under a PTY | Both earlier queued items (x2 and the mis-targeted x3) were delivered at start, before the composer became ready (15.1 s), each producing a user record, a turn and an assistant reply appended to the *same* rollout file; `queued_items` was empty afterwards. The screen showed the queued text echoed as `› Reply with exactly PARLEY-PROBE-x3 …`, a `Working` spinner, then `• PARLEY-PROBE-x3` above the ready composer `› Ask Codex to do anything` — the placeholder is drawn while a turn runs, so readiness needs the output to go quiet, not just the text to appear. A queued message is therefore delivered by whichever process next serves the thread |
@@ -185,12 +189,12 @@ described under [Matrix runner](host-probes.md#matrix-runner)):
   `run --attach --session` is the live-session submission path, `export` the observation
   channel, `session delete` the teardown. The `OpenCodeDriver` placeholder can be implemented.
 
-Still uncaptured, and therefore still fail-closed in the runner: what a Claude listing shows while
+Still uncaptured, and not assumed by the runner: what a Claude listing shows while
 a session is parked on a permission prompt (`approval`), whether `status: "busy"` is reliable for
 `busy`, and whether a queued Codex message is delivered mid-turn or only after the running turn
 ends. Those are established by the stage-2 trial runs themselves, not assumed here. Likewise
 inferred rather than captured, and marked as such in the runner: closing stdin for `codex exec`
 (from the `Reading additional input from stdin...` stderr line), `codex exec -m <model>` (the
-default model was used), `TERM` for the Codex TUI (the capture recorded none), what
+default model was used), what
 `codex delete --force` does to a still-queued item, and whether an OpenCode `error` event or a
 nonzero exit takes precedence when both occur.
