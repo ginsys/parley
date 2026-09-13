@@ -786,3 +786,11 @@ after-hook persists the new incident for another review of the complete set.
 Expiry persistence also snapshots the coordinator's remembered observations, so replay of a
 committed rejection retries a failed expiry write and invalidates the affected binding after
 persistence. It does not require an unrelated request to rediscover the expired recipient.
+
+Source initialization also preserves retained pending evidence: a different pending source or
+edges unreachable from the proposed initial cursor return `event_conflict`. The same bounded
+edge check used for resume applies; initializing at the retained first edge permits its retry.
+Reviewed floor reset has no 99-clock-incident cap. Its trusted complete incident list is retained
+in the receipt for exact cleanup replay, including after marker-removal failure. Only this
+internal recovery command is exempt from the ordinary 100-resource result limit; identity,
+version and result validation still apply. No schema migration is added.

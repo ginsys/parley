@@ -366,3 +366,68 @@ func TestFloorResetRejectsRollbackLatchedAtWriterTime(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestFloorResetCanCoverMoreThanNinetyNineClockIncidents(t *testing.T) {
+	a, s, now, r := restoreAdministration(t)
+	s.config.Markers.(*Directory).capacity = 200
+	ctx := context.Background()
+	var clocks []ReviewedIncident
+	floor := time.Unix(110, 0).UnixNano()
+	for i := 1; i <= 100; i++ {
+		observed := time.Unix(100, 0).UnixNano() + int64(i)
+		marker := Marker{IncidentID: fmt.Sprintf("61000000-0000-4000-8000-%012d", i), ServerID: s.serverID, Kind: "clock", Floor: &floor, Observed: &observed}
+		if err := s.config.Markers.Put(ctx, marker); err != nil {
+			t.Fatal(err)
+		}
+		clocks = append(clocks, ReviewedIncident{ID: marker.IncidentID, Version: 1})
+	}
+	*now = time.Unix(100, 100)
+	if err := s.prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var checkpoint store.ClockCheckpoint
+	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var err error
+		checkpoint, err = store.ReadClockCheckpoint(ctx, tx)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	a.resolve = func(context.Context, RecoveryCompleteRequest) (RestoreDisposition, error) {
+		return RestoreDisposition{Retire: []store.NamespaceRetirement{{PrincipalID: recoveryPrincipal}}, ClockFloor: &store.ReviewedClockFloor{CheckpointVersion: checkpoint.Version, Previous: floor, Reviewed: now.UnixNano()}, ClockIncidents: clocks}, nil
+	}
+	markers := &removalFailure{Markers: s.config.Markers, fail: true}
+	s.config.Markers = markers
+	receipt, err := a.Complete(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, r)
+	if err != store.TemporarilyUnavailable || receipt.Result.Code != "" || len(receipt.Result.Resources) != 101 {
+		t.Fatalf("large floor reset=%+v %v", receipt, err)
+	}
+	markers.fail = false
+	a.resolve = func(context.Context, RecoveryCompleteRequest) (RestoreDisposition, error) {
+		t.Fatal("replay re-resolved evidence")
+		return RestoreDisposition{}, nil
+	}
+	replay, err := a.Complete(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, r)
+	if err != nil || !replay.Replayed || replay.AuditID != receipt.AuditID {
+		t.Fatalf("large reset cleanup replay=%+v %v", replay, err)
+	}
+	if mode, err := s.InspectRecovery(ctx, s.config.Store); err != nil || mode != runtimeowner.Normal {
+		t.Fatalf("large floor reset held=%v %v", mode, err)
+	}
+	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM recovery_incidents WHERE status='cleared'").Scan(&count); err != nil {
+			return err
+		}
+		if count != 101 {
+			t.Errorf("cleared=%d", count)
+		}
+		got, err := store.ReadClockCheckpoint(ctx, tx)
+		if got.Instant.Int64 != now.UnixNano() {
+			t.Errorf("reset floor=%+v", got)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
