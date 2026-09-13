@@ -30,7 +30,7 @@ type authenticatedFixture struct {
 func authenticatedSetup(t *testing.T) *authenticatedFixture {
 	return authenticatedSetupBeforeManager(t, nil)
 }
-func authenticatedSetupBeforeManager(t *testing.T, setup func(*store.DB)) *authenticatedFixture {
+func authenticatedSetupBeforeManager(t *testing.T, setup func(*store.DB), configure ...func(*connection.ManagerConfig)) *authenticatedFixture {
 	t.Helper()
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "auth.db"))
@@ -71,7 +71,11 @@ func authenticatedSetupBeforeManager(t *testing.T, setup func(*store.DB)) *authe
 	if setup != nil {
 		setup(db)
 	}
-	m, err := connection.NewManager(connection.ManagerConfig{Store: db, MaxNonattached: 4, Now: func() time.Time { return time.Unix(110, 0) }, AfterFunc: func(time.Duration, func()) func() { return func() {} }, Guard: func(context.Context, *sql.Tx, string) error { return nil }, Verify: func(context.Context, connection.NativeTuple, connection.Token) error { return nil }})
+	config := connection.ManagerConfig{Store: db, MaxNonattached: 4, Now: func() time.Time { return time.Unix(110, 0) }, AfterFunc: func(time.Duration, func()) func() { return func() {} }, Guard: func(context.Context, *sql.Tx, string) error { return nil }, Verify: func(context.Context, connection.NativeTuple, connection.Token) error { return nil }}
+	for _, apply := range configure {
+		apply(&config)
+	}
+	m, err := connection.NewManager(config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,5 +381,56 @@ func TestLateSettlementRecordsRollbackAndRefundsOnlyOnce(t *testing.T) {
 		return err
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestAuthenticatedHandoffRechecksElapsedRecipientDeadline(t *testing.T) {
+	for _, kind := range []string{"credential", "liveness"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Unix(110, 0)
+			f := authenticatedSetupBeforeManager(t, nil, func(c *connection.ManagerConfig) { c.Now = func() time.Time { return now } })
+			makeReady(t, f.manager, f.recipient)
+			id := f.send(t)
+			deadline := time.Unix(141, 0)
+			if kind == "credential" {
+				// Keep liveness valid beyond the immutable credential expiry at 200.
+				for sec := int64(130); sec <= 190; sec += 20 {
+					now = time.Unix(sec, 0)
+					if err := f.manager.Heartbeat(ctx, f.recipient); err != nil {
+						t.Fatal(err)
+					}
+				}
+				deadline = time.Unix(201, 0)
+			}
+			deliveries := 0
+			bridge, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport {
+				// Claim committed, but no timer callback has run before handoff.
+				now = deadline
+				return authenticatedTransport(func(context.Context, store.Envelope) error { deliveries++; return nil })
+			}, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := bridge.DispatchOutcome(ctx, id)
+			if err != nil || out.Attempted || out.State != store.Queued || deliveries != 0 {
+				t.Fatalf("expired handoff=%+v %v deliveries=%d", out, err, deliveries)
+			}
+			f.assertBudget(t, 0)
+			if f.recipient.Context().Err() == nil {
+				t.Error("expired recipient remained live")
+			}
+			if kind == "credential" {
+				if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+					credential, err := store.ReadCredential(ctx, tx, "40000000-0000-4000-8000-000000000002")
+					if err == nil && credential.Status != "expired" {
+						t.Errorf("lost expiry evidence=%s", credential.Status)
+					}
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
 	}
 }
