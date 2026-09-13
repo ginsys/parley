@@ -19,6 +19,11 @@ func (m *Manager) AuthorizeWork(ctx context.Context, tx *sql.Tx, s *Session, rea
 	if s == nil || !m.owned(s.socket) || m.slots[s.token.BindingID] != s || m.expired(s.socket, m.now()) {
 		return store.AuthenticationFailed
 	}
+	// Trusted direct callers may not install an expiry observation collector.
+	// The exact retained denial still applies before any writer authorization.
+	if m.store.CredentialExpiryObserved(s.socket.credentialID) {
+		return store.BindingUnavailable
+	}
 	b, err := store.EnabledPeer(ctx, tx, s.token.PeerID, store.AuthorityTime(ctx, m.now))
 	if err != nil {
 		return err
