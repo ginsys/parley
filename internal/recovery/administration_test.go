@@ -131,3 +131,26 @@ func TestClockCleanupCannotClearAnotherIncidentOrReusedMarker(t *testing.T) {
 		t.Fatalf("reused cleared marker removed=%v", err)
 	}
 }
+
+func TestClockReconciliationStaleVersionRetainsExactIncident(t *testing.T) {
+	a, s, _, request := clockAdministration(t)
+	ctx := context.Background()
+	request.ExpectedClockVersion = 2
+	receipt, err := a.ClockReconcile(ctx, store.CommandPrincipal{ID: recoveryPrincipal}, request)
+	if err != nil || receipt.Result.Code != store.VersionConflict {
+		t.Fatalf("stale reconciliation=%+v %v", receipt, err)
+	}
+	markers, err := s.config.Markers.List(ctx)
+	if err != nil || len(markers) != 1 || markers[0].IncidentID != request.IncidentID {
+		t.Fatalf("stale removed incident=%+v %v", markers, err)
+	}
+	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		record, err := store.ReadRecovery(ctx, tx, request.IncidentID)
+		if record.Status != "held" || record.Version != 1 {
+			t.Errorf("stale mutated record=%+v", record)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
