@@ -363,7 +363,7 @@ func (p *Provisioner) finish(ctx context.Context, actor store.CommandPrincipal, 
 
 func domainRejection(err error) (store.CommandResult, error) {
 	var code store.Code
-	if errors.As(err, &code) {
+	if errors.As(err, &code) && code != "" {
 		return rejection(code)
 	}
 	return store.CommandResult{}, err

@@ -165,3 +165,17 @@ func TestMissingBindingRotationRetainsRejection(t *testing.T) {
 		t.Fatalf("unauthorized replay err=%v", err)
 	}
 }
+
+func TestEmptyProviderErrorCannotCommitSuccess(t *testing.T) {
+	for _, failure := range []error{store.Code(""), fmt.Errorf("synthetic provider: %w", store.Code(""))} {
+		p, db := testProvisioner(t, PublisherFunc(func(context.Context, CredentialFile) error { t.Error("failed precondition published"); return nil }))
+		p.config.Guard = func(context.Context, *sql.Tx, string) error { return failure }
+		result, err := p.Register(context.Background(), store.CommandPrincipal{ID: adminID}, testRegistration())
+		if err != store.TemporarilyUnavailable || result.Receipt.AuditID != "" {
+			t.Errorf("empty error result=%+v err=%v", result, err)
+		}
+		if got := provisioningCounts(t, db); got != [5]int{} {
+			t.Errorf("empty error persisted rows=%v", got)
+		}
+	}
+}
