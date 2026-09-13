@@ -288,7 +288,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   assistant reply at +2.6 s — so detaching as soon as the user record appeared would run every
   trial under an uncaptured mid-turn detach and make a missing `turn_start` or `ack`
   unattributable. A client that exits while typing is
-  `SubmissionUncaptured`. `resume` runs `claude --bg --resume <sessionId> '<msg>'` with no other
+  `SubmissionUncaptured`, whichever way the exit surfaces: the drain thread's EOF flag refuses the
+  write, or the write reaches `os.write` first and fails there. Both leave the line partly typed
+  with no Enter guaranteed, so both are the same uncaptured submission — the second only looks
+  different because it arrives as an `OSError`. `resume` runs `claude --bg --resume <sessionId> '<msg>'` with no other
   flags against a *stopped* session (the captured restarted path); a running session (`pid` set)
   is refused as uncaptured, since with flags, or against a running session, the captured result
   is a copy under a new id — which, when stdout names one anyway, is minted whatever the exit
@@ -333,7 +336,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `$CODEX_HOME/config.toml`), waits for the composer placeholder `› Ask Codex to do anything`
   drawn after that answer plus 3 s of quiet — the placeholder is drawn while a turn or the dialog
   is still up — and raises `PtyNotReady` with the stripped screen otherwise; inside `submit()`
-  that becomes `SubmissionUncaptured`. The default `-a never` cannot produce an
+  that becomes `SubmissionUncaptured`. A client that exits on the dialog, so that the Enter cannot
+  be written at all, is that same not-ready case and is named as one, rather than escaping as the
+  raw `OSError` `os.write` produced. The default `-a never` cannot produce an
   approval prompt, so an approval settle has to ask for other flags. `teardown()` runs
   `codex delete --force <id>` and releases only on exit 0; what it does to a still-queued item is
   uncaptured. `version()` is the rollout's first `session_meta.payload.cli_version` — the

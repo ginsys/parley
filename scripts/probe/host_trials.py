@@ -1090,10 +1090,13 @@ class ClaudeDriver(Driver):
         typed_at = _utc_now()
         try:
             client.type_line(message)
-        except ValueError as error:
-            # The client exited between readiness and typing: some, all or none of the line
-            # may have reached the composer, and no Enter is guaranteed.
-            raise SubmissionUncaptured(f'attach client exited while typing ({error}): '
+        except (ValueError, OSError) as error:
+            # The client exited between readiness and typing: `ValueError` if the drain thread had
+            # already seen EOF, `OSError` straight from `os.write` if the child died first and it
+            # had not. Both mean some, all or none of the line reached the composer with no Enter
+            # guaranteed; only the first was classified, so a write that failed at the fd escaped
+            # as a raw OSError instead of an uncaptured submission.
+            raise SubmissionUncaptured(f'attach client could not be typed into ({error!r}): '
                                        f'{client.screen()!r}') from error
         self.submission_note = (f'attach: typed at {typed_at}; client held attached until cleanup; '
                                 f'screen at type time: {screen_at_type!r}')
@@ -1374,15 +1377,26 @@ class CodexDriver(Driver):
         client = self.open_client(argv)
         # quiet=3.0 is the capture's own readiness criterion (3 s of output silence).
         ready = client.wait_for(CODEX_READY_PATTERN, quiet=3.0, timeout=60)
+        reason = 'never became ready'
         if ready and CODEX_TRUST_PATTERN.search(client.text_since(0)):
             since = client.mark()
-            client.send_keys(b'\r')
-            ready = client.wait_for(CODEX_READY_PATTERN, quiet=3.0, timeout=60, since=since)
+            try:
+                client.send_keys(b'\r')
+            except (ValueError, OSError) as error:
+                # The client exited on the dialog: `ValueError` if the drain thread had already
+                # seen EOF, `OSError` straight from `os.write` if it had not. Either way nothing
+                # answered the prompt, which is this client failing to become ready -- the caller
+                # in `submit()` turns that into `SubmissionUncaptured`, where a raw OSError would
+                # have escaped as an unclassified failure.
+                ready = False
+                reason = f'exited while its trust dialog was being answered ({error!r})'
+            else:
+                ready = client.wait_for(CODEX_READY_PATTERN, quiet=3.0, timeout=60, since=since)
         if not ready:
             screen = client.screen()
             client.close()
             self.clients.remove(client)
-            raise PtyNotReady(f'codex resume {thread_id} never became ready', screen=screen)
+            raise PtyNotReady(f'codex resume {thread_id} {reason}', screen=screen)
         return client
 
     def submit(self, thread_id, message):

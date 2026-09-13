@@ -1057,6 +1057,24 @@ class ClaudeDriverTests(DriverTestCase):
         # be the only one to a child that may still be alive.
         self.assertEqual(driver.clients, FakePtyClient.launched)
 
+    def test_a_failed_pty_write_while_typing_is_uncaptured_too(self):
+        # A child that dies with the drain thread not yet at EOF makes `send_keys` raise OSError
+        # straight from `os.write` rather than the eof guard's ValueError. Only ValueError was
+        # classified, so this escaped `submit()` unclassified -- and `run_trial` records an
+        # unclassified failure as the trial failing, not as a submission that may have half landed.
+        driver, run = self.create_live()
+
+        class WriteFailingClient(FakePtyClient):
+            def __init__(self, argv, **kwargs):
+                super().__init__(argv, **kwargs)
+                self.write_error = OSError(5, 'Input/output error')
+
+        driver.pty = WriteFailingClient
+        with self.assertRaises(SubmissionUncaptured) as caught:
+            driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertIn('Input/output error', str(caught.exception))
+        self.assertEqual(driver.clients, FakePtyClient.launched)
+
     def test_a_listing_timeout_before_submission_is_uncaptured_and_sends_nothing(self):
         driver, run = self.create_live()
         run.scripts.insert(0, (['claude', 'agents'], subprocess.TimeoutExpired(cmd=['claude'], timeout=15)))
@@ -1424,6 +1442,25 @@ class CodexDriverTests(DriverTestCase):
         self.assertTrue(client.closed)
         self.assertEqual(driver.clients, [])
         self.assertIn('Doyoutrustthecontentsofthisdirectory', str(caught.exception))
+
+    def test_a_failed_pty_write_answering_the_trust_dialog_is_not_ready(self):
+        # `send_keys` propagates OSError from `os.write` when the child died before the drain
+        # thread saw EOF. Unclassified it escaped `attach()` raw, and through `submit()` under
+        # mechanism=queue-then-resume, where only PtyNotReady becomes `SubmissionUncaptured`.
+        def failing(argv, *, cwd):
+            client = FakePtyClient(argv, cwd=cwd, trust_prompt=True)
+            client.write_error = OSError(5, 'Input/output error')
+            return client
+
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run, pty=failing)
+        driver.create('hello')
+        with self.assertRaises(PtyNotReady) as caught:
+            driver.attach(THREAD_ID)
+        self.assertIn('Input/output error', str(caught.exception))
+        client, = FakePtyClient.launched
+        self.assertTrue(client.closed)
+        self.assertEqual(driver.clients, [])
 
     def test_attach_accepts_other_sandbox_and_approval_flags(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output())])
