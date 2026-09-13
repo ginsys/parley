@@ -849,3 +849,8 @@ the same bound. Partial timestamp shapes compare safely even before marker valid
 Recovery hooks stay fail closed until their constructor finishes installation identity loading
 and preparation. A failed constructor retains this denial; the trusted owner must reopen the
 store for a fresh supervised initialization instead of falling back to unguarded services.
+
+Origin verification receives only canonical nonzero source UUIDs and UTF-8 cursor locators within
+4096 bytes. Malformed initialization coordinates return `invalid_request` before provider I/O.
+Historical dispatch compatibility checks include the 256-byte limit for conversation and both
+peer identifiers; oversized rows remain untouched with `incompatible_identifier` diagnostics.
