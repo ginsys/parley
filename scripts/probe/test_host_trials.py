@@ -1209,7 +1209,7 @@ class ClaudeDriverTests(DriverTestCase):
                        (['claude', 'stop'], FakeResult(0)),
                        (['claude', 'rm'], FakeResult(1, '', 'busy'))])
         driver = self.driver(run)
-        self.registry.mint('claude:69aa52ed')
+        driver.mint('69aa52ed')
         with self.assertRaises(RuntimeError):
             driver.teardown('69aa52ed')
         self.assertEqual(driver.owned(), {'69aa52ed'})
@@ -1329,8 +1329,9 @@ class CodexDriverTests(DriverTestCase):
             driver.submit(THREAD_ID, 'msg')
         self.assertEqual(FakePtyClient.launched, [])
         # Under `queue` a live client may still have drained it: the timeout propagates raw and
-        # `run_trial` polls with `accepted` unobservable.
-        driver = self.driver(run)
+        # `run_trial` polls with `accepted` unobservable. Same instance, since only the instance
+        # that created a thread may operate on it.
+        driver.mechanism = 'queue'
         driver.attach(THREAD_ID)
         with self.assertRaises(subprocess.TimeoutExpired):
             driver.submit(THREAD_ID, 'msg')
@@ -1451,15 +1452,32 @@ class CrossDriverNamespaceTests(DriverTestCase):
                               transcript_path_for=self.transcript_path_for)
         codex = CodexDriver(self.registry, run=FakeRun([]), cwd=self.cwd, pty=FakePtyClient,
                             rollout_path_for=self.transcript_path_for)
-        self.registry.mint('claude:abc')
-        self.registry.mint('codex:abc')
+        claude.mint('abc')
+        codex.mint('abc')  # the same name in another namespace is another session
         self.assertEqual(claude.owned(), {'abc'})
         self.assertEqual(codex.owned(), {'abc'})
-        self.registry.release('codex:abc')
+        self.assertEqual(self.registry.created, {'claude:abc', 'codex:abc'})
+        codex.release('abc')
         self.assertEqual(claude.owned(), {'abc'})
         self.assertEqual(codex.owned(), set())
         with self.assertRaises(ForeignSessionError):
             codex.observe('abc', marker=MARKER, submitted_at=0.0)
+
+    def test_owned_is_per_instance_not_per_registry(self):
+        # Sweeping one instance must not tear down a sibling's sessions: only that sibling holds
+        # the PTY client or server still serving them, so the sweep would delete a live trial.
+        first = ClaudeDriver(self.registry, run=FakeRun([]), cwd=self.cwd, pty=FakePtyClient,
+                             transcript_path_for=self.transcript_path_for)
+        second = ClaudeDriver(self.registry, run=FakeRun([]), cwd=self.cwd, pty=FakePtyClient,
+                              transcript_path_for=self.transcript_path_for)
+        first.mint('aaaaaaaa')
+        second.mint('bbbbbbbb')
+        self.assertEqual(first.owned(), {'aaaaaaaa'})
+        self.assertEqual(second.owned(), {'bbbbbbbb'})
+        for method in (lambda: second.stop('aaaaaaaa'), lambda: second.teardown('aaaaaaaa'),
+                       lambda: second.status('aaaaaaaa')):
+            with self.assertRaises(ForeignSessionError):
+                method()
 
 
 class FakePopen:
@@ -1867,6 +1885,7 @@ class FakeDriver(Driver):
                  teardown_errors=None, submission_note=None, registry=None, on_observe=None):
         self.registry = registry or SessionRegistry()
         self.clients = []
+        self.minted = set()
         self.observations = list(observations or [Observation()])
         self.accepted = accepted
         self.submit_error = submit_error
@@ -1883,7 +1902,7 @@ class FakeDriver(Driver):
 
     def create(self, prompt):
         self.order.append('create')
-        self.registry.mint(self._key('sid'))
+        self.mint('sid')
         return 'sid'
 
     def version(self, session_id):
@@ -1916,7 +1935,7 @@ class FakeDriver(Driver):
         self.torn_down.append(session_id)
         if session_id in self.teardown_errors:
             raise self.teardown_errors[session_id]
-        self.registry.release(self._key(session_id))
+        self.release(session_id)
 
     def close_servers(self):
         self.order.append('close_servers')
@@ -2431,8 +2450,8 @@ class ClosingClient:
 class SweepTests(unittest.TestCase):
     def test_sweep_closes_clients_then_tears_down_every_owned_id_then_closes_servers(self):
         driver = FakeDriver()
-        driver.registry.mint('fake:b')
-        driver.registry.mint('fake:a')
+        driver.mint('b')
+        driver.mint('a')
         driver.registry.mint('other:zzz')  # another driver's session on the shared registry
         driver.clients.append(ClosingClient(driver.order))
         self.assertEqual(sweep(driver), [])
@@ -2443,8 +2462,8 @@ class SweepTests(unittest.TestCase):
 
     def test_sweep_continues_past_a_failed_teardown_and_reports_it(self):
         driver = FakeDriver(teardown_errors={'a': RuntimeError('stop left a running')})
-        driver.registry.mint('fake:a')
-        driver.registry.mint('fake:b')
+        driver.mint('a')
+        driver.mint('b')
         driver.clients.append(ClosingClient(driver.order))
         failures = sweep(driver)
         self.assertEqual([label for label, _ in failures], ['a'])
@@ -2457,8 +2476,8 @@ class SweepTests(unittest.TestCase):
         # only handle to it: tearing the session down anyway would delete a thread still in use,
         # and dropping the handle would leave the child unrecoverable and unnamed.
         driver = FakeDriver()
-        driver.registry.mint('fake:a')
-        driver.registry.mint('fake:b')
+        driver.mint('a')
+        driver.mint('b')
         client = ClosingClient(driver.order, fail=True)
         driver.clients.append(client)
         failures = sweep(driver)
@@ -2514,7 +2533,7 @@ class RunTrialWithCleanupTests(unittest.TestCase):
         original_submit = driver.submit
 
         def minting_submit(session_id, message):
-            driver.registry.mint(driver._key('copy'))
+            driver.mint('copy')
             return original_submit(session_id, message)
 
         driver.submit = minting_submit

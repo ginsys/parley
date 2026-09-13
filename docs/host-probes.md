@@ -181,6 +181,13 @@ own creation output — stdout line 1 of `claude --bg`, the `thread.started` eve
 rollout directory. A driver has no adoption path at all: a thread this run did not create cannot
 be handed to it.
 
+Ownership is also *per driver instance*, not merely per namespace. Each driver keeps its own set
+of minted ids alongside the shared registry, and `owned()` and the refusal above both read that
+set, so two instances of one host driver sharing a registry cannot reach each other's sessions.
+Without that, sweeping one instance would close only its own PTY clients and servers and then tear
+down the other instance's sessions while that instance's client or server was still serving them —
+one `run_trial_with_cleanup()` deleting another live trial.
+
 Trials run under the real HOME so the host session is actually authenticated, per the owner's
 2026-09-11 decision — disposable at the *session* level, not the HOME level. The runner has no
 disposable mode: its drivers call `subprocess.run` without an `env=` argument, so every host
@@ -212,9 +219,10 @@ held and is reported. A client whose `close()` failed is kept on the driver too,
 then tears *nothing* down: that client may still be the process serving its session (a Codex
 resume client is exactly that), and its handle is the only one there is, so deleting the session
 anyway could remove a thread still in use and dropping the handle would leave the child
-unrecoverable and unnamed. Every id stays owned and is reported alongside the client's failure. A sweep covers the driver instance it is given: another instance over the
-same registry sees the same ids but not the first one's held clients, servers or cached Claude
-`sessionId`s, so sweep every instance that did work. One gap stays open by design: a Ctrl-C while
+unrecoverable and unnamed. Every id stays owned and is reported alongside the client's failure. A
+sweep covers exactly the driver instance it is given — its own minted ids, its own clients and
+servers — and reaches nothing another instance created, so sweep every instance that did
+work. One gap stays open by design: a Ctrl-C while
 `claude --bg`, `codex exec` or `opencode run` is still running loses that command's output, and a
 session the host created in that instant is findable only by a human (`claude agents --json
 --all --cwd <probe cwd>`; the newest rollout under `$CODEX_HOME/sessions` naming the probe cwd;

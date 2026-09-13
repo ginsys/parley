@@ -585,10 +585,14 @@ def private_directory(cwd):
 class Driver:
     """What every host driver shares: namespaced ownership, transient handles, a private cwd.
 
-    `owned()` is derived from the registry by namespace prefix, so a copy minted inside
-    `submit()` is swept with the session it copied. A second driver instance over the same
-    registry sees the same ids, but only the instance that minted one holds its transient state
-    (Claude's sessionId cache, a held PTY client or server), so sweep each instance that did work.
+    Ownership is *per instance*, not per registry: `mint()` records an id both in the shared
+    `SessionRegistry` (which keeps the run-wide "never touch a foreign session" guarantee) and in
+    this instance's own `minted` set, and `owned()`/`require_owned()` read the latter. Two
+    instances of one host driver over a shared registry therefore cannot reach each other's
+    sessions -- without that, sweeping instance A would close only A's clients and then tear down
+    B's sessions while B's PTY client or server was still serving them, so one
+    `run_trial_with_cleanup()` could delete another live trial. A copy minted inside `submit()`
+    lands in the same set and is swept with the session it copied.
     `clients` holds open `PtyClient`s (closed by `sweep()` before any teardown, since a Codex
     resume client is what serves its thread); `close_servers()` is the hook for a driver that
     runs a server process (closed after teardown).
@@ -600,6 +604,9 @@ class Driver:
         self.registry = registry
         self.cwd = private_directory(cwd)
         self.clients = []
+        # Ids this instance created. The registry keeps the run-wide set; this keeps the sweep
+        # and every operation from reaching a sibling instance's live sessions.
+        self.minted = set()
         # Free-text evidence about the last submit() call for a mechanism with no exit status of
         # its own (the attach path); `run_trial` copies it into `TrialRun.submission_diagnostic`.
         self.submission_note = None
@@ -607,9 +614,27 @@ class Driver:
     def _key(self, session_id):
         return f'{self.NAMESPACE}:{session_id}'
 
+    def mint(self, session_id):
+        key = self._key(session_id)
+        self.registry.mint(key)
+        self.minted.add(session_id)
+        return session_id
+
+    def require_owned(self, session_id):
+        key = self._key(session_id)
+        self.registry.require_owned(key)
+        if session_id not in self.minted:
+            raise ForeignSessionError(
+                f'refusing to operate on {session_id}: created by another driver instance over '
+                f'the same registry, which still holds its clients and servers')
+
+    def release(self, session_id):
+        key = self._key(session_id)
+        self.registry.release(key)
+        self.minted.discard(session_id)
+
     def owned(self):
-        prefix = self._key('')
-        return {key[len(prefix):] for key in self.registry.created if key.startswith(prefix)}
+        return set(self.minted)
 
     def open_client(self, argv):
         """Launch a PTY client in the probe cwd and hold it, in one statement.
@@ -827,7 +852,7 @@ class ClaudeDriver(Driver):
         precondition; what an approval-parked session shows, and how reliable `busy` is, are
         uncaptured. Only this driver's own `--cwd`-filtered listing is ever read.
         """
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         for entry in self._listing():
             if entry.get('id') == session_id and entry.get('kind') == 'background':
                 if isinstance(entry.get('sessionId'), str):
@@ -836,7 +861,7 @@ class ClaudeDriver(Driver):
         return None
 
     def _mint(self, session_id):
-        self.registry.mint(self._key(session_id))
+        self.mint(session_id)
         self.sessions.setdefault(session_id, None)
 
     def _settle_creation_turn(self, session_id, timeout=CLAUDE_CREATION_TURN_CAP):
@@ -925,7 +950,7 @@ class ClaudeDriver(Driver):
         `turn_stream` stays False: the captured transcript carries no turn-boundary record, so a
         busy trial's turn_start/ack cannot be told apart from the running turn's tail.
         """
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         parsed = self._read_transcript(session_id, claude_transcript_events)
         if parsed is None:
             return Observation(observable=False)
@@ -966,7 +991,7 @@ class ClaudeDriver(Driver):
         return failures + super().close_clients()
 
     def submit(self, session_id, message):
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         self.submission_note = None
         try:
             entry = self.status(session_id)
@@ -1071,7 +1096,7 @@ class ClaudeDriver(Driver):
         is tolerated, a surviving `pid` is an error whatever the exit status said. Returns the
         listing entry afterwards (None once removed).
         """
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         result = self.run(['claude', 'stop', session_id], capture_output=True, text=True, timeout=15)
         entry = self.status(session_id)
         if entry is not None and entry.get('pid') is not None:
@@ -1090,7 +1115,7 @@ class ClaudeDriver(Driver):
         result = self.run(['claude', 'rm', session_id], capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             raise RuntimeError(f'claude rm exited {result.returncode} for {session_id}: {result.stderr}')
-        self.registry.release(self._key(session_id))
+        self.release(session_id)
         self.sessions.pop(session_id, None)
 
     def version(self, session_id):
@@ -1099,7 +1124,7 @@ class ClaudeDriver(Driver):
         Called right after `create()`; the transcript appears within a fraction of a second of
         the listing's `startedAt` (captured), so a short bounded wait covers the race.
         """
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         deadline = self.monotonic() + 5.0
         while True:
             version = self._read_transcript(session_id, claude_session_version)
@@ -1311,11 +1336,11 @@ class CodexDriver(Driver):
         except subprocess.TimeoutExpired as error:
             thread_id = codex_thread_id(_partial_stdout(error))
             if thread_id:
-                self.registry.mint(self._key(thread_id))
+                self.mint(thread_id)
             raise
         thread_id = codex_thread_id(result.stdout)
         if thread_id:
-            self.registry.mint(self._key(thread_id))
+            self.mint(thread_id)
         if result.returncode != 0:
             raise RuntimeError(f'codex exec exited {result.returncode}: {result.stderr}')
         if thread_id is None:
@@ -1331,7 +1356,7 @@ class CodexDriver(Driver):
         produce an approval prompt, so an approval settle must ask for other ones. Any items
         already queued are delivered at start (captured), before the composer is ready.
         """
-        self.registry.require_owned(self._key(thread_id))
+        self.require_owned(thread_id)
         argv = ['codex', '--no-alt-screen', '-s', sandbox, '-a', approval, '-C', self.cwd,
                 'resume', thread_id]
         client = self.open_client(argv)
@@ -1359,7 +1384,7 @@ class CodexDriver(Driver):
         `queue-then-resume` a `codex queue` that times out is also uncaptured: whether the item
         was queued is unknown and nothing serves the thread yet.
         """
-        self.registry.require_owned(self._key(thread_id))
+        self.require_owned(thread_id)
         self.submission_note = None
         if self.mechanism == 'queue' and not any(not client.eof for client in self.clients):
             raise SubmissionUncaptured('mechanism=queue needs a live resume client already serving the '
@@ -1391,7 +1416,7 @@ class CodexDriver(Driver):
 
     def observe(self, thread_id, *, marker, submitted_at):
         """Read the thread's rollout; an unreadable or undatable rollout is unobservable."""
-        self.registry.require_owned(self._key(thread_id))
+        self.require_owned(thread_id)
         path = self.rollout_path_for(thread_id)
         if path is None:
             return Observation(observable=False)
@@ -1411,12 +1436,12 @@ class CodexDriver(Driver):
         Captured against a thread with no live process; the sweep closes any resume client
         first. What `delete` does to a still-queued item is uncaptured.
         """
-        self.registry.require_owned(self._key(thread_id))
+        self.require_owned(thread_id)
         result = self.run(['codex', 'delete', '--force', thread_id], capture_output=True, text=True,
                           timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f'codex delete exited {result.returncode} for {thread_id}: {result.stderr}')
-        self.registry.release(self._key(thread_id))
+        self.release(thread_id)
 
     def version(self, thread_id):
         """The thread's own rollout-recorded `cli_version`, or None; never `codex --version`.
@@ -1424,7 +1449,7 @@ class CodexDriver(Driver):
         The installed binary and a rollout's own record disagreed on the same day once
         (docs/host-probe-preflight.md, 2026-09-11), so the client's version is not a fallback.
         """
-        self.registry.require_owned(self._key(thread_id))
+        self.require_owned(thread_id)
         path = self.rollout_path_for(thread_id)
         if path is None:
             return None
@@ -1626,11 +1651,11 @@ class OpenCodeDriver(Driver):
         except subprocess.TimeoutExpired as error:
             session_id, _ = opencode_session_id(_partial_stdout(error))
             if session_id:
-                self.registry.mint(self._key(session_id))
+                self.mint(session_id)
             raise
         session_id, error = opencode_session_id(result.stdout)
         if session_id:
-            self.registry.mint(self._key(session_id))
+            self.mint(session_id)
         if error is not None:
             raise RuntimeError(f'opencode run reported an error event: {error}')
         if result.returncode != 0:
@@ -1725,7 +1750,7 @@ class OpenCodeDriver(Driver):
         had disappeared. A dead child makes that timeout `SubmissionUncaptured`; a live one
         re-raises, since the message may well have reached the session.
         """
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         self.submission_note = None
         if self.server is None:
             raise SubmissionUncaptured('only `run --attach` into a live `serve` is captured; call serve() first')
@@ -1747,7 +1772,7 @@ class OpenCodeDriver(Driver):
         if attached_id is not None and attached_id != session_id:
             # Minted before anything is raised, exactly as `create()` does: a session this run
             # caused to exist must be in `owned()` whatever happens next.
-            self.registry.mint(self._key(attached_id))
+            self.mint(attached_id)
         if result.returncode != 0:
             if self.server.process.poll() is not None:
                 # A dead server is this runner's failure, not the host refusing the message.
@@ -1782,7 +1807,7 @@ class OpenCodeDriver(Driver):
         `serve` is up reads the same store (captured side by side; strict consistency between the
         two is an assumption).
         """
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         raw = self._export(session_id)
         if raw is None:
             return Observation(observable=False)
@@ -1794,17 +1819,17 @@ class OpenCodeDriver(Driver):
 
     def teardown(self, session_id):
         """`opencode --pure session delete <id>`; release only on exit 0."""
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         result = self.run(['opencode', '--pure', 'session', 'delete', session_id], capture_output=True,
                           text=True, timeout=30)
         if result.returncode != 0:
             raise RuntimeError(f'opencode session delete exited {result.returncode} for {session_id}: '
                                f'{result.stderr}')
-        self.registry.release(self._key(session_id))
+        self.release(session_id)
 
     def version(self, session_id):
         """`info.version` from the session's export, or None."""
-        self.registry.require_owned(self._key(session_id))
+        self.require_owned(session_id)
         raw = self._export(session_id)
         return None if raw is None else opencode_export_version(raw)
 
