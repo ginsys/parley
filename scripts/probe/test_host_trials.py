@@ -1393,11 +1393,13 @@ class CodexDriverTests(DriverTestCase):
                                 '-C', driver.cwd, 'hello'])
         self.assertIs(kwargs['stdin'], subprocess.DEVNULL)
 
-    def test_create_passes_a_model_only_when_asked(self):
-        run = FakeRun([(['codex', 'exec'], self.exec_output())])
-        self.driver(run, model='gpt-6-astra').create('hello')
-        self.assertIn('-m', run.calls[0][0])
-        self.assertEqual(run.calls[0][0][-1], 'hello')
+    def test_uncaptured_codex_model_override_is_refused_before_any_host_call(self):
+        for model in ('synthetic-model', ''):
+            with self.subTest(model=model):
+                run = FakeRun([])
+                with self.assertRaisesRegex(ValueError, 'uncaptured'):
+                    self.driver(run, model=model)
+                self.assertEqual(run.calls, [])
 
     def test_create_mints_before_checking_the_exit_status_and_from_partial_output(self):
         run = FakeRun([(['codex', 'exec'], FakeResult(2, self.exec_output().stdout, 'quota'))])

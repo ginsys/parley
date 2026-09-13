@@ -1450,9 +1450,10 @@ class CodexDriver(Driver):
                  rollout_path_for=default_codex_rollout_path, pty=PtyClient, clock=time.time):
         if mechanism not in CODEX_MECHANISMS:
             raise ValueError(f'unknown submission mechanism: {mechanism!r}')
+        if model is not None:
+            raise ValueError('Codex model overrides are uncaptured; only the default is supported')
         super().__init__(registry, cwd=cwd)
         self.run = run
-        self.model = model
         self.mechanism = mechanism
         self.rollout_path_for = rollout_path_for
         self.pty = pty
@@ -1465,11 +1466,10 @@ class CodexDriver(Driver):
         checked and from partial output on a timeout, so a thread the host created is always in
         `owned()`. `exec` returns after its turn: the thread is idle with no live process. Passing
         stdin as `/dev/null` is inferred from the captured stderr `Reading additional input from
-        stdin...`, and `-m` is uncaptured (the default model was used).
+        stdin...`. `-m` is uncaptured (the default model was used), so construction rejects
+        any explicit model override before a host can be launched.
         """
         argv = ['codex', 'exec', '--json', '-s', 'read-only', '--skip-git-repo-check', '-C', self.cwd]
-        if self.model:
-            argv += ['-m', self.model]
         argv.append(prompt)
         try:
             result = self.run(argv, capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
