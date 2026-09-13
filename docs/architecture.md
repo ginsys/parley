@@ -241,7 +241,11 @@ CLI, and grants still come from the protected controller.
 
 Legacy evidence resolution retains only explicit `forbidden` rejections. Unavailable manifests
 and other resolver failures commit no disposition or receipt; the same operation ID can retry
-after recovery while quarantine and delivery evidence remain unchanged.
+after recovery while quarantine and delivery evidence remain unchanged. Disposition request
+digests encode malformed UTF-8 work IDs as a tagged base64 object; valid text keeps its existing
+canonical representation. Evidence lookup and storage use the original bytes, so incompatible
+historical IDs remain addressable without replacement-character aliases. This also applies to
+security-hold dispositions for legacy work.
 
 Release changes only the selected hold or quarantine version. A second incident remains effective.
 Cancellation is terminal; only queued work changes to cancelled, while dispatched/uncertain and

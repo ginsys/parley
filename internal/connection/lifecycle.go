@@ -3,6 +3,7 @@ package connection
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"time"
 	"unicode"
@@ -138,7 +139,7 @@ func (l *Lifecycle) HoldDisposition(ctx context.Context, p store.CommandPrincipa
 	if !canonicalID(r.IncidentID) || r.ExpectedHoldVersion < 1 || (r.Action != "release" && r.Action != "cancel") {
 		return store.CommandReceipt{}, store.InvalidRequest
 	}
-	request, err := store.NewCommandRequest("hold.disposition", r.OperationID, store.Field{Name: "work", Value: store.Fields{{Name: "kind", Value: r.Work.Kind}, {Name: "id", Value: r.Work.ID}}}, store.Field{Name: "incident_id", Value: r.IncidentID}, store.Field{Name: "expected_hold_version", Value: r.ExpectedHoldVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "reason", Value: reason})
+	request, err := store.NewCommandRequest("hold.disposition", r.OperationID, store.Field{Name: "work", Value: store.Fields{{Name: "kind", Value: r.Work.Kind}, {Name: "id", Value: retainedWorkID(r.Work.ID)}}}, store.Field{Name: "incident_id", Value: r.IncidentID}, store.Field{Name: "expected_hold_version", Value: r.ExpectedHoldVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "reason", Value: reason})
 	if err != nil {
 		return store.CommandReceipt{}, err
 	}
@@ -155,7 +156,7 @@ func (l *Lifecycle) LegacyDisposition(ctx context.Context, p store.CommandPrinci
 	if !canonicalID(r.MigrationIncidentID) || !canonicalID(r.DispositionRef) || r.WorkID == "" || r.ExpectedQuarantineVersion < 1 || (r.Action != "release" && r.Action != "cancel") {
 		return store.CommandReceipt{}, store.InvalidRequest
 	}
-	request, err := store.NewCommandRequest("legacy.disposition", r.OperationID, store.Field{Name: "migration_incident_id", Value: r.MigrationIncidentID}, store.Field{Name: "work_id", Value: r.WorkID}, store.Field{Name: "expected_quarantine_version", Value: r.ExpectedQuarantineVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "disposition_ref", Value: r.DispositionRef})
+	request, err := store.NewCommandRequest("legacy.disposition", r.OperationID, store.Field{Name: "migration_incident_id", Value: r.MigrationIncidentID}, store.Field{Name: "work_id", Value: retainedWorkID(r.WorkID)}, store.Field{Name: "expected_quarantine_version", Value: r.ExpectedQuarantineVersion}, store.Field{Name: "action", Value: r.Action}, store.Field{Name: "disposition_ref", Value: r.DispositionRef})
 	if err != nil {
 		return store.CommandReceipt{}, err
 	}
@@ -197,4 +198,14 @@ func (l *Lifecycle) disposition(ctx context.Context, p store.CommandPrincipal, r
 		}
 		return store.CommandResult{Resources: []store.ResourceChange{change}}, nil
 	}, nil)
+}
+
+// retainedWorkID preserves existing valid-text digests while distinguishing every
+// byte sequence in incompatible historical IDs. The tagged object cannot alias a
+// valid string; storage and evidence resolution still receive the original bytes.
+func retainedWorkID(id string) any {
+	if utf8.ValidString(id) {
+		return id
+	}
+	return store.Fields{{Name: "base64", Value: base64.StdEncoding.EncodeToString([]byte(id))}}
 }
