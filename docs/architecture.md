@@ -748,7 +748,8 @@ the storage primitive rejects reuse of a cleared incident without changing its t
 Retries reauthorize before looking up the receipt and may finish only that committed cleanup. Other
 incidents keep the global gate closed. `recovery.complete` follows the same two-phase protocol.
 Its implemented restore policy is conservative: every restored binding must be permanently retired,
-and every outstanding envelope receives an independent restore hold. Surviving-history import is
+and every outstanding envelope receives an independent restore hold with the same trusted creation
+instant as the retirement transaction. Surviving-history import is
 not implemented. Grant budgets, ACKs, states and attempt tokens remain snapshot evidence; retired
 identities cannot use them to authorize new work. A reviewed bad-floor disposition additionally
 retires affected authority, matches the exact checkpoint version and all held clock incidents, and

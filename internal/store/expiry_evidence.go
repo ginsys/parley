@@ -78,4 +78,3 @@ func observedExpiry(ctx context.Context, id string) bool {
 	evidence, ok := ctx.Value(expiryContextKey{}).(*ExpiryEvidence)
 	return ok && evidence.owner.CredentialExpiryObserved(id)
 }
-
