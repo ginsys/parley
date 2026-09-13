@@ -698,6 +698,8 @@ def private_directory(cwd):
         raise ValueError('probe cwd must be owned by the current operator')
     if metadata.st_mode & 0o022:
         raise ValueError('probe cwd must not be writable by the group or other users')
+    if metadata.st_mode & 0o011:
+        raise ValueError('probe cwd must not be traversable by the group or other users')
     ancestor = os.path.dirname(path)
     while True:
         parent_metadata = os.stat(ancestor)

@@ -1098,6 +1098,19 @@ class ClaudeDriverTests(DriverTestCase):
                 with self.assertRaisesRegex(ValueError, 'ancestor'):
                     self.driver(FakeRun([]), cwd=child)
 
+    def test_traversable_cwd_cannot_expose_writable_git_metadata(self):
+        self.git('init', '--quiet', self.cwd)
+        os.chmod(os.path.join(self.cwd, '.git'), 0o777)
+        for mode in (0o750, 0o755):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.cwd, mode)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'traversable'):
+                        self.driver(FakeRun([]))
+                finally:
+                    os.chmod(self.cwd, 0o700)
+        self.driver(FakeRun([]))  # private traversal protects the same nested metadata
+
     def test_operator_owned_sticky_ancestor_preserves_child_ownership(self):
         with tempfile.TemporaryDirectory(dir=self.fixtures.name) as parent:
             child = os.path.join(parent, 'probe')

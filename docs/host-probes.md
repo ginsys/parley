@@ -200,8 +200,10 @@ command inherits the operator's environment, and its PTY clients inherit it plus
 recorder's equivalent and applies only to PTY captures. Every matrix cell this produces
 therefore carries the developer's real credentials and config; it is not the clean-room
 isolation `--home disposable` gives the PTY fixtures above. Each driver refuses at construction
-any probe directory that is not owned by the current operator, is group/world writable, or is
-not empty. Its resolved ancestor chain must belong to the operator or root, and any shared
+any probe directory that is not owned by the current operator, permits group/other writes or
+traversal, or is not empty. Blocking traversal also protects writable descendants of an allowed
+fresh `.git` from access by other users after validation. Its resolved ancestor chain must belong
+to the operator or root, and any shared
 writable ancestor must have the sticky bit so other users cannot replace the owned child path.
 This permits ordinary sticky temporary roots while rejecting writable non-sticky parents,
 including unsafe ancestors above a private intermediate directory. It does not isolate against
