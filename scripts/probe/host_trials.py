@@ -1657,13 +1657,11 @@ class CodexDriver(Driver):
             raise SubmissionRejected(result.returncode, result.stderr)
         accepted_at = self.clock()
         if self.mechanism == 'queue-then-resume':
+            self.queue_clients[thread_id] = None
             try:
                 self.queue_clients[thread_id] = self.attach(thread_id)
             except PtyNotReady as error:
-                # The item is queued (exit 0) but nothing will serve it: an unobservable trial,
-                # not a host that ignored the message.
-                raise SubmissionUncaptured(f'queued, but the resume that should deliver it '
-                                           f'never became ready: {error}') from error
+                self.submission_note = f'queued, but the resume client never became ready: {error}'
             # The host accepted when `codex queue` exited, not after the resume client's startup
             # (captured: 15s with items queued); `run_trial` takes a number as the acceptance time.
             return accepted_at
@@ -1671,7 +1669,7 @@ class CodexDriver(Driver):
 
     def _queue_client_live(self, thread_id):
         client = self.queue_clients[thread_id]
-        return (any(held is client for held in self.clients) and not client.eof
+        return (client is not None and any(held is client for held in self.clients) and not client.eof
                 and getattr(client, 'serves', None) == thread_id)
 
     def observe(self, thread_id, *, marker, submitted_at):

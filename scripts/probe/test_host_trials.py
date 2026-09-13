@@ -1838,14 +1838,16 @@ class CodexDriverTests(DriverTestCase):
         self.assertFalse(client.closed)
         self.assertEqual(driver.clients, [client])
 
-    def test_queue_then_resume_with_no_composer_is_uncaptured_and_closes_the_client(self):
+    def test_queue_then_resume_with_no_composer_preserves_acceptance_and_closes_the_client(self):
         run = FakeRun([(['codex', 'exec'], self.exec_output()),
                        (['codex', 'queue'], FakeResult(0))])
-        driver = self.driver(run, mechanism='queue-then-resume',
+        driver = self.driver(run, mechanism='queue-then-resume', clock=lambda: 1234.5,
                              pty=lambda argv, *, cwd: FakePtyClient(argv, cwd=cwd, ready=False))
         driver.create('hello')
-        with self.assertRaises(SubmissionUncaptured):
-            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(driver.submit(THREAD_ID, 'msg'), 1234.5)
+        self.assertIn('never became ready', driver.submission_note)
+        self.transcripts[THREAD_ID] = self.write_lines('not-ready.jsonl', rollout_lines(cwd=driver.cwd))
+        self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
         self.assertTrue(FakePtyClient.launched[0].closed)
         self.assertEqual(driver.clients, [])
 

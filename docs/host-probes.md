@@ -408,7 +408,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   `$CODEX_HOME/config.toml`), waits for the composer placeholder `› Ask Codex to do anything`
   drawn after that answer plus 3 s of quiet — the placeholder is drawn while a turn or the dialog
   is still up — and raises `PtyNotReady` with the stripped screen otherwise; inside `submit()`
-  that becomes `SubmissionUncaptured`. A client that exits on the dialog, so that the Enter cannot
+  queue exit-zero acceptance is retained even when resume readiness fails. The diagnostic records
+  that failure, and only missing delivery outcomes become unobservable. A client that exits on the dialog, so that the Enter cannot
   be written at all, is that same not-ready case and is named as one, rather than escaping as the
   raw `OSError` `os.write` produced. The default `-a never` cannot produce an
   approval prompt, so an approval settle has to ask for other flags. `teardown()` runs
