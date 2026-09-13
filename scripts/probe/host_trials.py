@@ -2279,8 +2279,9 @@ class OpenCodeDriver(Driver):
         marker as `not_observed` for a host whose submission path had disappeared or had already
         said it failed. A dead child, an error event already printed, or an id already named that
         is not this session all make the timeout `SubmissionUncaptured`, with any stray id recorded
-        first. A partial stream naming *nothing* re-raises, since a truncated stream's silence is
-        not evidence of misdirection and the message may well have reached the session.
+        first. With a live child, empty/whitespace-only output or a stream of complete valid
+        matching events re-raises the timeout. A nonempty malformed final JSON line remains
+        `SubmissionUncaptured`: no repair or merely-truncated interpretation is inferred.
         """
         self.require_owned(session_id)
         self.submission_note = None

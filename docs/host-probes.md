@@ -524,8 +524,9 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   event can name a pre-existing human session and proves no creation authority. A timeout reads those same two
   signals off whatever the stream had already printed before it fired: an error event, or an id
   that is not this session, makes it `SubmissionUncaptured` rather than a bare timeout, with any
-  stray id recorded first. A partial stream naming nothing re-raises — silence in a truncated stream
-  is not proof of misdirection, and the message may have reached the session.
+  stray id recorded first. With a live child, empty/whitespace-only output or complete valid
+  matching events re-raise the timeout: the message may have reached the session. A nonempty
+  malformed final JSON line remains `SubmissionUncaptured`; no tail repair is inferred.
   After submission, observation retains the exact server used for
   the attempt. Its exit, removal or replacement makes missing delivery outcomes unobservable,
   even if the persistent export remains readable; positive export evidence still stands. `observe()` and
