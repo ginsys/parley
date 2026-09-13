@@ -287,7 +287,9 @@ equivalent because `subprocess.Popen` offers no way to restore the mask in the c
 masking there would hand the host child an uncaptured signal mask, which this runner will not do.
 What remains for both is the last store of an already-owned handle: the interpreter can deliver an
 interrupt between a constructor returning and the append or attribute assignment that puts the
-handle where cleanup reads it. That is one bytecode and is not closable from inside the process.
+handle where cleanup reads it. The current constructor-to-driver registration API leaves that
+window uncovered. An ownership callback or deferred parent-side cancellation could close it;
+it is an implementation limitation, not a fundamental impossibility.
 
 ### Drivers
 
