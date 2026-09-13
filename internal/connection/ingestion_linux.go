@@ -35,7 +35,13 @@ func NewIngestor(c IngestorConfig) (*Ingestor, error) {
 	}
 	return &Ingestor{c}, nil
 }
-func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor string) error {
+func (i *Ingestor) Initialize(ctx context.Context, s *Session, source, cursor string) (err error) {
+	ctx, expiry := store.ObserveExpiries(ctx, i.config.Manager.store)
+	defer func() {
+		if persistErr := expiry.Persist(i.config.Manager.store, i.config.Manager.Invalidate); persistErr != nil {
+			err = persistErr
+		}
+	}()
 	m := i.config.Manager
 	if err := m.sessionTransition(ctx, s, func(ctx context.Context, tx *sql.Tx) (store.TransitionResult, error) {
 		return store.TransitionResult{}, m.AuthorizeWork(ctx, tx, s, false)
