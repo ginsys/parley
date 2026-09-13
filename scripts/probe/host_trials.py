@@ -261,8 +261,8 @@ class Observation:
     # True when this read came from a host that emits its own turn-boundary events
     # (`detect_outcomes`' `turn_stream`), so a captured turn_start/ack is independent evidence
     # of a *new* turn even before turn_end appears. False means the host offers no such signal,
-    # and any assistant text after submission is indistinguishable from the tail of a turn that
-    # was already running -- `run_trial` must not trust it either.
+    # and bare assistant activity cannot establish a new turn. A matching fresh marker still
+    # establishes acknowledgement independently of which turn produced it.
     turn_stream: bool = False
     # The model named by the first in-window assistant message that names one, or None. See
     # `Event.model`; `run_trial` carries the first non-None reading onto the `TrialRun`.
@@ -1132,7 +1132,8 @@ class ClaudeDriver(Driver):
         """Read the session's JSONL transcript; unreadable or undatable content is unobservable.
 
         `turn_stream` stays False: the captured transcript carries no turn-boundary record, so a
-        busy trial's turn_start/ack cannot be told apart from the running turn's tail.
+        busy trial's turn_start cannot be told apart from the running turn's tail. A fresh-marker
+        acknowledgement remains independent evidence of receipt.
         """
         self.require_owned(session_id)
         parsed = self._read_transcript(session_id, claude_transcript_events)
@@ -2314,7 +2315,7 @@ class TrialRun:
     # The model the host recorded as serving this trial's own turn, or None when the trial saw no
     # assistant message, the host names none (every Codex cell), or the reading could not be
     # attributed to this trial (a busy trial on a host with no turn-boundary stream, whose
-    # turn_start/ack are unobservable for the same reason). The requested model is not it:
+    # turn_start is unobservable for the same reason). The requested model is not it:
     # `--model haiku` was captured not being honoured, so a cell whose model is None must say the
     # model is unknown rather than repeat what was asked for. `run_trial_with_cleanup` deletes the
     # session, so this is the caller's only chance to record it.
@@ -2369,7 +2370,7 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
     earlier gaps, but a failed last read leaves the tail of the window unseen. A `busy` trial
     polls to `BUSY_CAP`, adjusted to the dependent windows once the running turn's end is seen
     (extended past the cap when that end lands close to it); without a turn end, a host with no
-    turn-boundary stream gets turn_start/ack marked unobservable outright, while a turn-stream
+    turn-boundary stream gets turn_start and missing ack marked unobservable, while a turn-stream
     host reaches `Trial.result`'s own `inconclusive` via `turn_end_observable`.
 
     A `KeyboardInterrupt` inside the polling loop finalizes what was gathered with `interrupted`
@@ -2515,10 +2516,11 @@ def run_trial(driver, *, prompt, marker=None, state='idle', settle=None,
         else:
             observable[name] = channel_readable
     if state == 'busy' and turn_end is None and not turn_stream_capable:
-        # No turn-boundary stream: a captured turn_start/ack cannot be told apart from the
-        # running turn's tail, so it is ambiguity rather than evidence either way.
-        for name in ('turn_start', 'ack'):
-            observable[name] = False
+        # Bare assistant activity may be the running turn's tail. A matching fresh marker,
+        # however, independently acknowledges this submission even without a new turn.
+        observable['turn_start'] = False
+        if 'ack' not in outcomes:
+            observable['ack'] = False
         # The model was read off that same unattributable assistant record -- on Claude, the
         # first one after submission, which here may belong to the turn that was already
         # running. A cell naming the prior turn's model is worse than one saying the model is

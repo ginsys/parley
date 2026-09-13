@@ -3231,6 +3231,17 @@ class RunTrialTests(unittest.TestCase):
                            settle=lambda session_id: None)
         self.assertIsNone(run.model)
 
+    def test_a_busy_marker_ack_stands_without_a_turn_boundary(self):
+        clock = FakeClock()
+        observation = detect_outcomes([Event('assistant', MARKER, 1005.0)], MARKER, submitted_at=1000.0)
+        driver = FakeDriver(observations=[observation], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0, settle=lambda session_id: None)
+        self.assertFalse(run.observable['turn_start'])
+        self.assertTrue(run.observable['ack'])
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
+                      turn_end=run.turn_end, turn_end_observable=run.turn_end_observable)
+        self.assertEqual(classify_trial(trial, clock.time(), observable=run.observable)['ack'], 'observed')
+
     def test_a_busy_trial_on_a_turn_stream_host_keeps_its_model(self):
         # The host's own boundary attributes the turn, so the reading stands.
         clock = FakeClock()

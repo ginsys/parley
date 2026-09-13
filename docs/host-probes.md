@@ -571,10 +571,10 @@ the deadline collapses back to the last window measured from that boundary, whic
 lets the cell classify without waiting the cap out. If the window closes with no `turn_end`
 seen, what happens next depends on whether the host demonstrated a turn-boundary stream at all
 during the cap. Without one — Claude and OpenCode, whose transcripts carry no boundary record —
-`turn_start` and `ack` are marked `observable=False` unconditionally, even when one was
-captured: with no independent boundary this runner cannot tell a still-running prior turn's
-tail from a genuinely new one, so a bare capture is exactly that ambiguity rather than
-trustworthy evidence either way. With one — Codex, whose channel stayed readable through the
+`turn_start` is unobservable: bare assistant activity cannot distinguish a prior turn's tail
+from a new turn. An assistant message matching the fresh marker independently establishes
+`ack` and is preserved; only a missing acknowledgement is unobservable without that boundary.
+With a boundary stream — Codex, whose channel stayed readable through the
 whole cap but never emitted the boundary — `Trial.result()`'s own `turn_end_observable` branch
 classifies the cell `inconclusive` instead: the channel was readable the whole time and simply
 never resolved, a different, positive fact from an unavailable channel.
@@ -589,7 +589,7 @@ the host itself recorded as serving *this trial's* turn — Claude's `message.mo
 first in-window assistant message and carried on the result because
 `run_trial_with_cleanup()` deletes the session before a caller could go back for it. A busy trial
 on a host with no turn-boundary stream records `None` instead: the reading came off the same
-assistant record whose `turn_start` and `ack` are unobservable there, and it may belong to the
+assistant record whose `turn_start` is unobservable there, and it may belong to the
 turn that was already running. A cell whose
 `model` is `None` says the model is unknown; it never repeats what `-m`/`--model` asked for,
 since `--model haiku` was captured not being honoured. The requested `state`
