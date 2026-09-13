@@ -1729,6 +1729,16 @@ class OpenCodeDriver(Driver):
                 self.server = None
         return failures
 
+    def _mint_stray(self, attached_id, session_id):
+        """Own a session the attach named instead of the requested one, before anything raises.
+
+        Minted exactly as `create()` mints: a session this run caused to exist must be in
+        `owned()` whatever happens next. Idempotent, because a second submission can be
+        redirected to the same stray id and the registry refuses a repeat mint.
+        """
+        if attached_id is not None and attached_id != session_id and attached_id not in self.minted:
+            self.mint(attached_id)
+
     def submit(self, session_id, message):
         """`opencode run --pure --format json --attach <url> --session <id>`; exit 0 is acceptance.
 
@@ -1743,12 +1753,15 @@ class OpenCodeDriver(Driver):
         host that was never asked. Either shape is `SubmissionUncaptured`, and a different id is
         minted first so the sweep deletes whatever the run actually wrote to.
 
-        A timeout is checked the same way. `run --attach` hanging until its own timeout is what a
-        `serve` child dying under it looks like, and `run_trial` reads a bare `TimeoutExpired` as
-        "may have delivered" -- it would poll the export, which is readable independently of the
-        server, and record the absent marker as `not_observed` for a host whose submission path
-        had disappeared. A dead child makes that timeout `SubmissionUncaptured`; a live one
-        re-raises, since the message may well have reached the session.
+        A timeout is checked the same way, against both the child and the partial event stream.
+        `run --attach` hanging until its own timeout is what a `serve` child dying under it looks
+        like, and `run_trial` reads a bare `TimeoutExpired` as "may have delivered" -- it would
+        poll the export, which is readable independently of the server, and record the absent
+        marker as `not_observed` for a host whose submission path had disappeared or had already
+        said it failed. A dead child, an error event already printed, or an id already named that
+        is not this session all make the timeout `SubmissionUncaptured`, with any stray id minted
+        first. A partial stream naming *nothing* re-raises, since a truncated stream's silence is
+        not evidence of misdirection and the message may well have reached the session.
         """
         self.require_owned(session_id)
         self.submission_note = None
@@ -1763,16 +1776,22 @@ class OpenCodeDriver(Driver):
             result = self.run(argv, capture_output=True, text=True, timeout=60, cwd=self.cwd,
                               stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired as error:
+            partial_id, partial_error = opencode_session_id(_partial_stdout(error))
+            self._mint_stray(partial_id, session_id)
             if self.server.process.poll() is not None:
                 raise SubmissionUncaptured(
                     f'run --attach timed out against a serve child that had exited '
                     f'{self.server.process.returncode}') from error
+            if partial_error is not None:
+                raise SubmissionUncaptured(f'run --attach reported an error event before timing '
+                                           f'out: {partial_error}') from error
+            if partial_id is not None and partial_id != session_id:
+                raise SubmissionUncaptured(
+                    f'run --attach named {partial_id!r} before timing out, not {session_id}; '
+                    f'where the marker landed is uncaptured') from error
             raise
         attached_id, event_error = opencode_session_id(result.stdout)
-        if attached_id is not None and attached_id != session_id:
-            # Minted before anything is raised, exactly as `create()` does: a session this run
-            # caused to exist must be in `owned()` whatever happens next.
-            self.mint(attached_id)
+        self._mint_stray(attached_id, session_id)
         if result.returncode != 0:
             if self.server.process.poll() is not None:
                 # A dead server is this runner's failure, not the host refusing the message.

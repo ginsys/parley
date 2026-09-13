@@ -364,7 +364,11 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   carrying its `sessionID` — so a stream naming a different id, or none at all, is
   `SubmissionUncaptured` too: polling the requested session would otherwise read the missing
   marker as `not_observed` for a host that was never asked. A different id is minted before the
-  refusal, so the sweep deletes whatever the run actually wrote to. `observe()` and
+  refusal, so the sweep deletes whatever the run actually wrote to. A timeout reads those same two
+  signals off whatever the stream had already printed before it fired: an error event, or an id
+  that is not this session, makes it `SubmissionUncaptured` rather than a bare timeout, with any
+  stray id minted first. A partial stream naming nothing re-raises — silence in a truncated stream
+  is not evidence of misdirection, and the message may well have reached the session. `observe()` and
   `version()` read
   `opencode --pure export <id>`: `messages[].info.role`/`info.time.created` (ms epoch, used for
   both roles so turn_start is the earliest assistant activity as on the other hosts) and the

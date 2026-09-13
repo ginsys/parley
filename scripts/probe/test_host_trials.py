@@ -1713,15 +1713,53 @@ class OpenCodeDriverTests(DriverTestCase):
             driver.submit('ses_1', 'msg')
 
     def test_submit_timeout_with_the_serve_child_alive_stays_a_timeout(self):
-        # Nothing says the message failed to arrive, so the trial polls the export as usual.
-        error = subprocess.TimeoutExpired(cmd=['opencode'], timeout=60)
+        # Nothing says the message failed to arrive, so the trial polls the export as usual. A
+        # partial stream that named the requested session, or nothing at all, says nothing either:
+        # silence in a truncated stream is not evidence of misdirection.
+        for output in (None, b'', self.run_output().stdout.encode()):
+            with self.subTest(output=output):
+                # Each iteration mints `ses_1` and starts a server on the same port again, so it
+                # needs a registry of its own and a port that does not answer yet.
+                self.registry = SessionRegistry()
+                self.answering = False
+                error = subprocess.TimeoutExpired(cmd=['opencode'], timeout=60, output=output)
+                run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'],
+                                self.run_output()),
+                               (['opencode', 'run', '--pure', '--format', 'json', '--attach'], error)])
+                driver = self.driver(run, port=4096)
+                driver.create('hello')
+                driver.serve()
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    driver.submit('ses_1', 'msg')
+                self.assertEqual(driver.owned(), {'ses_1'})
+
+    def test_a_partial_attach_stream_that_already_failed_is_uncaptured_not_a_timeout(self):
+        # The live-server timeout path used to ignore `TimeoutExpired.output` entirely, so a
+        # submission the event stream had already reported failed or redirected was polled as one
+        # that may have delivered -- turning the absent marker into `not_observed`.
+        partial = self.run_output(error={'name': 'ProviderAuthError'}).stdout.encode()
+        error = subprocess.TimeoutExpired(cmd=['opencode'], timeout=60, output=partial)
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
                        (['opencode', 'run', '--pure', '--format', 'json', '--attach'], error)])
         driver = self.driver(run, port=4096)
         driver.create('hello')
         driver.serve()
-        with self.assertRaises(subprocess.TimeoutExpired):
+        with self.assertRaises(SubmissionUncaptured) as caught:
             driver.submit('ses_1', 'msg')
+        self.assertIn('ProviderAuthError', str(caught.exception))
+
+    def test_a_partial_attach_stream_naming_another_session_is_uncaptured_and_mints_it(self):
+        partial = self.run_output(session_id='ses_2').stdout.encode()
+        error = subprocess.TimeoutExpired(cmd=['opencode'], timeout=60, output=partial)
+        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'], error)])
+        driver = self.driver(run, port=4096)
+        driver.create('hello')
+        driver.serve()
+        with self.assertRaises(SubmissionUncaptured) as caught:
+            driver.submit('ses_1', 'msg')
+        self.assertIn('ses_2', str(caught.exception))
+        self.assertEqual(driver.owned(), {'ses_1', 'ses_2'})
 
     def test_submit_attaches_to_our_server_and_reports_exit_status(self):
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
