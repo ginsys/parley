@@ -850,6 +850,28 @@ def claude_entry(short='69aa52ed', *, pid=4242, status='idle', state='done', cwd
 
 
 class ClaudeDriverTests(DriverTestCase):
+    def test_interrupted_claude_creation_reports_candidates_without_adopting_them(self):
+        candidates = [claude_entry(), claude_entry('deadbeef')]
+        run = FakeRun([(['claude', '--bg'], KeyboardInterrupt()),
+                       (['claude', 'agents'], listing(candidates))])
+        driver = self.driver(run)
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            run_trial_with_cleanup(driver, prompt='hello')
+        self.assertEqual(driver.owned(), set())
+        self.assertEqual(driver.strays, {'69aa52ed', 'deadbeef'})
+        self.assertIn('manual investigation', ' '.join(caught.exception.__notes__))
+        self.assertEqual(run.argv('claude', 'stop'), [])
+        self.assertEqual(run.argv('claude', 'rm'), [])
+
+    def test_interrupted_creation_preserves_cancellation_when_discovery_fails(self):
+        run = FakeRun([(['claude', '--bg'], KeyboardInterrupt()),
+                       (['claude', 'agents'], subprocess.TimeoutExpired(['claude'], 15))])
+        driver = self.driver(run)
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            run_trial_with_cleanup(driver, prompt='hello')
+        self.assertIn('discovery failed', ' '.join(caught.exception.__notes__))
+        self.assertEqual(driver.owned(), set())
+
     def test_claude_transcript_removed_between_discovery_and_stat_is_unobservable(self):
         driver = self.driver(FakeRun([
             (['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),

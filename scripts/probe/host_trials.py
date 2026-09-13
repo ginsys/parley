@@ -1045,8 +1045,8 @@ class ClaudeDriver(Driver):
         The short id is minted *before* the listing runs, so a listing failure afterwards still
         leaves the session in `owned()` for the sweep. A timeout after the daemon already printed
         its id mints from the partial output before re-raising. A Ctrl-C mid-command loses that
-        output: the session, if any, is then only findable by a human running
-        `claude agents --json --all --cwd <cwd>`.
+        output: one bounded cwd-filtered listing reports visible candidates without adopting
+        them. Failed discovery and sessions appearing after that snapshot require manual work.
 
         Returns only once the creation turn has finished (`_settle_creation_turn`), so a caller
         that submits immediately is not observing that turn's reply.
@@ -1059,6 +1059,18 @@ class ClaudeDriver(Driver):
             short = backgrounded_id(_partial_stdout(error))
             if short:
                 self._mint(short)
+            raise
+        except KeyboardInterrupt as error:
+            try:
+                candidates = {entry['id'] for entry in self._listing()} - self.owned()
+            except Exception:
+                error.add_note('Claude creation interrupted; bounded candidate discovery failed; '
+                               'manual investigation required in the probe cwd')
+            else:
+                self.strays.update(candidates)
+                error.add_note(f'Claude creation interrupted; candidate IDs {sorted(candidates)!r}; '
+                               'no ownership granted, manual investigation required; '
+                               'the bounded snapshot cannot exclude later arrivals')
             raise
         short = backgrounded_id(result.stdout)
         if short:

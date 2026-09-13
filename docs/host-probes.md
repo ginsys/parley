@@ -243,11 +243,15 @@ unrecoverable and unnamed. Every id stays owned and is reported alongside the cl
 sweep covers exactly the driver instance it is given — its own minted ids, its own clients and
 servers — and reaches nothing another instance created, so sweep every instance that did
 work. One gap stays open by design: a Ctrl-C while
-`claude --bg`, `codex exec` or `opencode run` is still running loses that command's output, and a
-session the host created in that instant is findable only by a human (`claude agents --json
+`claude --bg`, `codex exec` or `opencode run` is still running loses that command's output.
+Claude makes one bounded (15-second command timeout), cwd-filtered listing snapshot and reports
+all visible unowned candidates without adopting, stopping or deleting them. Failed discovery and
+later arrivals remain uncertain, explicitly noted on the cancellation. Codex and OpenCode still
+require manual discovery when interrupted output names no session. The human discovery routes
+are `claude agents --json
 --all --cwd <probe cwd>`; the newest rollout under `$CODEX_HOME/sessions` naming the probe cwd;
 the newest `parley-probe-*` row of the global `opencode --pure session list`, removed with
-`opencode --pure session delete <id>`). The `opencode serve` child has the same shape in a
+`opencode --pure session delete <id>`. The `opencode serve` child has the same shape in a
 narrower instant: it is spawned and held in one statement inside the handler that closes it, but
 an interrupt delivered between the OS creating it and its handle reaching Python leaves a process
 nothing in-process can name. Its child runs in its own process group, so a terminal Ctrl-C does
