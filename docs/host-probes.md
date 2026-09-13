@@ -202,8 +202,11 @@ repository's contents would feed the model. The one exception is a `.git` left b
 `git init` — what the captured Codex probe directory was, since `codex resume` gets no
 `--skip-git-repo-check` — and it is checked, not trusted: a `.git` holding an index, a reflog,
 any ref or any object is a repository with history, and a `.git` that is a file rather than a
-directory points at a linked worktree or submodule store outside the probe directory. Both are
-refused, because either would hand the authenticated hosts real history and configuration under
+directory points at a linked worktree or submodule store outside the probe directory. So does a
+symlink, at `.git` itself or at any path beneath it: a link is followed by the very calls that
+read the directory, so the freshness checks would describe a store the probe directory does not
+hold, and `git init` leaves none for a legitimate one to be mistaken for. All three are
+refused, because each would hand the authenticated hosts real history and configuration under
 a directory whose emptiness is the whole precondition.
 
 Cleanup is part of the module, not left to a caller: `run_trial_with_cleanup()` is the entry

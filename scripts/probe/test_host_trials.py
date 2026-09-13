@@ -8,6 +8,7 @@ uses). Every host-facing shape in the fixtures mirrors a capture in docs/host-pr
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -851,6 +852,33 @@ class ClaudeDriverTests(DriverTestCase):
             handle.write(f'gitdir: {os.path.join(self.fixtures.name, "real-store")}\n')
         with self.assertRaises(ValueError):
             self.driver(FakeRun([]))
+
+    def test_a_symlinked_git_store_is_refused(self):
+        # `os.path.isdir` follows the link, so a `.git` symlink into a real repository read as a
+        # directory; the freshness checks then described a store the probe directory never held.
+        store = os.path.join(self.fixtures.name, 'elsewhere')
+        self.git('init', '--quiet', store)
+        os.symlink(os.path.join(store, '.git'), os.path.join(self.cwd, '.git'))
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
+
+    def test_a_symlink_beneath_a_fresh_git_directory_is_refused(self):
+        # `os.walk('.git/refs')` and `os.listdir('.git/objects')` both follow a link given by
+        # name, so a fresh-looking `.git` whose `refs` or `objects` points elsewhere would have
+        # been judged on another repository's contents.
+        store = os.path.join(self.fixtures.name, 'elsewhere')
+        self.git('init', '--quiet', store)
+        self.git('-C', store, 'commit', '--quiet', '--allow-empty', '-m', 'history')
+        for name in ('refs', 'objects'):
+            with self.subTest(name=name):
+                fresh = tempfile.TemporaryDirectory()
+                self.addCleanup(fresh.cleanup)
+                self.git('init', '--quiet', fresh.name)
+                target = os.path.join(fresh.name, '.git', name)
+                shutil.rmtree(target)
+                os.symlink(os.path.join(store, '.git', name), target)
+                with self.assertRaises(ValueError):
+                    self.driver(FakeRun([]), cwd=fresh.name)
 
     def test_create_mints_from_stdout_line_one_then_confirms_via_the_listing(self):
         run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n  claude attach 69aa52ed\n')),

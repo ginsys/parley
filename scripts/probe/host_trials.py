@@ -532,17 +532,29 @@ def unfresh_git_reason(path):
     """Why `<path>/.git` is not the history-free repository `git init` leaves, or None.
 
     Checked rather than trusted: an existing repository whose worktree files were merely deleted,
-    and a `.git` *file* pointing at a linked worktree or a submodule's real store elsewhere, both
-    carry the name `.git` and would hand the authenticated hosts real history and configuration.
-    A `git init` and nothing else leaves no index, no reflog, no refs and no objects; anything
-    beyond that is history.
+    a `.git` *file* pointing at a linked worktree or a submodule's real store elsewhere, and a
+    `.git` *symlink* to either of those all carry the name `.git` and would hand the authenticated
+    hosts real history and configuration. A `git init` and nothing else leaves no index, no
+    reflog, no refs, no objects, and no symlink anywhere beneath `.git`; anything beyond that is
+    history, or a store this directory does not hold.
     """
     git = os.path.join(path, '.git')
+    if os.path.islink(git):
+        return '`.git` is a symlink: it names a store outside the probe directory'
     if not os.path.isdir(git):
         return '`.git` is not a directory: it points at a store outside the probe directory'
     for name in ('index', 'packed-refs', 'logs', 'shallow'):
-        if os.path.exists(os.path.join(git, name)):
+        if os.path.lexists(os.path.join(git, name)):
             return f'`.git/{name}` exists'
+    # `os.walk` does not descend into a symlinked directory, but every read below opens one by
+    # name -- `os.walk('.git/refs')`, `os.listdir('.git/objects')` -- and those do follow. One
+    # sweep for links first is what keeps the freshness checks inside the probe directory.
+    for root, directories, files in os.walk(git):
+        for entry in sorted(directories + files):
+            candidate = os.path.join(root, entry)
+            if os.path.islink(candidate):
+                return (f'`{os.path.relpath(candidate, path)}` is a symlink: `git init` leaves '
+                        f'none, and reading through it would leave the probe directory')
     for root, _directories, files in os.walk(os.path.join(git, 'refs')):
         if files:
             return f'`{os.path.join(root, sorted(files)[0])}` exists'
