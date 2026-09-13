@@ -1180,7 +1180,7 @@ class ClaudeDriverTests(DriverTestCase):
         self.driver(FakeRun([]))  # does not raise
         self.driver(FakeRun([]))  # validation never changes the shared probe directory
 
-    def test_fresh_git_files_cannot_have_external_hard_links_or_shared_writes(self):
+    def test_fresh_git_files_cannot_have_external_hard_links(self):
         self.git('init', '--quiet', self.cwd)
         for name in ('HEAD', 'config', 'hooks/pre-commit.sample'):
             path = os.path.join(self.cwd, '.git', name)
@@ -1192,14 +1192,6 @@ class ClaudeDriverTests(DriverTestCase):
                         self.driver(FakeRun([]))
                 finally:
                     os.unlink(alias)
-            with self.subTest(name=name, kind='shared-write'):
-                mode = os.stat(path).st_mode
-                os.chmod(path, mode | 0o022)
-                try:
-                    with self.assertRaisesRegex(ValueError, 'writable'):
-                        self.driver(FakeRun([]))
-                finally:
-                    os.chmod(path, mode)
         self.driver(FakeRun([]))
 
     def test_fresh_git_files_must_be_operator_owned(self):

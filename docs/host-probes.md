@@ -228,9 +228,11 @@ each once. Includes, extra sections or keys and modified values are refused. A f
 a separate temporary baseline with installed Git, ignoring inherited Git environment settings
 and global/system configuration. HEAD must name an initial branch accepted by Git; every other
 path, file type and file's contents (apart from the separately checked config) must match that
-baseline. Every regular metadata file must also be operator-owned, deny group/other writes and
-have exactly one hard link: an external alias could otherwise change its inode without entering
-the private probe directory. Extra attributes, modified templates and unknown metadata are refused. This requires
+baseline. Every regular metadata file must also be operator-owned and have exactly one hard link:
+an external alias could otherwise change its inode without entering the private probe directory.
+Group-write file modes from the operator's umask remain allowed behind the private directory's
+traversal barrier; no second inode path can bypass it. Extra attributes, modified templates and
+unknown metadata are refused. This requires
 Git to be available; initialization failure or its ten-second timeout refuses the directory.
 Drivers validate the same directory independently without initializing or changing it. The
 temporary baseline is removed on exit. This keeps repeated driver construction compatible

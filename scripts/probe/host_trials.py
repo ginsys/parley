@@ -611,8 +611,6 @@ def unfresh_git_reason(path):
                     return f'`{os.path.relpath(candidate, path)}` is hard-linked outside its unique path'
                 if metadata.st_uid != os.geteuid():
                     return f'`{os.path.relpath(candidate, path)}` is not operator-owned'
-                if metadata.st_mode & 0o022:
-                    return f'`{os.path.relpath(candidate, path)}` is writable by group or others'
     for root, _directories, files in os.walk(os.path.join(git, 'refs')):
         if files:
             return f'`{os.path.join(root, sorted(files)[0])}` exists'
