@@ -3,6 +3,7 @@ package connection
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -19,7 +20,9 @@ type LifecycleConfig struct {
 	Invalidate         func(string)
 	PendingWork        func(context.Context, *sql.Tx, string) ([]store.WorkRef, error)
 	PendingDisposition func(context.Context, *sql.Tx, store.WorkRef, string) error
-	LegacyEvidence     func(context.Context, LegacyDispositionRequest) error
+	// LegacyEvidence returns Forbidden for rejected evidence; unavailable sources
+	// and other provider failures remain uncommitted and retryable.
+	LegacyEvidence func(context.Context, LegacyDispositionRequest) error
 }
 type Lifecycle struct{ config LifecycleConfig }
 
@@ -177,7 +180,10 @@ func (l *Lifecycle) disposition(ctx context.Context, p store.CommandPrincipal, r
 			return domainRejection(err)
 		}
 		if evidenceErr != nil {
-			return rejection(store.Forbidden)
+			if errors.Is(evidenceErr, store.Forbidden) {
+				return rejection(store.Forbidden)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
 		now, err := store.InstantNanos(l.config.Now())
 		if err != nil {

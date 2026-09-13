@@ -233,6 +233,10 @@ and effects commit before socket invalidation. Missing capabilities fail closed.
 test-only callers until the ordinary caller migration; they add no human endpoint or credential
 CLI, and grants still come from the protected controller.
 
+Legacy evidence resolution retains only explicit `forbidden` rejections. Unavailable manifests
+and other resolver failures commit no disposition or receipt; the same operation ID can retry
+after recovery while quarantine and delivery evidence remain unchanged.
+
 Release changes only the selected hold or quarantine version. A second incident remains effective.
 Cancellation is terminal; only queued work changes to cancelled, while dispatched/uncertain and
 handed-off evidence stays intact. Legacy release is limited to queued or handed-off work with an
