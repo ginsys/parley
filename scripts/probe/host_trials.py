@@ -1646,6 +1646,13 @@ class OpenCodeDriver(Driver):
         Both the exit status and the event stream decide: a structured `error` event is
         `SubmissionUncaptured` whatever the exit status said, and a nonzero exit against a serve
         child that has died is this runner's failure rather than a host rejection.
+
+        A timeout is checked the same way. `run --attach` hanging until its own timeout is what a
+        `serve` child dying under it looks like, and `run_trial` reads a bare `TimeoutExpired` as
+        "may have delivered" -- it would poll the export, which is readable independently of the
+        server, and record the absent marker as `not_observed` for a host whose submission path
+        had disappeared. A dead child makes that timeout `SubmissionUncaptured`; a live one
+        re-raises, since the message may well have reached the session.
         """
         self.registry.require_owned(self._key(session_id))
         self.submission_note = None
@@ -1656,8 +1663,15 @@ class OpenCodeDriver(Driver):
                                        'submission; nothing sent')
         argv = ['opencode', 'run', '--pure', '--format', 'json', '--attach', self.server.url,
                 '--session', session_id, '-m', self.model, message]
-        result = self.run(argv, capture_output=True, text=True, timeout=60, cwd=self.cwd,
-                          stdin=subprocess.DEVNULL)
+        try:
+            result = self.run(argv, capture_output=True, text=True, timeout=60, cwd=self.cwd,
+                              stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired as error:
+            if self.server.process.poll() is not None:
+                raise SubmissionUncaptured(
+                    f'run --attach timed out against a serve child that had exited '
+                    f'{self.server.process.returncode}') from error
+            raise
         _, event_error = opencode_session_id(result.stdout)
         if result.returncode != 0:
             if self.server.process.poll() is not None:

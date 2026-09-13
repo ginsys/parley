@@ -328,9 +328,12 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   already handles (captured: a stale credential), so trusting the exit status alone would record
   a provider, credential or model failure as accepted and later blame the host for the transcript
   outcomes that never arrive; on a nonzero exit the event's text joins the stderr in the
-  rejection's diagnostic. If the `serve` child has exited, before the call or by the
-  time a nonzero exit comes back, it is `SubmissionUncaptured` instead, since a dead server says
-  nothing about the host. `observe()` and `version()` read
+  rejection's diagnostic. If the `serve` child has exited — before the call, by the time a
+  nonzero exit comes back, or by the time the call times out — it is `SubmissionUncaptured`
+  instead, since a dead server says nothing about the host. The timeout case matters because the
+  export is readable without the server: a bare `TimeoutExpired` would be polled as a submission
+  that may have delivered and turn the absent marker into `not_observed`. `observe()` and
+  `version()` read
   `opencode --pure export <id>`: `messages[].info.role`/`info.time.created` (ms epoch, used for
   both roles so turn_start is the earliest assistant activity as on the other hosts) and the
   `text` parts; an unparseable or malformed document is unobservable. `teardown()` is

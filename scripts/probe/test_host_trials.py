@@ -1605,6 +1605,34 @@ class OpenCodeDriverTests(DriverTestCase):
         with self.assertRaises(SubmissionUncaptured):
             driver.submit('ses_1', 'msg')
 
+    def test_submit_timeout_against_a_dead_serve_child_is_uncaptured(self):
+        # The export is readable without the server, so a bare timeout would poll it and read the
+        # absent marker as `not_observed` for a submission path that had disappeared.
+        server = None
+
+        def dying_attach(argv):
+            server.process.returncode = -9
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=60)
+
+        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'], dying_attach)])
+        driver = self.driver(run, port=4096)
+        driver.create('hello')
+        server = driver.serve()
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('ses_1', 'msg')
+
+    def test_submit_timeout_with_the_serve_child_alive_stays_a_timeout(self):
+        # Nothing says the message failed to arrive, so the trial polls the export as usual.
+        error = subprocess.TimeoutExpired(cmd=['opencode'], timeout=60)
+        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'], error)])
+        driver = self.driver(run, port=4096)
+        driver.create('hello')
+        driver.serve()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            driver.submit('ses_1', 'msg')
+
     def test_submit_attaches_to_our_server_and_reports_exit_status(self):
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
                        (['opencode', 'run', '--pure', '--format', 'json', '--attach'], FakeResult(0))])
