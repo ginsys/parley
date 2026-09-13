@@ -1,51 +1,71 @@
-"""Controlled fixtures only: no test here launches an installed Claude, Codex or OpenCode CLI."""
+"""Controlled fixtures only: no test here launches an installed Claude, Codex or OpenCode CLI.
 
-import datetime
+Process creation is injected everywhere a host command would run (`run`, `popen`, `pty`), and the
+PTY client is exercised against controlled Python children (the pattern `test_wake_probe.py`
+uses). Every host-facing shape in the fixtures mirrors a capture in docs/host-probe-preflight.md.
+"""
+
 import json
 import os
+import re
+import shutil
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
+import unittest.mock
 from dataclasses import dataclass
-from unittest.mock import patch
 
+import host_trials
 from host_trials import (
+    CLAUDE_READY_PATTERN,
+    CLOCK_DRIFT_TOLERANCE,
+    CODEX_READY_PATTERN,
+    CODEX_TRUST_PATTERN,
     MARKER_PATTERN,
+    OUTCOME_NAMES,
     SIGNAL_ASSISTANT_MESSAGE,
     SIGNAL_SUBMIT_EXIT_STATUS,
     SIGNAL_TURN_BOUNDARY_EVENT,
     SIGNAL_USER_MESSAGE,
-    AmbiguousSessionCreation,
     ClaudeDriver,
+    CleanupFailed,
     CodexDriver,
+    Driver,
     Event,
     ForeignSessionError,
     Observation,
-    ObservationFailed,
-    OpenCodeDriver,
-    SessionCreationUncaptured,
+    PtyClient,
+    PtyNotReady,
     SessionRegistry,
-    SettleFailed,
-    SubmissionFailed,
     SubmissionRejected,
     SubmissionUncaptured,
     SubmissionUnsupported,
-    TeardownUnsupported,
-    VersionProbeInterrupted,
-    background_sessions,
+    backgrounded_id,
     classify_trial,
+    claude_session_version,
+    claude_transcript_events,
     codex_rollout_events,
     codex_session_version,
+    codex_thread_ids,
     detect_outcomes,
     marker_message,
     marker_token,
-    parse_claude_transcript,
-    rollout_started_at,
+    opencode_export_events,
+    opencode_export_version,
+    opencode_session_ids,
     run_trial,
+    run_trial_with_cleanup,
+    strip_ansi,
+    sweep,
 )
 from wake_probe import Trial, aggregate
 
 MARKER = 'PARLEY-PROBE-deadbeefdeadbeefdeadbeefdeadbeef'
+SESSION_UUID = '69aa52ed-1111-4222-8333-444455556666'
+THREAD_ID = '01a09a24-ff1d-7360-9385-722d230ef92b'
 
 
 @dataclass
@@ -55,10 +75,42 @@ class FakeResult:
     stderr: str = ''
 
 
+class FakeRun:
+    """Scripted `subprocess.run`: each entry keys on the command's leading words.
+
+    Values are a `FakeResult`, an exception instance to raise, or a callable taking the argv
+    and returning either. The first matching prefix wins; a command with no script is an
+    error, never a silent success, so a test cannot pass by an unexpected host call.
+    """
+
+    def __init__(self, scripts):
+        self.scripts = scripts
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((list(argv), kwargs))
+        for prefix, value in self.scripts:
+            if argv[:len(prefix)] == list(prefix):
+                if callable(value):
+                    value = value(argv)
+                if isinstance(value, BaseException):
+                    raise value
+                return value
+        raise AssertionError(f'unscripted host command: {argv}')
+
+    def argv(self, *prefix):
+        return [call for call, _ in self.calls if call[:len(prefix)] == list(prefix)]
+
+
 class RegistryTests(unittest.TestCase):
+    # The owner is any object; the registry only ever compares identity. These use plain
+    # sentinels so the store's own contract is tested without a driver in the way.
+    OWNER = object()
+    OTHER = object()
+
     def test_mint_then_require_owned_then_release(self):
         registry = SessionRegistry()
-        registry.mint('a')
+        registry.mint('a', self.OWNER)
         registry.require_owned('a')  # does not raise
         registry.release('a')
         with self.assertRaises(ForeignSessionError):
@@ -66,22 +118,34 @@ class RegistryTests(unittest.TestCase):
 
     def test_foreign_session_is_refused(self):
         registry = SessionRegistry()
-        registry.mint('a')
+        registry.mint('a', self.OWNER)
         with self.assertRaises(ForeignSessionError):
             registry.require_owned('some-real-background-session-id')
 
     def test_duplicate_mint_and_empty_id_are_rejected(self):
         registry = SessionRegistry()
-        registry.mint('a')
+        registry.mint('a', self.OWNER)
         with self.assertRaises(ValueError):
-            registry.mint('a')
+            registry.mint('a', self.OWNER)
         with self.assertRaises(ValueError):
-            registry.mint('')
+            registry.mint('', self.OWNER)
 
     def test_release_of_foreign_session_is_refused(self):
         registry = SessionRegistry()
         with self.assertRaises(ForeignSessionError):
             registry.release('never-created')
+
+    def test_the_id_and_its_owner_are_stored_together(self):
+        # One store, so an interrupt cannot leave a created session registered and unattributed:
+        # the sweep would then pass over a live session while its key blocked re-registration.
+        registry = SessionRegistry()
+        registry.mint('a', self.OWNER)
+        registry.mint('b', self.OTHER)
+        self.assertIs(registry.owner('a'), self.OWNER)
+        self.assertEqual(registry.owned_by(self.OWNER), {'a'})
+        self.assertEqual(registry.owned_by(self.OTHER), {'b'})
+        registry.release('a')
+        self.assertEqual(registry.owned_by(self.OWNER), set())
 
 
 class DetectOutcomesTests(unittest.TestCase):
@@ -122,6 +186,26 @@ class DetectOutcomesTests(unittest.TestCase):
         self.assertEqual(detect_outcomes(events, MARKER, submitted_at=9.0).outcomes,
                           {'turn_start': 11.0, 'ack': 12.0})
 
+    def test_reordered_assistant_activity_uses_the_earliest_timestamp(self):
+        for separate_creation in (False, True):
+            with self.subTest(separate_creation=separate_creation):
+                events = [Event(role='assistant', text=MARKER, time=1121,
+                                created_at=1070 if separate_creation else None),
+                          Event(role='assistant', text=MARKER, time=1003,
+                                created_at=1001 if separate_creation else None)]
+                observation = detect_outcomes(events, MARKER, submitted_at=1000)
+                self.assertEqual(observation.outcomes,
+                                 {'turn_start': 1001 if separate_creation else 1003, 'ack': 1003})
+                self.assertEqual(Trial(submitted=1000, outcomes=observation.outcomes)
+                                 .result('turn_start', 1121), 'observed')
+
+    def test_reordered_user_and_boundary_events_use_the_earliest_timestamp(self):
+        events = [Event(role=role, text=MARKER, time=when)
+                  for when in (1070, 1001) for role in ('user', 'turn_start', 'turn_end')]
+        observation = detect_outcomes(events, MARKER, submitted_at=1000, turn_stream=True)
+        self.assertEqual(observation.outcomes, {'visible': 1001, 'turn_start': 1001})
+        self.assertEqual(observation.turn_end, 1001)
+
     def test_untimed_events_are_never_promoted_into_the_window(self):
         # An undated entry cannot be ordered against submission: counting it would let a
         # pre-submission turn (a creation prompt's own reply, an old rollout record) fabricate
@@ -161,73 +245,161 @@ class DetectOutcomesTests(unittest.TestCase):
         self.assertNotIn('turn_start', observation.outcomes)
         self.assertNotIn('turn_start', observation.signals)
 
+    def test_the_model_comes_from_the_first_in_window_assistant_event(self):
+        # A session can change model between turns (captured: creation under `claude-sonnet-5`,
+        # the no-flag resume reply under `claude-opus-5`), so a cell must cite the model that
+        # served this trial, not whichever one the session started under.
+        events = [Event(role='assistant', text='before', time=1.0, model='claude-sonnet-5'),
+                  Event(role='user', text=MARKER, time=10.0),
+                  Event(role='assistant', text=f'ok {MARKER}', time=11.0, model='claude-opus-5'),
+                  Event(role='assistant', text='more', time=12.0, model='claude-sonnet-5')]
+        self.assertEqual(detect_outcomes(events, MARKER, submitted_at=9.0).model, 'claude-opus-5')
+
+    def test_the_model_is_none_when_no_in_window_assistant_event_names_one(self):
+        events = [Event(role='user', text=MARKER, time=10.0),
+                  Event(role='assistant', text='reply', time=11.0)]
+        self.assertIsNone(detect_outcomes(events, MARKER, submitted_at=9.0).model)
+
+
+def claude_record(kind, content, *, stamp='2026-09-13T09:00:00.000Z', version='2.1.270',
+                  model=None, **extra):
+    message = {'role': kind, 'content': content}
+    if model is not None:
+        message['model'] = model
+    record = {'type': kind, 'timestamp': stamp, 'message': message,
+              'sessionId': SESSION_UUID, 'version': version, 'uuid': 'u', 'parentUuid': None}
+    record.update(extra)
+    return json.dumps(record)
+
 
 class ClaudeParsingTests(unittest.TestCase):
-    # Field names captured from a real `claude agents --json --all` / `claude agents --json`
-    # run: background sessions report `state`; interactive sessions report `status` instead.
-    RAW = json.dumps([
-        {'id': 'e9f3bf35', 'kind': 'background', 'state': 'done', 'cwd': '/x'},
-        {'pid': 1, 'kind': 'interactive', 'status': 'idle', 'sessionId': 'abc', 'cwd': '/y'},
-    ])
+    def test_backgrounded_line_yields_the_short_id_from_line_one_only(self):
+        # Captured stdout: `backgrounded · 69aa52ed` then four hint lines.
+        stdout = 'backgrounded · 69aa52ed\n  claude attach 69aa52ed\n  claude logs 69aa52ed\n'
+        self.assertEqual(backgrounded_id(stdout), '69aa52ed')
+        self.assertIsNone(backgrounded_id('hint\nbackgrounded · 69aa52ed\n'))
+        self.assertIsNone(backgrounded_id(''))
+        self.assertIsNone(backgrounded_id('backgrounded · notahexid\n'))
 
-    def test_background_sessions_filters_out_interactive_schema(self):
-        sessions = background_sessions(self.RAW)
-        self.assertEqual([s['id'] for s in sessions], ['e9f3bf35'])
+    def test_transcript_extracts_user_string_and_assistant_text_parts(self):
+        # Captured shape: user content is a string; assistant content is a list of typed parts,
+        # some records carrying only a `thinking` part.
+        lines = [
+            claude_record('user', MARKER, stamp='2026-09-13T09:00:01.000Z'),
+            claude_record('assistant', [{'type': 'thinking', 'thinking': 'hmm'}],
+                          stamp='2026-09-13T09:00:02.000Z'),
+            claude_record('assistant', [{'type': 'text', 'text': f'ack {MARKER}'}],
+                          stamp='2026-09-13T09:00:03.000Z'),
+        ]
+        events, unusable = claude_transcript_events(lines)
+        self.assertEqual([(e.role, e.text) for e in events],
+                          [('user', MARKER), ('assistant', ''), ('assistant', f'ack {MARKER}')])
+        self.assertLess(events[0].time, events[2].time)
+        self.assertEqual(unusable, 0)
 
-    def test_background_sessions_raises_on_a_daemon_error_object_not_a_list(self):
-        # A degraded daemon can print a valid-JSON error object and still exit 0; iterating it
-        # as the expected list-of-objects shape would raise an unrelated-looking AttributeError.
-        with self.assertRaises(RuntimeError):
-            background_sessions('{"error":"daemon restarting"}')
+    def test_bookkeeping_record_types_are_skipped_not_counted(self):
+        # Captured: attachment/system carry timestamps; file-history-snapshot, last-prompt,
+        # mode, permission-mode, ai-title, ... carry none. None of them is a failed read.
+        lines = [json.dumps({'type': 'file-history-snapshot', 'snapshot': {}}),
+                 json.dumps({'type': 'attachment', 'timestamp': '2026-09-13T09:00:00.000Z'}),
+                 json.dumps({'type': 'last-prompt', 'lastPrompt': 'x'}),
+                 json.dumps({'type': 'system', 'timestamp': '2026-09-13T09:00:00.000Z'})]
+        self.assertEqual(claude_transcript_events(lines), ([], 0))
 
-    def test_background_sessions_raises_on_a_null_top_level(self):
-        with self.assertRaises(RuntimeError):
-            background_sessions('null')
+    def test_unparseable_non_object_or_untyped_lines_are_unusable(self):
+        lines = ['not json', json.dumps(None), json.dumps([1]), json.dumps({'timestamp': 'x'}),
+                 json.dumps({'type': 3})]
+        self.assertEqual(claude_transcript_events(lines), ([], 5))
 
-    def test_background_session_ids_raises_on_an_entry_with_no_id(self):
-        driver = ClaudeDriver(SessionRegistry(),
-                              run=lambda *a, **k: FakeResult(0, stdout='[{"kind":"background"}]'),
-                              cwd='/scratch')
-        with self.assertRaises(RuntimeError):
-            driver._background_session_ids()
+    def test_message_records_with_bad_timestamp_or_role_or_content_are_unusable(self):
+        lines = [
+            claude_record('user', MARKER, stamp='not-a-date'),
+            claude_record('user', MARKER, stamp='2026-09-13T09:00:00'),  # naive
+            json.dumps({'type': 'user', 'timestamp': '2026-09-13T09:00:00.000Z',
+                        'message': {'role': 'assistant', 'content': MARKER}}),
+            json.dumps({'type': 'user', 'timestamp': '2026-09-13T09:00:00.000Z', 'message': None}),
+            claude_record('assistant', {'type': 'text', 'text': 'x'}),  # object, not list
+            claude_record('assistant', ['not-a-part']),
+            claude_record('assistant', [{'type': 'text', 'text': None}]),
+            claude_record('user', 7),
+        ]
+        self.assertEqual(claude_transcript_events(lines), ([], 8))
 
-    def test_background_sessions_raises_on_a_non_dict_list_entry(self):
-        # A malformed entry silently dropped by the filter, rather than rejected, lets a
-        # snapshot read as "just fewer sessions" instead of "untrustworthy for diffing" -- a
-        # race where a real background session is malformed in one snapshot and well-formed in
-        # the next could then have create() mint it as this trial's own.
-        with self.assertRaises(RuntimeError):
-            background_sessions(json.dumps([{'id': 'a', 'kind': 'background'}, 'not-an-object']))
+    def test_cross_role_content_shapes_are_unusable_rather_than_promoted(self):
+        # The captured contract is role-specific: a string only on user records, a typed-part
+        # list only on assistant records. An assistant string carrying the marker must not become
+        # an acknowledgement, and a user part list must not establish visibility -- a changed or
+        # malformed transcript makes the read unobservable instead.
+        lines = [claude_record('assistant', f'ack {MARKER}'),
+                 claude_record('user', [{'type': 'text', 'text': MARKER}])]
+        self.assertEqual(claude_transcript_events(lines), ([], 2))
 
-    def test_background_sessions_raises_on_an_empty_string_id(self):
-        with self.assertRaises(RuntimeError):
-            background_sessions(json.dumps([{'id': '', 'kind': 'background'}]))
+    def test_assistant_parts_require_a_captured_type(self):
+        parts = [{'text': MARKER}] + [dict(type=kind, text=MARKER)
+                                     for kind in (None, 1, [], {}, '', ' ', 'future-part')]
+        for part in parts:
+            with self.subTest(part=part):
+                self.assertEqual(claude_transcript_events([claude_record('assistant', [part])]),
+                                 ([], 1))
 
-    def test_background_sessions_raises_on_an_unrecognized_kind(self):
-        # A missing or schema-drifted kind was previously dropped by the same `!= 'background'`
-        # check used to skip the known `interactive` entries. If that entry is a real background
-        # session that is merely malformed in this snapshot -- and well-formed in the other --
-        # silently dropping it here would let create()'s diff mint it as this trial's own.
-        with self.assertRaises(RuntimeError):
-            background_sessions(json.dumps([{'id': 'a'}]))
-        with self.assertRaises(RuntimeError):
-            background_sessions(json.dumps([{'id': 'a', 'kind': 'zombie'}]))
+    def test_the_assistant_records_model_is_carried_and_never_inferred(self):
+        # Captured at 2.1.270: `message.model` names the serving model, and it is not the one
+        # `--model` asked for. Nothing else on a record supplies it, so anything but a string on
+        # an assistant record reads as None rather than as evidence.
+        lines = [claude_record('user', MARKER, model='claude-haiku-ignored'),
+                 claude_record('assistant', [{'type': 'text', 'text': 'a'}],
+                               model='claude-sonnet-5', stamp='2026-09-13T09:00:02.000Z'),
+                 claude_record('assistant', [{'type': 'text', 'text': 'b'}],
+                               model=7, stamp='2026-09-13T09:00:03.000Z'),
+                 claude_record('assistant', [{'type': 'text', 'text': 'c'}],
+                               stamp='2026-09-13T09:00:04.000Z')]
+        events, unusable = claude_transcript_events(lines)
+        self.assertEqual([event.model for event in events], [None, 'claude-sonnet-5', None, None])
+        self.assertEqual(unusable, 0)  # a missing model is not a failed read
 
-    def test_transcript_parses_role_prefixed_multiline_blocks(self):
-        raw = f'User: hello {MARKER}\ncontinued\nAssistant: got it\nstill talking\n'
-        events = parse_claude_transcript(raw)
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[0].role, 'user')
-        self.assertEqual(events[0].text, f'hello {MARKER}\ncontinued')
-        self.assertEqual(events[1].role, 'assistant')
-        self.assertEqual(events[1].text, 'got it\nstill talking')
+    def test_session_version_reads_the_single_recorded_version(self):
+        lines = [json.dumps({'type': 'mode', 'mode': 'x'}),
+                 claude_record('user', 'hi', version='2.1.270'),
+                 claude_record('assistant', [{'type': 'text', 'text': 'yo'}], version='2.1.270')]
+        self.assertEqual(claude_session_version(lines), '2.1.270')
 
-    def test_transcript_without_marker_does_not_raise(self):
-        events = parse_claude_transcript('User: hi\nAssistant: hello\n')
-        self.assertEqual(len(events), 2)
+    def test_session_version_is_none_when_absent_or_disagreeing(self):
+        self.assertIsNone(claude_session_version([json.dumps({'type': 'user', 'message': {}})]))
+        self.assertIsNone(claude_session_version(['not json', '']))
+        self.assertIsNone(claude_session_version([claude_record('user', 'a', version='2.1.269'),
+                                                  claude_record('user', 'b', version='2.1.270')]))
+        self.assertIsNone(claude_session_version([claude_record('user', 'a', version=3)]))
 
 
 class CodexParsingTests(unittest.TestCase):
+    def test_transcript_discovery_rejects_non_uuid_ids_before_globbing(self):
+        for lookup in (host_trials.default_codex_rollout_path, host_trials.default_claude_transcript_path):
+            for session_id in ('*', '../*', '--help', THREAD_ID + '[ab]'):
+                with self.subTest(lookup=lookup.__name__, session_id=session_id):
+                    with unittest.mock.patch.object(host_trials.glob, 'glob', return_value=['foreign-path']) as globber, \
+                            unittest.mock.patch.object(os.path, 'getmtime', return_value=1):
+                        self.assertIsNone(lookup(session_id))
+                        globber.assert_not_called()
+
+    def test_codex_home_metacharacters_remain_literal_during_discovery(self):
+        with tempfile.TemporaryDirectory(prefix='parley[owned]-') as home:
+            directory = os.path.join(home, 'sessions', '2026', '09', '13')
+            os.makedirs(directory)
+            path = os.path.join(directory, f'rollout-synthetic-{THREAD_ID}.jsonl')
+            with open(path, 'w') as handle:
+                handle.write('{}\n')
+            with unittest.mock.patch.dict(os.environ, {'CODEX_HOME': home}):
+                self.assertEqual(host_trials.default_codex_rollout_path(THREAD_ID), path)
+
+    def test_thread_ids_come_from_thread_started_events(self):
+        stdout = '\n'.join([json.dumps({'type': 'thread.started', 'thread_id': THREAD_ID}),
+                            json.dumps({'type': 'turn.started'}), 'not json'])
+        self.assertEqual(codex_thread_ids(stdout), ({THREAD_ID: None}, 1))
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'turn.started'})), ({}, 0))
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'thread.started', 'thread_id': ''})), ({}, 1))
+        self.assertEqual(codex_thread_ids(json.dumps({'type': 'thread.started', 'thread_id': 5})), ({}, 1))
+        self.assertEqual(codex_thread_ids(''), ({}, 0))
+
     def test_rollout_extracts_user_and_assistant_skips_developer_and_other_types(self):
         lines = [
             json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
@@ -260,16 +432,11 @@ class CodexParsingTests(unittest.TestCase):
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
     def test_a_non_string_payload_type_is_unusable_rather_than_a_typeerror(self):
-        # A schema-drifted, unhashable payload.type (e.g. a list) crashed the
-        # `kind in TURN_BOUNDARY_ROLES` membership test with a TypeError.
         lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'event_msg',
                              'payload': {'type': []}})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
 
     def test_a_relevant_record_with_a_non_object_payload_is_unusable(self):
-        # A response_item/event_msg record is one of the two kinds this runner reads at all --
-        # a missing or malformed payload there is a corrupted or schema-drifted record, not one
-        # of the record kinds this runner has no use for.
         lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                              'payload': None})]
         self.assertEqual(codex_rollout_events(lines), ([], 1))
@@ -317,62 +484,25 @@ class CodexParsingTests(unittest.TestCase):
         ]
         self.assertEqual(codex_rollout_events(lines), ([], 2))
 
-    def test_null_content_is_unusable_rather_than_a_typeerror(self):
-        # payload.get('content', []) only substitutes [] when the key is absent; an explicit
-        # "content": null slips past that default and a bare iteration would raise TypeError.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
-                             'payload': {'type': 'message', 'role': 'user', 'content': None}})]
-        self.assertEqual(codex_rollout_events(lines), ([], 1))
-
-    def test_object_valued_content_is_unusable_not_silently_empty(self):
-        # A structured/tool-call payload shape (content as a single object, not a list of parts)
-        # must not parse as an empty-text event with observable=True -- that reads as "checked,
-        # nothing there" instead of "this shape was never captured".
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
-                             'payload': {'type': 'message', 'role': 'assistant',
-                                         'content': {'type': 'tool_call', 'name': 'x'}}})]
-        self.assertEqual(codex_rollout_events(lines), ([], 1))
-
-    def test_a_non_string_part_text_is_unusable_rather_than_a_typeerror(self):
-        # A list-shaped content whose part carries a non-string `text` (e.g. explicit null) made
-        # ''.join(...) raise instead of reading as an unrecognized shape.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
-                             'payload': {'type': 'message', 'role': 'user',
-                                         'content': [{'text': None}]}})]
-        self.assertEqual(codex_rollout_events(lines), ([], 1))
-
-    def test_a_non_dict_part_makes_the_whole_record_unusable_not_silently_shorter(self):
-        # Silently skipping just the non-dict part let an unreadable marker message join down to
-        # an empty, ordinary-looking string -- negative evidence rather than unusable.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
-                             'payload': {'type': 'message', 'role': 'user',
-                                         'content': ['not-a-part', {'text': 'hi'}]}})]
-        self.assertEqual(codex_rollout_events(lines), ([], 1))
-
-    def test_a_part_omitting_text_entirely_makes_the_whole_record_unusable(self):
-        # `.get('text', '')` let a part with no `text` key default to an empty string and pass
-        # as captured -- an unreadable marker message would join down to an ordinary-looking
-        # empty string, negative evidence rather than the unusable read it actually is.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
-                             'payload': {'type': 'message', 'role': 'assistant',
-                                         'content': [{'type': 'text'}]}})]
-        self.assertEqual(codex_rollout_events(lines), ([], 1))
-
-    def test_a_part_type_mismatched_with_its_records_role_is_unusable(self):
-        # input_text belongs to a user record, output_text to an assistant one
-        # (docs/host-probe-preflight.md) -- accepting any string-valued `text` regardless of
-        # `type` would also accept an output_text part inside a user record (or the reverse), a
-        # shape this runner has never captured.
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
-                             'payload': {'type': 'message', 'role': 'user',
-                                         'content': [{'type': 'output_text', 'text': MARKER}]}})]
-        self.assertEqual(codex_rollout_events(lines), ([], 1))
+    def test_malformed_content_shapes_are_unusable_rather_than_empty_or_a_typeerror(self):
+        # Explicit null, a single object instead of a list of parts, a non-string part text, a
+        # non-dict part, a part omitting `text`, and a part type mismatched with the role --
+        # each read as an uncaptured shape, never as an ordinary-looking empty message.
+        base = {'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item'}
+        contents = [
+            ('user', None),
+            ('assistant', {'type': 'tool_call', 'name': 'x'}),
+            ('user', [{'text': None}]),
+            ('user', ['not-a-part', {'text': 'hi'}]),
+            ('assistant', [{'type': 'text'}]),
+            ('user', [{'type': 'output_text', 'text': MARKER}]),
+        ]
+        for role, content in contents:
+            with self.subTest(role=role, content=content):
+                line = json.dumps({**base, 'payload': {'type': 'message', 'role': role, 'content': content}})
+                self.assertEqual(codex_rollout_events([line]), ([], 1))
 
     def test_a_payload_missing_its_type_key_is_unusable_not_silently_skipped(self):
-        # `payload.get('type')` returning `None` for a missing key must not fall through the
-        # same path as a recognized-but-irrelevant string kind -- both `response_item` and
-        # `event_msg` always carry `payload.type` in every captured shape, so its absence here
-        # is a corrupted or drifted record, not evidence of a successful read.
         lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                              'payload': {'role': 'assistant',
                                          'content': [{'type': 'output_text', 'text': MARKER}]}}),
@@ -380,11 +510,6 @@ class CodexParsingTests(unittest.TestCase):
         self.assertEqual(codex_rollout_events(lines), ([], 2))
 
     def test_a_record_missing_its_outer_type_key_is_unusable_not_silently_skipped(self):
-        # record.get('type') returning None (or a non-string) for a missing/malformed outer
-        # discriminator must not fall through the same path as a recognized-but-irrelevant
-        # string kind like token_usage_record/world_state/turn_context/session_meta -- those
-        # are always a recognized string in every captured shape, so a missing or non-string
-        # outer type here is a corrupted or drifted record, not evidence of a successful read.
         lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
                              'payload': {'type': 'message', 'role': 'assistant',
                                          'content': [{'type': 'output_text', 'text': MARKER}]}}),
@@ -394,9 +519,6 @@ class CodexParsingTests(unittest.TestCase):
         self.assertEqual(codex_rollout_events(lines), ([], 2))
 
     def test_a_non_object_record_is_unusable_rather_than_an_attributeerror(self):
-        # Valid JSON is not necessarily an object -- a damaged or schema-drifted line can decode
-        # to `null`, a number or a list -- and `record.get(...)` on any of those raises instead
-        # of reading as an unrecognized shape, aborting the whole read rather than just the line.
         lines = [json.dumps(None), json.dumps([1, 2]), json.dumps(3),
                 json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item',
                             'payload': {'type': 'message', 'role': 'user',
@@ -406,824 +528,1923 @@ class CodexParsingTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
 
     def test_an_unrelated_outer_record_type_is_skipped_regardless_of_payload_shape(self):
-        # The outer type gates first: session_meta/world_state/turn_context/token_usage_record
-        # records are skipped silently no matter what their payload happens to contain, so an
-        # unrelated record cannot masquerade as transcript evidence via a colliding payload.type.
         lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'turn_context',
                              'payload': {'type': 'message', 'role': 'user',
                                          'content': [{'text': MARKER}]}})]
         self.assertEqual(codex_rollout_events(lines), ([], 0))
 
-    def test_rollout_started_at_takes_the_earliest_record_of_any_type(self):
-        lines = [
-            json.dumps({'timestamp': '2026-09-11T00:00:05.000Z', 'payload': {'type': 'message'}}),
-            json.dumps({'timestamp': '2026-09-11T00:00:01.000Z', 'type': 'session_meta'}),
-        ]
-        expected = datetime.datetime(2026, 9, 11, 0, 0, 1, tzinfo=datetime.UTC).timestamp()
-        self.assertEqual(rollout_started_at(lines), expected)
-
-    def test_rollout_started_at_fails_closed_on_an_undated_record_of_any_type(self):
-        # A record whose own timestamp is missing or unusable must not be silently skipped from
-        # the earliest-of computation: skipping it could hide that this exact record was the
-        # earliest one in the file, letting a thread that predates this run pass provenance.
-        lines = [
-            json.dumps({'timestamp': '2026-09-11T00:00:05.000Z', 'payload': {'type': 'message'}}),
-            json.dumps({'type': 'world_state'}),  # no timestamp key at all
-        ]
-        self.assertIsNone(rollout_started_at(lines))
-
-    def test_rollout_started_at_fails_closed_on_an_unparseable_line(self):
-        # The unreadable line could be the earliest record, so a minimum taken over whatever
-        # survived would let a thread older than this run pass the provenance check.
-        lines = ['not json', json.dumps({'timestamp': '2026-09-11T00:00:01.000Z', 'type': 'session_meta'})]
-        self.assertIsNone(rollout_started_at(lines))
-        self.assertIsNone(rollout_started_at(['']))
-
-    def test_rollout_started_at_fails_closed_on_a_non_object_record(self):
-        # Same shape as an unparseable line: valid JSON that isn't an object carries no
-        # `.get`-able timestamp, and treating it as skippable could let the earliest real
-        # record's own poisoning go unnoticed.
-        lines = [json.dumps(None), json.dumps({'timestamp': '2026-09-11T00:00:01.000Z'})]
-        self.assertIsNone(rollout_started_at(lines))
-
     def test_codex_session_version_reads_the_confirmed_payload_shape(self):
-        # Shape confirmed from a real rollout on this workstation
-        # (~/.codex/sessions/2026/09/08/rollout-2026-09-08T16-42-57-*.jsonl).
-        lines = [json.dumps({'timestamp': '2026-09-08T14:44:05.650Z', 'type': 'session_meta',
-                             'payload': {'cli_version': '0.153.4'}})]
-        self.assertEqual(codex_session_version(lines), '0.153.4')
-
-    def test_codex_session_version_is_none_without_a_session_meta_record(self):
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'response_item'})]
-        self.assertIsNone(codex_session_version(lines))
-
-    def test_codex_session_version_is_none_when_the_payload_carries_no_cli_version(self):
-        lines = [json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'session_meta',
-                             'payload': {}})]
-        self.assertIsNone(codex_session_version(lines))
-
-    def test_codex_session_version_skips_an_unparseable_line_rather_than_failing_closed(self):
-        # Unlike rollout_started_at, this is best-effort evidence enrichment with a client
-        # fallback available -- an unreadable line does not need to poison the whole read.
-        lines = ['not json', json.dumps({'timestamp': '2026-09-11T00:00:00.000Z',
-                                        'type': 'session_meta',
-                                        'payload': {'cli_version': '0.153.4'}})]
-        self.assertEqual(codex_session_version(lines), '0.153.4')
-
-    def test_codex_session_version_skips_a_valid_but_non_object_record(self):
-        # A bare JSON scalar, list or null is valid JSON -- json.loads() succeeds -- but calling
-        # .get() on it raises AttributeError, losing a later genuine session_meta record's
-        # version instead of skipping the record as this helper's docstring promises.
-        lines = ['null', '42', '[1, 2]', '"a string"',
-                 json.dumps({'timestamp': '2026-09-11T00:00:00.000Z', 'type': 'session_meta',
-                            'payload': {'cli_version': '0.153.4'}})]
-        self.assertEqual(codex_session_version(lines), '0.153.4')
-
-
-class ClaudeDriverTests(unittest.TestCase):
-    def test_create_mints_the_new_session_id_from_a_listing_diff(self):
-        # `claude --bg --print`'s own stdout shape has never been captured against a real
-        # session, so a wrong guess parsed from it could mint a footer/informational line
-        # instead of the real id. Identify the session from what `claude agents --json --all`
-        # itself reports as new, never from stdout.
-        registry = SessionRegistry()
-        calls = []
-        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
-        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'abcd1234', 'kind': 'background'}])
-        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout='irrelevant footer text\n'),
-                          FakeResult(0, stdout=after)])
-
-        def fake_run(argv, **kwargs):
-            calls.append((argv, kwargs))
-            return next(responses)
-
-        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
-        session_id = driver.create('probe prompt')
-        self.assertEqual(session_id, 'abcd1234')
-        self.assertIn('claude:abcd1234', registry.created)
-        # The root command has no --cwd flag (docs/host-probe-preflight.md); the session's
-        # directory is the subprocess cwd, the same directory the listings filter on.
-        self.assertEqual(calls[1][0][:3], ['claude', '--bg', '--print'])
-        self.assertNotIn('--cwd', calls[1][0])
-        self.assertEqual(calls[1][1].get('cwd'), '/scratch')
-
-    def test_create_raises_on_nonzero_exit(self):
-        def fake_run(argv, **kwargs):
-            return FakeResult(1, stderr='boom') if '--bg' in argv else FakeResult(0, stdout='[]')
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaises(RuntimeError):
-            driver.create('probe prompt')
-
-    def test_create_raises_when_no_new_background_session_appears(self):
-        # claude --bg exiting 0 with no corresponding new listing entry must not be silently
-        # accepted: a background session may exist now, untracked, or none was created at all.
-        listing = json.dumps([{'id': 'old1', 'kind': 'background'}])
-
-        def fake_run(argv, **kwargs):
-            return FakeResult(0, stdout='  \n') if '--bg' in argv else FakeResult(0, stdout=listing)
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaisesRegex(RuntimeError, '0 new'):
-            driver.create('probe prompt')
-
-    def test_create_raises_when_multiple_new_background_sessions_appear(self):
-        # Ambiguity, not a guess: nothing here picks a winner among several new sessions.
-        before = json.dumps([])
-        after = json.dumps([{'id': 'a', 'kind': 'background'}, {'id': 'b', 'kind': 'background'}])
-        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=''), FakeResult(0, stdout=after)])
-
-        def fake_run(argv, **kwargs):
-            return next(responses)
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaisesRegex(RuntimeError, '2 new'):
-            driver.create('probe prompt')
-
-    def test_create_never_mints_an_ambiguous_session_so_teardown_cannot_reach_a_foreign_one(self):
-        # Minting an unverified id gave it the same teardown authority as a session this runner
-        # actually created -- teardown() would then accept and `claude rm` a session that could
-        # be an unrelated human's, contradicting the ownership guarantee. Candidates are surfaced
-        # on the exception for a human to investigate out of band, never minted into the registry.
-        registry = SessionRegistry()
-        before = json.dumps([])
-        after = json.dumps([{'id': 'a', 'kind': 'background'}, {'id': 'b', 'kind': 'background'}])
-        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=''), FakeResult(0, stdout=after)])
-
-        def fake_run(argv, **kwargs):
-            return next(responses)
-
-        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
-        with self.assertRaises(AmbiguousSessionCreation) as ctx:
-            driver.create('probe prompt')
-        self.assertEqual(ctx.exception.candidates, ('a', 'b'))
-        self.assertEqual(registry.created, set())
-
-    def test_create_raises_when_the_post_create_listing_itself_fails(self):
-        # claude --bg can succeed and still leave a real, live session with an unknown id if the
-        # follow-up listing call times out, exits nonzero, or returns malformed JSON -- that
-        # failure must not propagate as an unrelated exception from _background_session_ids().
-        # The recovery attempt itself also fails here, so candidates still comes back empty --
-        # a real recovery is covered by the next test.
-        responses = iter([FakeResult(0, stdout=json.dumps([])), FakeResult(0, stdout=''),
-                          FakeResult(1, stderr='daemon unavailable'),
-                          FakeResult(1, stderr='daemon unavailable')])
-
-        def fake_run(argv, **kwargs):
-            return next(responses)
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaises(AmbiguousSessionCreation) as ctx:
-            driver.create('probe prompt')
-        self.assertEqual(ctx.exception.candidates, ())
-
-    def test_create_recovers_candidates_when_the_post_create_listing_itself_fails(self):
-        # Unlike the case above, a fresh recovery listing here succeeds -- the transient failure
-        # must not be treated as reason to give up with an empty candidate set when a retry can
-        # still find the id.
-        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
-        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'new1', 'kind': 'background'}])
-        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=''),
-                          FakeResult(1, stderr='daemon unavailable'), FakeResult(0, stdout=after)])
-
-        def fake_run(argv, **kwargs):
-            return next(responses)
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaises(AmbiguousSessionCreation) as ctx:
-            driver.create('probe prompt')
-        self.assertEqual(ctx.exception.candidates, ('new1',))
-
-    def test_create_recovers_candidates_when_claude_bg_itself_times_out(self):
-        # claude --bg can exceed its own 30s timeout after already detaching the background
-        # session -- the subprocess call raises before returning, but the session it forked is
-        # not thereby undone. A best-effort post-timeout listing should still surface it.
-        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
-        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'new1', 'kind': 'background'}])
-        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=after)])
-
-        def fake_run(argv, **kwargs):
-            if '--bg' in argv:
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 30))
-            return next(responses)
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaises(AmbiguousSessionCreation) as ctx:
-            driver.create('probe prompt')
-        self.assertEqual(ctx.exception.candidates, ('new1',))
-
-    def test_create_reports_no_candidates_when_bg_timeout_recovery_listing_also_fails(self):
-        # The recovery attempt's own failure must not escalate to a second, unrelated exception
-        # -- it swallows to an empty candidate set since the caller is already reporting the
-        # original timeout.
-        before = json.dumps([])
-
-        def fake_run(argv, **kwargs):
-            if '--bg' in argv:
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 30))
-            if not hasattr(fake_run, 'called'):
-                fake_run.called = True
-                return FakeResult(0, stdout=before)
-            return FakeResult(1, stderr='daemon unavailable')
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaises(AmbiguousSessionCreation) as ctx:
-            driver.create('probe prompt')
-        self.assertEqual(ctx.exception.candidates, ())
-
-    def test_create_reports_no_candidates_when_a_second_interrupt_hits_the_recovery_listing(self):
-        # A second Ctrl-C while the best-effort recovery listing runs must not escalate into a
-        # bare KeyboardInterrupt -- the caller is already mid-raise of AmbiguousSessionCreation
-        # built from this method's return value, so letting it escape here would destroy that
-        # signal and its candidate-cleanup path for nothing; the original ambiguity is real
-        # either way.
-        before = json.dumps([])
-
-        def fake_run(argv, **kwargs):
-            if '--bg' in argv:
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 30))
-            if not hasattr(fake_run, 'called'):
-                fake_run.called = True
-                return FakeResult(0, stdout=before)
-            raise KeyboardInterrupt()
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaises(AmbiguousSessionCreation) as ctx:
-            driver.create('probe prompt')
-        self.assertEqual(ctx.exception.candidates, ())
-
-    def test_create_recovers_candidates_when_interrupted_during_the_post_create_listing(self):
-        # claude --bg can exit 0 -- a background session definitely exists -- and then a Ctrl-C
-        # lands while the post-create listing itself is being read. That listing's own except
-        # clause caught only RuntimeError/TimeoutExpired, so KeyboardInterrupt escaped without a
-        # minted id or recovered candidates even though a fresh listing could still find one.
-        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
-        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'new1', 'kind': 'background'}])
-        calls = []
-
-        def fake_run(argv, **kwargs):
-            calls.append(argv)
-            if '--bg' in argv:
-                return FakeResult(0)
-            if len(calls) == 3:
-                raise KeyboardInterrupt()
-            return FakeResult(0, stdout=before if len(calls) == 1 else after)
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaises(AmbiguousSessionCreation) as ctx:
-            driver.create('probe prompt')
-        self.assertEqual(ctx.exception.candidates, ('new1',))
-        self.assertIsInstance(ctx.exception.__cause__, KeyboardInterrupt)
-
-    def test_create_recovers_candidates_when_interrupted_while_claude_bg_is_blocked(self):
-        # A Ctrl-C while claude --bg is running shares the timeout case's ambiguity: the
-        # background session may already have detached before the interrupt landed. This must
-        # not propagate the bare KeyboardInterrupt and lose the candidate id.
-        before = json.dumps([{'id': 'old1', 'kind': 'background'}])
-        after = json.dumps([{'id': 'old1', 'kind': 'background'}, {'id': 'new1', 'kind': 'background'}])
-        responses = iter([FakeResult(0, stdout=before), FakeResult(0, stdout=after)])
-
-        def fake_run(argv, **kwargs):
-            if '--bg' in argv:
-                raise KeyboardInterrupt()
-            return next(responses)
-
-        driver = ClaudeDriver(SessionRegistry(), run=fake_run, cwd='/scratch')
-        with self.assertRaises(AmbiguousSessionCreation) as ctx:
-            driver.create('probe prompt')
-        self.assertEqual(ctx.exception.candidates, ('new1',))
-        self.assertIsInstance(ctx.exception.__cause__, KeyboardInterrupt)
-
-    def test_submit_refuses_a_foreign_session(self):
-        driver = ClaudeDriver(SessionRegistry(), run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
-        with self.assertRaises(ForeignSessionError):
-            driver.submit('not-mine', 'msg')
-
-    def test_submit_confirms_listing_then_refuses_to_claim_an_uncaptured_delivery(self):
-        # A listed session no longer yields a bare True: nothing captured at this version
-        # delivers a further message to a running --bg session, so reporting acceptance would
-        # record an `accepted` outcome for a marker the host never received. The refusal is
-        # `Uncaptured`, not `Unsupported` — we have not exercised a path, which is not the
-        # same claim as Claude not having one.
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        present = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(
-            0, stdout=json.dumps([{'id': 'abcd1234', 'kind': 'background', 'state': 'idle'}])), cwd='/scratch')
-        with self.assertRaises(SubmissionUncaptured):
-            present.submit('abcd1234', 'msg')
-        self.assertNotIsInstance(SubmissionUncaptured(''), SubmissionUnsupported)
-
-    def test_submit_lists_background_sessions_and_reports_a_failed_listing(self):
-        # Without --all a completed background session drops out of the listing, so an owned
-        # session could fail the membership check; a nonzero exit is reported, not parsed as JSON.
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        seen = []
-
-        def fake_run(argv, **kwargs):
-            seen.append(argv)
-            return FakeResult(1, stderr='daemon unreachable')
-
-        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
-        with self.assertRaises(RuntimeError):
-            driver.submit('abcd1234', 'msg')
-        self.assertIn('--all', seen[0])
-
-    def test_submit_translates_a_listing_timeout_into_uncaptured_not_a_raw_timeout(self):
-        # The listing is a presence check, run entirely before submit()'s unconditional
-        # SubmissionUncaptured raise -- its timing out means the marker was definitely never
-        # sent. Left as a raw TimeoutExpired, run_trial's generic handler would treat it as
-        # "maybe delivered before the timeout fired", which is not true for a driver with no
-        # delivery mechanism at all.
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-
-        def fake_run(argv, **kwargs):
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 15))
-
-        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
-        with self.assertRaises(SubmissionUncaptured):
-            driver.submit('abcd1234', 'msg')
-
-    def test_submit_rejects_a_session_absent_from_the_listing_before_anything_else(self):
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        absent = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
-        with self.assertRaises(ValueError) as caught:
-            absent.submit('abcd1234', 'msg')
-        self.assertNotIsInstance(caught.exception, SubmissionUnsupported)
-
-    def test_observe_is_unobservable_when_logs_unreachable(self):
-        # Reproduces the real observation: `claude logs <id>` fails once a `done` session's
-        # daemon socket is gone (ENOENT). A dead observation channel is not a negative result,
-        # so it must not reach classification as an empty (hence not_observed) outcome map.
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(1, stderr='connect ENOENT'), cwd='/scratch')
-        self.assertEqual(driver.observe('abcd1234', marker=MARKER, submitted_at=0.0),
-                          Observation(outcomes={}, observable=False))
-
-    def test_observe_is_unobservable_when_claude_logs_times_out(self):
-        # A stalled claude logs raised TimeoutExpired uncaught, aborting the whole trial instead
-        # of returning the same unobservable result a nonzero exit already produces.
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-
-        def fake_run(argv, **kwargs):
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get('timeout', 15))
-
-        driver = ClaudeDriver(registry, run=fake_run, cwd='/scratch')
-        self.assertEqual(driver.observe('abcd1234', marker=MARKER, submitted_at=0.0),
-                          Observation(outcomes={}, observable=False))
-
-    def test_observe_of_an_untimestamped_transcript_is_unobservable(self):
-        # `claude logs` prints no per-line timestamp, so a reachable transcript still cannot be
-        # ordered against submission: the create() prompt's own turn would otherwise be read as
-        # this trial's turn_start before the marker existed.
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        raw = f'User: {MARKER}\nAssistant: ack {MARKER}\n'
-        driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout=raw), cwd='/scratch')
-        observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
-        self.assertEqual(observation.outcomes, {})
-        self.assertFalse(observation.observable)
-
-    def test_observe_of_an_unrecognized_transcript_shape_is_unobservable(self):
-        # Non-empty output that yields no recognized User:/Assistant: block is a format this
-        # runner cannot parse, not "read cleanly, no conversation yet" -- those must not
-        # collapse into the same empty, observable=True result.
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='some other format\n'),
-                              cwd='/scratch')
-        observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
-        self.assertEqual(observation, Observation(outcomes={}, observable=False))
-
-    def test_observe_of_genuinely_empty_output_is_still_observable(self):
-        # A session with no conversation yet (nothing sent, or a poll racing session creation)
-        # must not be conflated with an unrecognized shape: empty output is a legitimate read.
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='  \n'), cwd='/scratch')
-        observation = driver.observe('abcd1234', marker=MARKER, submitted_at=0.0)
-        self.assertEqual(observation, Observation(outcomes={}, observable=True))
-
-    def test_teardown_releases_the_registry_entry(self):
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0), cwd='/scratch')
-        driver.teardown('abcd1234')
-        with self.assertRaises(ForeignSessionError):
-            registry.require_owned('claude:abcd1234')
-
-    def test_failed_teardown_keeps_ownership_so_it_can_be_retried(self):
-        registry = SessionRegistry()
-        registry.mint('claude:abcd1234')
-        driver = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(1, stderr='rm failed'), cwd='/scratch')
-        with self.assertRaises(RuntimeError):
-            driver.teardown('abcd1234')
-        registry.require_owned('claude:abcd1234')  # still ours: the live session can still be removed
-
-    def test_version_reports_stripped_stdout(self):
-        driver = ClaudeDriver(SessionRegistry(),
-                               run=lambda *a, **k: FakeResult(0, stdout='2.1.268\n'), cwd='/scratch')
-        self.assertEqual(driver.version('abcd1234'), '2.1.268')
-
-    def test_version_is_none_when_the_command_fails(self):
-        driver = ClaudeDriver(SessionRegistry(),
-                               run=lambda *a, **k: FakeResult(1, stderr='not found'), cwd='/scratch')
-        self.assertIsNone(driver.version('abcd1234'))
-
-    def test_version_is_none_when_the_run_call_itself_raises(self):
-        def raising_run(*_args, **_kwargs):
-            raise subprocess.TimeoutExpired(cmd=['claude', '--version'], timeout=15)
-
-        driver = ClaudeDriver(SessionRegistry(), run=raising_run, cwd='/scratch')
-        self.assertIsNone(driver.version('abcd1234'))
-
-
-class CodexDriverTests(unittest.TestCase):
-    RUN_STARTED = datetime.datetime(2026, 9, 11, 12, 0, 0, tzinfo=datetime.UTC).timestamp()
-
+        lines = [json.dumps({'timestamp': '2026-09-13T09:41:51.650Z', 'type': 'session_meta',
+                             'payload': {'cli_version': '0.154.0'}})]
+        self.assertEqual(codex_session_version(lines), '0.154.0')
+
+    def test_codex_session_version_is_none_without_a_usable_session_meta_record(self):
+        self.assertIsNone(codex_session_version([json.dumps({'type': 'response_item'})]))
+        self.assertIsNone(codex_session_version([json.dumps({'type': 'session_meta', 'payload': {}})]))
+        self.assertIsNone(codex_session_version([json.dumps({'type': 'session_meta',
+                                                             'payload': {'cli_version': 7}})]))
+
+    def test_codex_session_version_skips_unparseable_and_non_object_lines(self):
+        lines = ['not json', 'null', '42', '[1, 2]',
+                 json.dumps({'type': 'session_meta', 'payload': {'cli_version': '0.154.0'}})]
+        self.assertEqual(codex_session_version(lines), '0.154.0')
+
+
+def opencode_export(messages, *, version='1.18.30', session_id='ses_1', directory='/synthetic'):
+    return json.dumps({'info': {'id': session_id, 'version': version, 'directory': directory,
+                                'time': {'created': 1, 'updated': 2}},
+                       'messages': messages})
+
+
+def opencode_message(role, parts, created_ms, **info):
+    info = {'id': f'msg_{role}_{created_ms}', 'sessionID': 'ses_1', **info}
+    if isinstance(parts, list):
+        parts = [{'sessionID': info['sessionID'], 'messageID': info['id'], **part}
+                 if isinstance(part, dict) else part for part in parts]
+    stamp = {'created': created_ms}
+    if role == 'assistant':
+        stamp['completed'] = created_ms + 100
+    return {'info': {'role': role, 'time': stamp, **info}, 'parts': parts}
+
+
+class OpenCodeParsingTests(unittest.TestCase):
+    def test_assistant_only_parts_cannot_make_user_messages_observable(self):
+        for kind in ('reasoning', 'step-start', 'step-finish'):
+            for role in ('user', 'assistant'):
+                with self.subTest(kind=kind, role=role):
+                    raw = opencode_export([opencode_message(role, [{'type': kind, 'text': MARKER}], 1000000)])
+                    events, unusable = opencode_export_events(raw)
+                    self.assertEqual(unusable, 1 if role == 'user' else 0)
+                    self.assertEqual(len(events), 0 if role == 'user' else 1)
+
+    def test_present_event_parts_require_a_usable_matching_session_identity(self):
+        for part in (None, [], {}, {'sessionID': None}, {'sessionID': ''}, {'sessionID': 7}):
+            with self.subTest(part=part):
+                ids, error, unusable = opencode_session_ids(json.dumps(
+                    {'type': 'step_start', 'sessionID': 'ses_1', 'part': part}))
+                self.assertEqual(set(ids), {'ses_1'})
+                self.assertIsNone(error)
+                self.assertEqual(unusable, 1)
+
+    def test_ack_uses_completion_time_without_backdating_it_to_message_creation(self):
+        raw = opencode_export([opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1001000,
+                                               time={'created': 1001000, 'completed': 1121000})])
+        events, unusable = opencode_export_events(raw)
+        self.assertEqual(unusable, 0)
+        observation = detect_outcomes(events, MARKER, submitted_at=1000)
+        self.assertEqual(observation.outcomes, {'turn_start': 1001, 'ack': 1121})
+        trial = Trial(submitted=1000, outcomes=observation.outcomes)
+        self.assertEqual(trial.result('ack', 1121), 'not_observed')
+
+    def test_missing_or_invalid_completion_cannot_backdate_an_ack(self):
+        for completed in (None, True, '1002000', float('nan'), float('inf'), 1000000):
+            with self.subTest(completed=completed):
+                stamp = {'created': 1001000}
+                if completed is not None:
+                    stamp['completed'] = completed
+                raw = opencode_export([opencode_message('assistant', [{'type': 'text', 'text': MARKER}],
+                                                       1001000, time=stamp)])
+                events, _ = opencode_export_events(raw)
+                observation = detect_outcomes(events, MARKER, submitted_at=1000)
+                self.assertEqual(observation.outcomes, {'turn_start': 1001})
+                self.assertFalse(observation.observable)
+
+    def test_earliest_ack_completion_wins_even_if_messages_complete_out_of_order(self):
+        raw = opencode_export([
+            opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1001000,
+                             time={'created': 1001000, 'completed': 1121000}),
+            opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1002000,
+                             time={'created': 1002000, 'completed': 1003000})])
+        events, _ = opencode_export_events(raw)
+        self.assertEqual(detect_outcomes(events, MARKER, submitted_at=1000).outcomes['ack'], 1003)
+
+    def test_text_completed_after_submission_does_not_move_an_older_turn_start(self):
+        raw = opencode_export([opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 999000,
+                                               time={'created': 999000, 'completed': 1002000})])
+        events, _ = opencode_export_events(raw)
+        observation = detect_outcomes(events, MARKER, submitted_at=1000)
+        self.assertEqual(observation.outcomes, {'ack': 1002})
+
+    def test_export_parts_require_a_captured_type(self):
+        parts = [{'text': MARKER}] + [dict(type=kind, text=MARKER)
+                                     for kind in (None, 1, [], {}, '', ' ', 'future-part')]
+        for part in parts:
+            for role in ('user', 'assistant'):
+                with self.subTest(part=part, role=role):
+                    raw = opencode_export([opencode_message(role, [part], 1_757_754_001_000)])
+                    self.assertEqual(opencode_export_events(raw), ([], 1))
+
+    def test_session_ids_are_collected_and_an_error_event_is_reported(self):
+        # Captured: a failing turn (401) still emits its sessionID and lists the session.
+        stdout = '\n'.join([json.dumps({'type': 'step_start', 'sessionID': 'ses_1',
+                                        'part': {'type': 'step-start', 'sessionID': 'ses_1'}}),
+                            json.dumps({'type': 'error', 'sessionID': 'ses_1',
+                                        'error': {'name': 'ProviderAuthError'}}),
+                            'not json', json.dumps([1])])
+        session_ids, error, unusable = opencode_session_ids(stdout)
+        self.assertEqual(list(session_ids), ['ses_1'])
+        self.assertIn('ProviderAuthError', error)
+        self.assertEqual(unusable, 2)
+        self.assertEqual(opencode_session_ids(''), ({}, None, 0))
+        self.assertEqual(opencode_session_ids(json.dumps({'type': 'text', 'sessionID': ''})), ({}, None, 2))
+
+    def test_export_extracts_text_parts_with_millisecond_creation_times(self):
+        raw = opencode_export([
+            opencode_message('user', [{'type': 'text', 'text': MARKER}], 1_757_754_001_000),
+            opencode_message('assistant', [{'type': 'step-start'},
+                                           {'type': 'reasoning', 'text': 'hmm'},
+                                           {'type': 'text', 'text': f'ack {MARKER}'}], 1_757_754_002_500),
+        ])
+        events, unusable = opencode_export_events(raw)
+        self.assertEqual([(e.role, e.text, e.time) for e in events],
+                          [('user', MARKER, 1_757_754_001.0), ('assistant', f'ack {MARKER}', 1_757_754_002.6)])
+        self.assertEqual(events[1].created_at, 1_757_754_002.5)
+        self.assertEqual(unusable, 0)
+
+    def test_malformed_export_documents_and_messages_are_unusable(self):
+        for raw in ('not json', json.dumps([1]), json.dumps({'messages': 'x'}), json.dumps({})):
+            with self.subTest(raw=raw):
+                self.assertEqual(opencode_export_events(raw), ([], 1))
+        messages = [
+            'not-a-message',
+            {'info': None, 'parts': []},
+            {'info': {'role': 'system', 'time': {'created': 1}}, 'parts': []},
+            {'info': {'role': 'user', 'time': {'created': 'x'}}, 'parts': []},
+            {'info': {'role': 'user', 'time': {'created': True}}, 'parts': []},
+            {'info': {'role': 'user', 'time': {'created': float('inf')}}, 'parts': []},
+            {'info': {'role': 'user'}, 'parts': []},
+            {'info': {'role': 'user', 'time': {'created': 1}}, 'parts': None},
+            {'info': {'role': 'user', 'time': {'created': 1}}, 'parts': ['x']},
+            {'info': {'role': 'user', 'time': {'created': 1}}, 'parts': [{'type': 'text', 'text': 2}]},
+        ]
+        self.assertEqual(opencode_export_events(opencode_export(messages)), ([], len(messages)))
+
+    def test_export_carries_the_assistant_provider_and_model_only(self):
+        raw = opencode_export([
+            opencode_message('user', [{'type': 'text', 'text': MARKER}], 1_757_754_001_000,
+                             providerID='opencode', modelID='ling-3.0-flash-fin-free'),
+            opencode_message('assistant', [{'type': 'text', 'text': 'a'}], 1_757_754_002_000,
+                             providerID='opencode', modelID='ling-3.0-flash-fin-free'),
+            opencode_message('assistant', [{'type': 'text', 'text': 'b'}], 1_757_754_003_000,
+                             modelID='ling-3.0-flash-fin-free'),  # provider absent: report it bare
+            opencode_message('assistant', [{'type': 'text', 'text': 'c'}], 1_757_754_004_000,
+                             providerID='opencode', modelID=7),
+        ])
+        events, unusable = opencode_export_events(raw)
+        self.assertEqual([event.model for event in events],
+                          [None, 'opencode/ling-3.0-flash-fin-free', 'ling-3.0-flash-fin-free', None])
+        self.assertEqual(unusable, 0)  # the model is evidence, never a reason to fail the read
+
+    def test_export_version_reads_info_version(self):
+        self.assertEqual(opencode_export_version(opencode_export([])), '1.18.30')
+        self.assertIsNone(opencode_export_version(opencode_export([], version=3)))
+        self.assertIsNone(opencode_export_version('not json'))
+        self.assertIsNone(opencode_export_version(json.dumps({'info': 'x'})))
+
+
+class StripAnsiTests(unittest.TestCase):
+    def test_csi_osc_and_two_byte_escapes_are_removed_and_cr_becomes_newline(self):
+        raw = b'\x1b[2J\x1b[1;1H\x1b]0;title\x07hello\x1b[0 q \x1b=\x1b(B\r\nworld\rx\x1bM'
+        self.assertEqual(strip_ansi(raw), 'hello \nworld\nx')
+
+    def test_the_captured_claude_composer_line_matches_the_ready_pattern(self):
+        # Captured attach screen: a rule, then `❯` + NBSP alone on its line, then a rule.
+        screen = '────\r\n❯\xa0\r\n────\r\n[Sonnet 5] │ ⌂ claude\r\n'
+        self.assertRegex(strip_ansi(screen.encode()), CLAUDE_READY_PATTERN)
+        # An earlier prompt echoed back with text after the chevron is not the idle composer.
+        self.assertNotRegex('❯ tell me a joke\n', CLAUDE_READY_PATTERN)
+
+    def test_the_captured_codex_composer_and_trust_dialog_match_their_patterns(self):
+        # Both as they read after strip_ansi on the real captured screens: the composer keeps its
+        # spaces, the trust dialog loses them (the TUI places words with cursor moves).
+        self.assertRegex('› Ask Codex to do anything   ? for shortcuts', CODEX_READY_PATTERN)
+        collapsed = ('>You are in <probe-cwd>Doyoutrustthecontentsofthisdirectory?Workingwithuntrusted'
+                     'contents...› 1. Yes, continue2.No,quitPress enter to continue')
+        self.assertRegex(collapsed, CODEX_TRUST_PATTERN)
+        self.assertNotRegex('Do you trust the contents of this directory?', CODEX_TRUST_PATTERN)
+        self.assertNotRegex(collapsed + '\n› Ask Codex to do anything', CODEX_TRUST_PATTERN)
+
+
+PTY_CHILD = '''
+import sys, termios, time
+config = termios.tcgetattr(0)
+config[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, config)
+print('BOOT', flush=True)
+time.sleep(0.3)
+print('\\x1b[1m> Ask me anything\\x1b[0m', flush=True)
+for line in sys.stdin:
+    line = line.rstrip('\\n')
+    if line == 'quit':
+        break
+    print('GOT:' + line, flush=True)
+'''
+
+
+class PtyClientTests(unittest.TestCase):
     def setUp(self):
-        # One sessions root per test, so adoption sees exactly the rollouts the test wrote.
-        root = tempfile.TemporaryDirectory()
-        self.addCleanup(root.cleanup)
-        self.sessions_root = root.name
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
 
-    def rollout(self, *records, lines=None):
-        """A throwaway rollout under this test's sessions root; returns its path."""
-        path = os.path.join(self.sessions_root, f'rollout-{len(os.listdir(self.sessions_root))}.jsonl')
+    def spawn(self, code=PTY_CHILD, **kwargs):
+        client = PtyClient([sys.executable, '-u', '-c', code], cwd=self.tmp.name,
+                           env={'PATH': os.defpath, 'HOME': self.tmp.name}, **kwargs)
+        self.addCleanup(client.close)
+        return client
+
+    def test_wait_for_needs_the_pattern_and_a_quiet_period(self):
+        client = self.spawn()
+        self.assertTrue(client.wait_for(r'> Ask me anything', quiet=0.3, timeout=5))
+        # The pattern arrived after BOOT; the stripped screen holds both, ANSI removed.
+        self.assertIn('BOOT\n> Ask me anything', client.screen())
+        self.assertFalse(client.wait_for(r'never printed', quiet=0.1, timeout=0.5))
+
+    def test_a_select_failure_invalidates_the_pty_client(self):
+        with unittest.mock.patch.object(host_trials.select, 'select', side_effect=OSError('lost fd')):
+            client = self.spawn()
+            client.thread.join(timeout=2)
+        self.assertFalse(client.thread.is_alive())
+        self.assertTrue(client.eof)
+        self.assertFalse(client.wait_for(r'.*', quiet=0, timeout=0))
+        with self.assertRaises(ValueError):
+            client.send_keys(b'unsafe\r')
+
+    def test_a_client_that_cannot_start_its_drain_thread_closes_the_child_it_launched(self):
+        # The child is already running and the half-built client is about to be discarded, so
+        # nothing would ever hold a handle to it.
+        launched = []
+        real = host_trials.PtyProcess
+
+        def recording(*args, **kwargs):
+            launched.append(real(*args, **kwargs))
+            return launched[-1]
+
+        class Refusing(threading.Thread):
+            def start(self):
+                raise RuntimeError('cannot start thread')
+
+        with unittest.mock.patch.object(host_trials, 'PtyProcess', recording), \
+             unittest.mock.patch.object(host_trials.threading, 'Thread', Refusing):
+            with self.assertRaises(RuntimeError):
+                PtyClient([sys.executable, '-u', '-c', PTY_CHILD], cwd=self.tmp.name,
+                          env={'PATH': os.defpath, 'HOME': self.tmp.name})
+        self.assertEqual(len(launched), 1)
+        self.assertIsNotNone(launched[0].exit_code)  # reaped, not left running
+
+    def test_type_line_delivers_a_long_line_in_chunks_and_ends_with_enter(self):
+        client = self.spawn()
+        self.assertTrue(client.wait_for(r'> Ask me anything', quiet=0.3, timeout=5))
+        since = client.mark()
+        message = marker_message(MARKER)  # longer than one chunk
+        client.type_line(message, chunk=16, gap=0.01, pause=0.05)
+        self.assertTrue(client.wait_for(re.escape('GOT:' + message), quiet=0.1, timeout=5, since=since))
+        self.assertIn(f'GOT:{message}', client.text_since(since))
+
+    def test_the_drain_thread_keeps_reading_past_the_process_transcript_cap(self):
+        # A held client must not stall the child or trip PtyProcess's 1 MiB `_record` cap: the
+        # child emits 2 MiB and the client keeps only its bounded window, latest bytes last.
+        # The trailing read keeps the child alive: `wait_for` refuses to call an exited client
+        # ready, so a child that printed and exited could never satisfy it.
+        code = '''
+import sys
+for i in range(2048):
+    sys.stdout.write('L%05d ' % i + 'x' * 1017 + '\\n')
+    sys.stdout.flush()
+print('DONE', flush=True)
+sys.stdin.readline()
+'''
+        client = self.spawn(code, window=64 * 1024)
+        self.assertTrue(client.wait_for(r'DONE', quiet=0.2, timeout=20))
+        self.assertGreater(client.total, 2 * 1024 * 1024)
+        self.assertLessEqual(len(client.window), 64 * 1024)
+        self.assertIn('L02047', client.screen())
+        self.assertNotIn('L00000', client.text_since(0))
+
+    def test_close_reaps_the_child_and_send_keys_refuses_afterwards(self):
+        client = self.spawn()
+        self.assertTrue(client.wait_for(r'> Ask me anything', quiet=0.3, timeout=5))
+        client.close()
+        self.assertIsNotNone(client.exit_code)
+        with self.assertRaises(ValueError):
+            client.send_keys(b'x')
+
+    def test_child_exit_marks_eof_and_wait_for_returns_false_promptly(self):
+        client = self.spawn()
+        self.assertTrue(client.wait_for(r'> Ask me anything', quiet=0.3, timeout=5))
+        client.type_line('quit', chunk=8, gap=0.0, pause=0.0)
+        started = time.monotonic()
+        self.assertFalse(client.wait_for(r'never', quiet=0.1, timeout=10))
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertTrue(client.eof)
+
+    def test_wait_for_refuses_a_composer_drawn_by_a_child_that_then_exited(self):
+        # Readiness is a property of a live client. A child that drew the composer and exited
+        # serves nothing: retaining it would let `CodexDriver.submit` read a nonempty client list
+        # as proof that a queued message has a serving process.
+        client = self.spawn("print('> Ask me anything', flush=True)")
+        self.assertFalse(client.wait_for(r'> Ask me anything', quiet=0.5, timeout=5))
+        self.assertTrue(client.eof)
+        self.assertIn('> Ask me anything', client.screen())  # it did appear; the exit is what refuses
+
+    def test_env_carries_xterm_term_and_the_resolved_cwd(self):
+        code = ("import os, sys; print('TERM=' + os.environ['TERM'] + ' PWD=' + os.environ['PWD'], "
+                "flush=True); sys.stdin.readline()")  # stays alive: an exited client is never ready
+        client = self.spawn(code)
+        self.assertTrue(client.wait_for(r'TERM=xterm-256color PWD=' + re.escape(os.path.realpath(self.tmp.name)),
+                                        quiet=0.1, timeout=5))
+
+
+class FakePtyClient:
+    """Scripted TUI. `ready` False means the composer never appears after startup (or, with
+    `trust_prompt`, after the trust dialog is answered). `trust_prompt` starts on the captured
+    escape-stripped dialog, words run together, with the composer placeholder already drawn
+    beneath it -- so a readiness match alone cannot tell the two screens apart. `eof` mirrors the
+    real client's: a client whose child exited is never ready and refuses every write."""
+
+    launched = []
+
+    def __init__(self, argv, *, cwd, ready=True, trust_prompt=False, eof=False):
+        self.argv = argv
+        self.cwd = cwd
+        self.ready = ready
+        self.trust_prompt = trust_prompt
+        self.eof = eof
+        # Set by a test after launch to make the next write fail the way `os.write` can, without
+        # the client having exited (the real `send_keys` propagates `OSError` straight through).
+        self.write_error = None
+        self.keys = []
+        self.typed = []
+        self.closed = False
+        self.text = ('› Ask Codex to do anything\n'
+                     'Doyoutrustthecontentsofthisdirectory?Workingwithuntrustedcontents'
+                     'comeswithhigherriskofpromptinjection.Trustingthedirectoryallows'
+                     'project-localconfig,hooks,andexecpoliciestoload.'
+                     '› 1. Yes, continue2.No,quitPress enter to continue\n'
+                     if trust_prompt else '')
+        FakePtyClient.launched.append(self)
+
+    def mark(self):
+        return len(self.text)
+
+    def text_since(self, offset=0):
+        return self.text[offset:]
+
+    def screen(self, limit=1500):
+        return self.text[-limit:]
+
+    def wait_for(self, pattern, *, timeout, quiet=1.0, since=0):
+        if self.eof:
+            return False
+        answered = b'\r' in self.keys
+        if self.ready and (not self.trust_prompt or answered):
+            self.text += '❯\xa0\n› Ask Codex to do anything\n'
+        return bool(re.search(pattern, self.text[since:]))
+
+    def send_keys(self, data):
+        if self.closed or self.eof:
+            raise ValueError('closed or exited session')
+        if self.write_error is not None:
+            raise self.write_error
+        self.keys.append(data)
+        return len(data)
+
+    def type_line(self, text, **kwargs):
+        self.typed.append(text)
+        self.send_keys(text.encode())
+        self.send_keys(b'\r')
+
+    def close(self):
+        self.closed = True
+
+
+class DriverTestCase(unittest.TestCase):
+    def setUp(self):
+        # These small Linux probe fixtures need a trusted sticky ancestor; inherited TMPDIR
+        # may have group-writable parents. Build caches and verification logs stay in scratch.
+        self.tmp = tempfile.TemporaryDirectory(dir='/tmp')
+        self.addCleanup(self.tmp.cleanup)
+        self.cwd = self.tmp.name
+        # Fixture files live in their own private directory: the probe cwd must stay empty, and
+        # its parent is the shared temp root where fixed names would collide across runs.
+        self.fixtures = tempfile.TemporaryDirectory(dir='/tmp')
+        self.addCleanup(self.fixtures.cleanup)
+        self.registry = SessionRegistry()
+        FakePtyClient.launched = []
+        self.transcripts = {}
+
+    def git(self, *args):
+        """Run one real `git` command, insulated from the operator's own configuration.
+
+        `private_directory`'s `.git` exception is a claim about what `git init` leaves on disk,
+        so the fixtures make a real one rather than a hand-built skeleton that could agree with
+        a wrong predicate. `git` is not a host CLI and creates no session; the AGENTS.md rule it
+        must not break is launching an installed Claude/Codex/OpenCode, which this does not.
+        """
+        env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                   GIT_CONFIG_NOSYSTEM='1', GIT_AUTHOR_NAME='probe', GIT_AUTHOR_EMAIL='probe@invalid',
+                   GIT_COMMITTER_NAME='probe', GIT_COMMITTER_EMAIL='probe@invalid')
+        # Installed Git is required evidence, so an unavailable/failed command must fail the
+        # fixture rather than silently skipping the freshness check.
+        subprocess.run(['git', *args], check=True, env=env, capture_output=True)
+
+    def transcript_path_for(self, session_uuid):
+        return self.transcripts.get(session_uuid)
+
+    def write_lines(self, name, lines):
+        path = os.path.join(self.fixtures.name, name)
         with open(path, 'w', encoding='utf-8') as handle:
-            handle.writelines(lines or [json.dumps(record) + '\n' for record in records])
+            handle.write('\n'.join(lines) + '\n')
         return path
 
-    @staticmethod
-    def message(stamp, role, text):
-        return {'timestamp': stamp, 'type': 'response_item',
-                'payload': {'type': 'message', 'role': role,
-                                                 'content': [{'type': 'output_text', 'text': text}]}}
 
-    def driver(self, registry, path, *, run=None):
-        return CodexDriver(registry, run=run or (lambda *a, **k: FakeResult(0)),
-                           rollout_path_for=lambda _id: path, started_at=self.RUN_STARTED,
-                           sessions_root=self.sessions_root)
+def listing(entries):
+    return FakeResult(0, json.dumps(entries))
 
-    def test_create_refuses_because_no_thread_creation_path_is_captured(self):
-        # Guessing what `codex exec` prints would be the evidence failure OpenCodeDriver
-        # refuses for; run_trial(existing_session=...) is the supported way in.
-        with self.assertRaises(SessionCreationUncaptured):
-            self.driver(SessionRegistry(), None).create('hi')
 
-    def test_a_non_finite_started_at_is_rejected_at_construction(self):
-        # A NaN boundary makes both `started < self.started_at` (register_existing) and
-        # `started >= self.started_at` (the rival scan) evaluate False, so an arbitrarily old
-        # rollout could adopt as owned while every concurrent candidate is silently ruled out.
-        for bad in (float('nan'), float('inf'), float('-inf')):
-            with self.assertRaises(ValueError):
-                CodexDriver(SessionRegistry(), rollout_path_for=lambda _id: None, started_at=bad,
-                           sessions_root=self.sessions_root)
+def claude_entry(short='69aa52ed', *, cwd, pid=4242, status='idle', state='done'):
+    return {'pid': pid, 'id': short, 'cwd': cwd, 'kind': 'background', 'startedAt': 1757754000000,
+            'sessionId': short + SESSION_UUID[8:], 'name': None, 'status': status, 'state': state}
 
-    def test_register_existing_refuses_without_a_sessions_root(self):
-        # Without sessions_root there is no way to rule out a concurrent human thread at all --
-        # this fixture's own driver() helper always supplies one, so the refusal path needs its
-        # own direct construction to stay covered.
-        registry = SessionRegistry()
-        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
-        driver = CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
-                             rollout_path_for=lambda _id: mine, started_at=self.RUN_STARTED,
-                             sessions_root=None)
+
+class ClaudeDriverTests(DriverTestCase):
+    def entry(self, short='69aa52ed', **kwargs):
+        kwargs.setdefault('cwd', self.cwd)
+        return claude_entry(short, **kwargs)
+
+    def test_listing_cwd_must_match_before_binding_or_driving(self):
+        for cwd in (None, '', '/foreign'):
+            with self.subTest(cwd=cwd):
+                self.registry = SessionRegistry()
+                entry = self.entry(cwd=cwd)
+                if cwd is None:
+                    del entry['cwd']
+                run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', 'agents'], listing([entry]))])
+                driver = self.driver(run)
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.create('hello')
+                self.assertIsNone(driver.sessions['69aa52ed'])
+                self.assertEqual(driver.clients, [])
+                self.assertEqual(run.argv('claude', '--bg', '--resume'), [])
+
+    def test_uncaptured_claude_models_are_rejected_before_host_calls(self):
+        for model in (None, '', 'opus', 'sonnet'):
+            with self.subTest(model=model):
+                run = FakeRun([])
+                with self.assertRaisesRegex(ValueError, 'uncaptured'):
+                    self.driver(run, model=model)
+                self.assertEqual(run.calls, [])
+
+    def test_listing_cannot_bind_a_short_id_to_an_unrelated_uuid(self):
+        entry = self.entry()
+        entry['sessionId'] = 'deadbeef' + SESSION_UUID[8:]
+        driver = self.driver(FakeRun([(['claude', 'agents'], listing([entry]))]))
+        driver._mint('69aa52ed')
+        with self.assertRaisesRegex(RuntimeError, 'malformed'):
+            driver.status('69aa52ed')
+        self.assertIsNone(driver.sessions['69aa52ed'])
+
+    def test_listing_cannot_change_an_already_bound_full_uuid(self):
+        entry = self.entry()
+        run = FakeRun([(['claude', 'agents'], lambda argv: listing([entry]))])
+        driver = self.driver(run)
+        driver._mint('69aa52ed')
+        driver.status('69aa52ed')
+        entry['sessionId'] = '69aa52ed-aaaa-4222-8333-444455556666'
+        with self.assertRaisesRegex(RuntimeError, 'changed'):
+            driver.status('69aa52ed')
+        self.assertEqual(driver.sessions['69aa52ed'], SESSION_UUID)
+
+    def test_interrupted_claude_creation_reports_candidates_without_adopting_them(self):
+        candidates = [self.entry(), self.entry('deadbeef')]
+        run = FakeRun([(['claude', '--bg'], KeyboardInterrupt()),
+                       (['claude', 'agents'], listing(candidates))])
+        driver = self.driver(run)
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            run_trial_with_cleanup(driver, prompt='hello')
+        self.assertEqual(driver.owned(), set())
+        self.assertEqual(driver.strays, {'69aa52ed', 'deadbeef'})
+        self.assertIn('manual investigation', ' '.join(caught.exception.__notes__))
+        self.assertEqual(run.argv('claude', 'stop'), [])
+        self.assertEqual(run.argv('claude', 'rm'), [])
+
+    def test_interrupted_creation_preserves_cancellation_when_discovery_fails(self):
+        for recovery_error in (subprocess.TimeoutExpired(['claude'], 15), KeyboardInterrupt()):
+            with self.subTest(recovery_error=type(recovery_error).__name__):
+                original = KeyboardInterrupt()
+                run = FakeRun([(['claude', '--bg'], original), (['claude', 'agents'], recovery_error)])
+                driver = self.driver(run)
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    run_trial_with_cleanup(driver, prompt='hello')
+                self.assertIs(caught.exception, original)
+                self.assertIn('discovery failed', ' '.join(caught.exception.__notes__))
+                self.assertEqual(driver.owned(), set())
+
+    def test_unrecognized_creation_output_reports_candidates_without_adoption(self):
+        for result in (FakeResult(0, 'changed output'), FakeResult(1, 'changed output'),
+                       subprocess.TimeoutExpired(['claude'], 60, output='changed output')):
+            with self.subTest(result=type(result).__name__):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['claude', '--bg'], result),
+                               (['claude', 'agents'], listing([self.entry()]))])
+                driver = self.driver(run)
+                with self.assertRaises((RuntimeError, subprocess.TimeoutExpired)) as caught:
+                    run_trial_with_cleanup(driver, prompt='hello')
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual(driver.strays, {'69aa52ed'})
+                self.assertIn('manual investigation', ' '.join(caught.exception.__notes__))
+                self.assertEqual(run.argv('claude', 'stop'), [])
+                self.assertEqual(run.argv('claude', 'rm'), [])
+
+    def test_failed_candidate_discovery_preserves_the_creation_error(self):
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'changed output')),
+                       (['claude', 'agents'], KeyboardInterrupt())])
+        driver = self.driver(run)
+        with self.assertRaisesRegex(RuntimeError, 'no backgrounded line') as caught:
+            run_trial_with_cleanup(driver, prompt='hello')
+        self.assertIn('discovery failed', ' '.join(caught.exception.__notes__))
+        self.assertEqual(driver.owned(), set())
+
+    def test_candidate_discovery_excludes_other_claude_owners_in_the_shared_registry(self):
+        for unknown in (False, True):
+            with self.subTest(unknown=unknown):
+                self.registry = SessionRegistry()
+                sibling, _ = self.create_live()
+                entries = [self.entry()]
+                if unknown:
+                    entries.append(self.entry('deadbeef'))
+                    # Another host's key cannot hide an unowned Claude candidate.
+                    self.registry.mint('codex:deadbeef', object())
+                run = FakeRun([(['claude', '--bg'], FakeResult(0, 'changed output')),
+                               (['claude', 'agents'], listing(entries))])
+                driver = self.driver(run)
+                with self.assertRaisesRegex(RuntimeError, 'no backgrounded line'):
+                    run_trial_with_cleanup(driver, prompt='hello')
+                self.assertEqual(driver.strays, {'deadbeef'} if unknown else set())
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual(sibling.owned(), {'69aa52ed'})
+                self.assertEqual(run.argv('claude', 'stop'), [])
+                self.assertEqual(run.argv('claude', 'rm'), [])
+
+    def test_claude_transcript_removed_between_discovery_and_stat_is_unobservable(self):
+        driver = self.driver(FakeRun([
+            (['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+            (['claude', 'agents'], listing([self.entry()]))]),
+            transcript_path_for=host_trials.default_claude_transcript_path)
+        driver.create('hello')
+        with unittest.mock.patch.object(host_trials.glob, 'glob', return_value=['synthetic-transcript']), \
+                unittest.mock.patch.object(os.path, 'getmtime', side_effect=FileNotFoundError):
+            self.assertFalse(driver.observe('69aa52ed', marker=MARKER, submitted_at=0).observable)
+            self.assertIsNone(driver.version('69aa52ed'))
+
+    def driver(self, run, **kwargs):
+        kwargs.setdefault('transcript_path_for', self.transcript_path_for)
+        kwargs.setdefault('pty', FakePtyClient)
+        # One fake clock drives both the sleeps and the deadlines they wait out, so a bounded
+        # wait (the 5s version read, the 10s pre-detach check) ends without real time passing.
+        self.clock = FakeClock()
+        kwargs.setdefault('sleep', self.clock.sleep)
+        kwargs.setdefault('monotonic', self.clock.monotonic)
+        kwargs.setdefault('cwd', self.cwd)
+        return ClaudeDriver(self.registry, run=run, **kwargs)
+
+    def test_a_non_empty_probe_cwd_is_refused_at_construction(self):
+        with open(os.path.join(self.cwd, 'notes.txt'), 'w') as handle:
+            handle.write('x')
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]), cwd=os.path.join(self.cwd, 'missing'))
+
+    def test_probe_cwd_must_be_operator_owned_and_not_writable_by_others(self):
+        for mode in (0o770, 0o777):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.cwd, mode)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'writable'):
+                        self.driver(FakeRun([]))
+                finally:
+                    os.chmod(self.cwd, 0o700)
+        with unittest.mock.patch('os.geteuid', return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(ValueError, 'owned'):
+                self.driver(FakeRun([]))
+
+    def test_writable_non_sticky_ancestors_are_refused(self):
+        for mode in (0o770, 0o777):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory(dir=self.fixtures.name) as parent:
+                child = os.path.join(parent, 'nested', 'probe')
+                os.makedirs(child, mode=0o700)
+                os.chmod(parent, mode)
+                with self.assertRaisesRegex(ValueError, 'ancestor'):
+                    self.driver(FakeRun([]), cwd=child)
+
+    def test_traversable_cwd_cannot_expose_writable_git_metadata(self):
+        self.git('init', '--quiet', self.cwd)
+        os.chmod(os.path.join(self.cwd, '.git'), 0o777)
+        for mode in (0o750, 0o755):
+            with self.subTest(mode=oct(mode)):
+                os.chmod(self.cwd, mode)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'traversable'):
+                        self.driver(FakeRun([]))
+                finally:
+                    os.chmod(self.cwd, 0o700)
+        self.driver(FakeRun([]))  # private traversal protects the same nested metadata
+
+    def test_operator_owned_sticky_ancestor_preserves_child_ownership(self):
+        with tempfile.TemporaryDirectory(dir=self.fixtures.name) as parent:
+            child = os.path.join(parent, 'probe')
+            os.mkdir(child, 0o700)
+            os.chmod(parent, 0o1777)
+            self.driver(FakeRun([]), cwd=child)
+
+    def test_an_untrusted_ancestor_owner_is_refused_even_without_shared_write(self):
+        original_stat = os.stat
+        parent = os.path.dirname(self.cwd)
+
+        def changed_owner(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if path == parent:
+                fields = list(result)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return result
+
+        with unittest.mock.patch('os.stat', side_effect=changed_owner):
+            with self.assertRaisesRegex(ValueError, 'ancestor'):
+                self.driver(FakeRun([]))
+
+    def test_a_freshly_initialized_git_directory_is_allowed(self):
+        # Real `git init`, not a hand-built skeleton: the predicate has to accept what the
+        # captured Codex probe directory actually was.
+        self.git('init', '--quiet', self.cwd)
+        self.driver(FakeRun([]))  # does not raise
+        self.driver(FakeRun([]))  # validation never changes the shared probe directory
+
+    def test_fresh_git_files_cannot_have_external_hard_links(self):
+        self.git('init', '--quiet', self.cwd)
+        for name in ('HEAD', 'config', 'hooks/pre-commit.sample'):
+            path = os.path.join(self.cwd, '.git', name)
+            alias = os.path.join(self.fixtures.name, 'external-alias')
+            with self.subTest(name=name, kind='hard-link'):
+                os.link(path, alias)
+                try:
+                    with self.assertRaisesRegex(ValueError, 'hard.link'):
+                        self.driver(FakeRun([]))
+                finally:
+                    os.unlink(alias)
+        self.driver(FakeRun([]))
+
+    def test_fresh_git_files_must_be_operator_owned(self):
+        self.git('init', '--quiet', self.cwd)
+        config = os.path.join(self.cwd, '.git', 'config')
+        original = os.lstat
+
+        def different_owner(path, *args, **kwargs):
+            result = original(path, *args, **kwargs)
+            if path == config:
+                fields = list(result)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return result
+
+        with unittest.mock.patch('os.lstat', side_effect=different_owner):
+            with self.assertRaisesRegex(ValueError, 'owned'):
+                self.driver(FakeRun([]))
+
+    def test_git_fixtures_ignore_inherited_repository_and_template_settings(self):
+        foreign = os.path.join(self.fixtures.name, 'foreign.git')
+        with unittest.mock.patch.dict(os.environ, {'GIT_DIR': foreign,
+                                                   'GIT_WORK_TREE': self.fixtures.name,
+                                                   'GIT_OBJECT_DIRECTORY': foreign + '/objects',
+                                                   'GIT_TEMPLATE_DIR': foreign + '/template'}):
+            try:
+                self.git('init', '--quiet', self.cwd)
+            except unittest.SkipTest as error:
+                self.fail(f'inherited Git configuration caused a skipped fixture: {error}')
+        self.assertTrue(os.path.isdir(os.path.join(self.cwd, '.git')))
+        self.assertFalse(os.path.exists(foreign))
+        self.driver(FakeRun([]))
+
+    def test_fresh_git_can_use_a_non_default_initial_branch(self):
+        self.git('init', '--quiet', '--initial-branch=probe/initial', self.cwd)
+        self.driver(FakeRun([]))
+
+    def test_a_git_directory_carrying_history_is_refused(self):
+        # An existing repository whose worktree files were deleted looks empty apart from `.git`,
+        # and would feed the authenticated hosts real history and configuration.
+        self.git('init', '--quiet', self.cwd)
+        self.git('-C', self.cwd, 'commit', '--quiet', '--allow-empty', '-m', 'history')
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
+
+    def test_a_git_directory_with_non_initial_configuration_is_refused(self):
+        self.git('init', '--quiet', self.cwd)
+        config = os.path.join(self.cwd, '.git', 'config')
+        with open(config) as handle:
+            baseline = handle.read()
+        for extra in ('\tfsmonitor = synthetic-command\n', '\thooksPath = elsewhere\n',
+                      '\tpager = synthetic-command\n', '[include]\n\tpath = elsewhere\n',
+                      '[alias]\n\tx = !synthetic-command\n',
+                      '[filter "x"]\n\tclean = synthetic-command\n',
+                      '\tbare = true\n', '\trepositoryformatversion = 1\n'):
+            with self.subTest(extra=extra):
+                with open(config, 'w') as handle:
+                    handle.write(baseline + extra)
+                with self.assertRaises(ValueError):
+                    self.driver(FakeRun([]))
+
+    def test_a_git_directory_with_an_active_hook_is_refused(self):
+        self.git('init', '--quiet', self.cwd)
+        with open(os.path.join(self.cwd, '.git', 'hooks', 'pre-commit'), 'w') as handle:
+            handle.write('#!/bin/sh\nexit 0\n')
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
+
+    def test_other_git_metadata_must_match_a_fresh_initialization(self):
+        for name, content in (('info/attributes', '* synthetic-attribute\n'),
+                              ('HEAD', 'ref: refs/tags/other\n'),
+                              ('HEAD', 'ref: refs/heads/../other\n'),
+                              ('unexpected', 'uncontrolled metadata\n'),
+                              ('description', 'uncontrolled instructions\n'),
+                              ('info/exclude', 'uncontrolled-pattern\n'),
+                              ('hooks/pre-commit.sample', 'uncontrolled sample\n')):
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory(dir=self.fixtures.name) as cwd:
+                    self.git('init', '--quiet', cwd)
+                    with open(os.path.join(cwd, '.git', name), 'w') as handle:
+                        handle.write(content)
+                    with self.assertRaises(ValueError):
+                        self.driver(FakeRun([]), cwd=cwd)
+
+    def test_a_git_file_pointing_at_another_store_is_refused(self):
+        # A linked worktree or a submodule: the store, and everything in it, lives elsewhere.
+        with open(os.path.join(self.cwd, '.git'), 'w') as handle:
+            handle.write(f'gitdir: {os.path.join(self.fixtures.name, "real-store")}\n')
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
+
+    def test_a_symlinked_git_store_is_refused(self):
+        # `os.path.isdir` follows the link, so a `.git` symlink into a real repository read as a
+        # directory; the freshness checks then described a store the probe directory never held.
+        store = os.path.join(self.fixtures.name, 'elsewhere')
+        self.git('init', '--quiet', store)
+        os.symlink(os.path.join(store, '.git'), os.path.join(self.cwd, '.git'))
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]))
+
+    def test_a_symlink_beneath_a_fresh_git_directory_is_refused(self):
+        # `os.walk('.git/refs')` and `os.listdir('.git/objects')` both follow a link given by
+        # name, so a fresh-looking `.git` whose `refs` or `objects` points elsewhere would have
+        # been judged on another repository's contents.
+        store = os.path.join(self.fixtures.name, 'elsewhere')
+        self.git('init', '--quiet', store)
+        self.git('-C', store, 'commit', '--quiet', '--allow-empty', '-m', 'history')
+        for name in ('refs', 'objects'):
+            with self.subTest(name=name):
+                fresh = tempfile.TemporaryDirectory(dir=self.fixtures.name)
+                self.addCleanup(fresh.cleanup)
+                self.git('init', '--quiet', fresh.name)
+                target = os.path.join(fresh.name, '.git', name)
+                shutil.rmtree(target)
+                os.symlink(os.path.join(store, '.git', name), target)
+                with self.assertRaises(ValueError):
+                    self.driver(FakeRun([]), cwd=fresh.name)
+
+    def test_create_mints_from_stdout_line_one_then_confirms_via_the_listing(self):
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n  claude attach 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry()]))])
+        driver = self.driver(run)
+        self.assertEqual(driver.create('hello'), '69aa52ed')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+        self.assertEqual(run.argv('claude', '--bg')[0], ['claude', '--bg', '--model', 'haiku', 'hello'])
+        self.assertEqual(run.argv('claude', 'agents')[0],
+                          ['claude', 'agents', '--json', '--all', '--cwd', driver.cwd])
+        self.assertEqual(driver.sessions['69aa52ed'], SESSION_UUID)
+
+    def test_create_waits_for_the_creation_turn_to_leave_working(self):
+        # `claude --bg` returns while the creation turn runs (captured `state: "working"`, reply
+        # 12 s later). Returning then would put that reply inside the trial's own window.
+        states = ['working', 'working', 'done']
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'],
+                        lambda argv: listing([self.entry(state=states.pop(0) if len(states) > 1
+                                                           else states[0])]))])
+        driver = self.driver(run)
+        self.assertEqual(driver.create('hello'), '69aa52ed')
+        self.assertEqual(states, ['done'])
+        self.assertEqual(self.clock.monotonic(), 2.0)  # one 1s sleep per still-working listing
+
+    def test_create_fails_when_the_creation_turn_never_finishes(self):
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry(state='working')]))])
+        driver = self.driver(run)
+        with self.assertRaises(RuntimeError) as caught:
+            driver.create('hello')
+        self.assertIn("still 'working'", str(caught.exception))
+        self.assertEqual(driver.owned(), {'69aa52ed'})  # the sweep still has to remove it
+
+    def test_create_keeps_the_id_owned_when_the_listing_lacks_it(self):
+        # The daemon printed its id: it exists. A listing that disagrees is an error the sweep
+        # still has to act on.
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([]))])
+        driver = self.driver(run)
+        with self.assertRaises(RuntimeError):
+            driver.create('hello')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_create_mints_from_partial_output_on_a_timeout(self):
+        error = subprocess.TimeoutExpired(cmd=['claude'], timeout=60, output=b'backgrounded \xc2\xb7 69aa52ed\n')
+        run = FakeRun([(['claude', '--bg'], error)])
+        driver = self.driver(run)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            driver.create('hello')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_create_with_no_backgrounded_line_or_nonzero_exit_owns_nothing(self):
+        for result in (FakeResult(1, '', 'boom'), FakeResult(0, 'something else\n')):
+            with self.subTest(result=result):
+                driver = self.driver(FakeRun([(['claude', '--bg'], result)]))
+                with self.assertRaises(RuntimeError):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), set())
+
+    def test_create_mints_a_backgrounded_id_even_when_the_exit_status_is_nonzero(self):
+        # The line names a session the daemon started; a later failure in the same command
+        # (or a wrapper's exit status) does not unstart it.
+        driver = self.driver(FakeRun([(['claude', '--bg'], FakeResult(1, 'backgrounded · 69aa52ed\n', 'boom'))]))
+        with self.assertRaises(RuntimeError):
+            driver.create('hello')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_status_and_teardown_refuse_a_foreign_id(self):
+        driver = self.driver(FakeRun([(['claude', 'agents'], listing([self.entry('deadbeef')]))]))
+        for method in (driver.status, driver.stop, driver.teardown, driver.version):
+            with self.assertRaises(ForeignSessionError):
+                method('deadbeef')
         with self.assertRaises(ForeignSessionError):
-            driver.register_existing('thread-1')
-
-    def test_register_existing_refuses_a_rollout_outside_sessions_root(self):
-        # _unruled_out_threads only ever walks sessions_root for rivals; an adopted rollout that
-        # actually lives outside that tree is invisible to that scan, so an inconsistent
-        # (sessions_root, rollout_path_for) pairing would otherwise silently disable the
-        # concurrent-thread guard instead of failing closed.
-        outside_root = tempfile.TemporaryDirectory()
-        self.addCleanup(outside_root.cleanup)
-        elsewhere = os.path.join(outside_root.name, 'rollout-elsewhere.jsonl')
-        with open(elsewhere, 'w', encoding='utf-8') as handle:
-            handle.write(json.dumps({'timestamp': '2026-09-11T12:00:30.000Z',
-                                      'type': 'session_meta'}) + '\n')
-        registry = SessionRegistry()
-        driver = CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
-                             rollout_path_for=lambda _id: elsewhere, started_at=self.RUN_STARTED,
-                             sessions_root=self.sessions_root)
+            driver.submit('deadbeef', 'x')
         with self.assertRaises(ForeignSessionError):
-            driver.register_existing('thread-1')
+            driver.observe('deadbeef', marker=MARKER, submitted_at=0.0)
 
-    def test_adoption_ignores_an_older_neighbour_but_refuses_a_concurrent_one(self):
-        # "Started after this run did" is equally true of a thread the human opened meanwhile,
-        # so a second fresh rollout under the sessions root makes the adopted one ambiguous.
-        registry = SessionRegistry()
-        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
-        self.rollout({'timestamp': '2026-09-10T09:00:00.000Z', 'type': 'session_meta'})
-        self.driver(registry, mine).register_existing('thread-1')
-        self.rollout({'timestamp': '2026-09-11T12:00:31.000Z', 'type': 'session_meta'})
-        with self.assertRaises(ForeignSessionError):
-            self.driver(SessionRegistry(), mine).register_existing('thread-1')
+    def test_partial_claude_history_cannot_establish_negative_delivery_evidence(self):
+        for roles in ((), ('user',), ('assistant',), ('user', 'assistant')):
+            with self.subTest(roles=roles):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', 'agents'], listing([self.entry()]))])
+                driver = self.driver(run)
+                driver.create('initial prompt')
+                lines = [claude_record(role, MARKER if role == 'user' else
+                                       [{'type': 'text', 'text': MARKER}], cwd=driver.cwd)
+                         for role in roles]
+                self.transcripts[SESSION_UUID] = self.write_lines('partial-claude.jsonl', lines)
+                absent = driver.observe('69aa52ed', marker=MARKER, submitted_at=2_000_000_000)
+                self.assertEqual(absent.outcomes, {})
+                self.assertEqual(absent.observable, len(roles) == 2)
+                positive = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                if 'user' in roles:
+                    self.assertIn('visible', positive.outcomes)
+                if 'assistant' in roles:
+                    self.assertIn('ack', positive.outcomes)
 
-    def test_three_trials_can_each_adopt_a_distinct_thread_in_the_same_run(self):
-        # The 3-trials-per-cell protocol (docs/host-probes.md) needs three adoptions in one run.
-        # Counting an earlier trial's own already-owned thread as an unresolved rival made the
-        # second adoption always refuse; it must be excluded once this run has claimed it.
-        registry = SessionRegistry()
-        paths = {}
-        driver = CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
-                             rollout_path_for=paths.get, started_at=self.RUN_STARTED,
-                             sessions_root=self.sessions_root)
-        for tid in ('thread-1', 'thread-2', 'thread-3'):
-            # One thread created and adopted before the next exists, matching how a real trial
-            # sequence works: each rollout appears only once its own thread has been created.
-            paths[tid] = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z',
-                                       'type': 'session_meta'})
-            driver.register_existing(tid)
-        self.assertEqual(registry.created, {'codex:thread-1', 'codex:thread-2', 'codex:thread-3'})
+    def test_observe_reads_the_owned_transcript_and_marks_unusable_reads_unobservable(self):
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry()]))])
+        driver = self.driver(run)
+        driver.create('hello')
+        self.transcripts[SESSION_UUID] = self.write_lines('t.jsonl', [
+            claude_record('user', marker_message(MARKER), stamp='2026-09-13T09:00:01.000Z', cwd=driver.cwd),
+            claude_record('assistant', [{'type': 'text', 'text': MARKER}],
+                          stamp='2026-09-13T09:00:03.000Z', cwd=driver.cwd),
+        ])
+        submitted_at = 1_789_290_000.0  # 2026-09-13T09:00:00Z
+        observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at)
+        self.assertEqual(set(observation.outcomes), {'visible', 'turn_start', 'ack'})
+        self.assertTrue(observation.observable)
+        self.assertFalse(observation.turn_stream)
+        self.transcripts[SESSION_UUID] = self.write_lines('u.jsonl', ['garbage'])
+        self.assertFalse(driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at).observable)
+        self.transcripts.pop(SESSION_UUID)
+        self.assertFalse(driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at).observable)
 
-    def test_an_owned_threads_rollout_path_going_missing_does_not_crash_adoption(self):
-        # rollout_path_for is a live lookup, not a snapshot: if an owned thread's rollout later
-        # becomes unresolvable (rotated away, cache evicted), the None it returns must not reach
-        # os.path.realpath() -- the same fail-closed handling register_existing/observe give a
-        # missing path elsewhere in this class.
-        registry = SessionRegistry()
-        paths = {}
-        driver = CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
-                             rollout_path_for=paths.get, started_at=self.RUN_STARTED,
-                             sessions_root=self.sessions_root)
-        paths['thread-1'] = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z',
-                                          'type': 'session_meta'})
-        driver.register_existing('thread-1')
-        os.remove(paths['thread-1'])  # rotated away: rollout_path_for('thread-1') now finds nothing
-        del paths['thread-1']
-        paths['thread-2'] = self.rollout({'timestamp': '2026-09-11T12:00:31.000Z',
-                                          'type': 'session_meta'})
-        driver.register_existing('thread-2')
-        self.assertEqual(registry.created, {'codex:thread-1', 'codex:thread-2'})
+    def test_version_comes_from_the_transcript_never_the_binary(self):
+        run = FakeRun([(['claude', '--bg'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry()]))])
+        driver = self.driver(run)
+        driver.create('hello')
+        self.transcripts[SESSION_UUID] = self.write_lines('v.jsonl', [claude_record('user', 'x', cwd=driver.cwd)])
+        self.assertEqual(driver.version('69aa52ed'), '2.1.270')
+        self.assertEqual(run.argv('claude', '--version'), [])
+        self.transcripts.pop(SESSION_UUID)
+        self.assertIsNone(driver.version('69aa52ed'))
+        self.assertGreaterEqual(self.clock.elapsed, 5.0)  # waited out its bound on the fake clock
 
-    def test_a_neighbour_that_cannot_be_dated_is_ambiguity_not_absence(self):
-        registry = SessionRegistry()
-        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
-        self.rollout(lines=['not json\n'])
-        with self.assertRaises(ForeignSessionError):
-            self.driver(registry, mine).register_existing('thread-1')
-        self.assertEqual(registry.created, set())
+    def test_transcript_record_binding_gates_all_evidence(self):
+        driver, _ = self.create_live()
+        original = [claude_record('user', MARKER, cwd=driver.cwd),
+                    claude_record('assistant', [{'type': 'text', 'text': MARKER}],
+                                  cwd=driver.cwd, model='synthetic-model')]
+        for index in (0, 1):
+            for key in ('sessionId', 'cwd'):
+                for value in (None, '', 'foreign'):
+                    with self.subTest(index=index, key=key, value=value):
+                        record = json.loads(original[index])
+                        if value is None:
+                            del record[key]
+                        else:
+                            record[key] = value
+                        lines = list(original)
+                        lines[index] = json.dumps(record)
+                        self.transcripts[SESSION_UUID] = self.write_lines('foreign-transcript.jsonl', lines)
+                        observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                        self.assertFalse(observation.observable)
+                        self.assertEqual(observation.outcomes, {})
+                        self.assertIsNone(observation.model)
+                        self.assertIsNone(driver.version('69aa52ed'))
 
-    def test_register_existing_mints_a_thread_created_after_the_run_started_then_submits(self):
-        registry = SessionRegistry()
-        calls = []
-        path = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
+    def create_live(self, extra_scripts=(), **kwargs):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry()])), *extra_scripts])
+        driver = self.driver(run, **kwargs)
+        driver.create('hello')
+        return driver, run
 
-        def fake_run(argv, **kwargs):
-            calls.append(argv)
+    def test_attach_submit_types_the_message_and_holds_the_client_attached(self):
+        # The capture only ever detached after the reply was displayed, so the client must stay
+        # attached across the whole observation instead of leaving mid-turn.
+        driver, run = self.create_live()
+        self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
+        client, = FakePtyClient.launched
+        self.assertEqual(client.argv, ['claude', 'attach', '69aa52ed'])
+        self.assertEqual(client.typed, [marker_message(MARKER)])
+        self.assertNotIn(b'\x1a', client.keys)  # no detach yet
+        self.assertFalse(client.closed)
+        self.assertEqual(driver.clients, [client])
+        self.assertIn('client held attached until cleanup', driver.submission_note)
+
+    def test_close_clients_detaches_the_held_attach_client_with_ctrl_z(self):
+        driver, run = self.create_live()
+        driver.submit('69aa52ed', marker_message(MARKER))
+        client, = FakePtyClient.launched
+        self.assertEqual(driver.close_clients(), [])
+        self.assertEqual(client.keys[-1], b'\x1a')  # captured detach: exit 0, session keeps running
+        self.assertTrue(client.closed)
+        self.assertEqual(driver.clients, [])
+        self.assertGreaterEqual(self.clock.elapsed, 1.0)  # the detach was given the captured moment
+
+    def test_attach_client_loss_during_observation_invalidates_only_missing_evidence(self):
+        for loss in ('exit', 'remove', 'replace', 'rebind'):
+            with self.subTest(loss=loss):
+                self.registry = SessionRegistry()
+                driver, _ = self.create_live()
+                client = driver.attach('69aa52ed')
+                self.transcripts[SESSION_UUID] = self.write_lines('lost-attach.jsonl', [
+                    claude_record('assistant', [{'type': 'text', 'text': 'PONG'}],
+                                  stamp='2026-09-13T08:59:59.000Z', cwd=driver.cwd),
+                    claude_record('user', MARKER, cwd=driver.cwd)])
+                submitted_at = 1_789_290_000.0
+                self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
+                self.assertTrue(driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at).observable)
+                if loss == 'exit':
+                    client.eof = True
+                elif loss == 'rebind':
+                    client.serves = '12345678'
+                else:
+                    driver.clients.remove(client)
+                    if loss == 'replace':
+                        driver.attach('69aa52ed')
+                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at)
+                self.assertFalse(observation.observable)
+                self.assertEqual(set(observation.outcomes), {'visible'})
+
+    def test_attach_client_exit_after_successful_write_invalidates_missing_evidence(self):
+        driver, _ = self.create_live()
+
+        class ExitAfterWrite(FakePtyClient):
+            def type_line(self, text, **kwargs):
+                super().type_line(text, **kwargs)
+                self.eof = True
+
+        driver.pty = ExitAfterWrite
+        self.transcripts[SESSION_UUID] = self.write_lines('exited-attach.jsonl', [
+            claude_record('user', 'initial prompt', cwd=driver.cwd)])
+        self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
+        observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+        self.assertFalse(observation.observable)
+        self.assertEqual(observation.outcomes, {})
+
+    def test_busy_submit_reuses_the_client_that_established_the_state(self):
+        driver, run = self.create_live()
+        client = driver.attach('69aa52ed')
+        client.type_line('synthetic prior turn')
+        run.scripts.insert(0, (['claude', 'agents'],
+                               listing([self.entry(status='busy', state='working')])))
+        with unittest.mock.patch.object(client, 'wait_for', side_effect=AssertionError('idle wait')):
+            self.assertIsNone(driver.submit('69aa52ed', marker_message(MARKER)))
+        self.assertEqual(FakePtyClient.launched, [client])
+        self.assertEqual(client.typed, ['synthetic prior turn', marker_message(MARKER)])
+
+    def test_an_exited_or_unready_attach_is_not_reused(self):
+        driver, run = self.create_live()
+        client = driver.attach('69aa52ed')
+        client.eof = True
+        self.assertIsNone(driver.live_client_for('69aa52ed'))
+        driver.pty = lambda argv, **kw: FakePtyClient(argv, ready=False, **kw)
+        with self.assertRaises(SubmissionUncaptured):
+            driver.attach('69aa52ed')
+        self.assertIsNone(driver.live_client_for('69aa52ed'))
+
+    def test_a_client_for_another_owned_session_is_not_reused(self):
+        driver, run = self.create_live()
+        driver.attach('69aa52ed')
+        driver.mint('12345678')
+        self.assertIsNone(driver.live_client_for('12345678'))
+
+    def test_busy_submit_without_an_established_client_refuses_mid_turn_attach(self):
+        driver, run = self.create_live()
+        run.scripts.insert(0, (['claude', 'agents'],
+                               listing([self.entry(status='busy', state='working')])))
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertEqual(FakePtyClient.launched, [])
+
+    def test_close_clients_skips_the_detach_for_a_client_that_already_exited(self):
+        driver, run = self.create_live()
+        driver.submit('69aa52ed', marker_message(MARKER))
+        client, = FakePtyClient.launched
+        client.eof = True  # the attach client died on its own; close() below still reaps it
+        self.assertEqual(driver.close_clients(), [])
+        self.assertNotIn(b'\x1a', client.keys)
+        self.assertTrue(client.closed)
+        self.assertEqual(driver.clients, [])
+
+    def test_a_failed_detach_write_is_reported_and_does_not_escape_the_sweep(self):
+        # `send_keys` propagates OSError from os.write. Letting it out of close_clients() would
+        # abort sweep() before anything was closed or reported.
+        driver, run = self.create_live()
+        driver.submit('69aa52ed', marker_message(MARKER))
+        client, = FakePtyClient.launched
+        client.write_error = OSError('input/output error')
+        failures = sweep(driver)
+        self.assertEqual([kind for kind, _ in failures], ['client'])
+        self.assertIsInstance(failures[0][1], OSError)
+        self.assertTrue(client.closed)  # the base close still ran
+        self.assertEqual(driver.owned(), {'69aa52ed'})  # and no teardown followed a failed detach
+        self.assertEqual(run.argv('claude', 'rm'), [])
+
+    def test_attach_client_exiting_while_typing_is_uncaptured(self):
+        driver, run = self.create_live()
+
+        class ExitingClient(FakePtyClient):
+            def type_line(self, text, **kwargs):
+                self.eof = True
+                self.send_keys(text.encode())
+
+        driver.pty = ExitingClient
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', marker_message(MARKER))
+        # The client stays held: the sweep owns every close now, and a handle dropped here would
+        # be the only one to a child that may still be alive.
+        self.assertEqual(driver.clients, FakePtyClient.launched)
+
+    def test_a_failed_pty_write_while_typing_is_uncaptured_too(self):
+        # A child that dies with the drain thread not yet at EOF makes `send_keys` raise OSError
+        # straight from `os.write` rather than the eof guard's ValueError. Only ValueError was
+        # classified, so this escaped `submit()` unclassified -- and `run_trial` records an
+        # unclassified failure as the trial failing, not as a submission that may have half landed.
+        driver, run = self.create_live()
+
+        class WriteFailingClient(FakePtyClient):
+            def __init__(self, argv, **kwargs):
+                super().__init__(argv, **kwargs)
+                self.write_error = OSError(5, 'Input/output error')
+
+        driver.pty = WriteFailingClient
+        with self.assertRaises(SubmissionUncaptured) as caught:
+            driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertIn('Input/output error', str(caught.exception))
+        self.assertEqual(driver.clients, FakePtyClient.launched)
+
+    def test_a_listing_timeout_before_submission_is_uncaptured_and_sends_nothing(self):
+        driver, run = self.create_live()
+        run.scripts.insert(0, (['claude', 'agents'], subprocess.TimeoutExpired(cmd=['claude'], timeout=15)))
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertEqual(FakePtyClient.launched, [])
+
+    def test_attach_submit_with_no_composer_is_uncaptured_never_rejected(self):
+        driver, run = self.create_live()
+        driver.pty = lambda argv, *, cwd: FakePtyClient(argv, cwd=cwd, ready=False)
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', marker_message(MARKER))
+        self.assertEqual(driver.clients, FakePtyClient.launched)  # the sweep closes it
+        self.assertEqual(driver.close_clients(), [])
+        self.assertTrue(FakePtyClient.launched[0].closed)
+
+    def test_attach_to_a_stopped_session_is_uncaptured(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
+        driver = self.driver(run)
+        driver.create('hello')
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', 'x')
+        self.assertEqual(FakePtyClient.launched, [])
+
+    def test_resume_submit_continues_a_stopped_session_with_no_other_flags(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        self.assertTrue(driver.submit('69aa52ed', 'msg'))
+        self.assertEqual(run.argv('claude', '--bg', '--resume')[0],
+                          ['claude', '--bg', '--resume', SESSION_UUID, 'msg'])
+
+    def test_resume_daemon_loss_preserves_positive_evidence_but_invalidates_missing_outcomes(self):
+        for loss in ('exit', 'replace', 'missing', 'unreadable'):
+            with self.subTest(loss=loss):
+                self.registry = SessionRegistry()
+                entry = self.entry(pid=None)
+                entries = [entry]
+                run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', 'agents'], lambda argv: listing(entries))])
+                driver = self.driver(run, mechanism='resume')
+                driver.create('hello')
+                self.transcripts[SESSION_UUID] = self.write_lines('resumed.jsonl', [
+                    claude_record('assistant', [{'type': 'text', 'text': 'PONG'}],
+                                  stamp='2026-09-13T08:59:59.000Z', cwd=driver.cwd),
+                    claude_record('user', MARKER, cwd=driver.cwd)])
+                submitted_at = 1_789_290_000.0
+                self.assertTrue(driver.submit('69aa52ed', marker_message(MARKER)))
+                entry['pid'] = 4321
+                self.assertTrue(driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at).observable)
+                if loss == 'missing':
+                    entries.clear()
+                elif loss == 'unreadable':
+                    run.scripts.insert(0, (['claude', 'agents'], subprocess.TimeoutExpired(['claude'], 15)))
+                else:
+                    entry['pid'] = None if loss == 'exit' else 9876
+                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at)
+                self.assertFalse(observation.observable)
+                self.assertEqual(set(observation.outcomes), {'visible'})
+                entry['pid'] = 4321
+                entries[:] = [entry]
+                self.assertFalse(driver.observe('69aa52ed', marker=MARKER, submitted_at=submitted_at).observable)
+
+    def test_resume_daemon_missing_at_first_poll_cannot_establish_negative_evidence(self):
+        for result in (FakeResult(0, 'backgrounded · 69aa52ed\n'),
+                       FakeResult(1, 'backgrounded · 69aa52ed\n', 'ambiguous'),
+                       subprocess.TimeoutExpired(['claude'], 60)):
+            with self.subTest(result=result):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', '--bg', '--resume'], result),
+                               (['claude', 'agents'], listing([self.entry(pid=None)]))])
+                driver = self.driver(run, mechanism='resume')
+                driver.create('hello')
+                self.transcripts[SESSION_UUID] = self.write_lines('missing-daemon.jsonl', [
+                    claude_record('user', 'initial prompt', cwd=driver.cwd)])
+                try:
+                    driver.submit('69aa52ed', marker_message(MARKER))
+                except subprocess.TimeoutExpired:
+                    pass
+                observation = driver.observe('69aa52ed', marker=MARKER, submitted_at=0)
+                self.assertFalse(observation.observable)
+                self.assertEqual(observation.outcomes, {})
+
+    def test_resume_submit_against_a_running_session_is_uncaptured(self):
+        driver, run = self.create_live(mechanism='resume')
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit('69aa52ed', 'msg')
+        self.assertEqual(run.argv('claude', '--bg', '--resume'), [])
+
+    def test_resume_requires_done_even_after_the_pid_disappears(self):
+        for state in ('working', 'unknown'):
+            with self.subTest(state=state):
+                self.registry = SessionRegistry()
+                entry = self.entry()
+                run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                               (['claude', 'agents'], lambda argv: listing([entry]))])
+                driver = self.driver(run, mechanism='resume')
+                driver.create('hello')
+                entry.update(pid=None, state=state)
+                with self.assertRaises(SubmissionUncaptured):
+                    driver.submit('69aa52ed', 'msg')
+                self.assertEqual(run.argv('claude', '--bg', '--resume'), [])
+
+    def test_resume_submit_that_starts_a_copy_mints_it_and_reports_a_rejection(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 0badc0de\n')),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        with self.assertRaises(SubmissionRejected):
+            driver.submit('69aa52ed', 'msg')
+        self.assertEqual(driver.owned(), {'69aa52ed', '0badc0de'})
+
+    def test_resume_submit_nonzero_exit_is_a_rejection_with_its_stderr(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], FakeResult(1, '', 'No conversation found')),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        with self.assertRaises(SubmissionRejected) as caught:
+            driver.submit('69aa52ed', 'msg')
+        self.assertEqual(caught.exception.returncode, 1)
+        self.assertIn('No conversation found', caught.exception.stderr)
+
+    def test_resume_nonzero_after_backgrounding_the_original_remains_pollable(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'],
+                        FakeResult(1, 'backgrounded · 69aa52ed\n', 'then failed')),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        self.assertIsNone(driver.submit('69aa52ed', 'msg'))
+        self.assertIn('acceptance is ambiguous', driver.submission_note)
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_resume_submit_nonzero_exit_still_mints_a_copy_named_on_stdout(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], FakeResult(1, 'backgrounded · 0badc0de\n', 'then failed')),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        with self.assertRaises(SubmissionRejected):
+            driver.submit('69aa52ed', 'msg')
+        self.assertEqual(driver.owned(), {'69aa52ed', '0badc0de'})
+
+    def test_resume_submit_timeout_that_named_a_copy_is_uncaptured_not_a_timeout(self):
+        # The copy proves where the message went. Re-raising the timeout would poll the original
+        # and turn its absent marker into `not_observed`.
+        error = subprocess.TimeoutExpired(cmd=['claude'], timeout=60, output=b'backgrounded \xc2\xb7 0badc0de\n')
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], error),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        with self.assertRaises(SubmissionUncaptured) as caught:
+            driver.submit('69aa52ed', 'msg')
+        self.assertIn('0badc0de', str(caught.exception))
+        self.assertEqual(driver.owned(), {'69aa52ed', '0badc0de'})
+
+    def test_resume_submit_timeout_with_no_copy_named_stays_a_timeout(self):
+        # Nothing says where the message went, so the trial polls its own session.
+        error = subprocess.TimeoutExpired(cmd=['claude'], timeout=60, output=b'')
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], error),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)]))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        with self.assertRaises(subprocess.TimeoutExpired):
+            driver.submit('69aa52ed', 'msg')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_teardown_stops_confirms_the_pid_is_gone_then_removes(self):
+        listings = iter([listing([self.entry()]), listing([self.entry(pid=None, status=None)])])
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], lambda argv: next(listings)),
+                       (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n')),
+                       (['claude', 'rm'], FakeResult(0, 'removed 69aa52ed\n'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.teardown('69aa52ed')
+        self.assertEqual(driver.owned(), set())
+        self.assertEqual([call[:2] for call, _ in run.calls[2:]],
+                          [['claude', 'stop'], ['claude', 'agents'], ['claude', 'rm']])
+
+    def test_stop_confirms_through_the_listing_and_keeps_the_session_owned(self):
+        listings = iter([listing([self.entry()]), listing([self.entry(pid=None, status=None)])])
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], lambda argv: next(listings)),
+                       (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        entry = driver.stop('69aa52ed')
+        self.assertIsNone(entry['pid'])
+        self.assertEqual(run.argv('claude', 'stop'), [['claude', 'stop', '69aa52ed']])
+        self.assertEqual(run.argv('claude', 'rm'), [])
+        self.assertEqual(driver.owned(), {'69aa52ed'})  # the restarted cell resumes it next
+
+    def test_stop_is_an_error_when_the_pid_survives_whatever_the_exit_status(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry()])),
+                       (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        with self.assertRaises(RuntimeError):
+            driver.stop('69aa52ed')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_the_restarted_cell_is_stop_then_a_flagless_resume(self):
+        listings = iter([listing([self.entry()]), listing([self.entry(pid=None, status=None)])])
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', '--bg', '--resume'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], lambda argv: next(listings, listing([self.entry(pid=None, status=None)]))),
+                       (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n'))])
+        driver = self.driver(run, mechanism='resume')
+        driver.create('hello')
+        driver.stop('69aa52ed')  # the settle callback
+        self.assertTrue(driver.submit('69aa52ed', 'msg'))
+        self.assertEqual([call[:3] for call, _ in run.calls],
+                          [['claude', '--bg', '--model'], ['claude', 'agents', '--json'],
+                           ['claude', 'stop', '69aa52ed'], ['claude', 'agents', '--json'],
+                           ['claude', 'agents', '--json'], ['claude', '--bg', '--resume']])
+
+    def test_teardown_tolerates_a_nonzero_stop_against_an_already_stopped_session(self):
+        # The restarted cell's session is stopped before the sweep reaches it; the listing, not
+        # `stop`'s exit status, is what gates `rm`.
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry(pid=None, status=None)])),
+                       (['claude', 'stop'], FakeResult(1, '', 'not running')),
+                       (['claude', 'rm'], FakeResult(0, 'removed 69aa52ed\n'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.teardown('69aa52ed')
+        self.assertEqual(run.argv('claude', 'rm'), [['claude', 'rm', '69aa52ed']])
+        self.assertEqual(driver.owned(), set())
+
+    def test_teardown_never_runs_rm_while_the_daemon_still_has_a_pid(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry()])),
+                       (['claude', 'stop'], FakeResult(1, '', 'not stopped')),
+                       (['claude', 'rm'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        with self.assertRaises(RuntimeError):
+            driver.teardown('69aa52ed')
+        self.assertEqual(run.argv('claude', 'rm'), [])
+        self.assertEqual(driver.owned(), {'69aa52ed'})  # retained for a human to find
+
+    def test_malformed_claude_listings_never_authorize_rm_after_a_failed_stop(self):
+        missing_pid = self.entry(pid=None, status=None)
+        missing_pid.pop('pid')
+        missing_id = self.entry(pid=None, status=None)
+        missing_id.pop('id')
+        for entries in ([missing_pid], [None], [missing_id],
+                        [self.entry(pid=False)], [self.entry(pid='unknown')],
+                        [self.entry(pid=None), self.entry(pid=None)]):
+            with self.subTest(entries=entries):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['claude', 'agents'], listing(entries)),
+                               (['claude', 'stop'], FakeResult(1, '', 'not stopped')),
+                               (['claude', 'rm'], FakeResult(0))])
+                driver = self.driver(run)
+                driver._mint('69aa52ed')
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.teardown('69aa52ed')
+                self.assertEqual(run.argv('claude', 'rm'), [])
+                self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_teardown_retains_ownership_when_rm_fails(self):
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([])),
+                       (['claude', 'stop'], FakeResult(0)),
+                       (['claude', 'rm'], FakeResult(1, '', 'busy'))])
+        driver = self.driver(run)
+        driver.mint('69aa52ed')
+        with self.assertRaises(RuntimeError):
+            driver.teardown('69aa52ed')
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+
+    def test_an_unknown_mechanism_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]), mechanism='channels')
+
+
+def rollout_lines(*, cli_version='0.154.0', cwd='/synthetic', messages=()):
+    lines = [json.dumps({'timestamp': '2026-09-13T09:41:51.650Z', 'type': 'session_meta',
+                         'payload': {'id': THREAD_ID, 'session_id': THREAD_ID, 'cwd': cwd,
+                                     'cli_version': cli_version}})]
+    for stamp, role, text in messages:
+        part_type = 'input_text' if role == 'user' else 'output_text'
+        lines.append(json.dumps({'timestamp': stamp, 'type': 'response_item',
+                                 'payload': {'type': 'message', 'role': role,
+                                             'content': [{'type': part_type, 'text': text}]}}))
+    return lines
+
+
+class CodexDriverTests(DriverTestCase):
+    def test_creation_rejects_missing_malformed_or_uncaptured_event_types(self):
+        for kind in (None, 1, [], {}, '', ' ', 'future.event', 'missing'):
+            with self.subTest(kind=kind):
+                self.registry = SessionRegistry()
+                event = {'type': kind, 'error': 'synthetic failure'}
+                if kind == 'missing':
+                    del event['type']
+                output = self.exec_output().stdout + json.dumps(event) + '\n'
+                driver = self.driver(FakeRun([(['codex', 'exec'], FakeResult(0, output))]))
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), {THREAD_ID})
+
+    def test_codex_creation_never_mints_a_non_uuid_thread_id(self):
+        for thread_id in ('*', '../*', '--help', 'not-a-uuid'):
+            with self.subTest(thread_id=thread_id):
+                self.registry = SessionRegistry()
+                output = json.dumps({'type': 'thread.started', 'thread_id': thread_id})
+                driver = self.driver(FakeRun([(['codex', 'exec'], FakeResult(0, output))]))
+                with self.assertRaisesRegex(RuntimeError, 'UUID'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), set())
+
+    def driver(self, run, **kwargs):
+        kwargs.setdefault('rollout_path_for', self.transcript_path_for)
+        kwargs.setdefault('pty', FakePtyClient)
+        return CodexDriver(self.registry, run=run, cwd=self.cwd, **kwargs)
+
+    def exec_output(self, thread_id=THREAD_ID):
+        return FakeResult(0, '\n'.join([json.dumps({'type': 'thread.started', 'thread_id': thread_id}),
+                                        json.dumps({'type': 'turn.completed'})]) + '\n')
+
+    def test_create_runs_exec_json_read_only_and_mints_the_thread(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run)
+        self.assertEqual(driver.create('hello'), THREAD_ID)
+        self.assertEqual(driver.owned(), {THREAD_ID})
+        argv, kwargs = run.calls[0]
+        self.assertEqual(argv, ['codex', 'exec', '--json', '-s', 'read-only', '--skip-git-repo-check',
+                                '-C', driver.cwd, 'hello'])
+        self.assertIs(kwargs['stdin'], subprocess.DEVNULL)
+
+    def test_uncaptured_codex_model_override_is_refused_before_any_host_call(self):
+        for model in ('synthetic-model', ''):
+            with self.subTest(model=model):
+                run = FakeRun([])
+                with self.assertRaisesRegex(ValueError, 'uncaptured'):
+                    self.driver(run, model=model)
+                self.assertEqual(run.calls, [])
+
+    def test_ambiguous_codex_creation_reports_all_candidates_without_ownership(self):
+        other = '01a09a24-ff1d-7360-9385-722d230ef92c'
+        output = self.exec_output().stdout + '\n' + json.dumps(
+            {'type': 'thread.started', 'thread_id': other})
+        for timeout in (False, True):
+            with self.subTest(timeout=timeout):
+                self.registry = SessionRegistry()
+                result = (subprocess.TimeoutExpired(['codex'], 300, output=output)
+                          if timeout else FakeResult(0, output))
+                driver = self.driver(FakeRun([(['codex', 'exec'], result)]))
+                with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual({label for label, _ in sweep(driver)}, {THREAD_ID, other})
+                for candidate in (THREAD_ID, other):
+                    with self.assertRaises(ForeignSessionError):
+                        driver.teardown(candidate)
+
+    def test_malformed_codex_creation_cannot_hide_behind_a_valid_thread_event(self):
+        for suffix in ('{"type":', '[1]', 'null',
+                       json.dumps({'type': 'thread.started', 'thread_id': 5})):
+            with self.subTest(suffix=suffix):
+                self.registry = SessionRegistry()
+                run = FakeRun([(['codex', 'exec'],
+                                FakeResult(0, self.exec_output().stdout + '\n' + suffix))])
+                driver = self.driver(run)
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), {THREAD_ID})
+
+    def test_create_mints_before_checking_the_exit_status_and_from_partial_output(self):
+        run = FakeRun([(['codex', 'exec'], FakeResult(2, self.exec_output().stdout, 'quota'))])
+        driver = self.driver(run)
+        with self.assertRaises(RuntimeError):
+            driver.create('hello')
+        self.assertEqual(driver.owned(), {THREAD_ID})
+        partial = self.exec_output().stdout.encode()
+        run = FakeRun([(['codex', 'exec'], subprocess.TimeoutExpired(cmd=['codex'], timeout=300, output=partial))])
+        self.registry = SessionRegistry()  # a fresh run; the first driver's thread stays its own
+        driver = self.driver(run)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            driver.create('hello')
+        self.assertEqual(driver.owned(), {THREAD_ID})
+
+    def test_create_without_a_thread_started_event_owns_nothing(self):
+        driver = self.driver(FakeRun([(['codex', 'exec'], FakeResult(0, json.dumps({'type': 'turn.completed'})))]))
+        with self.assertRaises(RuntimeError):
+            driver.create('hello')
+        self.assertEqual(driver.owned(), set())
+
+    def test_queue_submit_is_accepted_on_exit_zero_and_rejected_with_stderr_otherwise(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], FakeResult(0, f'Queued message x for thread {THREAD_ID}.\n'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        client = driver.attach(THREAD_ID)  # what a live-cell settle does before submission
+        self.assertTrue(driver.submit(THREAD_ID, 'msg'))
+        self.assertEqual(run.argv('codex', 'queue')[0],
+                          ['codex', 'queue', '--thread', THREAD_ID, '--message', 'msg'])
+        self.assertEqual(FakePtyClient.launched, [client])  # submit opened no client of its own
+        run.scripts.insert(0, (['codex', 'queue'], FakeResult(1, '', 'Error: No active session found')))
+        with self.assertRaises(SubmissionRejected) as caught:
+            driver.submit(THREAD_ID, 'msg')
+        self.assertIn('No active session', caught.exception.stderr)
+
+    def test_queue_submit_with_no_resume_client_open_is_uncaptured_and_queues_nothing(self):
+        # Captured: a queued item is delivered only by a process serving the thread. With none
+        # open the trial would time out for certain, which is evidence about the runner, not
+        # the host.
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(run.argv('codex', 'queue'), [])
+
+    def test_queue_submit_requires_a_ready_client_for_the_exact_owned_thread(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()), (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.attach(THREAD_ID)
+        other = '01a09a24-ff1d-7360-9385-722d230ef92c'
+        driver.mint(other)
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(other, 'msg')
+        self.assertEqual(run.argv('codex', 'queue'), [])
+
+    def test_a_held_unready_codex_client_cannot_authorize_queue_submission(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()), (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.open_client(['codex', 'resume', THREAD_ID])
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(run.argv('codex', 'queue'), [])
+
+    def test_queue_submit_with_only_an_exited_resume_client_is_uncaptured(self):
+        # A resume client that exited serves nothing. Counting the retained handle as a serving
+        # process would queue an item nobody delivers and blame the host for the silence.
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'resume'], None),
+                       (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        driver.attach(THREAD_ID)
+        client, = FakePtyClient.launched
+        client.eof = True
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(run.argv('codex', 'queue'), [])
+
+    def test_queue_then_resume_treats_a_queue_timeout_as_uncaptured(self):
+        # Nothing serves the thread yet, so a `codex queue` whose exit status is unknown cannot
+        # be polled for: it is neither accepted nor a host rejection.
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], subprocess.TimeoutExpired(cmd=['codex', 'queue'], timeout=15))])
+        driver = self.driver(run, mechanism='queue-then-resume')
+        driver.create('hello')
+        with self.assertRaises(SubmissionUncaptured):
+            driver.submit(THREAD_ID, 'msg')
+        self.assertEqual(FakePtyClient.launched, [])
+        # Under `queue` a live client may still have drained it: the timeout propagates raw and
+        # `run_trial` polls with `accepted` unobservable. Same instance, since only the instance
+        # that created a thread may operate on it.
+        driver.mechanism = 'queue'
+        driver.attach(THREAD_ID)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            driver.submit(THREAD_ID, 'msg')
+
+    def test_losing_the_exact_queue_client_preserves_acceptance_but_not_negative_evidence(self):
+        for loss in ('exit', 'remove', 'replace'):
+            for timeout in (False, True):
+                with self.subTest(loss=loss, timeout=timeout):
+                    self.registry = SessionRegistry()
+
+                    def queue(argv):
+                        if loss == 'exit':
+                            client.eof = True
+                        else:
+                            driver.clients.remove(client)
+                            if loss == 'replace':
+                                driver.attach(THREAD_ID)
+                        if timeout:
+                            raise subprocess.TimeoutExpired(argv, 15)
+                        return FakeResult(0)
+
+                    run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                                   (['codex', 'queue'], queue)])
+                    driver = self.driver(run)
+                    driver.create('hello')
+                    client = driver.attach(THREAD_ID)
+                    self.transcripts[THREAD_ID] = self.write_lines('lost-client.jsonl', rollout_lines(
+                        cwd=driver.cwd,
+                        messages=[('2026-09-13T09:42:01.000Z', 'user', MARKER)]))
+                    if timeout:
+                        with self.assertRaises(subprocess.TimeoutExpired):
+                            driver.submit(THREAD_ID, 'msg')
+                    else:
+                        self.assertIs(driver.submit(THREAD_ID, 'msg'), True)
+                    observation = driver.observe(THREAD_ID, marker=MARKER, submitted_at=0)
+                    self.assertIn('visible', observation.outcomes)
+                    self.assertFalse(observation.observable)
+
+    def test_queue_client_loss_during_observation_invalidates_missing_outcomes(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()), (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run)
+        driver.create('hello')
+        client = driver.attach(THREAD_ID)
+        self.transcripts[THREAD_ID] = self.write_lines('later-client-loss.jsonl', rollout_lines(
+            cwd=driver.cwd, messages=[('2026-09-13T09:41:00.000Z', 'user', 'initial prompt'),
+                                     ('2026-09-13T09:41:01.000Z', 'assistant', 'PONG')]))
+        self.assertIs(driver.submit(THREAD_ID, 'msg'), True)
+        self.assertTrue(driver.observe(THREAD_ID, marker=MARKER, submitted_at=1_789_292_520.0).observable)
+        client.eof = True
+        self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=1_789_292_520.0).observable)
+
+    def test_submit_and_observe_refuse_a_foreign_thread(self):
+        driver = self.driver(FakeRun([]))
+        for call in (lambda: driver.submit('other', 'x'),
+                     lambda: driver.observe('other', marker=MARKER, submitted_at=0.0),
+                     lambda: driver.teardown('other'), lambda: driver.version('other'),
+                     lambda: driver.attach('other')):
+            with self.assertRaises(ForeignSessionError):
+                call()
+
+    def test_queue_then_resume_opens_the_resume_client_after_queueing_and_keeps_it(self):
+        def queue(argv):
+            self.assertEqual(FakePtyClient.launched, [])  # queued first: a resume drains at start
             return FakeResult(0)
 
-        driver = self.driver(registry, path, run=fake_run)
-        driver.register_existing('thread-1')
-        self.assertTrue(driver.submit('thread-1', MARKER))
-        self.assertEqual(calls[0], ['codex', 'queue', '--thread', 'thread-1', '--message', MARKER])
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], queue)])
+        readings = iter([1234.5, 1250.0])  # queue exit, then whatever comes after the client
+        driver = self.driver(run, mechanism='queue-then-resume', clock=lambda: next(readings))
+        driver.create('hello')
+        # Acceptance is the `codex queue` exit, stamped before the resume client's startup.
+        self.assertEqual(driver.submit(THREAD_ID, 'msg'), 1234.5)
+        client, = FakePtyClient.launched
+        self.assertEqual(client.argv, ['codex', '--no-alt-screen', '-s', 'read-only', '-a', 'never',
+                                       '-C', driver.cwd, 'resume', THREAD_ID])
+        self.assertEqual(len(run.argv('codex', 'queue')), 1)
+        self.assertFalse(client.closed)
+        self.assertEqual(driver.clients, [client])
 
-    def test_register_existing_refuses_a_thread_that_predates_this_run(self):
-        # The registry's guarantee is that only sessions this run created are ever contacted;
-        # a mistyped or copy-pasted id naming someone's ordinary thread must not be adoptable.
-        registry = SessionRegistry()
-        path = self.rollout({'timestamp': '2026-09-10T09:00:00.000Z', 'type': 'session_meta'})
-        with self.assertRaises(ForeignSessionError):
-            self.driver(registry, path).register_existing('someone-elses-thread')
-        self.assertEqual(registry.created, set())
+    def test_queue_then_resume_with_no_composer_preserves_acceptance_and_closes_the_client(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], FakeResult(0))])
+        driver = self.driver(run, mechanism='queue-then-resume', clock=lambda: 1234.5,
+                             pty=lambda argv, *, cwd: FakePtyClient(argv, cwd=cwd, ready=False))
+        driver.create('hello')
+        self.assertEqual(driver.submit(THREAD_ID, 'msg'), 1234.5)
+        self.assertIn('never became ready', driver.submission_note)
+        self.transcripts[THREAD_ID] = self.write_lines('not-ready.jsonl', rollout_lines(cwd=driver.cwd))
+        self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
+        self.assertTrue(FakePtyClient.launched[0].closed)
+        self.assertEqual(driver.clients, [])
 
-    def test_register_existing_refuses_without_a_rollout_or_a_usable_timestamp(self):
-        registry = SessionRegistry()
-        with self.assertRaises(ForeignSessionError):
-            self.driver(registry, None).register_existing('thread-1')
-        undated = self.rollout({'type': 'session_meta'})
-        with self.assertRaises(ForeignSessionError):
-            self.driver(registry, undated).register_existing('thread-1')
-        self.assertEqual(registry.created, set())
+    def test_resume_startup_failure_preserves_queue_acceptance_through_cleanup_and_classification(self):
+        for error in (OSError(11, 'synthetic fork exhaustion'),
+                      RuntimeError('synthetic thread startup failure')):
+            with self.subTest(error=type(error).__name__):
+                self.registry = SessionRegistry()
+                clock = FakeClock()
 
-    def test_an_unlistable_sibling_directory_is_treated_as_an_unruled_out_rival(self):
-        # glob.glob swallows an OSError from an unreadable directory and just returns fewer
-        # matches, with no signal anything was skipped -- a real rival hiding there would read
-        # as "no rivals found" instead of "could not check". Mock the walk failure directly
-        # rather than chmod(0o000): running as root (e.g. in CI containers) ignores directory
-        # permission bits entirely, so os.walk would succeed and the test would pass for the
-        # wrong reason -- or not raise at all.
-        registry = SessionRegistry()
-        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
+                def refusing_pty(argv, *, cwd):
+                    raise error
 
-        def fake_walk(root, onerror=None, **kwargs):
-            onerror(OSError('permission denied (simulated)'))
-            return iter(())
+                run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                               (['codex', 'queue'], FakeResult(0)),
+                               (['codex', 'delete'], FakeResult(0))])
+                driver = self.driver(run, mechanism='queue-then-resume', clock=clock.time,
+                                     pty=refusing_pty)
+                self.transcripts[THREAD_ID] = self.write_lines('startup-failure.jsonl',
+                                                             rollout_lines(cwd=driver.cwd))
+                result = run_trial_with_cleanup(
+                    driver, prompt='synthetic', marker=MARKER, state='restarted',
+                    settle=lambda thread_id: None, clock=clock.time, monotonic=clock.time,
+                    sleep=clock.sleep)
+                classified = classify_trial(
+                    Trial(submitted=result.submitted_at, state=result.state, outcomes=result.outcomes),
+                    clock.time(), supported=result.supported, observable=result.observable)
+                self.assertEqual(classified, dict(accepted='observed', visible='unobservable',
+                                                  turn_start='unobservable', ack='unobservable'))
+                self.assertIn(str(error), result.submission_diagnostic)
+                self.assertEqual(len(run.argv('codex', 'queue')), 1)
+                self.assertEqual(len(run.argv('codex', 'delete')), 1)
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual(driver.clients, [])
 
-        with patch('host_trials.os.walk', side_effect=fake_walk):
-            with self.assertRaises(ForeignSessionError):
-                self.driver(registry, mine).register_existing('thread-1')
+    def test_resume_startup_interruption_still_propagates(self):
+        def interrupted_pty(argv, *, cwd):
+            raise KeyboardInterrupt
 
-    def test_a_neighbour_untouched_since_before_the_run_is_skipped_without_being_opened(self):
-        # A file whose mtime hasn't moved since before started_at cannot contain a record newer
-        # than that mtime, so its earliest record is provably older too -- it never needs
-        # opening. Garbage content that would otherwise read as an unruled-out rival proves the
-        # skip happened before any read was attempted, not just that the answer came out right.
-        registry = SessionRegistry()
-        mine = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
-        old = self.rollout(lines=['not json\n'])
-        old_time = self.RUN_STARTED - 3600
-        os.utime(old, (old_time, old_time))
-        self.driver(registry, mine).register_existing('thread-1')
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'queue'], FakeResult(0)),
+                       (['codex', 'delete'], FakeResult(0))])
+        driver = self.driver(run, mechanism='queue-then-resume', pty=interrupted_pty)
+        with self.assertRaises(KeyboardInterrupt):
+            run_trial_with_cleanup(driver, prompt='synthetic', state='restarted',
+                                   settle=lambda thread_id: None)
+        self.assertEqual(len(run.argv('codex', 'delete')), 1)
+        self.assertEqual(driver.owned(), set())
 
-    def test_register_existing_refuses_an_unreadable_rollout_rather_than_raising_oserror(self):
-        registry = SessionRegistry()
-        missing = os.path.join(self.tmp_missing(), 'never-written.jsonl')
-        with self.assertRaises(ForeignSessionError):
-            self.driver(registry, missing).register_existing('thread-1')
+    def test_attach_answers_the_first_run_trust_prompt_with_enter(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run, pty=lambda argv, *, cwd: FakePtyClient(argv, cwd=cwd, trust_prompt=True))
+        driver.create('hello')
+        client = driver.attach(THREAD_ID)
+        self.assertEqual(client.keys, [b'\r'])
+        self.assertEqual(driver.clients, [client])
 
-    def test_observe_is_unobservable_when_the_rollout_is_not_readable_yet(self):
-        # A rollout is created lazily, so an early poll can precede the file: an unreadable
-        # channel is unobservable, exactly as a failed `claude logs` read is.
-        registry = SessionRegistry()
-        registry.mint('codex:thread-1')
-        missing = os.path.join(self.tmp_missing(), 'never-written.jsonl')
-        self.assertEqual(self.driver(registry, missing).observe('thread-1', marker=MARKER, submitted_at=0.0),
-                          Observation(outcomes={}, observable=False))
+    def test_historical_trust_text_does_not_answer_the_current_composer(self):
+        for history in ('Do you trust the contents of this directory?',
+                        'Doyoutrustthecontentsofthisdirectory?',
+                        'Doyoutrustthecontentsofthisdirectory?Workingwithuntrustedcontents'
+                        '...› 1. Yes, continue2.No,quitPress enter to continue'):
+            with self.subTest(history=history):
+                self.registry = SessionRegistry()
+                FakePtyClient.launched.clear()
 
-    def tmp_missing(self):
-        directory = tempfile.mkdtemp()
-        self.addCleanup(os.rmdir, directory)
-        return directory
+                def pty(argv, *, cwd):
+                    client = FakePtyClient(argv, cwd=cwd)
+                    client.text = history + '\n'
+                    return client
 
-    def test_submit_refuses_a_foreign_thread(self):
-        with self.assertRaises(ForeignSessionError):
-            self.driver(SessionRegistry(), None).submit('not-mine', MARKER)
+                driver = self.driver(FakeRun([(['codex', 'exec'], self.exec_output())]), pty=pty)
+                driver.create('hello')
+                client = driver.attach(THREAD_ID)
+                self.assertEqual(client.keys, [])
+                self.assertIs(driver.live_client_for(THREAD_ID), client)
 
-    def test_submit_raises_rejection_with_the_exit_status_and_stderr_on_a_nonzero_exit(self):
-        registry = SessionRegistry()
-        registry.mint('codex:thread-1')
-        driver = self.driver(registry, None,
-                             run=lambda *a, **k: FakeResult(1, stderr='thread expired'))
-        with self.assertRaises(SubmissionRejected) as ctx:
-            driver.submit('thread-1', MARKER)
-        self.assertEqual(ctx.exception.returncode, 1)
-        self.assertEqual(ctx.exception.stderr, 'thread expired')
+    def test_attach_is_not_ready_when_the_composer_never_follows_the_answered_trust_dialog(self):
+        # The placeholder drawn beneath the dialog must not count: only output after the Enter does.
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run, pty=lambda argv, *, cwd: FakePtyClient(argv, cwd=cwd, trust_prompt=True,
+                                                                          ready=False))
+        driver.create('hello')
+        with self.assertRaises(PtyNotReady) as caught:
+            driver.attach(THREAD_ID)
+        client, = FakePtyClient.launched
+        self.assertEqual(client.keys, [b'\r'])
+        self.assertTrue(client.closed)
+        self.assertEqual(driver.clients, [])
+        self.assertIn('Doyoutrustthecontentsofthisdirectory', str(caught.exception))
 
-    def test_observe_reads_the_rollout_file(self):
-        registry = SessionRegistry()
-        registry.mint('codex:thread-1')
-        path = self.rollout(
-            {'timestamp': '2026-09-11T00:00:00.500Z', 'type': 'event_msg',
-             'payload': {'type': 'task_started'}},
-            self.message('2026-09-11T00:00:01.000Z', 'assistant', f'ack {MARKER}'),
-            {'timestamp': '2026-09-11T00:00:02.000Z', 'type': 'event_msg',
-             'payload': {'type': 'task_complete'}})
-        observation = self.driver(registry, path).observe('thread-1', marker=MARKER, submitted_at=0.0)
-        # turn_start comes from the host's own boundary event, not from the message.
-        self.assertEqual(set(observation.outcomes), {'turn_start', 'ack'})
-        self.assertIsNotNone(observation.turn_end)
+    def test_a_failed_pty_write_answering_the_trust_dialog_is_not_ready(self):
+        # `send_keys` propagates OSError from `os.write` when the child died before the drain
+        # thread saw EOF. Unclassified it escaped `attach()` raw, and through `submit()` under
+        # mechanism=queue-then-resume, which now preserves queue acceptance on resume failure.
+        def failing(argv, *, cwd):
+            client = FakePtyClient(argv, cwd=cwd, trust_prompt=True)
+            client.write_error = OSError(5, 'Input/output error')
+            return client
+
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run, pty=failing)
+        driver.create('hello')
+        with self.assertRaises(PtyNotReady) as caught:
+            driver.attach(THREAD_ID)
+        self.assertIn('Input/output error', str(caught.exception))
+        client, = FakePtyClient.launched
+        self.assertTrue(client.closed)
+        self.assertEqual(driver.clients, [])
+
+    def test_attach_rejects_uncaptured_sandbox_and_approval_flags_before_launch(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run)
+        driver.create('hello')
+        for sandbox, approval in (('workspace-write', 'never'), ('danger-full-access', 'never'),
+                                  ('read-only', 'on-request'), ('read-only', 'untrusted'),
+                                  (None, 'never'), ('read-only', None)):
+            with self.subTest(sandbox=sandbox, approval=approval):
+                with self.assertRaisesRegex(ValueError, 'uncaptured'):
+                    driver.attach(THREAD_ID, sandbox=sandbox, approval=approval)
+                self.assertEqual(FakePtyClient.launched, [])
+
+    def test_partial_codex_history_cannot_establish_negative_delivery_evidence(self):
+        for roles in ((), ('user',), ('assistant',), ('user', 'assistant')):
+            with self.subTest(roles=roles):
+                self.registry = SessionRegistry()
+                driver = self.driver(FakeRun([(['codex', 'exec'], self.exec_output())]))
+                driver.create('initial prompt')
+                messages = [('2026-09-13T09:42:01.000Z', role, MARKER) for role in roles]
+                self.transcripts[THREAD_ID] = self.write_lines(
+                    'partial-codex.jsonl', rollout_lines(cwd=driver.cwd, messages=messages))
+                absent = driver.observe(THREAD_ID, marker=MARKER, submitted_at=2_000_000_000)
+                self.assertEqual(absent.outcomes, {})
+                self.assertEqual(absent.observable, len(roles) == 2)
+                positive = driver.observe(THREAD_ID, marker=MARKER, submitted_at=0)
+                if 'user' in roles:
+                    self.assertIn('visible', positive.outcomes)
+                if 'assistant' in roles:
+                    self.assertIn('ack', positive.outcomes)
+
+    def test_observe_reads_the_rollout_with_the_turn_stream_and_fails_closed(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run)
+        driver.create('hello')
+        self.transcripts[THREAD_ID] = self.write_lines('r.jsonl', rollout_lines(cwd=driver.cwd, messages=[
+            ('2026-09-13T09:42:01.000Z', 'user', f'injected host text {MARKER}'),
+            ('2026-09-13T09:42:03.000Z', 'assistant', MARKER)]))
+        observation = driver.observe(THREAD_ID, marker=MARKER, submitted_at=1_789_292_520.0)  # 09:42:00Z
+        self.assertEqual(set(observation.outcomes), {'visible', 'ack'})  # turn_start needs task_started
+        self.assertTrue(observation.turn_stream)
         self.assertTrue(observation.observable)
+        self.transcripts.pop(THREAD_ID)
+        self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0.0).observable)
 
-    def test_observe_is_unobservable_when_the_rollout_holds_unparseable_content(self):
-        # Opening the file proved nothing about reading it: a truncated or corrupt rollout
-        # would otherwise yield an empty, observable read and classify as not_observed.
-        registry = SessionRegistry()
-        registry.mint('codex:thread-1')
-        with tempfile.NamedTemporaryFile('w', suffix='.jsonl', delete=False) as handle:
-            handle.write('{"timestamp": "2026-09-11T00:00:0\n')
-            path = handle.name
-        self.addCleanup(os.unlink, path)
-        observation = self.driver(registry, path).observe('thread-1', marker=MARKER, submitted_at=0.0)
-        self.assertEqual(observation.outcomes, {})
-        self.assertFalse(observation.observable)
+    def test_rollout_removed_between_discovery_and_stat_is_unobservable(self):
+        driver = self.driver(FakeRun([(['codex', 'exec'], self.exec_output())]),
+                             rollout_path_for=host_trials.default_codex_rollout_path)
+        driver.create('hello')
+        with unittest.mock.patch.object(host_trials.glob, 'glob', return_value=['synthetic-rollout']), \
+                unittest.mock.patch.object(os.path, 'getmtime', side_effect=FileNotFoundError):
+            self.assertFalse(driver.observe(THREAD_ID, marker=MARKER, submitted_at=0).observable)
+            self.assertIsNone(driver.version(THREAD_ID))
 
-    def test_observe_is_unobservable_when_the_rollout_holds_an_undated_message(self):
-        registry = SessionRegistry()
-        registry.mint('codex:thread-1')
-        path = self.rollout({'type': 'response_item',
-                             'payload': {'type': 'message', 'role': 'assistant',
-                                          'content': [{'type': 'output_text', 'text': f'ack {MARKER}'}]}})
-        observation = self.driver(registry, path).observe('thread-1', marker=MARKER, submitted_at=0.0)
-        self.assertEqual(observation.outcomes, {})
-        self.assertFalse(observation.observable)
+    def test_version_reads_the_rollouts_cli_version_never_the_binary(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output())])
+        driver = self.driver(run)
+        driver.create('hello')
+        self.transcripts[THREAD_ID] = self.write_lines('r.jsonl', rollout_lines(cwd=driver.cwd, cli_version='0.154.0'))
+        self.assertEqual(driver.version(THREAD_ID), '0.154.0')
+        self.assertEqual(run.argv('codex', '--version'), [])
+        self.transcripts.pop(THREAD_ID)
+        self.assertIsNone(driver.version(THREAD_ID))
 
-    def test_observe_preserves_signals_alongside_outcomes_when_the_poll_is_unusable(self):
-        # run_trial's polling loop merges outcomes across polls with setdefault(); an unusable
-        # poll that dropped `signals` while keeping `outcomes` would let the outcome's timestamp
-        # in but permanently lose what established it, since setdefault() never overwrites the
-        # None already recorded by an earlier poll.
-        registry = SessionRegistry()
-        registry.mint('codex:thread-1')
-        path = self.rollout(
-            {'timestamp': '2026-09-11T00:00:01.000Z', 'type': 'response_item',
-             'payload': {'type': 'message', 'role': 'assistant',
-                         'content': [{'type': 'output_text', 'text': f'ack {MARKER}'}]}},
-            {'type': 'response_item', 'payload': {'type': 'message', 'role': 'assistant',
-                                                   'content': [{'type': 'output_text', 'text': 'undated'}]}},
-        )
-        observation = self.driver(registry, path).observe('thread-1', marker=MARKER, submitted_at=0.0)
-        self.assertFalse(observation.observable)
-        self.assertIn('ack', observation.outcomes)
-        self.assertEqual(observation.signals.get('ack'), SIGNAL_ASSISTANT_MESSAGE)
+    def test_rollout_identity_and_cwd_gate_outcomes_and_version(self):
+        driver = self.driver(FakeRun([(['codex', 'exec'], self.exec_output())]))
+        driver.create('hello')
+        original = rollout_lines(cwd=driver.cwd, messages=[
+            ('2026-09-13T09:42:01.000Z', 'user', MARKER),
+            ('2026-09-13T09:42:03.000Z', 'assistant', MARKER)])
+        cases = [('missing metadata', original[1:])]
+        for key in ('id', 'session_id', 'cwd'):
+            for value in (None, '', 'foreign'):
+                metadata = json.loads(original[0])
+                if value is None:
+                    del metadata['payload'][key]
+                else:
+                    metadata['payload'][key] = value
+                bad = json.dumps(metadata)
+                cases.append((f'{key}={value}', [bad, *original[1:]]))
+                cases.append((f'conflicting later {key}={value}', [*original, bad]))
+        for name, lines in cases:
+            with self.subTest(name=name):
+                self.transcripts[THREAD_ID] = self.write_lines('wrong-rollout.jsonl', lines)
+                observation = driver.observe(THREAD_ID, marker=MARKER, submitted_at=0)
+                self.assertFalse(observation.observable)
+                self.assertEqual(observation.outcomes, {})
+                self.assertIsNone(driver.version(THREAD_ID))
 
-    def test_observe_is_unobservable_without_a_rollout_path(self):
-        registry = SessionRegistry()
-        registry.mint('codex:thread-1')
-        self.assertEqual(self.driver(registry, None).observe('thread-1', marker=MARKER, submitted_at=0.0),
-                          Observation(outcomes={}, observable=False))
+    def test_teardown_deletes_with_force_and_releases_only_on_exit_zero(self):
+        run = FakeRun([(['codex', 'exec'], self.exec_output()),
+                       (['codex', 'delete'], FakeResult(1, '', 'nope'))])
+        driver = self.driver(run)
+        driver.create('hello')
+        with self.assertRaises(RuntimeError):
+            driver.teardown(THREAD_ID)
+        self.assertEqual(driver.owned(), {THREAD_ID})
+        run.scripts.insert(0, (['codex', 'delete'], FakeResult(0, f'Deleted session {THREAD_ID}.\n')))
+        driver.teardown(THREAD_ID)
+        self.assertEqual(run.argv('codex', 'delete')[-1], ['codex', 'delete', '--force', THREAD_ID])
+        self.assertEqual(driver.owned(), set())
 
-    def test_teardown_refuses_and_retains_ownership(self):
-        # codex has no `queue --stop`; releasing the registry entry anyway would make the
-        # runner believe a live, authenticated host session had been cleaned up when it had
-        # not.
-        registry = SessionRegistry()
-        registry.mint('codex:thread-1')
-        with self.assertRaises(TeardownUnsupported):
-            self.driver(registry, None).teardown('thread-1')
-        registry.require_owned('codex:thread-1')  # still ours: nothing was actually torn down
+    def test_an_unknown_mechanism_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.driver(FakeRun([]), mechanism='stdin')
 
-    def test_teardown_refuses_a_foreign_thread(self):
+
+class CrossDriverNamespaceTests(DriverTestCase):
+    def test_owned_is_per_namespace_over_one_shared_registry(self):
+        claude = ClaudeDriver(self.registry, run=FakeRun([]), cwd=self.cwd, pty=FakePtyClient,
+                              transcript_path_for=self.transcript_path_for)
+        codex = CodexDriver(self.registry, run=FakeRun([]), cwd=self.cwd, pty=FakePtyClient,
+                            rollout_path_for=self.transcript_path_for)
+        claude.mint('abc')
+        codex.mint('abc')  # the same name in another namespace is another session
+        self.assertEqual(claude.owned(), {'abc'})
+        self.assertEqual(codex.owned(), {'abc'})
+        self.assertEqual(self.registry.created, {'claude:abc': claude, 'codex:abc': codex})
+        codex.release('abc')
+        self.assertEqual(claude.owned(), {'abc'})
+        self.assertEqual(codex.owned(), set())
         with self.assertRaises(ForeignSessionError):
-            self.driver(SessionRegistry(), None).teardown('not-mine')
+            codex.observe('abc', marker=MARKER, submitted_at=0.0)
 
-    def test_version_prefers_the_adopted_rollouts_own_recorded_version(self):
-        # A rollout's session_meta.cli_version can disagree with the currently installed
-        # client's (docs/host-probe-preflight.md, 2026-09-11: 0.154.0 vs 0.153.4 same day); the
-        # adopted thread's own record is the one that actually describes its transcript.
-        path = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta',
-                             'payload': {'cli_version': '0.154.0'}})
-        driver = self.driver(SessionRegistry(), path,
-                              run=lambda *a, **k: FakeResult(0, stdout='codex-cli 0.153.4\n'))
-        self.assertEqual(driver.version('thread-1'), '0.154.0')
-
-    def test_version_is_none_rather_than_the_client_when_the_rollout_has_no_cli_version(self):
-        # The installed client's version can disagree with the adopted thread's own (see the
-        # test above) -- falling back to it here would misattribute the matrix cell to a binary
-        # that may not be the one that produced the transcript, so this reports unknown instead
-        # of ever calling `codex --version` for this field.
-        path = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta'})
-        driver = self.driver(SessionRegistry(), path)
-        self.assertIsNone(driver.version('thread-1'))
-
-    def test_version_is_none_rather_than_the_client_when_there_is_no_rollout_path(self):
-        driver = self.driver(SessionRegistry(), None)
-        self.assertIsNone(driver.version('thread-1'))
-
-    def test_version_is_none_when_the_rollout_cannot_be_read(self):
-        # The rollout carries a real version, so a read that went through would return it and
-        # only a failed open yields None here. The failure is simulated rather than produced
-        # with chmod(0): as root (CI containers) mode bits are ignored, and the earlier variant
-        # of this test wrote unparseable lines, which return None whether or not the read was
-        # blocked -- it could not fail.
-        path = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta',
-                             'payload': {'cli_version': '0.154.0'}})
-        driver = self.driver(SessionRegistry(), path)
-        self.assertEqual(driver.version('thread-1'), '0.154.0')  # readable: the control
-        with patch('host_trials.open', create=True,
-                   side_effect=OSError('permission denied (simulated)')):
-            self.assertIsNone(driver.version('thread-1'))
+    def test_owned_is_per_instance_not_per_registry(self):
+        # Sweeping one instance must not tear down a sibling's sessions: only that sibling holds
+        # the PTY client or server still serving them, so the sweep would delete a live trial.
+        first = ClaudeDriver(self.registry, run=FakeRun([]), cwd=self.cwd, pty=FakePtyClient,
+                             transcript_path_for=self.transcript_path_for)
+        second = ClaudeDriver(self.registry, run=FakeRun([]), cwd=self.cwd, pty=FakePtyClient,
+                              transcript_path_for=self.transcript_path_for)
+        first.mint('aaaaaaaa')
+        second.mint('bbbbbbbb')
+        self.assertEqual(first.owned(), {'aaaaaaaa'})
+        self.assertEqual(second.owned(), {'bbbbbbbb'})
+        for method in (lambda: second.stop('aaaaaaaa'), lambda: second.teardown('aaaaaaaa'),
+                       lambda: second.status('aaaaaaaa')):
+            with self.assertRaises(ForeignSessionError):
+                method()
 
 
-class CrossDriverNamespaceTests(unittest.TestCase):
-    """A bare session id minted by one driver must not satisfy another's ownership check.
-
-    `claude agents` and `codex queue --thread` both accept caller-chosen names, so nothing stops
-    the two hosts from coincidentally sharing one -- a run that adopts a Codex thread named
-    `abcd1234` right after a Claude driver mints a session with the same id must not let either
-    driver operate on the other's session.
-    """
-
-    RUN_STARTED = datetime.datetime(2026, 9, 11, 12, 0, 0, tzinfo=datetime.UTC).timestamp()
-
-    def codex_driver(self, registry):
-        return CodexDriver(registry, run=lambda *a, **k: FakeResult(0),
-                           rollout_path_for=lambda _id: None, started_at=self.RUN_STARTED,
-                           sessions_root=None)
-
-    def test_a_claude_minted_id_does_not_satisfy_a_codex_driver_with_the_same_bare_id(self):
-        registry = SessionRegistry()
-        registry.mint('claude:collide')
-        codex = self.codex_driver(registry)
-        with self.assertRaises(ForeignSessionError):
-            codex.submit('collide', 'hi')
-        with self.assertRaises(ForeignSessionError):
-            codex.observe('collide', marker=MARKER, submitted_at=0.0)
-        with self.assertRaises(ForeignSessionError):
-            codex.teardown('collide')
-
-    def test_a_codex_minted_id_does_not_satisfy_a_claude_driver_with_the_same_bare_id(self):
-        registry = SessionRegistry()
-        registry.mint('codex:collide')
-        claude = ClaudeDriver(registry, run=lambda *a, **k: FakeResult(0, stdout='[]'), cwd='/scratch')
-        with self.assertRaises(ForeignSessionError):
-            claude.submit('collide', 'hi')
-        with self.assertRaises(ForeignSessionError):
-            claude.observe('collide', marker=MARKER, submitted_at=0.0)
-        with self.assertRaises(ForeignSessionError):
-            claude.teardown('collide')
-
-
-class OpenCodeDriverTests(unittest.TestCase):
-    def test_instantiation_refuses_until_export_format_is_captured(self):
-        with self.assertRaises(NotImplementedError):
-            OpenCodeDriver()
 
 
 class FakeClock:
@@ -1245,11 +2466,21 @@ class FakeClock:
         self.elapsed += seconds
 
 
-class FakeDriver:
-    """Scripted host: `observations` is consumed one entry per observe() call, last repeating."""
+class FakeDriver(Driver):
+    """Scripted host: `observations` is consumed one entry per observe() call, last repeating.
+
+    Ids minted here go through a real `SessionRegistry` under the `fake` namespace so the sweep
+    tests exercise the same ownership path the real drivers use.
+    """
+
+    NAMESPACE = 'fake'
 
     def __init__(self, *, observations=None, accepted=True, submit_error=None,
-                 observe_error=None, version_value=None, version_error=None, clock=None):
+                 observe_error=None, version_value=None, version_error=None, clock=None,
+                 teardown_errors=None, submission_note=None, registry=None, on_observe=None):
+        self.registry = registry or SessionRegistry()
+        self.clients = []
+        self.strays = set()
         self.observations = list(observations or [Observation()])
         self.accepted = accepted
         self.submit_error = submit_error
@@ -1257,10 +2488,16 @@ class FakeDriver:
         self.version_value = version_value
         self.version_error = version_error
         self.clock = clock
+        self.teardown_errors = dict(teardown_errors or {})
+        self.submission_note = submission_note
+        self.on_observe = on_observe
         self.order = []
+        self.torn_down = []
+        self.server_closes = 0
 
     def create(self, prompt):
         self.order.append('create')
+        self.mint('sid')
         return 'sid'
 
     def version(self, session_id):
@@ -1269,10 +2506,6 @@ class FakeDriver:
         if self.version_error is not None:
             raise self.version_error
         return self.version_value
-
-    def register_existing(self, session_id):
-        self.order.append('register_existing')
-        return session_id
 
     def submit(self, session_id, message):
         assert session_id == 'sid'
@@ -1286,9 +2519,23 @@ class FakeDriver:
 
     def observe(self, session_id, *, marker, submitted_at):
         self.order.append('observe')
+        if self.on_observe is not None:
+            self.on_observe()
         if self.observe_error is not None:
             raise self.observe_error
         return self.observations.pop(0) if len(self.observations) > 1 else self.observations[0]
+
+    def teardown(self, session_id):
+        self.order.append(f'teardown:{session_id}')
+        self.torn_down.append(session_id)
+        if session_id in self.teardown_errors:
+            raise self.teardown_errors[session_id]
+        self.release(session_id)
+
+    def close_servers(self):
+        self.order.append('close_servers')
+        self.server_closes += 1
+        return []
 
 
 class RunTrialTests(unittest.TestCase):
@@ -1296,10 +2543,17 @@ class RunTrialTests(unittest.TestCase):
         return run_trial(driver, prompt='hi', marker=MARKER, clock=clock.time,
                           monotonic=clock.monotonic, sleep=clock.sleep, **kwargs)
 
+    def test_later_snapshots_can_supply_earlier_outcomes_and_turn_completion(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock, observations=[
+            Observation(outcomes={'visible': 1008}, turn_end=1008, turn_stream=True),
+            Observation(outcomes={'visible': 1001, 'turn_start': 1002, 'ack': 1016},
+                        turn_end=1001, turn_stream=True)])
+        run = self.run_one(driver, clock, state='busy', settle=lambda session_id: None)
+        self.assertEqual(run.outcomes['visible'], 1001)
+        self.assertEqual(run.turn_end, 1001)
+
     def test_submission_asks_the_host_to_echo_the_marker_rather_than_sending_it_bare(self):
-        # A bare opaque token gives an awake host no reason to quote it back; detect_outcomes
-        # only recognizes acknowledgement when the marker appears in the reply, so a correct,
-        # non-quoting answer to a bare token would misclassify as not_observed.
         clock = FakeClock()
         driver = FakeDriver(clock=clock)
         self.run_one(driver, clock)
@@ -1320,9 +2574,22 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.accepted_at, 1012.0)
         self.assertEqual(run.outcomes['accepted'], 1012.0)
 
+    def test_a_numeric_submit_result_is_the_drivers_own_acceptance_time(self):
+        # Codex queue-then-resume: `codex queue` exits 0, then the resume client takes 15s to
+        # start. Stamping at return would push a real acceptance out of its 10s window.
+        clock = FakeClock()
+        driver = FakeDriver(accepted=1003.5, clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertEqual(run.accepted_at, 1003.5)
+        self.assertEqual(run.outcomes['accepted'], 1003.5)
+        self.assertEqual(run.signals['accepted'], SIGNAL_SUBMIT_EXIT_STATUS)
+        self.assertGreater(clock.time(), 1003.5)  # submit() returned later than it stamped
+        for bad in ('yes', float('nan'), object()):
+            with self.subTest(result=bad):
+                with self.assertRaises(TypeError):
+                    self.run_one(FakeDriver(accepted=bad, clock=FakeClock()), FakeClock())
+
     def test_the_result_carries_which_signal_established_each_outcome(self):
-        # docs/host-probes.md, Trial protocol: "Record which signal established each positive
-        # result, not just a timestamp" -- a bare TrialRun.outcomes timestamp cannot show this.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(
             outcomes={'visible': 1000.0, 'turn_start': 1001.0, 'ack': 1002.0},
@@ -1336,9 +2603,7 @@ class RunTrialTests(unittest.TestCase):
 
     def test_a_keyboardinterrupt_during_polling_finalizes_a_partial_result(self):
         # A busy trial's poll loop can wait up to 900s; losing everything gathered so far to a
-        # propagated interrupt would discard real evidence instead of finalizing it. The channel
-        # stayed readable (observable=True, the default) right up to the interrupt, but that must
-        # not read as "definitively absent" for the outcomes the interrupted poll never reached.
+        # propagated interrupt would discard real evidence instead of finalizing it.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(outcomes={'visible': 1000.0},
                                                        signals={'visible': SIGNAL_USER_MESSAGE})],
@@ -1357,34 +2622,174 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(run.observable['ack'])
         self.assertTrue(run.interrupted)
 
-    def test_the_result_carries_the_driver_version_captured_at_trial_time(self):
-        # A matrix cell is version-scoped (docs/host-wake-matrix.md); without this, a cell built
-        # against a drifted binary is indistinguishable from one built at the recorded preflight.
+    def test_a_keyboardinterrupt_inside_the_first_observe_still_finalizes(self):
         clock = FakeClock()
-        driver = FakeDriver(version_value='2.1.268', clock=clock)
+        driver = FakeDriver(observe_error=KeyboardInterrupt(), clock=clock)
         run = self.run_one(driver, clock)
-        self.assertEqual(run.version, '2.1.268')
+        self.assertTrue(run.interrupted)
+        self.assertEqual(run.outcomes, {'accepted': 1012.0})
+        self.assertFalse(any(run.observable[name] for name in ('visible', 'turn_start', 'ack')))
+        self.assertFalse(run.turn_end_observable)
+
+    def test_interrupted_poll_finalization_rechecks_clock_drift(self):
+        for location in ('sleep', 'observe'):
+            for step in (60.0, -60.0):
+                with self.subTest(location=location, step=step):
+                    clock = FakeClock()
+                    driver = FakeDriver(clock=clock, observations=[Observation(
+                        outcomes={'visible': 1001}, model='synthetic-model')])
+
+                    def interrupt(*args):
+                        clock.wall += step
+                        raise KeyboardInterrupt
+
+                    if location == 'observe':
+                        driver.on_observe = interrupt
+                    run = run_trial(driver, prompt='hi', marker=MARKER, clock=clock.time,
+                                    monotonic=clock.monotonic, sleep=interrupt)
+                    self.assertTrue(run.interrupted)
+                    self.assertAlmostEqual(run.clock_step, step)
+                    self.assertEqual(run.outcomes, {})
+                    self.assertIsNone(run.model)
+                    self.assertFalse(any(run.observable.values()))
+
+    def test_a_clock_correction_also_discards_the_attributed_model(self):
+        for step in (60.0, -60.0):
+            with self.subTest(step=step):
+                clock = FakeClock()
+                driver = FakeDriver(
+                    observations=[Observation(outcomes={'turn_start': 1001.0}, model='prior-model')],
+                    clock=clock, on_observe=lambda: setattr(clock, 'wall', clock.wall + step))
+                run = self.run_one(driver, clock)
+                self.assertIsNotNone(run.clock_step)
+                self.assertIsNone(run.model)
+
+    def test_rejection_checks_clock_drift_without_polling(self):
+        for step in (60.0, -60.0):
+            for raises in (False, True):
+                with self.subTest(step=step, raises=raises):
+                    clock = FakeClock()
+
+                    class RejectedAfterStep(FakeDriver):
+                        def submit(self, session_id, message):
+                            clock.wall += step
+                            return super().submit(session_id, message)
+
+                    driver = RejectedAfterStep(accepted=False, clock=clock,
+                                               submit_error=SubmissionRejected(1, 'rejected') if raises else None)
+                    run = self.run_one(driver, clock)
+                    self.assertAlmostEqual(run.clock_step, step)
+                    self.assertFalse(any(run.observable.values()))
+                    self.assertEqual(run.outcomes, {})
+                    self.assertNotIn('observe', driver.order)
+                    if step > 0:
+                        trial = Trial(submitted=run.submitted_at, outcomes=run.outcomes)
+                        self.assertEqual(classify_trial(trial, clock.time(), supported=run.supported,
+                                                        observable=run.observable),
+                                         dict.fromkeys(OUTCOME_NAMES, 'unobservable'))
+
+    def test_a_wall_clock_correction_during_polling_makes_the_whole_trial_unobservable(self):
+        # Every compared stamp is wall time, so a correction moves host events relative to their
+        # windows -- a +60s step alone turns a reply 2s after submission into one 62s after it,
+        # outside the 30s visibility window. Nothing can rebase a stamp another process wrote.
+        for step in (60.0, -60.0):
+            with self.subTest(step=step):
+                clock = FakeClock()
+                driver = FakeDriver(
+                    observations=[Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0},
+                                              signals={'visible': SIGNAL_USER_MESSAGE},
+                                              turn_end=1005.0)],
+                    clock=clock, on_observe=lambda clock=clock: setattr(clock, 'wall',
+                                                                        clock.wall + step))
+                run = self.run_one(driver, clock, state='busy', settle=lambda session_id: None)
+                self.assertAlmostEqual(run.clock_step, step)
+                self.assertEqual(run.outcomes, {})
+                self.assertEqual(run.signals, {})
+                self.assertIsNone(run.accepted_at)
+                self.assertIsNone(run.turn_end)
+                self.assertFalse(run.turn_end_observable)
+                self.assertFalse(any(run.observable.values()))
+                trial = Trial(submitted=run.submitted_at, state=run.state, turn_end=run.turn_end,
+                              turn_end_observable=run.turn_end_observable, outcomes=run.outcomes)
+                if step > 0:
+                    self.assertEqual(classify_trial(trial, clock.time(), supported=run.supported,
+                                                    observable=run.observable),
+                                     {name: 'unobservable' for name in OUTCOME_NAMES})
+                else:
+                    # The documented residual: a step backwards past the trial's own duration
+                    # puts the caller's `now` before submission, and `Trial.result` refuses the
+                    # run outright rather than classifying it -- fail-closed the same way.
+                    with self.assertRaises(ValueError):
+                        classify_trial(trial, clock.time(), supported=run.supported,
+                                       observable=run.observable)
+
+    def test_slew_within_tolerance_leaves_an_ordinary_trial_alone(self):
+        # NTP slew is bounded at 500 ppm, well under a second across even the 900s busy cap; a
+        # tolerance that fired on it would make every long cell unobservable.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'visible': 1000.0,
+                                                                'turn_start': 1001.0,
+                                                                'ack': 1002.0})],
+                            clock=clock,
+                            on_observe=lambda: setattr(clock, 'wall',
+                                                       clock.wall + CLOCK_DRIFT_TOLERANCE / 2))
+        run = self.run_one(driver, clock)
+        self.assertIsNone(run.clock_step)
+        self.assertEqual(run.outcomes['visible'], 1000.0)
+        self.assertTrue(all(run.observable.values()))
+
+    def test_descheduling_during_clock_sampling_is_not_a_clock_step(self):
+        for sample in (1, 3):  # baseline and first poll (sample 2 records acceptance)
+            for side in ('before', 'after'):
+                with self.subTest(sample=sample, side=side):
+                    clock = FakeClock()
+                    calls = 0
+
+                    def wall_time():
+                        nonlocal calls
+                        calls += 1
+                        if calls == sample and side == 'before':
+                            clock.elapsed += 3.0
+                        value = clock.time()
+                        if calls == sample and side == 'after':
+                            clock.elapsed += 3.0
+                        return value
+
+                    driver = FakeDriver(observations=[Observation(outcomes={
+                        'visible': 1015.0, 'turn_start': 1016.0, 'ack': 1017.0})], clock=clock)
+                    run = run_trial(driver, prompt='hi', marker=MARKER, clock=wall_time,
+                                    monotonic=clock.monotonic, sleep=clock.sleep)
+                    self.assertIsNone(run.clock_step)
+                    self.assertEqual(run.outcomes['ack'], 1017.0)
+
+    def test_the_result_carries_the_driver_version_captured_at_trial_time(self):
+        clock = FakeClock()
+        driver = FakeDriver(version_value='2.1.270', clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertEqual(run.version, '2.1.270')
+
+    def test_the_result_carries_the_serving_model_the_first_poll_that_saw_one_read(self):
+        # `run_trial_with_cleanup` deletes the session, so this is the caller's only chance to
+        # record the model -- and the requested one is not it (`--model haiku` was captured not
+        # being honoured). A poll that names none must not overwrite one already read.
+        clock = FakeClock()
+        observations = [Observation(),
+                        Observation(outcomes={'visible': 1000.0}, model='claude-sonnet-5'),
+                        Observation(outcomes={'turn_start': 1002.0, 'ack': 1002.0})]
+        run = self.run_one(FakeDriver(observations=observations, clock=clock), clock)
+        self.assertEqual(run.model, 'claude-sonnet-5')
+
+    def test_the_result_model_is_none_when_no_poll_ever_named_one(self):
+        clock = FakeClock()
+        run = self.run_one(FakeDriver(clock=clock), clock)
+        self.assertIsNone(run.model)
 
     def test_a_version_read_failure_records_none_rather_than_losing_the_trial(self):
         clock = FakeClock()
-        driver = FakeDriver(version_error=RuntimeError('claude --version exited 1'), clock=clock)
+        driver = FakeDriver(version_error=RuntimeError('transcript unreadable'), clock=clock)
         run = self.run_one(driver, clock)
         self.assertIsNone(run.version)
         self.assertEqual(run.session_id, 'sid')  # the rest of the trial still completed normally
-
-    def test_a_version_read_interrupt_stops_the_trial_before_settle_or_submit_run(self):
-        # Unlike an ordinary version() failure, a Ctrl-C here is honored as an explicit
-        # cancellation: swallowing it and continuing would still let the trial proceed into
-        # settle()/submit()/polling (up to 900s), spending real quota and host interaction
-        # despite the interrupt. Raising still carries session_id so the caller can find and
-        # tear down the already-live session.
-        clock = FakeClock()
-        driver = FakeDriver(version_error=KeyboardInterrupt(), clock=clock)
-        with self.assertRaises(VersionProbeInterrupted) as ctx:
-            self.run_one(driver, clock, settle=lambda session_id: driver.order.append('settle'))
-        self.assertEqual(ctx.exception.session_id, 'sid')
-        self.assertNotIn('settle', driver.order)
-        self.assertNotIn('submit', driver.order)
 
     def test_settle_runs_between_create_and_submit(self):
         clock = FakeClock()
@@ -1399,56 +2804,21 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(driver.order[:4], ['create', 'version', 'settle', 'submit'])
         self.assertEqual(received, ['sid'])  # settle must be able to target the created session
 
-    def test_a_settle_failure_carries_the_session_id_rather_than_discarding_it(self):
-        # settle() runs after create() already produced a live, owned session; letting its
-        # failure propagate bare would discard the only place that session_id is ever surfaced,
-        # leaving an authenticated real-HOME session running with no way to find it.
-        clock = FakeClock()
-        driver = FakeDriver(clock=clock)
-
-        def failing_settle(session_id):
-            raise RuntimeError('could not confirm busy state')
-
-        with self.assertRaises(SettleFailed) as caught:
-            self.run_one(driver, clock, settle=failing_settle)
-        self.assertEqual(caught.exception.session_id, 'sid')
-        self.assertIsInstance(caught.exception.original, RuntimeError)
-        self.assertNotIn('submit', driver.order)
-
-    def test_a_settle_interrupt_also_carries_the_session_id(self):
-        clock = FakeClock()
-        driver = FakeDriver(clock=clock)
-
-        def interrupting_settle(session_id):
-            raise KeyboardInterrupt
-
-        with self.assertRaises(SettleFailed) as caught:
-            self.run_one(driver, clock, settle=interrupting_settle)
-        self.assertEqual(caught.exception.session_id, 'sid')
-        self.assertIsInstance(caught.exception.original, KeyboardInterrupt)
-
-    def test_an_unenumerated_submission_failure_also_carries_the_session_id(self):
-        # submit() runs after create()/settle() already produced a live, owned session; a
-        # pre-delivery failure that is not one of the four documented submission signals (a
-        # listing call's nonzero exit, here) previously propagated bare, discarding the only
-        # place that session_id is ever surfaced.
-        clock = FakeClock()
-        driver = FakeDriver(submit_error=RuntimeError('claude agents exited 1'), clock=clock)
-        with self.assertRaises(SubmissionFailed) as caught:
-            self.run_one(driver, clock)
-        self.assertEqual(caught.exception.session_id, 'sid')
-        self.assertIsInstance(caught.exception.original, RuntimeError)
-
-    def test_an_unenumerated_observation_failure_also_carries_the_session_id(self):
-        # observe() runs in the polling loop after submission already succeeded; a mid-poll
-        # failure that is not KeyboardInterrupt previously propagated bare, discarding the only
-        # place that session_id is ever surfaced and any outcomes already gathered.
-        clock = FakeClock()
-        driver = FakeDriver(observe_error=RuntimeError('claude agents exited 1'), clock=clock)
-        with self.assertRaises(ObservationFailed) as caught:
-            self.run_one(driver, clock)
-        self.assertEqual(caught.exception.session_id, 'sid')
-        self.assertIsInstance(caught.exception.original, RuntimeError)
+    def test_failures_after_create_propagate_raw_and_leave_the_session_owned(self):
+        # The registry, not a wrapper exception, is what names the live session now; the
+        # caller's sweep (run_trial_with_cleanup) reads it. Nothing is swallowed or re-typed.
+        cases = [
+            ('settle', dict(), lambda session_id: (_ for _ in ()).throw(RuntimeError('no busy state'))),
+            ('submit', dict(submit_error=RuntimeError('claude agents exited 1')), None),
+            ('observe', dict(observe_error=OSError('transcript vanished')), None),
+        ]
+        for label, kwargs, settle in cases:
+            with self.subTest(stage=label):
+                clock = FakeClock()
+                driver = FakeDriver(clock=clock, **kwargs)
+                with self.assertRaises((RuntimeError, OSError)):
+                    self.run_one(driver, clock, settle=settle)
+                self.assertEqual(driver.owned(), {'sid'})
 
     def test_rejected_submission_does_not_add_accepted(self):
         clock = FakeClock()
@@ -1458,10 +2828,6 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.marker, MARKER)  # the submitted token is still evidence, even rejected
 
     def test_rejected_submission_skips_polling_and_marks_transcript_outcomes_unobservable(self):
-        # A clean nonzero exit is a real, observed failure to accept -- 'not_observed' is the
-        # true classification for `accepted` itself -- but nothing was delivered, so polling for
-        # transcript outcomes and eventually reporting them `not_observed` would be negative
-        # evidence for a marker the host never received.
         clock = FakeClock()
         driver = FakeDriver(accepted=False, clock=clock)
         run = self.run_one(driver, clock)
@@ -1471,18 +2837,35 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(run.observable['turn_start'])
         self.assertFalse(run.observable['ack'])
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
-        # Known immediately as a fact, but classify_trial has no "already resolved" input --
-        # `accepted`'s own 10s window must still actually elapse before it reports that fact.
         with self.assertRaises(ValueError):
             classify_trial(trial, run.submitted_at, observable=run.observable)
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['accepted'], 'not_observed')
         self.assertEqual(classified['visible'], 'unobservable')
 
+    def test_a_none_from_submit_leaves_accepted_unobservable_and_still_polls(self):
+        # The attach path: a PTY write is never host acceptance, so `accepted` is unobservable
+        # -- but the message may well have been delivered, so the transcript outcomes are polled
+        # and stand on their own evidence.
+        clock = FakeClock()
+        driver = FakeDriver(accepted=None, submission_note='attach: typed at ...',
+                            observations=[Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0,
+                                                                'ack': 1002.0})], clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertIsNone(run.accepted_at)
+        self.assertNotIn('accepted', run.outcomes)
+        self.assertNotIn('accepted', run.signals)
+        self.assertFalse(run.observable['accepted'])
+        self.assertIn('observe', driver.order)
+        self.assertTrue(run.observable['visible'])
+        self.assertEqual(run.outcomes['ack'], 1002.0)
+        self.assertEqual(run.submission_diagnostic, 'attach: typed at ...')
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
+        classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
+        self.assertEqual(classified['accepted'], 'unobservable')
+        self.assertEqual(classified['ack'], 'observed')
+
     def test_submission_rejected_carries_its_diagnostic_rather_than_a_bare_false(self):
-        # A `SubmissionRejected` (e.g. from `CodexDriver.submit`) folds into the identical
-        # not-accepted shape a plain `False` return produces, except with the returncode/stderr
-        # behind it retained via `submission_diagnostic` instead of discarded.
         clock = FakeClock()
         driver = FakeDriver(submit_error=SubmissionRejected(3, 'thread expired'), clock=clock)
         run = self.run_one(driver, clock)
@@ -1493,8 +2876,6 @@ class RunTrialTests(unittest.TestCase):
         self.assertNotIn('observe', driver.order)
 
     def test_observation_continues_through_the_windows_instead_of_one_snapshot(self):
-        # The outcome lands on a later poll: a single immediate snapshot reported it
-        # not_observed even though it arrived inside its own window.
         clock = FakeClock()
         late = Observation(outcomes={'visible': 1000.0, 'turn_start': 1030.0, 'ack': 1031.0})
         driver = FakeDriver(observations=[Observation(), Observation(), late], clock=clock)
@@ -1502,8 +2883,6 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(driver.order.count('observe'), 3)
         self.assertEqual(set(run.outcomes), {'accepted', 'visible', 'turn_start', 'ack'})
         self.assertTrue(all(run.observable.values()))
-        # Merging the polls is only half of it: the merged timestamps must also classify as
-        # arrived-in-window, which is the failure a single snapshot produced.
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
         classified = classify_trial(trial, run.submitted_at + 200, observable=run.observable)
         self.assertEqual(classified['ack'], 'observed')
@@ -1518,8 +2897,6 @@ class RunTrialTests(unittest.TestCase):
         self.assertTrue(run.observable['visible'])
 
     def test_a_channel_that_dies_mid_window_leaves_the_unseen_outcomes_unobservable(self):
-        # One early readable poll does not cover the rest of the window: the acknowledgement
-        # could have arrived into a transcript nobody could read by the deadline.
         clock = FakeClock()
         seen = Observation(outcomes={'visible': 1000.0}, observable=True)
         dead = Observation(observable=False)
@@ -1529,8 +2906,6 @@ class RunTrialTests(unittest.TestCase):
         self.assertFalse(run.observable['ack'])  # the tail of the window went unread
 
     def test_a_readable_final_poll_covers_an_earlier_failed_one(self):
-        # A transcript is cumulative, so the last successful read sees everything the failed
-        # earlier read would have; a transient failure is not a permanent loss of coverage.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(observable=False),
                                            Observation(outcomes={'visible': 1000.0})], clock=clock)
@@ -1554,19 +2929,20 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.outcomes, {})
         self.assertFalse(any(run.supported.values()))
         self.assertNotIn('observe', driver.order)  # nothing was delivered, so nothing is ours
-        self.assertEqual(run.marker, MARKER)  # the submitted token is still evidence, even unsupported
+        self.assertEqual(run.marker, MARKER)
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes)
         classified = classify_trial(trial, run.submitted_at + 1000, supported=run.supported)
         self.assertTrue(all(value == 'unsupported' for value in classified.values()))
 
     def test_uncaptured_submission_is_unobservable_not_a_claim_about_the_host(self):
         clock = FakeClock()
-        driver = FakeDriver(submit_error=SubmissionUncaptured('nothing captured here'), clock=clock)
+        driver = FakeDriver(submit_error=SubmissionUncaptured('attach never showed the composer: ...'),
+                            clock=clock)
         run = self.run_one(driver, clock)
         self.assertTrue(all(run.supported.values()))  # no claim that the host lacks the path
         self.assertFalse(any(run.observable.values()))
-        self.assertFalse(run.interrupted)  # fail-closed like an interrupt, but nobody cancelled
-        self.assertEqual(run.marker, MARKER)  # the submitted token is still evidence, even unobservable
+        self.assertFalse(run.interrupted)
+        self.assertIn('never showed the composer', run.submission_diagnostic)
         trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
                       turn_end_observable=run.turn_end_observable)
         classified = classify_trial(trial, run.submitted_at + 1000,
@@ -1574,9 +2950,6 @@ class RunTrialTests(unittest.TestCase):
         self.assertTrue(all(value == 'unobservable' for value in classified.values()))
 
     def test_a_submission_timeout_is_unobservable_acceptance_but_still_polls_for_evidence(self):
-        # The subprocess may already have handed the marker to the host before its hard-coded
-        # timeout fired; losing the trial here would also lose any transcript evidence that
-        # delivery produced. Acceptance alone goes unobservable; observation still runs.
         clock = FakeClock()
         driver = FakeDriver(
             observations=[Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0,
@@ -1591,41 +2964,7 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(run.outcomes['visible'], 1000.0)
         self.assertEqual(run.outcomes['ack'], 1002.0)
 
-    def test_a_keyboardinterrupt_during_submit_stops_immediately_without_polling(self):
-        # An operator's Ctrl-C while submit() is blocked leaves the same ambiguity as a
-        # subprocess.TimeoutExpired from it (the host may already have received the marker), but
-        # must honor the explicit cancellation rather than entering the up-to-900s polling loop
-        # regardless -- that would need a second Ctrl-C to actually stop the trial. No observe()
-        # call should happen at all.
-        clock = FakeClock()
-        driver = FakeDriver(
-            observations=[Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0,
-                                                'ack': 1002.0})],
-            submit_error=KeyboardInterrupt(), clock=clock)
-        run = self.run_one(driver, clock)
-        self.assertIsNone(run.accepted_at)
-        self.assertNotIn('accepted', run.outcomes)
-        self.assertFalse(run.observable['accepted'])
-        self.assertFalse(run.observable['visible'])
-        self.assertFalse(run.observable['turn_start'])
-        self.assertFalse(run.observable['ack'])
-        self.assertEqual(run.outcomes, {})
-        self.assertNotIn('observe', driver.order)
-        self.assertTrue(run.interrupted)
-
-    def test_an_existing_session_is_adopted_instead_of_created(self):
-        clock = FakeClock()
-        driver = FakeDriver(clock=clock)
-        run = self.run_one(driver, clock, existing_session='sid')
-        self.assertEqual(driver.order[:3], ['register_existing', 'version', 'submit'])
-        self.assertNotIn('create', driver.order)
-        self.assertEqual(run.session_id, 'sid')
-
     def test_an_idle_trial_never_adopts_a_turn_end(self):
-        # Observation.turn_end means "completion of the turn already running at submission"
-        # (its own docstring). An idle trial has no such turn: a turn boundary the host emits
-        # after submission is the completion of *this trial's own* marker turn, not one left
-        # running before it, and must not be mislabeled as the busy-only field.
         clock = FakeClock()
         seen = Observation(outcomes={'visible': 1000.0, 'turn_start': 1001.0, 'ack': 1002.0},
                            turn_end=1002.0)
@@ -1633,8 +2972,6 @@ class RunTrialTests(unittest.TestCase):
         self.assertIsNone(run.turn_end)
 
     def test_a_busy_trial_without_a_turn_end_leaves_its_dependent_outcomes_unobservable(self):
-        # The host never said the running turn finished, so the turn_start/ack windows never
-        # started: their absence measures nothing and must not read as host silence.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(outcomes={'visible': 1000.0})], clock=clock)
         run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
@@ -1649,10 +2986,6 @@ class RunTrialTests(unittest.TestCase):
         self.assertEqual(classified['turn_start'], 'unobservable')
 
     def test_a_busy_trial_without_turn_stream_never_trusts_a_bare_assistant_message(self):
-        # Without a turn-boundary stream, an assistant message after submission cannot be told
-        # apart from the tail of the turn already running (`detect_outcomes`' docstring) -- a
-        # captured value here is exactly that ambiguity, not evidence, even though the general
-        # "positively seen" rule would otherwise let it stand on its own.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(outcomes={'turn_start': 1005.0})], clock=clock)
         run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
@@ -1665,11 +2998,38 @@ class RunTrialTests(unittest.TestCase):
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['turn_start'], 'unobservable')
 
+    def test_a_busy_trial_without_turn_stream_records_no_model(self):
+        # The model comes off the same assistant record whose turn_start cannot be attributed;
+        # it may be the turn that was already running.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'turn_start': 1005.0},
+                                                      model='claude-opus-5')], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
+        self.assertIsNone(run.model)
+
+    def test_a_busy_marker_ack_stands_without_a_turn_boundary(self):
+        clock = FakeClock()
+        observation = detect_outcomes([Event('assistant', MARKER, 1005.0)], MARKER, submitted_at=1000.0)
+        driver = FakeDriver(observations=[observation], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0, settle=lambda session_id: None)
+        self.assertFalse(run.observable['turn_start'])
+        self.assertTrue(run.observable['ack'])
+        trial = Trial(submitted=run.submitted_at, state=run.state, outcomes=run.outcomes,
+                      turn_end=run.turn_end, turn_end_observable=run.turn_end_observable)
+        self.assertEqual(classify_trial(trial, clock.time(), observable=run.observable)['ack'], 'observed')
+
+    def test_a_busy_trial_on_a_turn_stream_host_keeps_its_model(self):
+        # The host's own boundary attributes the turn, so the reading stands.
+        clock = FakeClock()
+        driver = FakeDriver(observations=[Observation(outcomes={'turn_start': 1005.0},
+                                                      turn_stream=True, model='gpt-5')],
+                            clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
+        self.assertEqual(run.model, 'gpt-5')
+
     def test_a_turn_stream_hosts_readable_busy_timeout_stays_inconclusive(self):
-        # A channel that stayed readable for the whole cap but never emitted a boundary is
-        # itself evidence the earlier turn never finished -- Trial.result's own `inconclusive`
-        # case via `turn_end_observable` -- not an unreadable channel, and must not be forced to
-        # `unobservable` here the way a non-turn-stream host's ambiguity is.
         clock = FakeClock()
         driver = FakeDriver(observations=[Observation(turn_stream=True)], clock=clock)
         run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
@@ -1698,11 +3058,20 @@ class RunTrialTests(unittest.TestCase):
         classified = classify_trial(trial, run.submitted_at + 1000, observable=run.observable)
         self.assertEqual(classified['ack'], 'observed')
 
+    def test_an_early_turn_end_collapses_the_busy_deadline_to_its_own_window(self):
+        # Submitted at wall 1000; the slow submit returns at +12s, when the first poll reports a
+        # turn end at wall 1030. The deadline becomes LAST_WINDOW past that turn end: at the poll
+        # that is 120 - (1012 - 1030) = 138s away, so polling stops at +150s.
+        clock = FakeClock()
+        seen = Observation(outcomes={'visible': 1012.0, 'turn_start': 1040.0}, turn_end=1030.0,
+                           turn_stream=True)
+        driver = FakeDriver(observations=[seen], clock=clock)
+        run = self.run_one(driver, clock, state='busy', poll_interval=300.0,
+                           settle=lambda session_id: None)
+        self.assertEqual(run.turn_end, 1030.0)
+        self.assertEqual(clock.elapsed, 150.0)  # not BUSY_CAP, and not cut short either
+
     def test_a_turn_ending_close_to_the_cap_extends_the_wait_past_it(self):
-        # A turn ending at 850s (within BUSY_CAP=900) still owes turn_start/ack the full 120s
-        # window from that end -- out to 970s -- even though that lands past the cap itself.
-        # `min(deadline, ...)` could only shorten the cap-based deadline, never stretch it,
-        # so the old code stopped polling at 900s and lost the ack sitting at 970s.
         clock = FakeClock()
         turn_end = 1850.0  # wall time; submitted_at is 1000.0, so this is 850s in
         early = Observation(outcomes={'visible': 1012.0})
@@ -1725,19 +3094,12 @@ class RunTrialTests(unittest.TestCase):
             self.run_one(FakeDriver(clock=clock), clock, state='asleep')
 
     def test_a_non_idle_state_without_an_explicit_settle_is_rejected(self):
-        # The default no-op settle only ever exercises an idle host; silently accepting it for
-        # busy/approval/disconnected/restarted would publish a result for a condition the
-        # experiment never established, with no code able to detect the gap afterwards.
         clock = FakeClock()
         for state in ('busy', 'approval', 'disconnected', 'restarted'):
             with self.assertRaises(ValueError):
                 self.run_one(FakeDriver(clock=clock), clock, state=state)
 
     def test_poll_interval_is_validated_before_any_session_exists_or_marker_is_sent(self):
-        # A negative or NaN interval previously stayed unnoticed until the first sleep() call
-        # after submission -- by which point the real host may already have received the
-        # marker with no returned evidence. Zero would pass that same later check (sleep(0)
-        # never raises) and spin the polling loop CPU-bound for up to 900s instead.
         for bad in (-1.0, 0.0, float('nan')):
             clock = FakeClock()
             driver = FakeDriver(clock=clock)
@@ -1746,13 +3108,7 @@ class RunTrialTests(unittest.TestCase):
             self.assertEqual(driver.order, [])
 
     def test_marker_is_validated_before_any_session_exists_or_is_sent(self):
-        # An empty or hand-typed marker can appear in a transcript for reasons unrelated to this
-        # trial, silently promoting an unrelated message to `ack`; only marker_token()'s own
-        # high-entropy shape is accepted.
         for bad in ('', 'hello', MARKER.upper(), 'PARLEY-PROBE-tooshort', MARKER + '\n'):
-            # `re.match` treats `$` as matching immediately before a trailing newline, so a
-            # marker with one appended still satisfied the old `.match()` check; `.fullmatch()`
-            # requires the match to span the entire string.
             clock = FakeClock()
             driver = FakeDriver(clock=clock)
             with self.assertRaises(ValueError):
@@ -1761,10 +3117,6 @@ class RunTrialTests(unittest.TestCase):
             self.assertEqual(driver.order, [])
 
     def test_omitting_the_marker_generates_a_fresh_one_each_call(self):
-        # A caller-supplied marker was only ever checked for shape, so a fixed or reused literal
-        # passed the check and let a later trial's delayed echo of an earlier trial's marker
-        # count as its own acknowledgement. Omitting the argument is the path that actually
-        # guarantees a fresh, unique token per trial.
         clock = FakeClock()
         first_driver = FakeDriver(clock=clock)
         first_run = run_trial(first_driver, prompt='hi', clock=clock.time,
@@ -1779,6 +3131,171 @@ class RunTrialTests(unittest.TestCase):
         prefix = 'Automated probe: reply with exactly this token to confirm receipt: '
         self.assertEqual(first_driver.submitted_message.removeprefix(prefix), first_run.marker)
         self.assertEqual(second_driver.submitted_message.removeprefix(prefix), second_run.marker)
+
+
+class ClosingClient:
+    def __init__(self, log, fail=False):
+        self.log = log
+        self.fail = fail
+
+    def close(self):
+        self.log.append('client')
+        if self.fail:
+            raise OSError('pty gone')
+
+
+class SweepTests(unittest.TestCase):
+    def test_sweep_closes_clients_then_tears_down_every_owned_id_then_closes_servers(self):
+        driver = FakeDriver()
+        driver.mint('b')
+        driver.mint('a')
+        other = object()
+        driver.registry.mint('other:zzz', other)  # another driver's session on the shared registry
+        driver.clients.append(ClosingClient(driver.order))
+        self.assertEqual(sweep(driver), [])
+        self.assertEqual(driver.order, ['client', 'teardown:a', 'teardown:b', 'close_servers'])
+        self.assertEqual(driver.owned(), set())
+        self.assertEqual(driver.registry.created, {'other:zzz': other})
+        self.assertEqual(driver.clients, [])
+
+    def test_sweep_continues_past_a_failed_teardown_and_reports_it(self):
+        driver = FakeDriver(teardown_errors={'a': RuntimeError('stop left a running')})
+        driver.mint('a')
+        driver.mint('b')
+        driver.clients.append(ClosingClient(driver.order))
+        failures = sweep(driver)
+        self.assertEqual([label for label, _ in failures], ['a'])
+        self.assertEqual(driver.torn_down, ['a', 'b'])
+        self.assertEqual(driver.owned(), {'a'})
+        self.assertEqual(driver.server_closes, 1)
+
+    def test_a_client_that_failed_to_close_blocks_every_teardown_and_stays_held(self):
+        # A client whose close failed may still be the process serving its session, and it is the
+        # only handle to it: tearing the session down anyway would delete a thread still in use,
+        # and dropping the handle would leave the child unrecoverable and unnamed.
+        driver = FakeDriver()
+        driver.mint('a')
+        driver.mint('b')
+        client = ClosingClient(driver.order, fail=True)
+        driver.clients.append(client)
+        failures = sweep(driver)
+        self.assertEqual([label for label, _ in failures], ['client'])
+        self.assertEqual(driver.torn_down, [])
+        self.assertEqual(driver.owned(), {'a', 'b'})
+        self.assertEqual(driver.clients, [client])
+        self.assertEqual(driver.server_closes, 1)  # the server is this run's, and still closes
+
+
+class RunTrialWithCleanupTests(unittest.TestCase):
+    def test_cleanup_failure_is_not_hidden_by_an_outer_exception_handler(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock, teardown_errors={'sid': RuntimeError('cleanup failed')})
+        try:
+            raise ValueError('unrelated outer exception')
+        except ValueError as outer:
+            with self.assertRaises(CleanupFailed) as caught:
+                self.run_one(driver, clock)
+            self.assertEqual(caught.exception.run.session_id, 'sid')
+            self.assertFalse(hasattr(outer, '__notes__'))
+
+    def test_interrupt_after_successful_trial_return_still_sweeps(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock)
+        returned = False
+        original_run = host_trials.run_trial
+
+        def completed(*args, **kwargs):
+            nonlocal returned
+            result = original_run(*args, **kwargs)
+            returned = True
+            return result
+
+        def interrupt_handoff(frame, event, arg):
+            if returned and event == 'line' and frame.f_code is run_trial_with_cleanup.__code__:
+                raise KeyboardInterrupt
+            return interrupt_handoff
+
+        previous_trace = sys.gettrace()
+        try:
+            with unittest.mock.patch.object(host_trials, 'run_trial', completed):
+                sys.settrace(interrupt_handoff)
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_one(driver, clock)
+        finally:
+            sys.settrace(previous_trace)
+        self.assertEqual(driver.torn_down, ['sid'])
+        self.assertEqual(driver.owned(), set())
+
+    def run_one(self, driver, clock, **kwargs):
+        return run_trial_with_cleanup(driver, prompt='hi', marker=MARKER, clock=clock.time,
+                                      monotonic=clock.monotonic, sleep=clock.sleep, **kwargs)
+
+    def test_a_completed_trial_is_swept_and_returned(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock)
+        run = self.run_one(driver, clock)
+        self.assertEqual(run.session_id, 'sid')
+        self.assertEqual(driver.owned(), set())
+        self.assertEqual(driver.order[-2:], ['teardown:sid', 'close_servers'])
+
+    def test_a_failure_in_any_stage_still_sweeps_every_owned_id(self):
+        cases = [
+            ('settle', dict(), lambda session_id: (_ for _ in ()).throw(RuntimeError('no busy state'))),
+            ('submit', dict(submit_error=RuntimeError('listing exited 1')), None),
+            ('observe', dict(observe_error=OSError('transcript vanished')), None),
+        ]
+        for label, kwargs, settle in cases:
+            with self.subTest(stage=label):
+                clock = FakeClock()
+                driver = FakeDriver(clock=clock, **kwargs)
+                with self.assertRaises((RuntimeError, OSError)):
+                    self.run_one(driver, clock, settle=settle)
+                self.assertEqual(driver.torn_down, ['sid'])
+                self.assertEqual(driver.owned(), set())
+
+    def test_a_keyboardinterrupt_in_settle_still_sweeps(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock)
+
+        def interrupting_settle(session_id):
+            raise KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_one(driver, clock, settle=interrupting_settle)
+        self.assertEqual(driver.torn_down, ['sid'])
+
+    def test_a_copy_minted_during_submit_is_swept_too(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock, submit_error=SubmissionRejected(0, 'started a copy'))
+        original_submit = driver.submit
+
+        def minting_submit(session_id, message):
+            driver.mint('copy')
+            return original_submit(session_id, message)
+
+        driver.submit = minting_submit
+        run = self.run_one(driver, clock)
+        self.assertIsNone(run.accepted_at)
+        self.assertEqual(sorted(driver.torn_down), ['copy', 'sid'])
+        self.assertEqual(driver.owned(), set())
+
+    def test_a_failed_sweep_after_a_completed_trial_raises_cleanupfailed_with_the_run(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock, teardown_errors={'sid': RuntimeError('rm exited 1')})
+        with self.assertRaises(CleanupFailed) as caught:
+            self.run_one(driver, clock)
+        self.assertEqual(caught.exception.run.session_id, 'sid')
+        self.assertEqual(caught.exception.owned, ['sid'])
+        self.assertEqual([label for label, _ in caught.exception.failures], ['sid'])
+
+    def test_a_failed_sweep_after_a_failed_trial_annotates_the_original_error(self):
+        clock = FakeClock()
+        driver = FakeDriver(clock=clock, submit_error=RuntimeError('listing exited 1'),
+                            teardown_errors={'sid': RuntimeError('rm exited 1')})
+        with self.assertRaises(RuntimeError) as caught:
+            self.run_one(driver, clock)
+        self.assertEqual(str(caught.exception), 'listing exited 1')
+        self.assertTrue(any("still owned: ['sid']" in note for note in caught.exception.__notes__))
 
 
 class ClassifyTrialTests(unittest.TestCase):
@@ -1811,9 +3328,6 @@ class MarkerTokenTests(unittest.TestCase):
         self.assertTrue(first.startswith('PARLEY-PROBE-'))
 
     def test_generated_tokens_satisfy_run_trials_own_validation(self):
-        # assertRegex is re.search semantics: `$` matches before a trailing newline, so it would
-        # not catch a generated token run_trial's own `.fullmatch()` check rejects (the same gap
-        # test_marker_is_validated_before_any_session_exists_or_is_sent documents).
         self.assertIsNotNone(MARKER_PATTERN.fullmatch(marker_token()))
 
 
