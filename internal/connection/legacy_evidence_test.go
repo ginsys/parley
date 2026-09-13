@@ -15,6 +15,11 @@ import (
 
 func legacyDispositionFixture(t *testing.T) (*Lifecycle, LegacyDispositionRequest) {
 	t.Helper()
+	return legacyDispositionIDFixture(t, "work")
+}
+
+func legacyDispositionIDFixture(t *testing.T, workID string) (*Lifecycle, LegacyDispositionRequest) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	seed, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -36,6 +41,9 @@ func legacyDispositionFixture(t *testing.T) (*Lifecycle, LegacyDispositionReques
 		if _, err := seed.Exec(statement); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := seed.Exec("UPDATE envelopes SET id=?", workID); err != nil {
+		t.Fatal(err)
 	}
 	if err := seed.Close(); err != nil {
 		t.Fatal(err)
@@ -59,7 +67,7 @@ func legacyDispositionFixture(t *testing.T) (*Lifecycle, LegacyDispositionReques
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := LegacyDispositionRequest{OperationID: registerID, WorkID: "work", ExpectedQuarantineVersion: 1, Action: "cancel", DispositionRef: targetID}
+	r := LegacyDispositionRequest{OperationID: registerID, WorkID: workID, ExpectedQuarantineVersion: 1, Action: "cancel", DispositionRef: targetID}
 	if err := db.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
 		return tx.QueryRowContext(ctx, "SELECT incident_id FROM migration_quarantine WHERE work_id=?", r.WorkID).Scan(&r.MigrationIncidentID)
 	}); err != nil {
@@ -144,6 +152,56 @@ func TestLegacyEvidenceFailureRetainsCorrectOutcome(t *testing.T) {
 					t.Error("successful retry did not cancel work")
 				}
 				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestLegacyDispositionPreservesMalformedIDBytes(t *testing.T) {
+	for _, action := range []string{"release", "cancel"} {
+		t.Run(action, func(t *testing.T) {
+			id := string([]byte{'w', 0xff})
+			l, request := legacyDispositionIDFixture(t, id)
+			request.Action = action
+			ctx := context.Background()
+			actor := store.CommandPrincipal{ID: adminID}
+			calls := 0
+			l.config.LegacyEvidence = func(_ context.Context, r LegacyDispositionRequest) error {
+				calls++
+				if r.WorkID != id {
+					t.Fatalf("evidence ID bytes changed: %x", r.WorkID)
+				}
+				return nil
+			}
+			result, err := l.LegacyDisposition(ctx, actor, request)
+			if err != nil || result.Result.Code != "" {
+				t.Fatalf("disposition=%+v err=%v", result, err)
+			}
+			replay, err := l.LegacyDisposition(ctx, actor, request)
+			if err != nil || !replay.Replayed || replay.AuditID != result.AuditID || calls != 1 {
+				t.Fatalf("replay=%+v err=%v calls=%d", replay, err, calls)
+			}
+			for _, other := range []string{string([]byte{'w', 0xfe}), "w\ufffd"} {
+				request.WorkID = other
+				if _, err := l.LegacyDisposition(ctx, actor, request); err != store.OperationConflict {
+					t.Fatalf("different ID %x replayed: %v", other, err)
+				}
+			}
+			if err := l.config.Store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+				var got, status string
+				if err := tx.QueryRowContext(ctx, "SELECT work_id,status FROM migration_quarantine").Scan(&got, &status); err != nil {
+					return err
+				}
+				want := "released"
+				if action == "cancel" {
+					want = "cancelled"
+				}
+				if got != id || status != want {
+					t.Errorf("retained ID=%x status=%s", got, status)
+				}
+				return nil
 			}); err != nil {
 				t.Fatal(err)
 			}
