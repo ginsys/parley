@@ -657,6 +657,16 @@ class PtyClientTests(unittest.TestCase):
         self.assertIn('BOOT\n> Ask me anything', client.screen())
         self.assertFalse(client.wait_for(r'never printed', quiet=0.1, timeout=0.5))
 
+    def test_a_select_failure_invalidates_the_pty_client(self):
+        with unittest.mock.patch.object(host_trials.select, 'select', side_effect=OSError('lost fd')):
+            client = self.spawn()
+            client.thread.join(timeout=2)
+        self.assertFalse(client.thread.is_alive())
+        self.assertTrue(client.eof)
+        self.assertFalse(client.wait_for(r'.*', quiet=0, timeout=0))
+        with self.assertRaises(ValueError):
+            client.send_keys(b'unsafe\r')
+
     def test_a_client_that_cannot_start_its_drain_thread_closes_the_child_it_launched(self):
         # The child is already running and the half-built client is about to be discarded, so
         # nothing would ever hold a handle to it.

@@ -463,7 +463,9 @@ attach to a busy or approval-parked session must still be able to type. Readines
 of a *live* client: a child that drew its composer and then exited returns `False` from
 `wait_for` even though the pattern matched, because it serves nothing — retaining such a client
 would let a nonempty client list stand in as proof that a queued Codex message has a serving
-process. A client is launched and held in one statement (`Driver.open_client()`), and `PtyClient`
+process. A failed drain-thread `select` also invalidates the client: readiness, reuse and writes
+all refuse it, while cleanup retains responsibility for the child. A client is launched and held
+in one statement (`Driver.open_client()`), and `PtyClient`
 closes the child itself if its own construction fails after the child started: the client object
 is the only handle to an authenticated host process, so a gap between creating it and holding it
 would leave that process serving a session the sweep was tearing down. The client is only ever

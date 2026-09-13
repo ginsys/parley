@@ -447,6 +447,7 @@ class PtyClient:
             try:
                 readable, _, _ = select.select([fd], [], [], 0.2)
             except (OSError, ValueError):
+                self.eof = True
                 break
             if not readable:
                 continue
