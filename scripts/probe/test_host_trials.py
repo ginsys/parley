@@ -11,12 +11,14 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
 import urllib.error
 from dataclasses import dataclass
 
+import host_trials
 from host_trials import (
     CLAUDE_READY_PATTERN,
     CODEX_READY_PATTERN,
@@ -614,6 +616,28 @@ class PtyClientTests(unittest.TestCase):
         # The pattern arrived after BOOT; the stripped screen holds both, ANSI removed.
         self.assertIn('BOOT\n> Ask me anything', client.screen())
         self.assertFalse(client.wait_for(r'never printed', quiet=0.1, timeout=0.5))
+
+    def test_a_client_that_cannot_start_its_drain_thread_closes_the_child_it_launched(self):
+        # The child is already running and the half-built client is about to be discarded, so
+        # nothing would ever hold a handle to it.
+        launched = []
+        real = host_trials.PtyProcess
+
+        def recording(*args, **kwargs):
+            launched.append(real(*args, **kwargs))
+            return launched[-1]
+
+        class Refusing(threading.Thread):
+            def start(self):
+                raise RuntimeError('cannot start thread')
+
+        with unittest.mock.patch.object(host_trials, 'PtyProcess', recording), \
+             unittest.mock.patch.object(host_trials.threading, 'Thread', Refusing):
+            with self.assertRaises(RuntimeError):
+                PtyClient([sys.executable, '-u', '-c', PTY_CHILD], cwd=self.tmp.name,
+                          env={'PATH': os.defpath, 'HOME': self.tmp.name})
+        self.assertEqual(len(launched), 1)
+        self.assertIsNotNone(launched[0].exit_code)  # reaped, not left running
 
     def test_type_line_delivers_a_long_line_in_chunks_and_ends_with_enter(self):
         client = self.spawn()

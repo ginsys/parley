@@ -407,8 +407,16 @@ class PtyClient:
         self.lock = threading.Lock()
         self.last_output = time.monotonic()
         self.process = PtyProcess(argv, cwd=cwd, env=env, generation=generation)
-        self.thread = threading.Thread(target=self._drain, daemon=True)
-        self.thread.start()
+        try:
+            self.thread = threading.Thread(target=self._drain, daemon=True)
+            self.thread.start()
+        except BaseException:
+            # The child is already running and this object is about to be discarded, so nothing
+            # would ever hold a handle to it: an authenticated host client would keep serving
+            # its session while the sweep tore the session down around it.
+            self.closing = True
+            self.process.close()
+            raise
 
     def _drain(self):
         fd = self.process.fd
@@ -558,6 +566,18 @@ class Driver:
     def owned(self):
         prefix = self._key('')
         return {key[len(prefix):] for key in self.registry.created if key.startswith(prefix)}
+
+    def open_client(self, argv):
+        """Launch a PTY client in the probe cwd and hold it, in one statement.
+
+        The returned object is the only handle to an authenticated host child, so it lands on
+        `clients` in the same statement that creates it: anything between the two -- a Ctrl-C, a
+        failure -- would leave that child serving a real-HOME session with nothing for the sweep
+        to close. `PtyClient` itself closes the process if its own construction fails after the
+        child started. Drivers that open clients supply `pty`.
+        """
+        self.clients.append(self.pty(argv, cwd=self.cwd))
+        return self.clients[-1]
 
     def close_clients(self):
         """Close every held client; one whose close fails stays on `clients` and is reported.
@@ -981,8 +1001,7 @@ class ClaudeDriver(Driver):
         """
         if entry.get('pid') is None:
             raise SubmissionUncaptured('attach to a stopped session is uncaptured; use mechanism=resume')
-        client = self.pty(['claude', 'attach', session_id], cwd=self.cwd)
-        self.clients.append(client)
+        client = self.open_client(['claude', 'attach', session_id])
         # quiet=3.0 is the capture's own readiness criterion (3 s of output silence).
         if not client.wait_for(CLAUDE_READY_PATTERN, quiet=3.0, timeout=30):
             raise SubmissionUncaptured(f'attach never showed the composer: {client.screen()!r}')
@@ -1271,8 +1290,7 @@ class CodexDriver(Driver):
         self.registry.require_owned(self._key(thread_id))
         argv = ['codex', '--no-alt-screen', '-s', sandbox, '-a', approval, '-C', self.cwd,
                 'resume', thread_id]
-        client = self.pty(argv, cwd=self.cwd)
-        self.clients.append(client)
+        client = self.open_client(argv)
         # quiet=3.0 is the capture's own readiness criterion (3 s of output silence).
         ready = client.wait_for(CODEX_READY_PATTERN, quiet=3.0, timeout=60)
         if ready and CODEX_TRUST_PATTERN.search(client.text_since(0)):
