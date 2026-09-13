@@ -117,6 +117,10 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 		if err != nil {
 			return outcome, err
 		}
+		if errors.Is(claimErr, ErrBudgetExhausted) {
+			outcome.ErrorCode = "budget_exhausted"
+			outcome.ErrorDetail = "Grant budget is exhausted; delivery awaits human renewal."
+		}
 		return outcome, claimErr
 	}
 	// The captured capability is immutable even if its live slot is replaced.

@@ -730,7 +730,8 @@ work rejects. A rollback detected in the writer immediately holds ordinary opera
 after the gate is released. The old direct acceptance/claim/ingestion paths refuse a recovery-owned
 store, while exact settlement remains available to retain an already attempted delivery's outcome.
 Authenticated dispatch reports incompatible historical identifiers with the explicit compatibility
-diagnostic, without rewriting the envelope, consuming budget or contacting a transport.
+diagnostic, without rewriting the envelope, consuming budget or contacting a transport. Exhausted
+grants similarly return the fixed budget-wait diagnostic with Attempted false and queued work intact.
 
 The Linux marker repository uses a pre-existing private directory and descriptor-relative,
 no-follow operations. Marker creation is non-replacing and syncs the file and parent directory.

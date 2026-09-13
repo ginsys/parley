@@ -271,3 +271,46 @@ func TestAuthenticatedCompatibilityDiagnosticPreservesHistory(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthenticatedBudgetExhaustionHasUnattemptedDiagnostic(t *testing.T) {
+	f := authenticatedSetup(t)
+	makeReady(t, f.manager, f.recipient)
+	id := f.send(t)
+	ctx := context.Background()
+	var budget int64
+	var before *store.Envelope
+	_, err := f.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		if err := tx.QueryRowContext(ctx, "SELECT max_exchanges FROM grants WHERE conversation='work'").Scan(&budget); err != nil {
+			return store.TransitionResult{}, err
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE grants SET exchanges_used=max_exchanges WHERE conversation='work'"); err != nil {
+			return store.TransitionResult{}, err
+		}
+		var err error
+		before, err = store.GetByID(ctx, tx, id)
+		return store.TransitionResult{Changed: true}, err
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport { t.Fatal("exhausted grant reached transport"); return nil }, func() time.Time { return time.Unix(110, 0) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		out, err := b.DispatchOutcome(ctx, id)
+		if err != ErrBudgetExhausted || out.State != store.Queued || out.Attempted || out.ErrorCode != "budget_exhausted" || out.ErrorDetail == "" {
+			t.Fatalf("budget wait=%+v %v", out, err)
+		}
+	}
+	f.assertBudget(t, budget)
+	if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		after, err := store.GetByID(ctx, tx, id)
+		if err == nil && !reflect.DeepEqual(before, after) {
+			t.Error("budget wait changed queued work")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
