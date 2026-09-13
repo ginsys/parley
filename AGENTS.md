@@ -304,3 +304,14 @@ restored binding and holds all outstanding work; it does not import surviving hi
 ACKs, grants, budgets or attempt outcomes. A bad clock floor can be lowered only by the separate
 reviewed restore/retirement disposition covering every outstanding clock incident. No human CLI,
 real host source, live listener or automatic restore detection is established by these APIs.
+
+## Controlled connection composition
+
+The [connection fixture handoff](docs/connection-fixtures.md) maps C01–C19 to controlled evidence and
+named deferrals. Runtime composition tests use only private synthetic storage, local Unix sessions
+and an injected test-binary child. They synchronize after child startup, retain uncertain settlement
+and budget, and verify the runtime keeps its writer lease until independent settlement drains.
+Recovery-held startup skips ordinary services. A test supervisor consumes the nonblocking clock
+persistence-failure signal outside the writer; real prevention of unattended restart remains an
+operator/deployment responsibility. These fixtures do not introduce a runnable bridge or satisfy
+#37's cross-host deployment validation, and do not waive the live-connection evidence gate.

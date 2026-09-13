@@ -682,3 +682,13 @@ records the floor change against the same audit. Ordinary reconciliation never l
 Recovery does not clear individual security holds, ingestion barriers or persisted expiry.
 Trusted writer authorization helpers enforce remembered exact-credential expiry denials even
 when their caller has not installed an expiry observation collector.
+
+
+The [controlled connection fixture handoff](connection-fixtures.md) maps the accepted C01–C19
+requirements to synthetic tests and named deferrals. Composition tests install recovery through the
+runtime inspector before constructing a connection manager, then exercise private-session dispatch
+and retained ingestion across independent conversations. Cancellation after a controlled child has
+started remains uncertain and consumes its original budget; runtime shutdown retains the writer
+lease until independent settlement drains. Marked restore startup skips ordinary services, and
+external clock-persistence failure signals a synthetic supervisor outside the writer callback.
+These are integration fixtures, not a production supervisor or runnable bridge.
