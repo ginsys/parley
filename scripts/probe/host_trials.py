@@ -2165,19 +2165,17 @@ class OpenCodeDriver(Driver):
                                            f'out: {partial_error}') from error
             raise
         attached_id, event_error = self._attach_events(result.stdout, session_id)
+        if event_error is not None:
+            # Provider/credential/model errors do not establish whether submission reached
+            # the session. Neither exit zero nor a nonzero status resolves that ambiguity.
+            raise SubmissionUncaptured(f'run --attach exited {result.returncode} but reported an '
+                                       f'error event: {event_error}; stderr: {result.stderr}')
         if result.returncode != 0:
             if self.server.process.poll() is not None:
                 # A dead server is this runner's failure, not the host refusing the message.
                 raise SubmissionUncaptured(f'run --attach exited {result.returncode} against a serve child '
                                            f'that had exited {self.server.process.returncode}: {result.stderr}')
-            raise SubmissionRejected(result.returncode, f'{result.stderr} / error event: {event_error}'
-                                     if event_error is not None else result.stderr)
-        if event_error is not None:
-            # Captured on `create()`: a provider/credential/model failure is reported as a
-            # structured `error` event while the command still exits 0. Reading the exit status
-            # alone would record that as accepted and later attribute the absent transcript
-            # outcomes to the host. Whether the message reached the session at all is uncaptured.
-            raise SubmissionUncaptured(f'run --attach exited 0 but reported an error event: {event_error}')
+            raise SubmissionRejected(result.returncode, result.stderr)
         if attached_id != session_id:
             raise SubmissionUncaptured(
                 f'run --attach exited 0 but its events named {attached_id!r}, not {session_id}; '

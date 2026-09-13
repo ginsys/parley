@@ -444,7 +444,8 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   and each signal. Submission is
   `opencode run --pure --format json --attach http://127.0.0.1:<p> --session <id> -m <model>
   '<msg>'`, judged on both the exit status and the event stream. A structured `error` event is
-  `SubmissionUncaptured` even on exit 0 — that exit-zero-with-an-error shape is the one `create()`
+  `SubmissionUncaptured` on both zero and nonzero exits — only a nonzero exit without an error
+  event and with a live serve child is a rejection. The exit-zero-with-an-error shape is the one `create()`
   already handles (captured: a stale credential), so trusting the exit status alone would record
   a provider, credential or model failure as accepted and later blame the host for the transcript
   outcomes that never arrive; on a nonzero exit the event's text joins the stderr in the

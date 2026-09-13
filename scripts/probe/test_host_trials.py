@@ -2511,7 +2511,7 @@ class OpenCodeDriverTests(DriverTestCase):
                 with self.assertRaises(ForeignSessionError):
                     driver.teardown('ses_human')
 
-    def test_a_nonzero_attach_reports_its_error_event_alongside_stderr(self):
+    def test_a_nonzero_attach_error_event_is_uncaptured_with_its_diagnostics(self):
         error_event = json.dumps({'type': 'error', 'error': {'name': 'UnknownModel'}})
         run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
                        (['opencode', 'run', '--pure', '--format', 'json', '--attach'],
@@ -2519,7 +2519,7 @@ class OpenCodeDriverTests(DriverTestCase):
         driver = self.driver(run, port=4096)
         driver.create('hello')
         driver.serve()
-        with self.assertRaises(SubmissionRejected) as caught:
+        with self.assertRaises(SubmissionUncaptured) as caught:
             driver.submit('ses_1', 'msg')
         self.assertIn('UnknownModel', str(caught.exception))
         self.assertIn('exited 1', str(caught.exception))
