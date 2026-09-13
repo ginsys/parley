@@ -67,7 +67,7 @@ from host_trials import (
 from wake_probe import Trial, aggregate
 
 MARKER = 'PARLEY-PROBE-deadbeefdeadbeefdeadbeefdeadbeef'
-SESSION_UUID = '4f2b7a9c-1111-4222-8333-444455556666'
+SESSION_UUID = '69aa52ed-1111-4222-8333-444455556666'
 THREAD_ID = '01a09a24-ff1d-7360-9385-722d230ef92b'
 
 
@@ -857,10 +857,30 @@ def listing(entries):
 
 def claude_entry(short='69aa52ed', *, pid=4242, status='idle', state='done', cwd='/x'):
     return {'pid': pid, 'id': short, 'cwd': cwd, 'kind': 'background', 'startedAt': 1757754000000,
-            'sessionId': SESSION_UUID, 'name': None, 'status': status, 'state': state}
+            'sessionId': short + SESSION_UUID[8:], 'name': None, 'status': status, 'state': state}
 
 
 class ClaudeDriverTests(DriverTestCase):
+    def test_listing_cannot_bind_a_short_id_to_an_unrelated_uuid(self):
+        entry = claude_entry()
+        entry['sessionId'] = 'deadbeef' + SESSION_UUID[8:]
+        driver = self.driver(FakeRun([(['claude', 'agents'], listing([entry]))]))
+        driver._mint('69aa52ed')
+        with self.assertRaisesRegex(RuntimeError, 'malformed'):
+            driver.status('69aa52ed')
+        self.assertIsNone(driver.sessions['69aa52ed'])
+
+    def test_listing_cannot_change_an_already_bound_full_uuid(self):
+        entry = claude_entry()
+        run = FakeRun([(['claude', 'agents'], lambda argv: listing([entry]))])
+        driver = self.driver(run)
+        driver._mint('69aa52ed')
+        driver.status('69aa52ed')
+        entry['sessionId'] = '69aa52ed-aaaa-4222-8333-444455556666'
+        with self.assertRaisesRegex(RuntimeError, 'changed'):
+            driver.status('69aa52ed')
+        self.assertEqual(driver.sessions['69aa52ed'], SESSION_UUID)
+
     def test_interrupted_claude_creation_reports_candidates_without_adopting_them(self):
         candidates = [claude_entry(), claude_entry('deadbeef')]
         run = FakeRun([(['claude', '--bg'], KeyboardInterrupt()),

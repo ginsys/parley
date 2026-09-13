@@ -290,7 +290,10 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   returns the owned entry from that listing (`pid`, `status`, `state`, `sessionId`) for settle
   callbacks. Every listing row must be a background-session object with nonempty string
   identity/state fields and an explicit `pid` that is null or a positive integer. Short IDs must
-  have the captured eight-hex-digit shape and full IDs the lowercase hyphenated UUID shape. Malformed rows,
+  have the captured eight-hex-digit shape and full IDs the lowercase hyphenated UUID shape.
+  The short ID must equal the full UUID's first eight digits, as captured; once bound, the full
+  UUID cannot change under the same owned short ID. Neither malformed nor changed bindings
+  may redirect transcript reads. Malformed rows,
   duplicate IDs and missing PIDs fail the listing; they never prove that a session is absent or
   stopped and cannot authorize `rm` after a failed `stop`. A transcript candidate disappearing
   between discovery and stat makes that read unobservable; later polls retry discovery and a

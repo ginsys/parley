@@ -983,6 +983,7 @@ class ClaudeDriver(Driver):
                         for key in ('id', 'kind', 'sessionId', 'state')) or
                     re.fullmatch(r'[0-9a-f]{8}', entry['id']) is None or
                     not is_session_uuid(entry['sessionId']) or
+                    entry['sessionId'][:8] != entry['id'] or
                     entry['kind'] != 'background' or entry['id'] in seen or
                     (entry['pid'] is not None and
                      (type(entry['pid']) is not int or entry['pid'] <= 0))):
@@ -1001,8 +1002,10 @@ class ClaudeDriver(Driver):
         self.require_owned(session_id)
         for entry in self._listing():
             if entry.get('id') == session_id and entry.get('kind') == 'background':
-                if isinstance(entry.get('sessionId'), str):
-                    self.sessions[session_id] = entry['sessionId']
+                previous = self.sessions.get(session_id)
+                if previous is not None and previous != entry['sessionId']:
+                    raise RuntimeError('claude listing changed the full UUID for an owned short ID')
+                self.sessions[session_id] = entry['sessionId']
                 return entry
         return None
 
