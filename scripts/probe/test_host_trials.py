@@ -1167,11 +1167,18 @@ class CodexDriverTests(unittest.TestCase):
         self.assertIsNone(driver.version('thread-1'))
 
     def test_version_is_none_when_the_rollout_cannot_be_read(self):
-        path = self.rollout(lines=['not json\n'])
-        os.chmod(path, 0)
-        self.addCleanup(os.chmod, path, 0o644)
+        # The rollout carries a real version, so a read that went through would return it and
+        # only a failed open yields None here. The failure is simulated rather than produced
+        # with chmod(0): as root (CI containers) mode bits are ignored, and the earlier variant
+        # of this test wrote unparseable lines, which return None whether or not the read was
+        # blocked -- it could not fail.
+        path = self.rollout({'timestamp': '2026-09-11T12:00:30.000Z', 'type': 'session_meta',
+                             'payload': {'cli_version': '0.154.0'}})
         driver = self.driver(SessionRegistry(), path)
-        self.assertIsNone(driver.version('thread-1'))
+        self.assertEqual(driver.version('thread-1'), '0.154.0')  # readable: the control
+        with patch('host_trials.open', create=True,
+                   side_effect=OSError('permission denied (simulated)')):
+            self.assertIsNone(driver.version('thread-1'))
 
 
 class CrossDriverNamespaceTests(unittest.TestCase):
