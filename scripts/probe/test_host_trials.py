@@ -1497,6 +1497,35 @@ class OpenCodeDriverTests(DriverTestCase):
         with self.assertRaises(SubmissionRejected):
             driver.submit('ses_1', 'msg')
 
+    def test_an_error_event_on_an_exit_zero_attach_is_uncaptured_never_accepted(self):
+        # Captured on `create()`: a provider/credential/model failure is a structured `error`
+        # event while the command still exits 0. Reading the exit status alone would record the
+        # trial as accepted and blame the host for the transcript outcomes that never arrive.
+        error_event = json.dumps({'type': 'error', 'sessionID': 'ses_1',
+                                  'error': {'name': 'ProviderAuthError'}})
+        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'],
+                        FakeResult(0, error_event))])
+        driver = self.driver(run, port=4096)
+        driver.create('hello')
+        driver.serve()
+        with self.assertRaises(SubmissionUncaptured) as caught:
+            driver.submit('ses_1', 'msg')
+        self.assertIn('ProviderAuthError', str(caught.exception))
+
+    def test_a_nonzero_attach_reports_its_error_event_alongside_stderr(self):
+        error_event = json.dumps({'type': 'error', 'error': {'name': 'UnknownModel'}})
+        run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                       (['opencode', 'run', '--pure', '--format', 'json', '--attach'],
+                        FakeResult(1, error_event, 'exited 1'))])
+        driver = self.driver(run, port=4096)
+        driver.create('hello')
+        driver.serve()
+        with self.assertRaises(SubmissionRejected) as caught:
+            driver.submit('ses_1', 'msg')
+        self.assertIn('UnknownModel', str(caught.exception))
+        self.assertIn('exited 1', str(caught.exception))
+
     def test_observe_and_version_read_the_export_and_fail_closed(self):
         export = opencode_export([
             opencode_message('user', [{'type': 'text', 'text': MARKER}], 1_757_754_001_000),

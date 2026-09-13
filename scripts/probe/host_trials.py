@@ -1538,6 +1538,12 @@ class OpenCodeDriver(Driver):
         return failures
 
     def submit(self, session_id, message):
+        """`opencode run --pure --format json --attach <url> --session <id>`; exit 0 is acceptance.
+
+        Both the exit status and the event stream decide: a structured `error` event is
+        `SubmissionUncaptured` whatever the exit status said, and a nonzero exit against a serve
+        child that has died is this runner's failure rather than a host rejection.
+        """
         self.registry.require_owned(self._key(session_id))
         self.submission_note = None
         if self.server is None:
@@ -1549,12 +1555,20 @@ class OpenCodeDriver(Driver):
                 '--session', session_id, '-m', self.model, message]
         result = self.run(argv, capture_output=True, text=True, timeout=60, cwd=self.cwd,
                           stdin=subprocess.DEVNULL)
+        _, event_error = opencode_session_id(result.stdout)
         if result.returncode != 0:
             if self.server.process.poll() is not None:
                 # A dead server is this runner's failure, not the host refusing the message.
                 raise SubmissionUncaptured(f'run --attach exited {result.returncode} against a serve child '
                                            f'that had exited {self.server.process.returncode}: {result.stderr}')
-            raise SubmissionRejected(result.returncode, result.stderr)
+            raise SubmissionRejected(result.returncode, f'{result.stderr} / error event: {event_error}'
+                                     if event_error is not None else result.stderr)
+        if event_error is not None:
+            # Captured on `create()`: a provider/credential/model failure is reported as a
+            # structured `error` event while the command still exits 0. Reading the exit status
+            # alone would record that as accepted and later attribute the absent transcript
+            # outcomes to the host. Whether the message reached the session at all is uncaptured.
+            raise SubmissionUncaptured(f'run --attach exited 0 but reported an error event: {event_error}')
         return True
 
     def _export(self, session_id):

@@ -304,7 +304,12 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   the captured unsecured loopback listener for the trial's duration. Any failure or Ctrl-C during
   that wait closes the child before re-raising. Submission is
   `opencode run --pure --format json --attach http://127.0.0.1:<p> --session <id> -m <model>
-  '<msg>'`, exit status as acceptance; if the `serve` child has exited, before the call or by the
+  '<msg>'`, judged on both the exit status and the event stream. A structured `error` event is
+  `SubmissionUncaptured` even on exit 0 — that exit-zero-with-an-error shape is the one `create()`
+  already handles (captured: a stale credential), so trusting the exit status alone would record
+  a provider, credential or model failure as accepted and later blame the host for the transcript
+  outcomes that never arrive; on a nonzero exit the event's text joins the stderr in the
+  rejection's diagnostic. If the `serve` child has exited, before the call or by the
   time a nonzero exit comes back, it is `SubmissionUncaptured` instead, since a dead server says
   nothing about the host. `observe()` and `version()` read
   `opencode --pure export <id>`: `messages[].info.role`/`info.time.created` (ms epoch, used for
