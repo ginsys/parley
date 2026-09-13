@@ -1540,9 +1540,25 @@ class OpenCodeDriverTests(DriverTestCase):
         self.assertEqual(killed, [(4321, 15)])
         self.assertIsNone(driver.server)
 
+    def test_serve_holds_the_child_before_it_waits_for_readiness(self):
+        # Ownership is taken with the spawn, not after the wait: anything running while `serve()`
+        # is still probing -- a sweep, a second exit path -- has to find the child, not None.
+        seen = []
+
+        def http_get(url):
+            if self.servers:
+                seen.append(driver.server)
+                return 200
+            raise urllib.error.URLError('refused')
+
+        driver = self.driver(FakeRun([]), popen=self.silent_popen, http_get=http_get, port=4096)
+        server = driver.serve()
+        self.assertEqual(seen, [server])
+        self.assertIs(server.process, self.servers[0])
+
     def test_serve_closes_the_child_when_the_readiness_wait_is_interrupted(self):
-        # A Ctrl-C (or any failing probe) between popen and `self.server = server` used to leave
-        # the child running with no handle to it: `close_servers()` had nothing to close.
+        # A Ctrl-C (or any failing probe) after the spawn used to leave the child running with no
+        # handle to it: `close_servers()` had nothing to close.
         for error in (KeyboardInterrupt(), TimeoutError('probe hung')):
             with self.subTest(error=type(error).__name__):
                 self.servers = []

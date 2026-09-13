@@ -1583,7 +1583,14 @@ class OpenCodeDriver(Driver):
         Readiness is "GET /session answers while the child is still alive"; a port that already
         answered before the child started is refused, since the global session store means a
         stranger's server would look identical. The child gets its own session so `close()` can
-        signal the whole group.
+        signal the whole group -- which also means a terminal Ctrl-C never reaches it, and this
+        handle is the only thing that can stop it.
+
+        Ownership is therefore taken in the same statement as the spawn, inside the handler that
+        closes it: from that point every exit from the readiness wait -- timeout, an early child
+        exit, a Ctrl-C, a failing probe -- closes and disowns the child. `self.server` is set
+        before the wait rather than after, so a `close_servers()` racing the wait finds the
+        child instead of leaving it running.
         """
         if self.server is not None:
             if self.server.process.poll() is not None:
@@ -1598,18 +1605,16 @@ class OpenCodeDriver(Driver):
             pass
         else:
             raise RuntimeError(f'{url} already answers; refusing to adopt a server this run did not start')
-        process = self.popen(['opencode', 'serve', '--pure', '--port', str(port)], cwd=self.cwd,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
-        server = Server(process, url)
         deadline = time.monotonic() + timeout
-        # Until the server is held on `self.server` nothing else can close it, so every exit
-        # from the readiness wait -- timeout, an early child exit, a Ctrl-C, a failing probe --
-        # closes it here.
         try:
+            self.server = Server(self.popen(['opencode', 'serve', '--pure', '--port', str(port)],
+                                            cwd=self.cwd, stdin=subprocess.DEVNULL,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                            start_new_session=True), url)
             while True:
-                if process.poll() is not None:
-                    raise RuntimeError(f'opencode serve exited {process.returncode} before answering')
+                if self.server.process.poll() is not None:
+                    raise RuntimeError(f'opencode serve exited {self.server.process.returncode} '
+                                       'before answering')
                 try:
                     self.http_get(f'{url}/session')
                     break
@@ -1618,10 +1623,11 @@ class OpenCodeDriver(Driver):
                         raise RuntimeError(f'opencode serve did not answer on {url} within {timeout}s') from None
                     self.sleep(0.25)
         except BaseException:
-            server.close()
+            server, self.server = self.server, None
+            if server is not None:
+                server.close()
             raise
-        self.server = server
-        return server
+        return self.server
 
     def close_servers(self):
         failures = []

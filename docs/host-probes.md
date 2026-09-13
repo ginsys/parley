@@ -213,7 +213,11 @@ same registry sees the same ids but not the first one's held clients, servers or
 session the host created in that instant is findable only by a human (`claude agents --json
 --all --cwd <probe cwd>`; the newest rollout under `$CODEX_HOME/sessions` naming the probe cwd;
 the newest `parley-probe-*` row of the global `opencode --pure session list`, removed with
-`opencode --pure session delete <id>`).
+`opencode --pure session delete <id>`). The `opencode serve` child has the same shape and one
+extra instant: it is spawned and handed to its owner in a single statement inside the handler
+that closes it, but an interrupt delivered between the child starting and that handle being
+recorded leaves a loopback server nothing in-process can name. It runs in its own process group,
+so a terminal Ctrl-C does not reach it either; `ss -lptn` on the probe run's port finds it.
 
 ### Drivers
 
