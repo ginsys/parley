@@ -21,7 +21,7 @@ func (m *Manager) sessionTransition(ctx context.Context, s *Session,
 	var expired bool
 	var publicationCode store.Code
 	code, err := m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, view store.CommitView) (store.TransitionResult, error) {
-		if s == nil || !m.owned(s.socket) || m.slots[s.token.BindingID] != s || s.token.Epoch != view.Epoch || m.expired(s.socket, m.now()) {
+		if s == nil || !m.owned(s.socket) || m.slots[s.token.BindingID] != s || s.token.Epoch != view.Epoch {
 			return store.TransitionResult{Code: store.AuthenticationFailed}, nil
 		}
 		b, err := store.ReadBinding(ctx, tx, s.token.BindingID)
@@ -42,6 +42,9 @@ func (m *Manager) sessionTransition(ctx context.Context, s *Session,
 		}
 		if expired {
 			return store.TransitionResult{Changed: true, Code: store.AuthenticationFailed}, nil
+		}
+		if m.expired(s.socket, m.now()) {
+			return store.TransitionResult{Code: store.AuthenticationFailed}, nil
 		}
 		if err := m.guard(ctx, tx, b.ID); err != nil {
 			return store.TransitionResult{}, err
@@ -148,6 +151,15 @@ func (m *Manager) BeginReadiness(ctx context.Context, s *Session) (Probe, error)
 	verifyErr := m.verify(verifyCtx, probe.Native, probe.Token)
 	if s.socket.Context().Err() != nil {
 		return Probe{}, store.AuthenticationFailed
+	}
+	if verifyCtx.Err() != nil || verifyErr != nil {
+		// A failed verifier grants no readiness, but elapsed credential expiry
+		// still needs observation/persistence, even if the caller cancelled.
+		if err := m.sessionTransition(context.WithoutCancel(ctx), s, func(context.Context, *sql.Tx) (store.TransitionResult, error) {
+			return store.TransitionResult{Changed: true}, nil
+		}, nil); err != nil {
+			return Probe{}, err
+		}
 	}
 	if verifyCtx.Err() != nil {
 		return Probe{}, store.TemporarilyUnavailable

@@ -251,7 +251,9 @@ The internal Linux Manager is exclusive per writer and consumes the shared coord
 capabilities are created only by authenticated attachment; Token fields supplied by a caller confer
 no authority. Capacity/deadline accounting starts before coordinator admission. Inspection remains
 restricted and nonattached; credential failure closes the socket before another credential attempt
-can proceed. Kernel UID, exact native tuple, credential lifecycle and durable generation are all
+can proceed. A fresh socket's serialized authentication attempt also closes on transient guard/store
+failure; transient rechecks of authenticated sockets preserve the existing attachment. Kernel UID,
+exact native tuple, credential lifecycle and durable generation are all
 required. Same-account stolen credentials remain within the accepted cooperative-policy limit.
 
 Use connection Transition for connection-specific state and Execute for durable administrative
@@ -268,7 +270,9 @@ before a fallible expiry write, and persist it independently of caller cancellat
 must retain that denial through clock rollback; a rotated successor has a different identity.
 
 Host verification is a mandatory trusted capability and runs with the exact native tuple/token,
-outside the gate and cancelled by socket lifetime. Readiness requires a fresh nonce per explicit
+outside the gate and cancelled by socket lifetime. Failed verification must still revalidate the
+session and persist observed credential expiry using a bounded context independent of caller
+cancellation; expiry takes precedence over the verifier outcome. Readiness requires a fresh nonce per explicit
 thirty-second attempt. Heartbeats only extend liveness; adapters send every ten seconds, close after
 thirty seconds without one. Stale timers, ACKs, disconnects and retained command results cannot
 alter a successor slot. Internal callbacks and synthetic Unix socket tests do not establish a

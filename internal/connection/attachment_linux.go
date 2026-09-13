@@ -288,9 +288,9 @@ func (m *Manager) Invalidate(binding string) {
 		}
 	}
 }
-func (m *Manager) active(binding string) bool {
+func (m *Manager) active(binding string, now time.Time) bool {
 	v := m.slots[binding]
-	return v != nil && v.socket.ctx.Err() == nil && !m.expired(v.socket, m.now())
+	return v != nil && v.socket.ctx.Err() == nil && !m.expired(v.socket, now)
 }
 func (m *Manager) owned(s *Socket) bool {
 	if s == nil || s.manager != m || s.ctx.Err() != nil {
@@ -407,7 +407,7 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 			rejected = true
 			return store.TransitionResult{Changed: true, Code: store.AuthenticationFailed}, nil
 		}
-		snapshot = Snapshot{view.Epoch, b.Generation, m.active(b.ID)}
+		snapshot = Snapshot{view.Epoch, b.Generation, m.active(b.ID, m.now())}
 		return store.TransitionResult{Changed: s.credentialID == "" || m.hasDueSockets()}, nil
 	}, func(store.CommitView) {
 		now := m.now()
@@ -420,6 +420,7 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 			m.remove(s)
 		} else {
 			m.prune(now)
+			snapshot.Active = m.active(b.ID, now)
 			if !m.owned(s) {
 				rejected = true
 				return
@@ -443,6 +444,12 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 		err = code
 	}
 	if err != nil {
+		if !s.authenticated.Load() {
+			rejected = true
+			if err == store.TemporarilyUnavailable {
+				err = store.AuthenticationFailed
+			}
+		}
 		if (expired || rejected || err == store.AuthenticationFailed) && s != nil && s.manager == m {
 			s.Close()
 		}
@@ -494,7 +501,7 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 			result = s.session
 			return store.TransitionResult{}, nil
 		}
-		if m.active(b.ID) {
+		if m.active(b.ID, m.now()) {
 			return store.TransitionResult{Changed: s.credentialID == "", Code: store.AlreadyConnected}, nil
 		}
 		if expected < 0 || b.Generation != expected {
@@ -549,6 +556,12 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 		err = code
 	}
 	if err != nil {
+		if !s.authenticated.Load() {
+			rejected = true
+			if err == store.TemporarilyUnavailable {
+				err = store.AuthenticationFailed
+			}
+		}
 		if (expired || rejected || err == store.AuthenticationFailed) && s != nil && s.manager == m {
 			s.Close()
 		}

@@ -128,7 +128,9 @@ an account; possession of a stolen credential within that account remains an acc
 
 A positive nonattached-socket bound and five-second authentication deadline include coordinator
 wait time. Each socket serializes credential operations through rejection cleanup. Failed initial
-authentication cancels that socket with authentication_failed. Successful inspection retains only
+authentication, including a transient guard/store failure after entering the serialized attempt,
+cancels that socket with authentication_failed; retry requires a new socket. Transient failures
+while rechecking an already-authenticated socket preserve its attachment. Successful inspection retains only
 a restricted identity and returns epoch, committed generation and active status; it reserves no
 attachment or readiness. Inspected sockets remain within the nonattached bound. Every lookup and
 attachment rechecks credential hash, native tuple, kernel UID, lifecycle and server-time expiry.
@@ -138,6 +140,8 @@ Publication uses one validated instant for credential checks, socket pruning and
 housekeeping cannot substitute a later, unchecked time when installing the attachment. Admission
 also rechecks its deadline and socket cancellation after commit, and cancellation during timer
 installation releases the registry entry and capacity instead of returning a dead socket.
+An inspection that publishes pruning recomputes its active flag from the remaining slot at the
+same validated instant, so the returned snapshot cannot still name a pruned winner as active.
 An exact-credential denial remains in the store coordinator if persistence fails, so an earlier
 clock cannot revive that identity. Persistence compares the immutable identity/deadline and cannot
 expire a rotated successor. This shared denial primitive is introduced with attachment and is also
@@ -158,6 +162,9 @@ Host verification runs outside the coordinator and is cancelled with the socket 
 explicit readiness attempt starts unready with a fresh random nonce and a thirty-second deadline.
 Only explicit `host_unverified` errors mean mismatched/unsupported evidence; other verifier errors
 return a sanitized `temporarily_unavailable`. Socket cancellation returns `authentication_failed`.
+Failed verification still revalidates the session with a bounded context independent of caller
+cancellation. Observed credential expiry takes precedence and is persisted even when socket
+liveness also elapsed; a verifier failure cannot leave that credential current for clock rollback.
 The trusted adapter ACK must match the verified native tuple, exact token and current nonce.
 Verifier completion and ACK publication recheck the attempt deadline after commit. Heartbeats
 recheck socket and credential deadlines there too, using the validated instant for deadline renewal;

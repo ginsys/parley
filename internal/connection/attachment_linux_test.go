@@ -340,7 +340,10 @@ func TestAttachmentGenerationOverflowDoesNotMutate(t *testing.T) {
 	if _, err := m.Attach(ctx, socket, auth, 9223372036854775807); err != store.InvalidRequest {
 		t.Fatalf("overflow=%v", err)
 	}
-	snapshot, err := m.Inspect(ctx, socket, auth)
+	if socket.Context().Err() == nil {
+		t.Fatal("failed first attempt retained socket")
+	}
+	snapshot, err := m.Inspect(ctx, acceptSocket(t, m), auth)
 	if err != nil || snapshot.Active || snapshot.Generation != 9223372036854775807 {
 		t.Fatalf("overflow mutated slot=%+v %v", snapshot, err)
 	}
