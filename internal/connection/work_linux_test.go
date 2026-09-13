@@ -384,6 +384,22 @@ func TestFailedExpiryPersistenceKeepsOnlyExactCredentialDenied(t *testing.T) {
 	if !m.store.CredentialExpiryObserved(other.socket.credentialID) {
 		t.Fatal("lost failed expiry observation")
 	}
+	// Trusted writer helpers must enforce the denial even without a caller's
+	// optional observation collector; no durable expiry update succeeded above.
+	if _, err := m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		if err := m.AuthorizeWork(ctx, tx, other, true); err != store.BindingUnavailable {
+			t.Errorf("direct authorization revived denied credential: %v", err)
+		}
+		if _, err := m.RecipientForClaim(ctx, tx, other.PeerID()); err != store.BindingUnavailable {
+			t.Errorf("direct claim revived denied credential: %v", err)
+		}
+		if err := m.AuthorizeWork(ctx, tx, author, true); err != nil {
+			t.Errorf("direct authorization blocked unrelated author: %v", err)
+		}
+		return store.TransitionResult{}, nil
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
 	_, err = m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
 		_, err := tx.ExecContext(ctx, "DROP TRIGGER fail_expiry")
 		return store.TransitionResult{Changed: true}, err
