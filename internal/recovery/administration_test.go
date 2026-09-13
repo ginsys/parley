@@ -146,10 +146,13 @@ func TestClockReconciliationStaleVersionRetainsExactIncident(t *testing.T) {
 	}
 	if err := s.maintenance.Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		record, err := store.ReadRecovery(ctx, tx, request.IncidentID)
+		if err != nil {
+			return err
+		}
 		if record.Status != "held" || record.Version != 1 {
 			t.Errorf("stale mutated record=%+v", record)
 		}
-		return err
+		return nil
 	}); err != nil {
 		t.Fatal(err)
 	}
