@@ -1768,7 +1768,7 @@ OPENCODE_FREE_MODEL = 'opencode/ling-3.0-flash-fin-free'  # captured: cost 0, no
 
 
 def opencode_session_ids(stdout):
-    """Every distinct session ID, the first error event, and malformed-line count."""
+    """Top-level IDs plus conflicting part IDs, the first error, and malformed-line count."""
     session_ids = {}
     error = None
     unusable = 0
@@ -1784,10 +1784,23 @@ def opencode_session_ids(stdout):
         if not isinstance(event, dict):
             unusable += 1
             continue
-        if isinstance(event.get('sessionID'), str) and event['sessionID']:
-            session_ids[event['sessionID']] = None
+        session_id = event.get('sessionID')
+        valid_id = isinstance(session_id, str) and bool(session_id)
+        if valid_id:
+            session_ids[session_id] = None
         else:
             unusable += 1
+        if 'part' in event:
+            part = event['part']
+            part_id = part.get('sessionID') if isinstance(part, dict) else None
+            if not isinstance(part_id, str) or not part_id:
+                unusable += 1
+            elif part_id != session_id:
+                unusable += 1
+                if valid_id:
+                    # Conflicting captured identities are ambiguous, never a unique creation.
+                    # A nested ID alone cannot substitute for missing top-level creation proof.
+                    session_ids[part_id] = None
         if error is None and event.get('type') == 'error':
             error = json.dumps(event.get('error'))
     return session_ids, error, unusable

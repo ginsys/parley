@@ -571,6 +571,15 @@ def opencode_message(role, parts, created_ms, **info):
 
 
 class OpenCodeParsingTests(unittest.TestCase):
+    def test_present_event_parts_require_a_usable_matching_session_identity(self):
+        for part in (None, [], {}, {'sessionID': None}, {'sessionID': ''}, {'sessionID': 7}):
+            with self.subTest(part=part):
+                ids, error, unusable = opencode_session_ids(json.dumps(
+                    {'type': 'step_start', 'sessionID': 'ses_1', 'part': part}))
+                self.assertEqual(set(ids), {'ses_1'})
+                self.assertIsNone(error)
+                self.assertEqual(unusable, 1)
+
     def test_ack_uses_completion_time_without_backdating_it_to_message_creation(self):
         raw = opencode_export([opencode_message('assistant', [{'type': 'text', 'text': MARKER}], 1001000,
                                                time={'created': 1001000, 'completed': 1121000})])
@@ -2428,10 +2437,47 @@ class OpenCodeDriverTests(DriverTestCase):
         return 200
 
     def run_output(self, session_id='ses_1', error=None):
-        events = [{'type': 'step_start', 'timestamp': 1, 'sessionID': session_id}]
+        events = [{'type': 'step_start', 'timestamp': 1, 'sessionID': session_id,
+                   'part': {'type': 'step-start', 'id': 'part-1', 'messageID': 'message-1',
+                            'sessionID': session_id}}]
         if error:
             events.append({'type': 'error', 'sessionID': session_id, 'error': error})
         return FakeResult(0, '\n'.join(json.dumps(e) for e in events) + '\n')
+
+    def test_conflicting_nested_creation_id_grants_no_ownership(self):
+        event = json.loads(self.run_output().stdout)
+        event['part']['sessionID'] = 'ses_foreign'
+        output = json.dumps(event)
+        for result in (FakeResult(0, output), FakeResult(1, output),
+                       subprocess.TimeoutExpired(['opencode'], 180, output=output)):
+            with self.subTest(result=type(result).__name__):
+                self.registry = SessionRegistry()
+                driver = self.driver(FakeRun([(['opencode', 'run'], result)]))
+                with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+                    driver.create('hello')
+                self.assertEqual(driver.owned(), set())
+                self.assertEqual(driver.strays, {'ses_1', 'ses_foreign'})
+
+    def test_conflicting_nested_attach_id_is_never_adopted(self):
+        event = json.loads(self.run_output().stdout)
+        event['part']['sessionID'] = 'ses_foreign'
+        output = json.dumps(event)
+        for result in (FakeResult(0, output), FakeResult(1, output),
+                       subprocess.TimeoutExpired(['opencode'], 60, output=output)):
+            with self.subTest(result=type(result).__name__):
+                self.registry = SessionRegistry()
+                self.answering = False
+                run = FakeRun([(['opencode', 'run', '--pure', '--format', 'json', '--dir'], self.run_output()),
+                               (['opencode', 'run', '--pure', '--format', 'json', '--attach'], result)])
+                driver = self.driver(run, port=4096)
+                driver.create('hello')
+                driver.serve()
+                with self.assertRaisesRegex(SubmissionUncaptured, 'unexpected'):
+                    driver.submit('ses_1', 'msg')
+                self.assertEqual(driver.owned(), {'ses_1'})
+                self.assertEqual(driver.strays, {'ses_foreign'})
+                with self.assertRaises(ForeignSessionError):
+                    driver.teardown('ses_foreign')
 
     def test_uncaptured_opencode_models_are_rejected_before_host_calls(self):
         for model in (None, '', 'synthetic-provider/uncaptured-model'):
