@@ -66,7 +66,7 @@ func (p *Provisioner) Reenroll(ctx context.Context, actor store.CommandPrincipal
 		if targetErr != nil || publisher == nil {
 			return rejection(store.Forbidden)
 		}
-		if !p.config.Now().Before(r.ExpiresAt) {
+		if !store.AuthorityTime(ctx, p.config.Now).Before(r.ExpiresAt) {
 			return rejection(store.InvalidRequest)
 		}
 		cv, err := store.NextVersion(r.ExpectedCredentialVersion)

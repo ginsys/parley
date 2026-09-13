@@ -86,6 +86,9 @@ var ErrStaleGrantVersion = errors.New("envelope grant version is no longer curre
 // calls the transport itself — that's Dispatch's job — so a crash between
 // accept and delivery leaves the message safely queued, not lost.
 func (b *Bridge) Send(ctx context.Context, conversation, from, to, text string, inReplyTo *string) (*store.Envelope, error) {
+	if b.db.RecoveryControlled() {
+		return nil, store.RecoveryRequired
+	}
 	for _, id := range []string{conversation, from, to} {
 		if err := bridgetext.ValidateMetadata(id); err != nil {
 			return nil, err
@@ -338,6 +341,9 @@ func resolveRequeueVersion(ctx context.Context, tx *sql.Tx, e *store.Envelope) (
 // claimed=false (no error) for either ErrBudgetExhausted's cause or a
 // concurrent state change — callers distinguish by re-reading state.
 func (b *Bridge) claim(ctx context.Context, envelopeID string) (*store.Envelope, bool, error) {
+	if b.db.RecoveryControlled() {
+		return nil, false, store.RecoveryRequired
+	}
 	tx, err := b.db.Begin(ctx)
 	if err != nil {
 		return nil, false, err

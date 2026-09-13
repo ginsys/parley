@@ -618,3 +618,63 @@ checks, not implicitly part of that gate.
 Passing synthetic fixtures does not prove impersonation resistance or compatibility with live
 Codex/Claude installations. Before live connection, the identity/approval-forgery and actual-host
 fixtures in [AGENTS.md](../AGENTS.md#record-evidence-and-decisions) must be designed and passed.
+
+## Authenticated work and retained ingestion
+
+The internal `connection.Manager.Send` API accepts a private attached Session, operation ID,
+conversation, recipient and text. The manager derives the sender and accepting credential version;
+caller-supplied token fields cannot impersonate a Session. Enabled recipients may be offline at
+acceptance. `dispatch.AuthenticatedBridge` claims only after both current bindings, immutable author
+provenance, grant/version, hold state, exact recipient readiness and budget have been checked under
+the shared coordinator. Transport receives the captured recipient Session after commit. A closed
+claim cannot retarget its replacement, and an unattempted handoff uses the existing exact-token
+settlement/refund transaction. These replacement APIs have test-only callers until caller migration.
+
+`connection.Ingestor` requires trusted native-source verification and origin providers. It stores
+source event identity, digest, revision and cursor edges independently of process epoch. Current
+authentication precedes replay; an exact retained terminal event is returned without rereading a
+changed host file, while changed content under that identity returns `event_conflict`. Source I/O
+uses a bounded socket-linked context outside the writer. Invalid UTF-8 is rejected before hashing.
+A pending predecessor keeps its cursor; terminal classification, original ACK, reply insertion and
+accepting provenance commit together. Permanently cancelled originals become terminal held evidence
+without an ACK. Human `ingestion.resume` requires an exact barrier/binding version and an immutable
+reviewed contiguous source interval. Its events become held evidence, preventing later replay from
+acknowledging old work. More than 1000 interval events returns `capacity_exceeded` and leaves the
+barrier closed. Native event production and large-interval tooling remain separate host work.
+
+## Durable recovery implementation
+
+`internal/recovery.Service` supplies `runtime.Config.InspectRecovery` and installs store hooks before
+service admission. Preparation and marker flush run outside the coordinator. Time sampling,
+checkpoint comparison and advancement share a writer acquisition; business transactions receive one
+validated authorization instant. A durable preceding checkpoint remains even when later business
+work rejects. A rollback detected in the writer immediately holds ordinary operations and is flushed
+after the gate is released. The old direct acceptance/claim/ingestion paths refuse a recovery-owned
+store, while exact settlement remains available to retain an already attempted delivery's outcome.
+
+The Linux marker repository uses a pre-existing private directory and descriptor-relative,
+no-follow operations. Marker creation is non-replacing and syncs the file and parent directory.
+Removal requires an exact matching canonical record and syncs the directory even when retrying an
+already absent file. Malformed entries, unsafe paths and reused cleared incidents fail closed.
+External publication failure invokes a mandatory nonblocking supervisor fail-stop callback; its
+actual process/supervisor integration remains required before live use. No persistence guarantee is
+claimed when every persistence path fails, or for a rollback never recorded before a crash and
+subsequent clock correction. Once a marker or held database incident exists, corrected wall time and
+restart cannot clear it. Restore detection requires the operator to establish a fresh external marker.
+
+Internal human `clock.reconcile` verifies reviewed source evidence and nondecreasing samples at
+least one monotonic second apart outside the writer, then rechecks the current floor/version. The
+reconciled record, receipt and audit commit before exact marker removal and a final durable clear.
+Recording an existing reconciled incident is idempotent because its global hold remains active;
+the storage primitive rejects reuse of a cleared incident without changing its terminal evidence.
+Retries reauthorize before looking up the receipt and may finish only that committed cleanup. Other
+incidents keep the global gate closed. `recovery.complete` follows the same two-phase protocol.
+Its implemented restore policy is conservative: every restored binding must be permanently retired,
+and every outstanding envelope receives an independent restore hold. Surviving-history import is
+not implemented. Grant budgets, ACKs, states and attempt tokens remain snapshot evidence; retired
+identities cannot use them to authorize new work. A reviewed bad-floor disposition additionally
+retires affected authority, matches the exact checkpoint version and all held clock incidents, and
+records the floor change against the same audit. Ordinary reconciliation never lowers the floor.
+Recovery does not clear individual security holds, ingestion barriers or persisted expiry.
+Trusted writer authorization helpers enforce remembered exact-credential expiry denials even
+when their caller has not installed an expiry observation collector.

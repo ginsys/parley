@@ -336,7 +336,8 @@ func (m *Manager) authenticate(ctx context.Context, tx *sql.Tx, s *Socket, a Aut
 	if s.credentialID != "" && (s.credentialID != a.credentialID || s.bindingID != b.ID || s.native != a.native) {
 		return b, c, false, store.AuthenticationFailed
 	}
-	if !m.now().Before(time.Unix(0, c.ExpiresAtNS)) {
+	if !store.AuthorityTime(ctx, m.now).Before(time.Unix(0, c.ExpiresAtNS)) || m.store.CredentialExpiryObserved(c.ID) {
+		m.store.RememberCredentialExpiry(c)
 		_, err := tx.ExecContext(ctx, "UPDATE credentials SET status='expired' WHERE credential_id=? AND status='current'", c.ID)
 		if err != nil {
 			return b, c, false, err
@@ -392,6 +393,7 @@ func (m *Manager) Inspect(ctx context.Context, s *Socket, a Authentication) (Sna
 	}, func(store.CommitView) {
 		if expired {
 			m.Invalidate(b.ID)
+			m.store.ForgetCredentialExpiry(c.ID)
 		} else if rejected {
 			m.remove(s)
 		} else {
@@ -471,6 +473,7 @@ func (m *Manager) Attach(ctx context.Context, s *Socket, a Authentication, expec
 	}, func(store.CommitView) {
 		if expired {
 			m.Invalidate(b.ID)
+			m.store.ForgetCredentialExpiry(c.ID)
 		} else if rejected {
 			m.remove(s)
 		} else {

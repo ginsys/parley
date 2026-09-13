@@ -68,7 +68,7 @@ func (l *Lifecycle) disable(ctx context.Context, p store.CommandPrincipal, r Bin
 		if err != nil {
 			return domainRejection(err)
 		}
-		now, err := store.InstantNanos(l.config.Now())
+		now, err := store.InstantNanos(store.AuthorityTime(ctx, l.config.Now))
 		if err != nil {
 			return domainRejection(err)
 		}
@@ -179,7 +179,7 @@ func (l *Lifecycle) disposition(ctx context.Context, p store.CommandPrincipal, r
 		if evidenceErr != nil {
 			return rejection(store.Forbidden)
 		}
-		now, err := store.InstantNanos(l.config.Now())
+		now, err := store.InstantNanos(store.AuthorityTime(ctx, l.config.Now))
 		if err != nil {
 			return domainRejection(err)
 		}
