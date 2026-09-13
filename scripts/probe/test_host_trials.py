@@ -2226,10 +2226,32 @@ class OpenCodeDriverTests(DriverTestCase):
         driver.serve()
         failures = driver.close_servers()
         self.assertEqual([label for label, _ in failures], ['server'])
-        self.assertIn('survived SIGTERM and SIGKILL', str(failures[0][1]))
-        self.assertEqual(killed, [(4321, 15), (4321, 9)])
+        self.assertIn('ownership cannot be verified', str(failures[0][1]))
+        self.assertEqual(killed, [(4321, 15)])
         self.assertIsNotNone(driver.server.process.returncode)  # the leader did exit
         self.assertIsNotNone(driver.server)  # and the handle is kept anyway
+
+    def test_close_never_signals_a_group_after_reaping_its_original_leader(self):
+        for already_reaped in (True, False):
+            with self.subTest(already_reaped=already_reaped):
+                self.answering = False
+                driver = self.driver(FakeRun([]), port=4096)
+                server = driver.serve()
+
+                def reap():
+                    server.process.returncode = 0
+                    return 0
+
+                if already_reaped:
+                    reap()
+                else:
+                    server.process.poll = reap
+                with unittest.mock.patch('os.killpg') as killpg:
+                    failures = driver.close_servers()
+                self.assertEqual([label for label, _ in failures], ['server'])
+                self.assertIn('ownership cannot be verified', str(failures[0][1]))
+                self.assertTrue(all(call.args[1] == 0 for call in killpg.call_args_list))
+                self.assertIs(driver.server, server)
 
     def test_foreign_ids_are_refused_everywhere(self):
         driver = self.driver(FakeRun([]))

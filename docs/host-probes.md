@@ -398,7 +398,12 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   of its own, so a descendant that outlives it stays in that group, keeps the port bound and
   keeps answering on the same URL. Judged by the handle alone that reads as a clean stop, the
   handle is released, and the next `serve()` refuses the run's own leftover as a stranger's
-  server. Submission is
+  server. Once the leader has been reaped, its numeric process-group ID may be reused. Cleanup
+  then probes existence only: a remaining group is reported for manual investigation and the
+  handle retained, with no further SIGTERM/SIGKILL. This can require manual cleanup of genuine
+  descendants, but prevents signaling unrelated processes through a reused number. Server
+  lifecycle operations are serialized, so an unreaped leader reserves the ID between the check
+  and each signal. Submission is
   `opencode run --pure --format json --attach http://127.0.0.1:<p> --session <id> -m <model>
   '<msg>'`, judged on both the exit status and the event stream. A structured `error` event is
   `SubmissionUncaptured` even on exit 0 — that exit-zero-with-an-error shape is the one `create()`

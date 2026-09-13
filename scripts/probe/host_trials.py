@@ -1753,8 +1753,8 @@ class Server:
         Signal 0 is the existence test: it reaches the whole group, so it answers about the
         descendants `serve` may have left behind and not only about the handle we hold. An
         unreaped leader is still a group member, hence the `poll()` -- otherwise a zombie would
-        read as a live server forever. (A group id can in principle be reused once the group is
-        empty; that would report a stranger as our survivor, which errs towards reporting.)
+        read as a live server forever. Once this reaps the leader, the numeric group ID may
+        be reused: close() must only report a surviving group, never signal it again.
         """
         self.process.poll()
         try:
@@ -1785,6 +1785,11 @@ class Server:
         for signum, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
             if not self._group_alive(pgid):
                 return
+            if self.process.returncode is not None:
+                raise RuntimeError(f'opencode serve leader {pgid} was reaped; process-group '
+                                   'ownership cannot be verified, manual investigation required')
+            # Server lifecycle calls are serialized. No poll/wait occurs between this check
+            # and killpg, so even if the leader exits, its unreaped PID reserves the group ID.
             try:
                 os.killpg(pgid, signum)
             except ProcessLookupError:
