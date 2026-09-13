@@ -105,6 +105,10 @@ Unsupported no-replace rename fails closed. There is no mutable active-file poin
 permission repair or cross-account ownership change; cross-account publication needs the trusted
 setup capability. Credential material is confined to the publisher's private file serialization,
 excluded from ordinary JSON results and redacted from standard diagnostic formatting.
+During target construction, directory resource/I/O failures return `temporarily_unavailable`;
+missing/inaccessible paths, symlinks and unsafe ownership/permissions remain terminal refusals.
+Controlled child processes exhaust descriptors at root/component lookup and prove that recovery
+permits the same registration operation ID to succeed without a poisoned receipt.
 
 Controlled fixtures cover authorization before host/file work, duplicate replay, expiry equality,
 legacy denial, rotation/version conflicts, missing providers, unsafe publication paths, no overwrite

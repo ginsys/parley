@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func credentialState(t *testing.T) string {
@@ -89,8 +91,96 @@ func TestPrivatePublicationRejectsUnsafeTargets(t *testing.T) {
 			case "wrong_uid":
 				uid++
 			}
-			if _, err := NewPrivatePublisher(state, uid); err == nil {
-				t.Fatal("accepted unsafe target")
+			if _, err := NewPrivatePublisher(state, uid); err != store.Forbidden {
+				t.Fatalf("unsafe target error=%v", err)
+			}
+		})
+	}
+}
+
+func TestDirectoryExhaustionDoesNotPoisonRegistration(t *testing.T) {
+	const childFlag = "PARLEY_TEST_DIRECTORY_EXHAUSTION"
+	if stage := os.Getenv(childFlag); stage != "" {
+		state := credentialState(t)
+		p, db := testProvisioner(t, nil)
+		calls := 0
+		p.config.Target = func(string, uint32) (Publisher, error) {
+			calls++
+			if calls > 1 {
+				return NewPrivatePublisher(state, uint32(os.Geteuid()))
+			}
+			// Exhaust only this controlled child's descriptors. Restore them before
+			// the coordinator runs, isolating the failure to publisher construction.
+			var original unix.Rlimit
+			if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &original); err != nil {
+				t.Fatal(err)
+			}
+			limited := original
+			if limited.Cur > 64 {
+				limited.Cur = 64
+			}
+			if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limited); err != nil {
+				t.Fatal(err)
+			}
+			var fds []int
+			defer func() {
+				for _, fd := range fds {
+					unix.Close(fd)
+				}
+				if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &original); err != nil {
+					t.Fatal(err)
+				}
+			}()
+			for {
+				fd, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+				if err == unix.EMFILE {
+					break
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				fds = append(fds, fd)
+			}
+			if stage == "component" {
+				if len(fds) == 0 {
+					t.Fatal("no descriptor available for root-open setup")
+				}
+				// Allow opening '/', then force Openat on the first component to fail.
+				unix.Close(fds[len(fds)-1])
+				fds = fds[:len(fds)-1]
+			}
+			return NewPrivatePublisher(state, uint32(os.Geteuid()))
+		}
+		actor := store.CommandPrincipal{ID: adminID}
+		result, err := p.Register(context.Background(), actor, testRegistration())
+		if err != store.TemporarilyUnavailable || result.Receipt.AuditID != "" {
+			t.Errorf("exhaustion result=%+v err=%v", result, err)
+		}
+		if got := provisioningCounts(t, db); got != [5]int{} {
+			t.Errorf("exhaustion retained rows=%v", got)
+		}
+		result, err = p.Register(context.Background(), actor, testRegistration())
+		if err != nil || result.Receipt.Replayed || result.Publication != "published" || calls != 2 {
+			t.Fatalf("recovered result=%+v err=%v calls=%d", result, err, calls)
+		}
+		replay, err := p.Register(context.Background(), actor, testRegistration())
+		if err != nil || !replay.Receipt.Replayed || replay.CredentialID != result.CredentialID || calls != 2 {
+			t.Fatalf("replay=%+v err=%v calls=%d", replay, err, calls)
+		}
+		return
+	}
+	for _, stage := range []string{"root", "component"} {
+		t.Run(stage, func(t *testing.T) {
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			child := exec.CommandContext(ctx, executable, "-test.run=^TestDirectoryExhaustionDoesNotPoisonRegistration$")
+			child.Env = append(os.Environ(), childFlag+"="+stage)
+			if output, err := child.CombinedOutput(); err != nil {
+				t.Fatalf("controlled %s exhaustion: %v\n%s", stage, err, output)
 			}
 		})
 	}

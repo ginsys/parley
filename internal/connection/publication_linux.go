@@ -4,6 +4,7 @@ package connection
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,20 +41,20 @@ func NewPrivatePublisher(stateDirectory string, uid uint32) (*PrivatePublisher, 
 func (p *PrivatePublisher) openDirectory() (int, error) {
 	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, store.Forbidden
+		return -1, directoryFailure(err)
 	}
 	parts := strings.Split(strings.TrimPrefix(p.directory, "/"), "/")
 	for i, part := range parts {
 		next, err := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		unix.Close(fd)
 		if err != nil {
-			return -1, store.Forbidden
+			return -1, directoryFailure(err)
 		}
 		fd = next
 		var st unix.Stat_t
 		if err := unix.Fstat(fd, &st); err != nil {
 			unix.Close(fd)
-			return -1, store.Forbidden
+			return -1, directoryFailure(err)
 		}
 		trusted := st.Uid == 0 || st.Uid == p.uid || st.Uid == uint32(os.Geteuid())
 		stickyRoot := st.Uid == 0 && st.Mode&unix.S_ISVTX != 0
@@ -67,6 +68,21 @@ func (p *PrivatePublisher) openDirectory() (int, error) {
 	}
 	return fd, nil
 }
+
+// A missing, inaccessible or unsafe configured path needs operator correction.
+// Resource exhaustion, interrupted calls and filesystem I/O failures must not
+// become permanent operation rejections when this runs during target resolution.
+func directoryFailure(err error) store.Code {
+	switch {
+	case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM),
+		errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENOTDIR),
+		errors.Is(err, unix.ELOOP), errors.Is(err, unix.ENAMETOOLONG):
+		return store.Forbidden
+	default:
+		return store.TemporarilyUnavailable
+	}
+}
+
 func (p *PrivatePublisher) Publish(ctx context.Context, file CredentialFile) error {
 	defer clear(file.secret[:])
 	if !canonicalID(file.ServerID) || !canonicalID(file.BindingID) || !canonicalID(file.CredentialID) || file.CredentialVersion < 1 {
