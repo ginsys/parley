@@ -221,6 +221,10 @@ Work merely addressed to that binding is not treated as authored by it. Admissio
 pending-work extension through trusted callbacks; no pending-request implementation ships here.
 Re-enrollment requires new reviewed host evidence and a fresh credential for the same tuple;
 it does not clear holds, quarantine, the earliest paused cursor or barrier incident history.
+Unavailable evidence and other provider errors leave reenrollment uncommitted, allowing the same
+operation ID to retry after recovery without altering the revoked binding, credential or barrier.
+Only an explicit `host_unverified` mismatch/unsupported result, or a missing evidence provider,
+is retained as a terminal host-verification rejection. Replays never reverify or republish.
 
 The internal Lifecycle service exposes revoke, retire, hold disposition and legacy disposition;
 Provisioner adds re-enrollment. Current administrator authorization precedes private replay;

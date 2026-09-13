@@ -3,6 +3,7 @@ package connection
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 
 	"github.com/ginsys/parley/internal/store"
@@ -61,7 +62,10 @@ func (p *Provisioner) Reenroll(ctx context.Context, actor store.CommandPrincipal
 			return domainRejection(err)
 		}
 		if evidenceErr != nil {
-			return rejection(store.HostUnverified)
+			if errors.Is(evidenceErr, store.HostUnverified) {
+				return rejection(store.HostUnverified)
+			}
+			return store.CommandResult{}, evidenceErr
 		}
 		if targetErr != nil || publisher == nil {
 			return rejection(store.Forbidden)

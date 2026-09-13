@@ -69,6 +69,8 @@ func (f PublisherFunc) Publish(ctx context.Context, c CredentialFile) error { re
 // unavailable source. Only HostUnverified is a retained verification rejection.
 type ProvisioningConfig struct {
 	// ReenrollEvidence resolves a trusted immutable host-evidence reference.
+	// Only HostUnverified (mismatch or unsupported evidence) is retained as a
+	// rejection; unavailable evidence and other provider errors remain retryable.
 	// Absence disables reenrollment, while registration and rotation remain usable.
 	ReenrollEvidence  func(context.Context, string, NativeTuple) error
 	Store             *store.DB
