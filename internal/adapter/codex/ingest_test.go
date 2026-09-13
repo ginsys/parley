@@ -3,14 +3,15 @@ package codex_test
 import (
 	"context"
 	"errors"
+	bridgefixture "github.com/ginsys/parley/internal/testfixture/bridge"
 	"path/filepath"
 	"testing"
 
-	"github.com/ginsys/parley/internal/adapter/codex"
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/dispatch"
-	"github.com/ginsys/parley/internal/replymarker"
 	"github.com/ginsys/parley/internal/store"
+	"github.com/ginsys/parley/internal/testfixture/identity"
+	"github.com/google/uuid"
 )
 
 func openTestDB(t *testing.T) *store.DB {
@@ -42,6 +43,9 @@ func queueOne(t *testing.T, db *store.DB) (conversation, id string) {
 	}); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
+	if err := identity.For(t, db).GrantPeers(); err != nil {
+		t.Fatal(err)
+	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -51,7 +55,7 @@ func queueOne(t *testing.T, db *store.DB) (conversation, id string) {
 		t.Fatalf("current grant: %v", err)
 	}
 	e := store.Envelope{
-		ID:           "env-1",
+		ID:           uuid.NewString(),
 		Conversation: conversation,
 		FromPeer:     "claude-session-a",
 		ToPeer:       "codex-thread-b",
@@ -63,6 +67,9 @@ func queueOne(t *testing.T, db *store.DB) (conversation, id string) {
 	}
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("insert queued: %v", err)
+	}
+	if err := identity.Record(ctx, tx, e); err != nil {
+		t.Fatal(err)
 	}
 	// Only a handed-off envelope is eligible for a reply to ack (Validate):
 	// replyingPeer cannot have seen a message the bridge never delivered.
@@ -81,7 +88,7 @@ func TestIngestTurnAccepted(t *testing.T) {
 	ctx := context.Background()
 
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"" + id + "\", \"to\": \"claude-session-a\", \"text\": \"here you go\"}\n```"
-	reply, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
+	reply, err := bridgefixture.IngestTurn(t, ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -96,6 +103,9 @@ func TestIngestTurnAccepted(t *testing.T) {
 	}
 
 	// The original envelope must now be acked, atomically with the reply.
+	if err := identity.For(t, db).GrantPeers(); err != nil {
+		t.Fatal(err)
+	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -115,11 +125,14 @@ func TestIngestTurnNoMarkerIsOrdinaryConversation(t *testing.T) {
 	conversation, id := queueOne(t, db)
 	ctx := context.Background()
 
-	_, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", "just chatting, nothing to forward")
-	if !codex.IsNoMarker(err) {
+	_, err := bridgefixture.IngestTurn(t, ctx, db, conversation, "codex-thread-b", "claude-session-a", "just chatting, nothing to forward")
+	if !errors.Is(err, bridgefixture.ErrNoMarker) {
 		t.Fatalf("want no-marker, got %v", err)
 	}
 
+	if err := identity.For(t, db).GrantPeers(); err != nil {
+		t.Fatal(err)
+	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -139,8 +152,8 @@ func TestIngestTurnMalformedStopsDelivery(t *testing.T) {
 	conversation, _ := queueOne(t, db)
 	ctx := context.Background()
 
-	_, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", "```BRIDGE-REPLY\nnot json\n```")
-	if !errors.Is(err, replymarker.ErrMalformedMarker) {
+	_, err := bridgefixture.IngestTurn(t, ctx, db, conversation, "codex-thread-b", "claude-session-a", "```BRIDGE-REPLY\nnot json\n```")
+	if !errors.Is(err, store.InvalidRequest) {
 		t.Fatalf("want ErrMalformedMarker, got %v", err)
 	}
 }
@@ -151,8 +164,8 @@ func TestIngestTurnWrongRecipientStopsDelivery(t *testing.T) {
 	ctx := context.Background()
 
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"" + id + "\", \"to\": \"someone-else\", \"text\": \"hi\"}\n```"
-	_, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
-	if !errors.Is(err, replymarker.ErrWrongRecipient) {
+	_, err := bridgefixture.IngestTurn(t, ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
+	if !errors.Is(err, store.Forbidden) {
 		t.Fatalf("want ErrWrongRecipient, got %v", err)
 	}
 }
@@ -163,8 +176,8 @@ func TestIngestTurnStaleReplyStopsDelivery(t *testing.T) {
 	ctx := context.Background()
 
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"does-not-exist\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
-	_, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
-	if !errors.Is(err, replymarker.ErrStaleReply) {
+	_, err := bridgefixture.IngestTurn(t, ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
+	if !errors.Is(err, store.Forbidden) {
 		t.Fatalf("want ErrStaleReply, got %v", err)
 	}
 }
@@ -192,6 +205,9 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 		t.Fatalf("grant: %v", err)
 	}
 
+	if err := identity.For(t, db).GrantPeers(); err != nil {
+		t.Fatal(err)
+	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -201,7 +217,7 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 		t.Fatalf("current grant: %v", err)
 	}
 	e := store.Envelope{
-		ID:           "env-direction",
+		ID:           uuid.NewString(),
 		Conversation: conversation,
 		FromPeer:     "claude-session-a",
 		ToPeer:       "codex-thread-b",
@@ -214,6 +230,9 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 	if err := store.InsertQueued(ctx, tx, e); err != nil {
 		t.Fatalf("insert queued: %v", err)
 	}
+	if err := identity.Record(ctx, tx, e); err != nil {
+		t.Fatal(err)
+	}
 	// Only a handed-off envelope is eligible for a reply to ack (Validate):
 	// replyingPeer cannot have seen a message the bridge never delivered.
 	if err := store.SetState(ctx, tx, e.ID, store.Queued, store.HandedOff, "2026-01-01T00:00:01Z"); err != nil {
@@ -224,9 +243,9 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 	}
 
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"" + e.ID + "\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
-	_, err = codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
-	if !errors.Is(err, codex.ErrDirectionNotPermitted) {
-		t.Fatalf("want ErrDirectionNotPermitted, got %v", err)
+	_, err = bridgefixture.IngestTurn(t, ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
+	if !errors.Is(err, store.BindingUnavailable) {
+		t.Fatalf("want binding_unavailable, got %v", err)
 	}
 
 	tx2, err := db.Begin(ctx)
@@ -247,7 +266,7 @@ func TestIngestTurnDirectionNotPermittedStopsDelivery(t *testing.T) {
 // doesn't itself consult the grant's remaining exchange budget -- but this
 // isn't a gap unique to replies, since store.InsertQueued (Bridge.Send's own
 // path) doesn't either. store.ClaimExchange has exactly one call site,
-// dispatch.Bridge's claim(), so budget is enforced uniformly at Dispatch
+// authenticated dispatch claim, so budget is enforced uniformly at Dispatch
 // time for every queued envelope regardless of how it was queued. This
 // proves a reply queued via IngestTurn is rejected at its own later
 // Dispatch once the grant's budget is spent, exactly like an ordinary one.
@@ -267,6 +286,9 @@ func TestIngestTurnReplyRespectsExchangeBudgetAtDispatch(t *testing.T) {
 		t.Fatalf("grant: %v", err)
 	}
 
+	if err := identity.For(t, db).GrantPeers(); err != nil {
+		t.Fatal(err)
+	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin: %v", err)
@@ -276,7 +298,7 @@ func TestIngestTurnReplyRespectsExchangeBudgetAtDispatch(t *testing.T) {
 		t.Fatalf("current grant: %v", err)
 	}
 	original := store.Envelope{
-		ID:           "env-reply-budget",
+		ID:           uuid.NewString(),
 		Conversation: conversation,
 		FromPeer:     "claude-session-a",
 		ToPeer:       "codex-thread-b",
@@ -289,19 +311,22 @@ func TestIngestTurnReplyRespectsExchangeBudgetAtDispatch(t *testing.T) {
 	if err := store.InsertQueued(ctx, tx, original); err != nil {
 		t.Fatalf("insert queued: %v", err)
 	}
+	if err := identity.Record(ctx, tx, original); err != nil {
+		t.Fatal(err)
+	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
 	// Spend the grant's only exchange slot dispatching the original
 	// envelope, before Codex ever replies.
-	bridge := dispatch.New(db, noopTransport{})
+	bridge := bridgefixture.New(t, db, noopTransport{})
 	if _, err := bridge.Dispatch(ctx, original.ID); err != nil {
 		t.Fatalf("dispatch original: %v", err)
 	}
 
 	turn := "```BRIDGE-REPLY\n{\"in_reply_to\": \"" + original.ID + "\", \"to\": \"claude-session-a\", \"text\": \"hi\"}\n```"
-	reply, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
+	reply, err := bridgefixture.IngestTurn(t, ctx, db, conversation, "codex-thread-b", "claude-session-a", turn)
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
@@ -320,8 +345,11 @@ func TestIngestHiddenHTMLReplyDoesNotAcknowledgeOrQueue(t *testing.T) {
 	conversation, id := queueOne(t, db)
 	ctx := context.Background()
 	turn := "Heading\n-\n<custom>\n```BRIDGE-REPLY\n{\"in_reply_to\":\"" + id + "\",\"to\":\"claude-session-a\",\"text\":\"hidden\"}\n```\n</custom>"
-	if _, err := codex.IngestTurn(ctx, db, conversation, "codex-thread-b", "claude-session-a", turn); !errors.Is(err, codex.ErrNoMarker) {
+	if _, err := bridgefixture.IngestTurn(t, ctx, db, conversation, "codex-thread-b", "claude-session-a", turn); !errors.Is(err, bridgefixture.ErrNoMarker) {
 		t.Fatalf("hidden reply accepted: %v", err)
+	}
+	if err := identity.For(t, db).GrantPeers(); err != nil {
+		t.Fatal(err)
 	}
 	tx, err := db.Begin(ctx)
 	if err != nil {

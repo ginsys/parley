@@ -49,7 +49,7 @@ func ListQueuedIDs(ctx context.Context, tx *sql.Tx, conversation, toPeer string,
 
 // InsertQueued writes a new envelope in the queued state. GrantVersion must
 // already be stamped by the caller from CurrentGrant at accept time.
-// TrustedReply must only ever be true when the caller is codex.IngestTurn.
+// TrustedReply must only ever be true when the caller performs authenticated ingestion.
 func InsertQueued(ctx context.Context, tx *sql.Tx, e Envelope) error {
 	ns, err := timestampNanos(e.CreatedAt)
 	if err != nil {
@@ -101,7 +101,7 @@ func CancelQueuedUnderVersion(ctx context.Context, tx *sql.Tx, conversation stri
 // CarryForwardQueuedReplies re-stamps queued reply rows from oldVersion to
 // newVersion instead of letting CancelQueuedUnderVersion cancel them. A
 // reply's own originating envelope was already unconditionally marked
-// 'acked' by IngestTurn before the reply was queued, so unlike a fresh Send,
+// 'acked' by authenticated ingestion before the reply was queued, so unlike a fresh Send,
 // there is no live sender left to notice the cancellation and resubmit —
 // cancelling a reply here would strand its content with no path back to
 // delivery, even though the whole point of a renewal is to let an
@@ -111,15 +111,13 @@ func CancelQueuedUnderVersion(ctx context.Context, tx *sql.Tx, conversation stri
 // against grants.
 //
 // A row only qualifies if is_trusted_reply was set at insert time — which
-// only codex.IngestTurn ever does, atomically, after validating in_reply_to
+// only authenticated ingestion does, atomically, after validating in_reply_to
 // against the specific original it just acked (replymarker.Validate). Bare
 // "in_reply_to IS NOT NULL" (or even "in_reply_to names some envelope this
-// conversation has acked") is not provenance: dispatch.Bridge.Send takes an
-// arbitrary caller-supplied inReplyTo with no validation at all, so an
-// ordinary send naming any acked envelope's id — not necessarily the one it
-// is actually replying to — could otherwise claim reply status and get
-// silently carried across a renewal instead of cancelled like every other
-// old-grant message.
+// conversation has acked") is not provenance: historical ordinary sends may
+// contain unvalidated correlation IDs. Those rows cannot claim reply status
+// or be carried across renewal. The authenticated Send API accepts neither
+// correlation IDs nor a trusted-reply flag.
 func CarryForwardQueuedReplies(ctx context.Context, tx *sql.Tx, conversation string, oldVersion, newVersion int64, updatedAt string) (int64, error) {
 	g, err := CurrentGrant(ctx, tx, conversation)
 	if err != nil {

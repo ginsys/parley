@@ -6,6 +6,7 @@ import (
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/dispatch"
 	"github.com/ginsys/parley/internal/store"
+	bridgefixture "github.com/ginsys/parley/internal/testfixture/bridge"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -22,7 +23,7 @@ func TestSendEnforcesGrantPairAndDirection(t *testing.T) {
 				t.Fatal(err)
 			}
 			tr := newFakeTransport()
-			bridge := dispatch.New(db, tr)
+			bridge := bridgefixture.New(t, db, tr)
 			if _, err := bridge.Send(ctx, "c", pair[0], pair[1], "unauthorized", nil); err == nil {
 				t.Fatal("accepted unauthorized message")
 			}
@@ -64,7 +65,7 @@ func TestClaimRejectsStaleVersionWithoutCallingItExhaustion(t *testing.T) {
 		t.Fatal(err)
 	}
 	tr := newFakeTransport()
-	state, err := dispatch.New(db, tr).Dispatch(ctx, e.ID)
+	state, err := bridgefixture.New(t, db, tr).Dispatch(ctx, e.ID)
 	if !errors.Is(err, dispatch.ErrStaleGrantVersion) || state != store.Cancelled || len(tr.delivered) != 0 {
 		t.Fatalf("state=%s err=%v delivered=%v", state, err, tr.delivered)
 	}
@@ -108,7 +109,7 @@ func TestRenewalCancellationChoiceIncludesLateSettlement(t *testing.T) {
 			if !late {
 				renew()
 			}
-			state, err := dispatch.New(db, tr).Dispatch(ctx, reply.ID)
+			state, err := bridgefixture.New(t, db, tr).Dispatch(ctx, reply.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,22 +147,38 @@ func TestBudgetRaceAcrossIndependentConnections(t *testing.T) {
 	}
 	defer b.Close()
 	grantOne(t, controller.New(a), "c", 1)
-	bridges := []*dispatch.Bridge{dispatch.New(a, newFakeTransport()), dispatch.New(b, newFakeTransport())}
-	var ids []string
-	for _, bridge := range bridges {
-		e, err := bridge.Send(ctx, "c", "claude-session-a", "codex-thread-b", "message", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ids = append(ids, e.ID)
+	bridge := bridgefixture.New(t, a, newFakeTransport())
+	e, err := bridge.Send(ctx, "c", "claude-session-a", "codex-thread-b", "message", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
 	start := make(chan struct{})
 	out := make(chan error, 2)
 	var wg sync.WaitGroup
-	for i, bridge := range bridges {
-		wg.Add(1)
-		go func() { defer wg.Done(); <-start; _, err := bridge.Dispatch(ctx, ids[i]); out <- err }()
-	}
+	wg.Add(2)
+	go func() { defer wg.Done(); <-start; _, err := bridge.Dispatch(ctx, e.ID); out <- err }()
+	// A separate SQLite writer competes for the same remaining budget. It is
+	// deliberately not a second connection manager for one live installation.
+	go func() {
+		defer wg.Done()
+		<-start
+		tx, err := b.Begin(ctx)
+		if err != nil {
+			out <- err
+			return
+		}
+		defer tx.Rollback()
+		ok, err := store.ClaimExchange(ctx, tx, "c", 1)
+		if err != nil {
+			out <- err
+			return
+		}
+		if !ok {
+			out <- dispatch.ErrBudgetExhausted
+			return
+		}
+		out <- tx.Commit()
+	}()
 	close(start)
 	wg.Wait()
 	close(out)
@@ -202,7 +219,7 @@ func TestRevokeWhileIndependentDispatchIsInFlight(t *testing.T) {
 	ctrl := controller.New(b)
 	grantOne(t, ctrl, "c", 3)
 	entered, release := make(chan struct{}), make(chan struct{})
-	bridge := dispatch.New(a, transportFunc(func(context.Context, store.Envelope) error { close(entered); <-release; return nil }))
+	bridge := bridgefixture.New(t, a, transportFunc(func(context.Context, store.Envelope) error { close(entered); <-release; return nil }))
 	first, err := bridge.Send(ctx, "c", "claude-session-a", "codex-thread-b", "first", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -247,7 +264,7 @@ func TestPermittedDirectionsAndClaimAuthorization(t *testing.T) {
 				t.Fatal(err)
 			}
 			tr := newFakeTransport()
-			bridge := dispatch.New(db, tr)
+			bridge := bridgefixture.New(t, db, tr)
 			for i, pair := range [][2]string{{"a", "b"}, {"b", "a"}, {"other", "b"}} {
 				allowed := i == 0 && (direction == store.AToB || direction == store.Bidirectional) || i == 1 && (direction == store.BToA || direction == store.Bidirectional)
 				e, err := bridge.Send(ctx, "c", pair[0], pair[1], "message", nil)
@@ -260,7 +277,7 @@ func TestPermittedDirectionsAndClaimAuthorization(t *testing.T) {
 					}
 					continue
 				}
-				if !errors.Is(err, dispatch.ErrNotPermitted) {
+				if !errors.Is(err, store.Forbidden) {
 					t.Fatalf("accept error=%v", err)
 				}
 				// Direct store insertion represents an invalid row reaching the shared claim boundary.
@@ -283,7 +300,7 @@ func TestPermittedDirectionsAndClaimAuthorization(t *testing.T) {
 				}
 			}
 			expireGrant(t, db, "c")
-			if _, err := bridge.Send(ctx, "c", "a", "b", "expired", nil); !errors.Is(err, dispatch.ErrGrantExpired) {
+			if _, err := bridge.Send(ctx, "c", "a", "b", "expired", nil); !errors.Is(err, store.Forbidden) {
 				t.Fatalf("expired acceptance=%v", err)
 			}
 		})
@@ -298,7 +315,7 @@ func TestReaderCandidateDoesNotAuthorizeAfterAdministration(t *testing.T) {
 			ctrl := controller.New(db)
 			grantOne(t, ctrl, "c", 5)
 			tr := newFakeTransport()
-			bridge := dispatch.New(db, tr)
+			bridge := bridgefixture.New(t, db, tr)
 			e, err := bridge.Send(ctx, "c", "claude-session-a", "codex-thread-b", "synthetic", nil)
 			if err != nil {
 				t.Fatal(err)
