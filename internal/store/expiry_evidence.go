@@ -45,6 +45,15 @@ func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
 		observations[id] = observed
 	}
 	e.mu.Unlock()
+	// A replay bypasses the business callback, so its collector may be empty.
+	// Retry all exact-credential observations retained by previous failed writes.
+	db.coordinator.credentialExpiries.Range(func(key, value any) bool {
+		id, deadline := key.(string), value.(int64)
+		if _, exists := observations[id]; !exists {
+			observations[id] = CredentialExpiry{Deadline: deadline}
+		}
+		return true
+	})
 	if len(observations) == 0 {
 		return nil
 	}
@@ -64,13 +73,21 @@ func (e *ExpiryEvidence) Persist(db *DB, invalidate func(string)) error {
 			}
 			changed = changed || n > 0
 			if n > 0 {
-				bindings = append(bindings, observed.BindingID)
+				binding := observed.BindingID
+				if binding == "" {
+					credential, err := ReadCredential(ctx, tx, id)
+					if err != nil {
+						return TransitionResult{}, err
+					}
+					binding = credential.BindingID
+				}
+				bindings = append(bindings, binding)
 			}
 		}
 		return TransitionResult{Changed: changed}, nil
 	}, func(CommitView) {
-		for id := range observations {
-			db.coordinator.credentialExpiries.Delete(id)
+		for id, observed := range observations {
+			db.coordinator.credentialExpiries.CompareAndDelete(id, observed.Deadline)
 		}
 		if invalidate != nil {
 			for _, binding := range bindings {

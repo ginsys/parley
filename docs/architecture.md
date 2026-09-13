@@ -773,3 +773,16 @@ without reversing the collection lock order. Malformed marker fields reach valid
 instead of pointer dereferences.
 Trusted writer authorization helpers enforce remembered exact-credential expiry denials even
 when their caller has not installed an expiry observation collector.
+
+The legacy protected `controller.Grant`, `Revoke` and `Renew` writers reject a store
+whose runtime installed recovery policy, even while healthy: their direct transactions cannot
+honor its writer-time contract. Grants used by these internal fixtures are established before
+recovery ownership; coordinated human grant commands remain the admission/control work item's
+responsibility. This slice exposes no new human CLI path.
+Restore retirement has no 1000-binding cap: the trusted resolver must enumerate every affected
+binding and retirement remains one atomic transaction. A new rollback latched at writer time
+aborts a reviewed floor reset before any disposition or retirement commits; the independent
+after-hook persists the new incident for another review of the complete set.
+Expiry persistence also snapshots the coordinator's remembered observations, so replay of a
+committed rejection retries a failed expiry write and invalidates the affected binding after
+persistence. It does not require an unrelated request to rediscover the expired recipient.

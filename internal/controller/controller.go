@@ -41,6 +41,10 @@ type GrantParams struct {
 // Grant creates the next historical version for a conversation. It fails if
 // the conversation already has an active grant — use Renew for that.
 func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, error) {
+	// This legacy writer has no coordinated recovery/clock contract.
+	if c.db.RecoveryControlled() {
+		return nil, store.RecoveryRequired
+	}
 	if err := validateGrant(p); err != nil {
 		return nil, err
 	}
@@ -105,6 +109,10 @@ type RevokeResult struct {
 // dispatch or already handed off are reported, not touched — Revoke cannot
 // undo a send that already committed to leaving this process.
 func (c *Controller) Revoke(ctx context.Context, conversation string) (*RevokeResult, error) {
+	// This legacy writer has no coordinated recovery/clock contract.
+	if c.db.RecoveryControlled() {
+		return nil, store.RecoveryRequired
+	}
 	tx, err := c.db.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -158,6 +166,10 @@ type RenewParams struct {
 // proven replies carry by default because their originals were acknowledged.
 // CancelPendingReplies explicitly opts out, including late unattempted rescue.
 func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, error) {
+	// This legacy writer has no coordinated recovery/clock contract.
+	if c.db.RecoveryControlled() {
+		return nil, store.RecoveryRequired
+	}
 	if err := bridgetext.ValidateMetadata(p.Conversation); err != nil {
 		return nil, fmt.Errorf("conversation identifier: %w", err)
 	}
