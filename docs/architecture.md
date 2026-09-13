@@ -81,6 +81,10 @@ The host verifier explicitly returns `host_unverified` for mismatched or unsuppo
 only that verification failure becomes a retained rejection. Unavailable evidence, cancellation
 and other provider errors leave no enrollment, receipt or audit entry, so the same operation ID
 can retry after recovery. Provider errors pass through the coordinator's fixed-code sanitization.
+Target resolution also preserves transient errors; invalid/unauthorized targets and missing
+publishers remain terminal. Wrapping a guard, eligibility or target domain code does not change
+its terminal/transient classification. Rotation of a missing binding records a terminal rejection
+without target lookup, and every replay still checks current administrator authority.
 
 Authorized retries consult retained receipts before host/target checks or mutation preconditions.
 They return committed metadata and current publication evidence, never a secret or a second file.
