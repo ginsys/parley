@@ -67,7 +67,7 @@ func (s *Service) before(ctx context.Context, kind string) error {
 	s.stateMu.Lock()
 	held := s.held
 	s.stateMu.Unlock()
-	if held && !humanRecovery(kind) {
+	if held && !humanRecovery(kind) && kind != "dispatch.settle" {
 		return store.RecoveryRequired
 	}
 	return nil
@@ -119,8 +119,14 @@ func (s *Service) transactionTime(ctx context.Context, tx *sql.Tx, kind string) 
 		if err := s.latchRollback(ctx, tx, checkpoint.Instant.Int64, ns); err != nil {
 			return time.Time{}, err
 		}
-		if !humanRecovery(kind) {
+		if !humanRecovery(kind) && kind != "dispatch.settle" {
 			return time.Time{}, store.RecoveryRequired
+		}
+		if kind == "dispatch.settle" {
+			// Late outcome evidence remains recordable, but its timestamp
+			// cannot regress below the trusted floor. The marker retains the
+			// actual observed rollback sample independently.
+			instant = time.Unix(0, checkpoint.Instant.Int64)
 		}
 	} else {
 		if _, err := store.AdvanceClockCheckpoint(ctx, tx, ns); err != nil {
@@ -140,7 +146,7 @@ func (s *Service) transactionTime(ctx context.Context, tx *sql.Tx, kind string) 
 	s.stateMu.Lock()
 	held := s.held || durableHeld
 	s.stateMu.Unlock()
-	if held && !humanRecovery(kind) {
+	if held && !humanRecovery(kind) && kind != "dispatch.settle" {
 		return time.Time{}, store.RecoveryRequired
 	}
 	if principal, ok := store.CommandIdentity(ctx); ok && !humanRecovery(kind) {
