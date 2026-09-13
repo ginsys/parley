@@ -93,7 +93,7 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 		evidenceCtx, cancel := context.WithTimeout(ctx, store.ReadinessDeadline)
 		evidenceErr = a.config.VerifyTime(evidenceCtx, r, record)
 		if evidenceErr == nil {
-			first, evidenceErr = store.InstantNanos(a.config.Service.config.Now())
+			first, evidenceErr = a.config.Service.sampleReconciliationClock(evidenceCtx, record.Floor.Int64)
 			monotonicStart := a.config.MonotonicNow()
 			if evidenceErr == nil {
 				evidenceErr = a.config.Wait(evidenceCtx, time.Second)
@@ -102,7 +102,7 @@ func (a *Administration) ClockReconcile(ctx context.Context, p store.CommandPrin
 				evidenceErr = store.HostUnverified
 			}
 			if evidenceErr == nil {
-				second, evidenceErr = store.InstantNanos(a.config.Service.config.Now())
+				second, evidenceErr = a.config.Service.sampleReconciliationClock(evidenceCtx, record.Floor.Int64)
 			}
 			if evidenceErr == nil && (second < first || first < record.Floor.Int64) {
 				evidenceErr = store.HostUnverified
@@ -242,4 +242,48 @@ func (a *Administration) finish(receipt store.CommandReceipt, id string, origina
 	s.held = held || len(markers) > 0 || len(s.pending) > 0
 	s.stateMu.Unlock()
 	return receipt, nil
+}
+
+// sampleReconciliationClock reads the applicable floor, closes its transaction,
+// then samples and records the observation while retaining the coordinator gate.
+// No writer can advance or reset the floor between comparison and publication.
+func (s *Service) sampleReconciliationClock(ctx context.Context, incidentFloor int64) (sample int64, err error) {
+	defer func() {
+		if flushErr := s.after(); flushErr != nil {
+			err = flushErr
+		}
+	}()
+	floor := incidentFloor
+	var sampleErr error
+	_, err = s.maintenance.Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		checkpoint, err := s.authorizationFloor(ctx, tx)
+		if err != nil {
+			return store.TransitionResult{}, err
+		}
+		if checkpoint.Instant.Valid && checkpoint.Instant.Int64 > floor {
+			floor = checkpoint.Instant.Int64
+		}
+		return store.TransitionResult{PublishUnchanged: true}, nil
+	}, func(store.CommitView) {
+		sample, sampleErr = store.InstantNanos(s.config.Now())
+		if sampleErr != nil {
+			return
+		}
+		if sample < floor {
+			if sampleErr = s.latch(floor, sample); sampleErr == nil {
+				sampleErr = store.RecoveryRequired
+			}
+			return
+		}
+		s.stateMu.Lock()
+		if s.trusted == nil || sample > *s.trusted {
+			value := sample
+			s.trusted = &value
+		}
+		s.stateMu.Unlock()
+	})
+	if err == nil {
+		err = sampleErr
+	}
+	return sample, err
 }

@@ -75,6 +75,9 @@ func TestAuthenticatedSendDerivesAuthorAndAllowsOfflineRecipient(t *testing.T) {
 		var author string
 		var cv int64
 		err = tx.QueryRowContext(ctx, "SELECT binding_id,credential_version FROM work_provenance WHERE work_id=?", id).Scan(&author, &cv)
+		if err != nil {
+			return err
+		}
 		if author != s.token.BindingID || cv != 1 {
 			t.Errorf("provenance=%s/%d", author, cv)
 		}
@@ -174,6 +177,9 @@ func TestAuthenticatedIngestionWaitsThenCommitsExactlyOneReply(t *testing.T) {
 			return err
 		}
 		err = tx.QueryRowContext(ctx, "SELECT cursor FROM ingestion_cursors WHERE binding_id=?", recipient.token.BindingID).Scan(&cursor)
+		if err != nil {
+			return err
+		}
 		if count != 2 || cv != recipient.token.CredentialVersion || cursor != "one" {
 			t.Errorf("count=%d cv=%d cursor=%s", count, cv, cursor)
 		}
@@ -899,5 +905,106 @@ func TestInitializeRejectsMalformedCoordinatesBeforeOrigin(t *testing.T) {
 				t.Errorf("malformed coordinates called origin %d times", calls)
 			}
 		})
+	}
+}
+
+func TestTerminalIngestionReplaysAcrossHeldReenrollment(t *testing.T) {
+	m, _, recipient, ingestor, request, _ := readyIngestion(t)
+	ctx := context.Background()
+	original, err := ingestor.Ingest(ctx, recipient, request)
+	if err != nil || original.Classification != "accepted" {
+		t.Fatalf("initial=%+v %v", original, err)
+	}
+	binding := recipient.token.BindingID
+	var secret [32]byte
+	secret[0] = 99
+	credential := store.CredentialRecord{BindingID: binding, ID: "40000000-0000-4000-8000-000000000003", Version: 2, Status: "current", ExpiresAtNS: time.Unix(300, 0).UnixNano(), Verifier: sha256.Sum256(secret[:])}
+	_, err = m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		if _, err := store.RevokeBinding(ctx, tx, store.RevocationRequest{BindingID: binding, IncidentID: "60000000-0000-4000-8000-000000000001", ExpectedBindingVersion: 1, ExpectedCredentialVersion: 1}, nil); err != nil {
+			return store.TransitionResult{}, err
+		}
+		return store.TransitionResult{Changed: true}, store.ReenrollCredential(ctx, tx, binding, 2, 1, credential)
+	}, func(store.CommitView) { m.Invalidate(binding) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := NewAuthentication(credential.ID, secret[:], recipient.socket.native)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor, err := m.Attach(ctx, acceptSocket(t, m), auth, recipient.token.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe, err := m.BeginReadiness(ctx, successor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Acknowledge(ctx, successor, probe); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	ingestor.config.Verify = func(context.Context, NativeTuple, Token, IngestRequest) error { calls++; return nil }
+	replay, err := ingestor.Ingest(ctx, successor, request)
+	if err != nil || !replay.Replayed || replay.EnvelopeID != original.EnvelopeID || replay.Classification != original.Classification {
+		t.Errorf("held replay=%+v %v", replay, err)
+	}
+	conflict := request
+	conflict.Event.Revision = "different"
+	if _, err := ingestor.Ingest(ctx, successor, conflict); err != store.EventConflict {
+		t.Errorf("held conflict=%v", err)
+	}
+	fresh := request
+	fresh.Event.ID = "fresh-event"
+	if _, err := ingestor.Ingest(ctx, successor, fresh); err != store.SecurityHold {
+		t.Errorf("held fresh event=%v", err)
+	}
+	if calls != 0 {
+		t.Errorf("retained replay/held work called verifier=%d", calls)
+	}
+	if err := m.store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM ingestion_evidence").Scan(&count); err != nil {
+			return err
+		}
+		if count != 1 {
+			t.Errorf("replay added evidence=%d", count)
+		}
+		if err := store.IngestionAllowed(ctx, tx, binding); err != store.SecurityHold {
+			t.Errorf("replay opened barrier=%v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInitializeRechecksBarrierRaisedDuringOrigin(t *testing.T) {
+	m, session, _ := workFixture(t)
+	ctx := context.Background()
+	ingestor, err := NewIngestor(IngestorConfig{Manager: m, Verify: func(context.Context, NativeTuple, Token, IngestRequest) error { return nil }, Origin: func(ctx context.Context, _ NativeTuple, _ Token, _ string, _ string) error {
+		_, err := m.store.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+			_, err := tx.ExecContext(ctx, "INSERT INTO ingestion_barriers(binding_id,barrier_version,status) VALUES(?,1,'held')", session.token.BindingID)
+			return store.TransitionResult{Changed: true}, err
+		}, nil)
+		return err
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ingestor.Initialize(ctx, session, "70000000-0000-4000-8000-000000000001", "start"); err != store.SecurityHold {
+		t.Fatalf("new barrier ignored=%v", err)
+	}
+	if err := m.store.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM ingestion_cursors WHERE binding_id=?", session.token.BindingID).Scan(&count); err != nil {
+			return err
+		}
+		if count != 0 {
+			t.Errorf("held initialization stored cursor=%d", count)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

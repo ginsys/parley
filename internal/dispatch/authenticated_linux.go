@@ -131,7 +131,7 @@ func (b *AuthenticatedBridge) DispatchOutcome(ctx context.Context, id string) (o
 	defer stop()
 	transport := b.transportFor(recipient)
 	var deliveryErr error
-	if transport == nil || recipient.Context().Err() != nil {
+	if transport == nil || b.manager.RequireReady(ctx, recipient) != nil || recipient.Context().Err() != nil {
 		deliveryErr = ErrNoAttempt
 	} else {
 		deliveryErr = transport.Deliver(attempt, *claimed)

@@ -117,12 +117,12 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
 			return store.TransitionResult{}, err
 		}
-		if err := store.IngestionAllowed(ctx, tx, s.token.BindingID); err != nil {
-			return store.TransitionResult{}, err
-		}
 		var err error
 		previous, _, err = store.LookupEvent(ctx, tx, e)
-		return store.TransitionResult{}, err
+		if err != nil || previous.Replayed {
+			return store.TransitionResult{}, err
+		}
+		return store.TransitionResult{}, store.IngestionAllowed(ctx, tx, s.token.BindingID)
 	}, nil)
 	if err != nil {
 		return store.EventResult{}, err
@@ -145,20 +145,20 @@ func (i *Ingestor) Ingest(ctx context.Context, s *Session, r IngestRequest) (out
 		if err := m.AuthorizeWork(ctx, tx, s, false); err != nil {
 			return store.TransitionResult{}, err
 		}
-		if err := store.IngestionAllowed(ctx, tx, s.token.BindingID); err != nil {
-			return store.TransitionResult{}, err
-		}
 		var found bool
 		var err error
 		result, found, err = store.LookupEvent(ctx, tx, e)
-		if err == nil && !found {
-			result, err = store.StageEvent(ctx, tx, e)
-		}
-		if err != nil {
+		if err != nil || result.Replayed {
 			return store.TransitionResult{}, err
 		}
-		if result.Replayed {
-			return store.TransitionResult{}, nil
+		if err := store.IngestionAllowed(ctx, tx, s.token.BindingID); err != nil {
+			return store.TransitionResult{}, err
+		}
+		if !found {
+			result, err = store.StageEvent(ctx, tx, e)
+			if err != nil {
+				return store.TransitionResult{}, err
+			}
 		}
 		pending := func(code store.Code) (store.TransitionResult, error) {
 			result = store.EventResult{Classification: "pending", Code: code}

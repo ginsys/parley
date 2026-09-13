@@ -741,8 +741,9 @@ External publication failure invokes a mandatory nonblocking supervisor fail-sto
 actual process/supervisor integration remains required before live use. No persistence guarantee is
 claimed when every persistence path fails, or for a rollback never recorded before a crash and
 subsequent clock correction. Distinct detected floor/observed pairs retain independent incidents
-even while another clock incident is held or awaiting cleanup; repeated identical observations
-reuse that evidence only while its incident is held. Reconciled incidents are being cleared, so
+even while another clock incident is held or awaiting cleanup; repeated identical writer
+observations reuse that evidence only while its incident is held. Independent reconciliation
+samples may retain fresh incidents for identical pairs; pending observations still deduplicate. Reconciled incidents are being cleared, so
 a repeated detection needs fresh evidence. A failed deduplication read retains the detection.
 Once a marker or held database incident exists, corrected wall time and restart cannot clear it. Restore detection requires the operator to establish a fresh external marker.
 
@@ -858,3 +859,15 @@ peer identifiers; oversized rows remain untouched with `incompatible_identifier`
 Namespace retirement is idempotent only within its original incident. A later incident naming
 that already-retired namespace receives `version_conflict`; immutable retirement evidence is
 never relinked or reported as a new retirement. Reviewed later recovery can omit prior retirements.
+
+Authenticated terminal event replay and retained identity conflicts precede ingestion barriers;
+fresh or pending work still checks the barrier before provider I/O and mutation. Re-enrollment
+therefore preserves access to old terminal results without reopening ingestion.
+Dispatch revalidates the exact captured recipient through the coordinator after claim commit and
+transport resolution. Crossed credential/liveness deadlines settle as never attempted and refund
+the exact claim; delayed timers cannot authorize host delivery to an expired capability.
+Reconciliation captures the applicable clock floor inside a short transaction, closes it, then
+takes and publishes each sample under the same coordinator gate. Verification and the monotonic
+one-second wait hold neither gate nor transaction. Valid samples raise the remembered floor;
+rollback samples latch exact evidence, flushed independently of caller cancellation. Later normal
+checkpoint advancement cannot retrospectively invalidate an earlier legitimate sample.
