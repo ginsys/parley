@@ -722,8 +722,11 @@ barrier closed. Native event production and large-interval tooling remain separa
 
 ## Durable recovery implementation
 
-`internal/recovery.Service` supplies `runtime.Config.InspectRecovery` and installs store hooks before
-service admission. Preparation and marker flush run outside the coordinator. Time sampling,
+`runtime.Config.InspectRecovery` constructs `internal/recovery.Service` inside its callback with
+the writer supplied by `runtime.Start`, then calls that service's `InspectRecovery` with the same
+writer. Retain that service for trusted administrative wiring after construction. Binding the method
+of a service constructed on a separate DB is invalid; runtime owns opening and closing its writer.
+This installs recovery hooks before readers, interrupted-dispatch recovery and service admission. Preparation and marker flush run outside the coordinator. Time sampling,
 checkpoint comparison and advancement share a writer acquisition; business transactions receive one
 validated authorization instant. A durable preceding checkpoint remains even when later business
 work rejects. A rollback detected in the writer immediately holds ordinary operations and is flushed
