@@ -15,6 +15,8 @@ mise exec -- go test ./internal/adapter/codex -run '^TestConnectionRuntime' -cou
 
 The runtime composition fixtures create private databases and recovery directories under `/tmp`,
 attach synthetic peers over local Unix sockets, and inject the test executable into `ExecSender`.
+The synthetic service serializes admission with its worker count, rejects sends and dispatches
+after StopAdmission, and drains previously admitted work before releasing storage.
 A child emits a controlled startup signal before cancellation. Parent synchronization distinguishes
 cancellation after process startup from a process that never ran; no installed `codex` is launched.
 These tests compose the existing internal APIs without introducing a runnable daemon, protocol
