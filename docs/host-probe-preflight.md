@@ -316,6 +316,14 @@ and does not keep a vanished menu. Detection still requires the captured tool la
 Yes/No choices, exact bound request and absence of tool execution. The initial idle-composer
 readiness pattern is unchanged. All failed setup artifacts are retained separately.
 
+The rendered capture also established that the pending `mcp__parleyprobe__hold` tool-use record
+may be persisted after the permission menu appears, even though the server has not received the
+call. Its shape is the same typed assistant call with `input: {}` and `caller: {type: "direct"}`.
+The parser recognizes this synthetic call without exposing its arguments as message text.
+While the verified approval menu remains present, this is the existing blocked turn's activity,
+not a new turn caused by the notification. The final approval trials apply that distinction;
+earlier parser-limited runs remain in the [attempt ledger](evidence/host-wake/attempts-20260914.json).
+
 For busy state, the same number-generation prompt used by Codex produced a user record at
 `2026-09-14T06:36:55.007Z` and a descendant `system` / `turn_duration` record at
 `2026-09-14T06:37:16.075Z`, with `durationMs: 21016`. The listing changed from `working` to
