@@ -450,9 +450,12 @@ ten-second acceptance window, despite earlier transcript visibility.
 For approval, the documented [inline configuration](https://opencode.ai/docs/config/#precedence-order)
 set `permission: {"*": "ask"}` only for the child. A request to run
 `printf PARLEY_APPROVAL_PREFLIGHT` produced `Permission required`, `Shell command`, the exact
-command, and `Allow once`, `Allow always`, `Reject`. No option was selected. A first setup hit
-provider `Endpoint is unavailable` before reaching approval; that failed setup was retained and
-a fresh setup succeeded. The pending export carried a `tool` part for `bash`, a `callID`, and
+command, and `Allow once`, `Allow always`, `Reject`. No option was selected. The first setup hit
+provider `Endpoint is unavailable` in two intermediate captures, then the host's retries reached
+approval in its final capture. A separate fresh setup also succeeded. The
+[attempt ledger](evidence/host-wake/opencode-attempts-20260914.json) preserves both the provider
+errors and the eventual menu; an earlier interim reading incorrectly called the whole setup a
+failure. The pending export carried a `tool` part for `bash`, a `callID`, and
 `state: {"status": "running", "input": {"command": "printf PARLEY_APPROVAL_PREFLIGHT"},
 "time": {"start": <epoch-ms>}}`. Here `running` means awaiting permission, not executed.
 An external `run --attach` placed its marker in the transcript but timed out after 60 seconds
