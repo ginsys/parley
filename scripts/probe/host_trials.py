@@ -2148,8 +2148,9 @@ class OpenCodeDriver(Driver):
 
     Submission needs `serve()` open: `run --attach <url> --session <id>` is the only captured path
     into an existing session. The server listens on loopback without a password (captured
-    warning; `OPENCODE_SERVER_PASSWORD` is uncaptured), on a free ephemeral port chosen per
-    `serve()` so a leftover server cannot answer in its place.
+    warning), on a free ephemeral port chosen per `serve()` so a leftover server cannot answer
+    in its place. The separate opencode_matrix reproducer injects the subsequently captured
+    authenticated child environment and readiness request; these defaults do not enable it.
     """
 
     NAMESPACE = 'opencode'

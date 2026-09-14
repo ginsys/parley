@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import opencode_matrix as matrix
@@ -82,6 +83,52 @@ class StateTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_disconnected_rejection_keeps_polling_and_records_acceptance_independently(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            root = Path(directory)
+            cwd = root / 'cwd'
+            cwd.mkdir(mode=0o700)
+            output = root / 'capture'
+            calls = []
+
+            def run(argv, **kwargs):
+                if argv == ['opencode', '--version']:
+                    return subprocess.CompletedProcess(argv, 0, '1.18.30\n', '')
+                if '--attach' in argv:
+                    calls.append(argv)
+                    return subprocess.CompletedProcess(argv, 1, '', 'Error: Session not found\n')
+                raise AssertionError('ordinary test must not launch a host')
+
+            def serve(driver):
+                driver.server = SimpleNamespace(url='http://127.0.0.1:12345')
+
+            def close(driver):
+                driver.server = None
+                return []
+
+            def trial(driver, **kwargs):
+                identity = f'owned-{len(calls)}'
+                driver.mint(identity)
+                kwargs['settle'](identity)
+                # None keeps run_trial on its observation path; False would skip it.
+                self.assertIsNone(driver.submit(identity, 'synthetic marker'))
+                driver.release(identity)
+                return TrialRun(session_id=identity, submitted_at=time.time() - 130,
+                                accepted_at=None, outcomes={}, state='disconnected', marker='synthetic',
+                                supported={key: True for key in ('accepted', 'visible', 'turn_start', 'ack')},
+                                observable={key: key != 'accepted' for key in ('accepted', 'visible', 'turn_start', 'ack')})
+
+            with patch.object(sys, 'argv', ['opencode_matrix.py', '--state', 'disconnected',
+                                           '--output-directory', str(output)]), \
+                    patch('subprocess.run', side_effect=run), patch('tempfile.mkdtemp', return_value=str(cwd)), \
+                    patch.object(matrix.OpenCodeDriver, 'serve', serve), \
+                    patch.object(matrix.OpenCodeDriver, 'close_servers', close), \
+                    patch.object(matrix, 'run_trial_with_cleanup', side_effect=trial):
+                matrix.main()
+            data = json.loads((output / 'aggregate.json').read_text())
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(set(data['aggregate'].values()), {'not_observed'})
+
     def invoke(self, directory, result):
         cwd = directory / 'cwd'
         cwd.mkdir(mode=0o700)
