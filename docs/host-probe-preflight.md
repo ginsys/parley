@@ -469,6 +469,9 @@ independently, including after this captured rejection. Unexpected server death 
 ordinary driver; intentional disconnection is an explicit investigation state.
 Other captured live-server rejections retain the shared driver's unobservable transcript outcomes;
 the reproducer waits out the acceptance window before classifying their negative acceptance.
+That wait uses a monotonic deadline. Bracketed wall/monotonic samples span setup, trial, cleanup
+and classification; a detected step aborts the attempt without a classification or aggregate.
+The exact checked UTC classification instant is retained separately from the journal write time.
 
 `scripts/probe/opencode_matrix.py --state <state> --output-directory <new-evidence-directory>`
 reproduces three trials of each state using these captured shapes and the fixed windows. Run it

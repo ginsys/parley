@@ -28,7 +28,8 @@ def combine(directories):
         checked = classify_trial(
             Trial(submitted=run['submitted_at'], state=run['state'], outcomes=run['outcomes'],
                   turn_end=run['turn_end'], turn_end_observable=run['turn_end_observable']),
-            result['utc'], supported=run['supported'], observable=run['observable'])
+            result.get('classification_utc', result['utc']),
+            supported=run['supported'], observable=run['observable'])
         if checked != result['outcomes']:
             raise ValueError('recorded classification does not match its original trial clock')
         trials.append(dict(source=f'{path.parent.name}/{path.name}', trial=run, outcomes=checked))
