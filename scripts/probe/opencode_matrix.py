@@ -25,7 +25,7 @@ from host_trials import (
     run_trial_with_cleanup,
 )
 from terminal_capture import terminal_screen
-from wake_probe import Trial, aggregate
+from wake_probe import WINDOWS, Trial, aggregate
 
 BUSY_PROMPT = ('Write the integers from one through five hundred in English words, '
                'one per line, followed by HOLD COMPLETE. Do not call tools or change files.')
@@ -310,6 +310,11 @@ def main():
                 record('trial', trial=dataclasses.asdict(trial))
                 if trial.interrupted or trial.clock_step is not None:
                     raise RuntimeError('invalid or interrupted trial retained separately')
+                # A captured live rejection returns before the acceptance window closes.
+                # Wait real elapsed time; never classify with an invented future timestamp.
+                remaining = trial.submitted_at + WINDOWS['accepted'] - time.time()
+                if remaining > 0:
+                    time.sleep(remaining)
                 result = classify_trial(Trial(submitted=trial.submitted_at, state=trial.state,
                                               outcomes=trial.outcomes, turn_end=trial.turn_end,
                                               turn_end_observable=trial.turn_end_observable),
