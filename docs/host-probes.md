@@ -3,6 +3,8 @@
 The investigation protocol is owned by [#18](https://github.com/ginsys/parley/issues/18).
 The tooling here records evidence; it is not a production host adapter or session authenticator.
 The controlled fixtures launch only Python children, never installed Claude, Codex or OpenCode.
+The [Claude/Codex matrix](host-wake-matrix.md) records direct-host results, sanitized evidence,
+reproduction commands and the measured limits of the available mechanisms.
 
 ## Reproduce controlled fixtures
 
@@ -14,8 +16,9 @@ mise run verify
 ```
 
 `mise run python` and `mise run docs` first create the gitignored `.venv` using the pinned
-Python and install `requirements-dev.txt` (`PyYAML==6.0.3`). CI uses the same setup task; no
-system-interpreter PyYAML installation is required.
+Python and install `requirements-dev.txt` (`PyYAML==6.0.3`, `pyte==0.8.2`, `wcwidth==0.2.13`).
+The latter two reconstruct the current terminal for investigation-only approval detection.
+CI uses the same setup task; no system-interpreter package installation is required.
 
 `mise run python` lints all Python under `scripts/` and runs the PTY, classification and aggregate
 CI fixtures. The CI Python job installs both pinned tools explicitly. Python is a dependency of
