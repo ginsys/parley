@@ -426,3 +426,49 @@ not proof that Codex has no IPC mechanism.
 times, raw rollout/client evidence and failed attempts, then applies the fixed trial protocol.
 Run it explicitly with `--state <state> --output-directory <new-private-evidence-directory>`.
 Ordinary tests inject every process creator; they do not launch a host.
+
+## 2026-09-14 — authenticated OpenCode state captures
+
+OpenCode `1.18.30`, model `opencode/ling-3.0-flash-fin-free`, was driven through newly created
+disposable sessions. An ephemeral `OPENCODE_SERVER_PASSWORD` and `OPENCODE_SERVER_USERNAME=opencode`
+were supplied only to the owned children. No password or Authorization header is evidence.
+The documented [Basic authentication](https://opencode.ai/docs/server/#authentication) was
+captured: `GET /session` returned 401 without credentials, 401 with incorrect credentials and
+200 with the generated credentials. Only the status was read. Authenticated readiness requests
+followed the owned child's listening line; preexisting-listener checks used no credentials.
+
+`opencode attach <owned-url> --pure --dir <probe-cwd> --session <owned-id>` uses those environment
+credentials. The current 80×24 terminal showed the creation PONG exchange, the private cwd and
+`Ling 3.0 Flash Fin Free`. During the request to spell integers one through five hundred, it
+showed `esc interrupt`. The bound export's assistant `parentID` named that exact request;
+`time.created` existed during the turn and `time.completed` plus `finish: "stop"` appeared at
+completion. In a separate busy submission capture, the marker user record appeared 0.77 seconds
+after `run --attach` started. Its assistant record followed completion of the old turn. The
+command returned zero after 46.97 seconds: the exit-status acceptance signal was later than the
+ten-second acceptance window, despite earlier transcript visibility.
+
+For approval, the documented [inline configuration](https://opencode.ai/docs/config/#precedence-order)
+set `permission: {"*": "ask"}` only for the child. A request to run
+`printf PARLEY_APPROVAL_PREFLIGHT` produced `Permission required`, `Shell command`, the exact
+command, and `Allow once`, `Allow always`, `Reject`. No option was selected. A first setup hit
+provider `Endpoint is unavailable` before reaching approval; that failed setup was retained and
+a fresh setup succeeded. The pending export carried a `tool` part for `bash`, a `callID`, and
+`state: {"status": "running", "input": {"command": "printf PARLEY_APPROVAL_PREFLIGHT"},
+"time": {"start": <epoch-ms>}}`. Here `running` means awaiting permission, not executed.
+An external `run --attach` placed its marker in the transcript but timed out after 60 seconds
+while the old approval remained pending. This pending call is neither acknowledgement text nor
+a new turn caused by the marker.
+
+After an owned server stopped, the same `run --attach` invocation returned exit 1, empty stdout
+and `Error: Session not found`. Restarting the owned server on the same port after that attempt
+did not replay the marker; no resubmission was made. The investigation observes all four windows
+independently, including after this captured rejection. Unexpected server death still fails the
+ordinary driver; intentional disconnection is an explicit investigation state.
+
+`scripts/probe/opencode_matrix.py --state <state> --output-directory <new-evidence-directory>`
+reproduces three trials of each state using these captured shapes and the fixed windows. Run it
+with the pinned virtual-environment Python after `mise run python`. Its approval observer checks
+the current menu and exact pending call before excluding that preexisting incomplete assistant
+record; it cannot supply marker acknowledgement or a new turn. Busy windows use the exact old
+assistant's completion. Exports, terminal bytes, UTC/monotonic observations and cleanup remain
+with each capture. These preflights alone fill no repeated-trial matrix cell.
