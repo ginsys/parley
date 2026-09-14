@@ -37,10 +37,15 @@ listener, human administration endpoint, host-native source reader or production
 | C13 | Reviewed held interval in ingestion storage; [human resume](../internal/connection/ingestion_resume_test.go) stale barrier, replay and renewed authorization | Real source-interval production and larger-interval tooling are #31; oversized intervals remain held |
 | C14 | Coordinator retained results survive reopen and cannot be deleted/replaced; [retention guards](../internal/store/retention_test.go); authenticated event replay/conflict | No TTL eviction or recovery by emptying identity history |
 | C15 | Retention migration preserves all legacy evidence and rolls back/reruns; [dispositions](../internal/store/dispositions_test.go); [identifier rejection](../internal/dispatch/identifiers_test.go); renewal/carry regressions | Historical exact identifiers remain unchanged |
-| C16 | [Restore administration](../internal/recovery/restore_test.go) preserves ACK/state/attempt/budget evidence and retires every restored binding; runtime composition restores a stopped pre-delivery/ACK/revoke/budget snapshot and skips ordinary service admission across marked restarts | Pending approval is #28; surviving-history import is not implemented; operators must mark every restore |
+| C16 | [Restore administration](../internal/recovery/restore_test.go) preserves ACK/state/attempt/budget evidence and retires every restored binding; runtime composition restores a stopped pre-delivery/ACK/binding-revocation/budget snapshot and skips ordinary service admission across marked restarts | Pending approval is #28; surviving-history import is not implemented; operators must mark every restore |
 | C17 | Registry key/locator constraints, signed-counter and SQLite-capacity fixtures; attachment deadline equality; dispatch attempt overflow; [expiry failure](../internal/connection/work_linux_test.go) retains exact denial without blocking unrelated credentials | Pending TTL is #28; physical storage limits can still prevent persistence |
 | C18 | Wrong-UID rejection and accepted same-UID credential possession in attachment; trusted socket path/kernel checks in the client | No claim of production account isolation or protection from a compromised trusted verifier |
 | C19 | [Recovery service](../internal/recovery/service_test.go) marker/DB failure, corrected-time restart and synchronized clock races; [clock reconciliation](../internal/recovery/administration_test.go) stale/independent incident and lost-response cleanup; runtime composition turns external-persistence failure into a supervised stop | Real supervisor prevention of unattended restart and cross-host deployment validation belong to #37/operator integration |
+
+The stopped-snapshot fixture performs binding revocation through the audited internal Lifecycle API
+after delivery and ACK. It never bypasses the recovery policy with a legacy controller transaction.
+It confirms that restoring the snapshot loses those newer effects while the external incident
+still prevents ordinary service admission and mutation.
 
 The current restore implementation is deliberately conservative: it disables every restored binding
 and holds outstanding work instead of importing surviving history. It does not rewrite ACKs, delivery
