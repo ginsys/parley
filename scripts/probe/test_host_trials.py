@@ -1881,12 +1881,54 @@ class ClaudeDriverTests(DriverTestCase):
         self.assertEqual(run.argv('claude', 'rm'), [])
         self.assertEqual(driver.owned(), {'69aa52ed'})  # retained for a human to find
 
+    def test_captured_interactive_attach_row_does_not_grant_background_ownership(self):
+        # 2026-09-14: the cwd-filtered listing includes the attach client's own registration.
+        interactive = {'pid': 8181, 'cwd': self.cwd, 'kind': 'interactive',
+                       'startedAt': 1789365323003,
+                       'sessionId': '8a54b464-bf16-4483-8661-88e337c6a64a',
+                       'name': 'synthetic-probe', 'status': 'idle'}
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], listing([self.entry(), interactive]))])
+        driver = self.driver(run)
+        driver.create('hello')
+        self.assertEqual(driver.status('69aa52ed'), self.entry())
+        self.assertEqual(driver.owned(), {'69aa52ed'})
+        self.assertNotIn(interactive['sessionId'], driver.sessions)
+
+    def test_captured_stopped_listing_omits_both_pid_and_status(self):
+        stopped = self.entry(pid=None, status=None)
+        stopped.pop('pid')
+        stopped.pop('status')
+        run = FakeRun([(['claude', 'agents'], listing([stopped])),
+                       (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n')),
+                       (['claude', 'rm'], FakeResult(0, 'removed 69aa52ed\n'))])
+        driver = self.driver(run)
+        driver._mint('69aa52ed')
+        self.assertIsNone(driver.status('69aa52ed')['pid'])
+        driver.teardown('69aa52ed')
+        self.assertEqual(run.argv('claude', 'rm'), [['claude', 'rm', '69aa52ed']])
+        self.assertEqual(driver.owned(), set())
+
+    def test_uncaptured_interactive_rows_still_refuse_the_listing(self):
+        interactive = {'pid': 8181, 'cwd': self.cwd, 'kind': 'interactive',
+                       'sessionId': '8a54b464-bf16-4483-8661-88e337c6a64a', 'status': 'idle'}
+        for change in ({'pid': None}, {'pid': True}, {'cwd': '/other'}, {'status': None},
+                       {'sessionId': 'invalid'}, {'id': '69aa52ed'}, {'state': 'done'}):
+            with self.subTest(change=change):
+                run = FakeRun([(['claude', 'agents'], listing([self.entry(), interactive | change]))])
+                driver = self.driver(run)
+                with self.assertRaisesRegex(RuntimeError, 'malformed'):
+                    driver._listing()
+
     def test_malformed_claude_listings_never_authorize_rm_after_a_failed_stop(self):
         missing_pid = self.entry(pid=None, status=None)
         missing_pid.pop('pid')
         missing_id = self.entry(pid=None, status=None)
         missing_id.pop('id')
-        for entries in ([missing_pid], [None], [missing_id],
+        missing_live_fields = self.entry(state='working')
+        missing_live_fields.pop('pid')
+        missing_live_fields.pop('status')
+        for entries in ([missing_pid], [None], [missing_id], [missing_live_fields],
                         [self.entry(pid=False)], [self.entry(pid='unknown')],
                         [self.entry(pid=None), self.entry(pid=None)]):
             with self.subTest(entries=entries):

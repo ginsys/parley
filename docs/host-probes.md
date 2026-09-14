@@ -321,15 +321,20 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   settles there rather than in a settle callback, and a turn still running at the 180 s cap is an
   error, with the session left owned for the sweep. `status(id)`
   returns the owned entry from that listing (`pid`, `status`, `state`, `sessionId`) for settle
-  callbacks. Every listing row must be a background-session object with nonempty string
-  identity/state fields and an explicit `pid` that is null or a positive integer. Short IDs must
+  callbacks. The [2026-09-14 capture](host-probe-preflight.md#claude-listing-shapes-2026-09-14)
+  also contains the attach client's transient `interactive` registration. Its exact cwd, UUID,
+  positive PID and nonempty status are checked; it must lack background `id`/`state` fields.
+  It is excluded from the background view and never grants ownership or deletion authority.
+  Background rows require nonempty string identity/state fields and a `pid` that is null or a
+  positive integer. The captured stopped form has `state: "done"` and omits both `pid` and
+  `status`; only this pair of omissions is normalized to null. Short IDs must
   have the captured eight-hex-digit shape and full IDs the lowercase hyphenated UUID shape.
   The short ID must equal the full UUID's first eight digits, as captured; once bound, the full
   UUID cannot change under the same owned short ID. Neither malformed nor changed bindings
   may redirect transcript reads. Assistant content parts must use the captured `text` or
   `thinking` types; missing, malformed or unknown types make the record unusable instead of
   silently hiding a marker and producing negative evidence. Malformed rows,
-  duplicate IDs and missing PIDs fail the listing; they never prove that a session is absent or
+  duplicate background IDs and any other missing-PID shape fail the listing; they never prove that a session is absent or
   stopped and cannot authorize `rm` after a failed `stop`. A transcript candidate disappearing
   between discovery and stat makes that read unobservable; later polls retry discovery and a
   version read remains unknown. Identity-binding/listing failures remain fatal lifecycle errors.

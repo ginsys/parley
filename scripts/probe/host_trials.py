@@ -1005,7 +1005,23 @@ class ClaudeDriver(Driver):
         if not isinstance(entries, list):
             raise RuntimeError(f'claude agents --json produced a non-list top level: {result.stdout!r}')
         seen = set()
+        backgrounds = []
         for entry in entries:
+            if isinstance(entry, dict) and entry.get('kind') == 'interactive':
+                # The 2026-09-14 cwd-filtered capture includes the owned attach client's
+                # transient registration. It has no background id/state and grants no session
+                # ownership. Validate its distinct shape before excluding it from this view.
+                if (entry.get('cwd') != self.cwd or not is_session_uuid(entry.get('sessionId')) or
+                        type(entry.get('pid')) is not int or entry['pid'] <= 0 or
+                        not isinstance(entry.get('status'), str) or not entry['status'] or
+                        'id' in entry or 'state' in entry):
+                    raise RuntimeError('claude agents --json produced a malformed listing entry')
+                continue
+            if (isinstance(entry, dict) and entry.get('kind') == 'background' and
+                    entry.get('state') == 'done' and 'pid' not in entry and 'status' not in entry):
+                # The stopped row in that capture omits both live-only fields. Normalize only
+                # this observed pair of omissions; an arbitrary missing PID remains invalid.
+                entry = entry | {'pid': None, 'status': None}
             if (not isinstance(entry, dict) or 'pid' not in entry or
                     any(not isinstance(entry.get(key), str) or not entry[key]
                         for key in ('id', 'kind', 'sessionId', 'state')) or
@@ -1018,12 +1034,14 @@ class ClaudeDriver(Driver):
                      (type(entry['pid']) is not int or entry['pid'] <= 0))):
                 raise RuntimeError('claude agents --json produced a malformed listing entry')
             seen.add(entry['id'])
-        return entries
+            backgrounds.append(entry)
+        return backgrounds
 
     def status(self, session_id):
         """The `claude agents --json --all --cwd <cwd>` entry for an owned id, or None if absent.
 
-        Captured fields: `pid` (None once stopped), `status` (`idle`/`busy`, None once stopped),
+        Captured fields: `pid` (None once stopped), `status` (`idle`/`busy`, None once stopped;
+        both omitted in the 2026-09-14 stopped capture and normalized to None),
         `state` (`working`/`done`), `sessionId`, exact `cwd`. Settle callbacks use it to establish or check a
         precondition; what an approval-parked session shows, and how reliable `busy` is, are
         uncaptured. Only this driver's own `--cwd`-filtered listing is ever read.

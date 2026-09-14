@@ -199,7 +199,7 @@ described under [Matrix runner](host-probes.md#matrix-runner)):
   `run --attach --session` is the live-session submission path, `export` the observation
   channel, `session delete` the teardown. The `OpenCodeDriver` placeholder can be implemented.
 
-Still uncaptured, and not assumed by the runner: what a Claude listing shows while
+At the end of this 2026-09-13 capture, still uncaptured and not assumed by the runner: what a Claude listing shows while
 a session is parked on a permission prompt (`approval`), whether `status: "busy"` is reliable for
 `busy`, and whether a queued Codex message is delivered mid-turn or only after the running turn
 ends. Those are established by the stage-2 trial runs themselves, not assumed here. Likewise
@@ -208,3 +208,42 @@ inferred rather than captured, and marked as such in the runner: closing stdin f
 default model was used), what
 `codex delete --force` does to a still-queued item, and whether an OpenCode `error` event or a
 nonzero exit takes precedence when both occur.
+
+## Claude listing shapes 2026-09-14
+
+Baseline `3ca5030218a3a33b3c57c9a77118af39ed517185`, Claude Code `2.1.270`, direct disposable
+session under real HOME. A plain-MCP compatibility preflight created its own background session
+with `claude --bg --model haiku --mcp-config <fixture-config> --strict-mcp-config '<prompt>'`
+from an empty private `<probe-cwd>`. The prompt was “Reply with exactly PONG. Do not call tools
+or change files.” It attached with `claude attach <short-id>`. MCP initialization was observed,
+but the preflight failed before sending a notification; it supplies no wake-matrix result.
+
+The repeated command `claude agents --json --all --cwd <probe-cwd>` returned a background row
+plus the attach client's own transient interactive registration. Relevant raw shapes, with only
+paths, PIDs, display names and identifiers substituted consistently:
+
+```json
+[
+  {"pid": 101, "id": "11111111", "cwd": "<probe-cwd>", "kind": "background", "startedAt": 1789365313428, "sessionId": "11111111-1111-4111-8111-111111111111", "name": "reply pong instruction", "status": "idle", "state": "done"},
+  {"pid": 102, "cwd": "<probe-cwd>", "kind": "interactive", "startedAt": 1789365323003, "sessionId": "22222222-2222-4222-8222-222222222222", "name": "synthetic-probe", "status": "idle"}
+]
+```
+
+After closing the attach client and `claude stop <short-id>` (exit 0, `stopped <short-id>`),
+the same filtered listing contained only this row. `pid` and `status` were absent, not JSON null:
+
+```json
+[{"id":"11111111","cwd":"<probe-cwd>","kind":"background","startedAt":1789365312488,"sessionId":"11111111-1111-4111-8111-111111111111","name":"reply pong instruction","state":"done"}]
+```
+
+The prior parser refused both shapes and therefore stopped before removing the background row.
+Its creation output, exact full UUID, private cwd and stopped state were rechecked before
+finishing cleanup with `claude rm <short-id>`. That exited 0; the filtered listing became `[]`.
+Hook-generated files remained in the disposable cwd and were retained with the failed attempt.
+
+The runner now validates and excludes the distinct interactive shape without minting it. For
+background rows, only `state: "done"` with both live fields absent is normalized to null; a
+working row missing its PID, a partial omission or malformed identity still refuses the listing.
+Controlled fixtures reproduce both failures and verify that removal remains confined to the
+created background ID. This expands the earlier captured contract; it does not adopt a session
+from a listing or infer a permission-prompt shape.
