@@ -1,0 +1,1107 @@
+{
+  "schema": 1,
+  "host": "Codex",
+  "version": "0.154.0",
+  "state": "approval",
+  "purpose": "Three independent repeat trials after current-screen approval guard correction.",
+  "sanitization": "Home/probe paths and native session/call IDs replaced consistently. Command outputs and cumulative PTY text omitted. First/final observations retained; unchanged intermediate observations omitted. Raw terminal bytes retained privately; SHA256 and rendered initial/final screens published. Rollout message bodies omitted; fresh marker occurrence counts and record counts retained.",
+  "aggregate": {
+    "state": "approval",
+    "trials": [
+      {
+        "ack": "not_observed",
+        "accepted": "observed",
+        "turn_start": "not_observed",
+        "visible": "not_observed"
+      },
+      {
+        "ack": "not_observed",
+        "accepted": "observed",
+        "turn_start": "not_observed",
+        "visible": "not_observed"
+      },
+      {
+        "ack": "not_observed",
+        "accepted": "observed",
+        "turn_start": "not_observed",
+        "visible": "not_observed"
+      }
+    ],
+    "aggregate": {
+      "accepted": "observed",
+      "visible": "not_observed",
+      "turn_start": "not_observed",
+      "ack": "not_observed"
+    }
+  },
+  "trials": [
+    {
+      "trial": "trial-1",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789371763.6489937,
+          "monotonic": 1011969.593963372,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371763.6825721,
+          "monotonic": 1011969.627541536,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "probe_directory",
+          "utc": 1789371763.6826847,
+          "monotonic": 1011969.627654062,
+          "cwd": "<probe-cwd>",
+          "retained_for_explicit_cleanup": true
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789371763.682793,
+          "monotonic": 1011969.627762285,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371763.6848278,
+          "monotonic": 1011969.629797128,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789371763.6901295,
+          "monotonic": 1011969.635098898,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": null,
+          "stdin_devnull": true
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371769.0639296,
+          "monotonic": 1011975.008898922,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789371769.0683775,
+          "monotonic": 1011975.013347443,
+          "argv": [
+            "codex",
+            "-c",
+            "approvals_reviewer=\"user\"",
+            "--no-alt-screen",
+            "-s",
+            "read-only",
+            "-a",
+            "on-request",
+            "-C",
+            "<probe-cwd>",
+            "resume",
+            "<session-1>"
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "state_prompt",
+          "utc": 1789371776.2785208,
+          "monotonic": 1011982.223490042,
+          "state": "approval",
+          "prompt": "This is an isolated approval prompt preflight. Use exec_command with sandbox_permissions=require_escalated for the exact command python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'. Ask for approval and wait. Do not use an unapproved fallback or another tool."
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789371782.1290135,
+          "monotonic": 1011988.073983137,
+          "state": "approval",
+          "evidence": {
+            "<call-1>": "<call-2>"
+          }
+        },
+        {
+          "kind": "approval_screen",
+          "utc": 1789371782.1418352,
+          "monotonic": 1011988.086804814,
+          "screen": "\u2502 directory: <probe-cwd>          \u2502                              \n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f                              \n                                                                                \n  Tip: New Use /fast to enable our fastest inference with increased plan usage. \n                                                                                \n                                                                                \n\u203a Reply with exactly PONG. Do not call tools or change files.                   \n                                                                                \n\u2022 Running python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                       \n                                                                                \n                                                                                \n  Would you like to run the following command?                                  \n                                                                                \n  Environment: local                                                            \n                                                                                \n  Reason: `/bin/bash -lc \"python3 -c 'print(\\\"PARLEY_APPROVAL_PREFLIGHT\\\")'\"`   \n  requires approval: nah requires review of this command before execution.      \n                                                                                \n  $ python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                             \n                                                                                \n\u203a 1. Yes, proceed (y)                                                           \n  2. No, and tell Codex what to do differently (esc)                            \n                                                                                \n  Press enter to confirm or esc to cancel                                       "
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789371782.1418874,
+          "monotonic": 1011988.086856735,
+          "thread_id": "<session-1>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-af076ae703014725a2a576490def442f"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789371782.1595397,
+          "monotonic": 1011988.104509315,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<session-1>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-af076ae703014725a2a576490def442f"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371782.4166694,
+          "monotonic": 1011988.361638793,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<session-1>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-af076ae703014725a2a576490def442f"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "submission_returned",
+          "utc": 1789371782.4167197,
+          "monotonic": 1011988.361688911,
+          "result": true
+        },
+        {
+          "kind": "observation",
+          "utc": 1789371782.4394424,
+          "monotonic": 1011988.384412016,
+          "thread_id": "<session-1>",
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789371902.1673563,
+          "monotonic": 1012108.112325836,
+          "thread_id": "<session-1>",
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789371902.2442472,
+          "monotonic": 1012108.189217082,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<session-1>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371902.6543782,
+          "monotonic": 1012108.599347723,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<session-1>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "deleted",
+          "utc": 1789371902.654433,
+          "monotonic": 1012108.599402225,
+          "thread_id": "<session-1>",
+          "owned": []
+        },
+        {
+          "kind": "trial",
+          "utc": 1789371902.6544724,
+          "monotonic": 1012108.59944165,
+          "trial": {
+            "session_id": "<session-1>",
+            "submitted_at": 1789371782.141879,
+            "accepted_at": 1789371782.4167328,
+            "outcomes": {
+              "accepted": 1789371782.4167328
+            },
+            "state": "approval",
+            "supported": {
+              "ack": true,
+              "accepted": true,
+              "turn_start": true,
+              "visible": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-af076ae703014725a2a576490def442f",
+            "signals": {
+              "accepted": "submit_exit_status"
+            },
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "0.154.0",
+            "model": null,
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789371902.6545272,
+          "monotonic": 1012108.599496463,
+          "outcomes": {
+            "ack": "not_observed",
+            "accepted": "observed",
+            "turn_start": "not_observed",
+            "visible": "not_observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789371902.6545427,
+          "monotonic": 1012108.599511983,
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "terminal_sha256": "2b94a65ede80971f95f8971c3131fb22b9eb81aab100e49813f1ca43271889c4",
+      "final_screen": "\u2502 directory: <probe-cwd>          \u2502                              \n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f                              \n                                                                                \n  Tip: New Use /fast to enable our fastest inference with increased plan usage. \n                                                                                \n                                                                                \n\u203a Reply with exactly PONG. Do not call tools or change files.                   \n                                                                                \n\u2022 Running python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                       \n                                                                                \n                                                                                \n  Would you like to run the following command?                                  \n                                                                                \n  Environment: local                                                            \n                                                                                \n  Reason: `/bin/bash -lc \"python3 -c 'print(\\\"PARLEY_APPROVAL_PREFLIGHT\\\")'\"`   \n  requires approval: nah requires review of this command before execution.      \n                                                                                \n  $ python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                             \n                                                                                \n\u203a 1. Yes, proceed (y)                                                           \n  2. No, and tell Codex what to do differently (esc)                            \n                                                                                \n  Press enter to confirm or esc to cancel                                       ",
+      "rollout_inventory": [
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:42:45.574Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:42:45.574Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:42:45.574Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:42:45.574Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:42:45.602Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "timestamp": "2026-09-14T07:42:48.433Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:42:57.605Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:42:57.640Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "timestamp": "2026-09-14T07:43:00.276Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "custom_tool_call",
+          "role": null,
+          "timestamp": "2026-09-14T07:43:01.973Z",
+          "marker_occurrences": 0
+        }
+      ]
+    },
+    {
+      "trial": "trial-2",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789371902.6546967,
+          "monotonic": 1012108.599665965,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371902.6882777,
+          "monotonic": 1012108.633247051,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "probe_directory",
+          "utc": 1789371902.6883643,
+          "monotonic": 1012108.63333362,
+          "cwd": "<probe-cwd>",
+          "retained_for_explicit_cleanup": true
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789371902.68848,
+          "monotonic": 1012108.633449344,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371902.6903918,
+          "monotonic": 1012108.635361092,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789371902.6951084,
+          "monotonic": 1012108.640077718,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": null,
+          "stdin_devnull": true
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371930.3750067,
+          "monotonic": 1012136.319976156,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789371930.3800492,
+          "monotonic": 1012136.32501859,
+          "argv": [
+            "codex",
+            "-c",
+            "approvals_reviewer=\"user\"",
+            "--no-alt-screen",
+            "-s",
+            "read-only",
+            "-a",
+            "on-request",
+            "-C",
+            "<probe-cwd>",
+            "resume",
+            "<session-2>"
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "state_prompt",
+          "utc": 1789371937.6896152,
+          "monotonic": 1012143.634584668,
+          "state": "approval",
+          "prompt": "This is an isolated approval prompt preflight. Use exec_command with sandbox_permissions=require_escalated for the exact command python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'. Ask for approval and wait. Do not use an unapproved fallback or another tool."
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789371944.3598437,
+          "monotonic": 1012150.304813478,
+          "state": "approval",
+          "evidence": {
+            "<call-1>": "<call-3>"
+          }
+        },
+        {
+          "kind": "approval_screen",
+          "utc": 1789371944.3808954,
+          "monotonic": 1012150.325865181,
+          "screen": "\u2502 directory: <probe-cwd>          \u2502                              \n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f                              \n                                                                                \n  Tip: New Use /fast to enable our fastest inference with increased plan usage. \n                                                                                \n                                                                                \n\u203a Reply with exactly PONG. Do not call tools or change files.                   \n                                                                                \n\u2022 Running python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                       \n                                                                                \n                                                                                \n  Would you like to run the following command?                                  \n                                                                                \n  Environment: local                                                            \n                                                                                \n  Reason: `/bin/bash -lc \"python3 -c 'print(\\\"PARLEY_APPROVAL_PREFLIGHT\\\")'\"`   \n  requires approval: nah requires review of this command before execution.      \n                                                                                \n  $ python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                             \n                                                                                \n\u203a 1. Yes, proceed (y)                                                           \n  2. No, and tell Codex what to do differently (esc)                            \n                                                                                \n  Press enter to confirm or esc to cancel                                       "
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789371944.3809555,
+          "monotonic": 1012150.325924605,
+          "thread_id": "<session-2>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-99e795fe88f5497699a1b6e1bfb1ef5c"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789371944.4000056,
+          "monotonic": 1012150.344975225,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<session-2>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-99e795fe88f5497699a1b6e1bfb1ef5c"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789371944.5946865,
+          "monotonic": 1012150.539655753,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<session-2>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-99e795fe88f5497699a1b6e1bfb1ef5c"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "submission_returned",
+          "utc": 1789371944.594736,
+          "monotonic": 1012150.539705593,
+          "result": true
+        },
+        {
+          "kind": "observation",
+          "utc": 1789371944.6179686,
+          "monotonic": 1012150.562938182,
+          "thread_id": "<session-2>",
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789372064.4054418,
+          "monotonic": 1012270.35041132,
+          "thread_id": "<session-2>",
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789372064.599954,
+          "monotonic": 1012270.544923458,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<session-2>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789372065.0510468,
+          "monotonic": 1012270.996016445,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<session-2>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "deleted",
+          "utc": 1789372065.051123,
+          "monotonic": 1012270.996092197,
+          "thread_id": "<session-2>",
+          "owned": []
+        },
+        {
+          "kind": "trial",
+          "utc": 1789372065.0511627,
+          "monotonic": 1012270.9961318,
+          "trial": {
+            "session_id": "<session-2>",
+            "submitted_at": 1789371944.3809452,
+            "accepted_at": 1789371944.5947495,
+            "outcomes": {
+              "accepted": 1789371944.5947495
+            },
+            "state": "approval",
+            "supported": {
+              "ack": true,
+              "accepted": true,
+              "turn_start": true,
+              "visible": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-99e795fe88f5497699a1b6e1bfb1ef5c",
+            "signals": {
+              "accepted": "submit_exit_status"
+            },
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "0.154.0",
+            "model": null,
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789372065.051206,
+          "monotonic": 1012270.996175335,
+          "outcomes": {
+            "ack": "not_observed",
+            "accepted": "observed",
+            "turn_start": "not_observed",
+            "visible": "not_observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789372065.0512204,
+          "monotonic": 1012270.996189788,
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "terminal_sha256": "9cc19efff930378dba45bdf3618c480d1411f425868bcbcfd7f319f663f69140",
+      "final_screen": "\u2502 directory: <probe-cwd>          \u2502                              \n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f                              \n                                                                                \n  Tip: New Use /fast to enable our fastest inference with increased plan usage. \n                                                                                \n                                                                                \n\u203a Reply with exactly PONG. Do not call tools or change files.                   \n                                                                                \n\u2022 Running python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                       \n                                                                                \n                                                                                \n  Would you like to run the following command?                                  \n                                                                                \n  Environment: local                                                            \n                                                                                \n  Reason: `/bin/bash -lc \"python3 -c 'print(\\\"PARLEY_APPROVAL_PREFLIGHT\\\")'\"`   \n  requires approval: nah requires review of this command before execution.      \n                                                                                \n  $ python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                             \n                                                                                \n\u203a 1. Yes, proceed (y)                                                           \n  2. No, and tell Codex what to do differently (esc)                            \n                                                                                \n  Press enter to confirm or esc to cancel                                       ",
+      "rollout_inventory": [
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:45:04.372Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:45:04.372Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:45:04.372Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:45:04.372Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:45:04.400Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "timestamp": "2026-09-14T07:45:29.854Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:45:39.019Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:45:39.077Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "timestamp": "2026-09-14T07:45:42.230Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "custom_tool_call",
+          "role": null,
+          "timestamp": "2026-09-14T07:45:44.241Z",
+          "marker_occurrences": 0
+        }
+      ]
+    },
+    {
+      "trial": "trial-3",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789372065.0513957,
+          "monotonic": 1012270.996364753,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789372065.0837889,
+          "monotonic": 1012271.028758055,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "probe_directory",
+          "utc": 1789372065.0838704,
+          "monotonic": 1012271.028839837,
+          "cwd": "<probe-cwd>",
+          "retained_for_explicit_cleanup": true
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789372065.0839865,
+          "monotonic": 1012271.028955799,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789372065.085834,
+          "monotonic": 1012271.030803207,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789372065.0908856,
+          "monotonic": 1012271.035855053,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": null,
+          "stdin_devnull": true
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789372069.3918293,
+          "monotonic": 1012275.336798544,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789372069.396568,
+          "monotonic": 1012275.341537732,
+          "argv": [
+            "codex",
+            "-c",
+            "approvals_reviewer=\"user\"",
+            "--no-alt-screen",
+            "-s",
+            "read-only",
+            "-a",
+            "on-request",
+            "-C",
+            "<probe-cwd>",
+            "resume",
+            "<session-3>"
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "state_prompt",
+          "utc": 1789372076.8065479,
+          "monotonic": 1012282.751517352,
+          "state": "approval",
+          "prompt": "This is an isolated approval prompt preflight. Use exec_command with sandbox_permissions=require_escalated for the exact command python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'. Ask for approval and wait. Do not use an unapproved fallback or another tool."
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789372084.6223698,
+          "monotonic": 1012290.567339488,
+          "state": "approval",
+          "evidence": {
+            "<call-1>": "<call-4>"
+          }
+        },
+        {
+          "kind": "approval_screen",
+          "utc": 1789372084.636973,
+          "monotonic": 1012290.581942454,
+          "screen": "  Tip: New Use /fast to enable our fastest inference with increased plan usage. \n                                                                                \n                                                                                \n\u203a Reply with exactly PONG. Do not call tools or change files.                   \n                                                                                \n                                                                                \n\u2022 PONG                                                                          \n                                                                                \n\u2022 Running python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                       \n                                                                                \n                                                                                \n  Would you like to run the following command?                                  \n                                                                                \n  Environment: local                                                            \n                                                                                \n  Reason: `/bin/bash -lc \"python3 -c 'print(\\\"PARLEY_APPROVAL_PREFLIGHT\\\")'\"`   \n  requires approval: nah requires review of this command before execution.      \n                                                                                \n  $ python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                             \n                                                                                \n\u203a 1. Yes, proceed (y)                                                           \n  2. No, and tell Codex what to do differently (esc)                            \n                                                                                \n  Press enter to confirm or esc to cancel                                       "
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789372084.6370275,
+          "monotonic": 1012290.581996819,
+          "thread_id": "<session-3>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-24384d8912b14b768c44aecb3f04b959"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789372084.6564877,
+          "monotonic": 1012290.601457128,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<session-3>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-24384d8912b14b768c44aecb3f04b959"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789372084.8671305,
+          "monotonic": 1012290.812099919,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<session-3>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-24384d8912b14b768c44aecb3f04b959"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "submission_returned",
+          "utc": 1789372084.8671803,
+          "monotonic": 1012290.812149592,
+          "result": true
+        },
+        {
+          "kind": "observation",
+          "utc": 1789372084.891229,
+          "monotonic": 1012290.836198725,
+          "thread_id": "<session-3>",
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789372204.663262,
+          "monotonic": 1012410.608231555,
+          "thread_id": "<session-3>",
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789372204.7740436,
+          "monotonic": 1012410.719013332,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<session-3>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789372205.2361486,
+          "monotonic": 1012411.181117907,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<session-3>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "deleted",
+          "utc": 1789372205.2361991,
+          "monotonic": 1012411.181168517,
+          "thread_id": "<session-3>",
+          "owned": []
+        },
+        {
+          "kind": "trial",
+          "utc": 1789372205.2362392,
+          "monotonic": 1012411.181208404,
+          "trial": {
+            "session_id": "<session-3>",
+            "submitted_at": 1789372084.6370184,
+            "accepted_at": 1789372084.8671927,
+            "outcomes": {
+              "accepted": 1789372084.8671927
+            },
+            "state": "approval",
+            "supported": {
+              "ack": true,
+              "accepted": true,
+              "turn_start": true,
+              "visible": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-24384d8912b14b768c44aecb3f04b959",
+            "signals": {
+              "accepted": "submit_exit_status"
+            },
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "0.154.0",
+            "model": null,
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789372205.2362802,
+          "monotonic": 1012411.18124968,
+          "outcomes": {
+            "ack": "not_observed",
+            "accepted": "observed",
+            "turn_start": "not_observed",
+            "visible": "not_observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789372205.236294,
+          "monotonic": 1012411.181263416,
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "terminal_sha256": "0401f0d437dd54672f47592248182a4ae5208bf68cd7788389a797b94e99147d",
+      "final_screen": "  Tip: New Use /fast to enable our fastest inference with increased plan usage. \n                                                                                \n                                                                                \n\u203a Reply with exactly PONG. Do not call tools or change files.                   \n                                                                                \n                                                                                \n\u2022 PONG                                                                          \n                                                                                \n\u2022 Running python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                       \n                                                                                \n                                                                                \n  Would you like to run the following command?                                  \n                                                                                \n  Environment: local                                                            \n                                                                                \n  Reason: `/bin/bash -lc \"python3 -c 'print(\\\"PARLEY_APPROVAL_PREFLIGHT\\\")'\"`   \n  requires approval: nah requires review of this command before execution.      \n                                                                                \n  $ python3 -c 'print(\"PARLEY_APPROVAL_PREFLIGHT\")'                             \n                                                                                \n\u203a 1. Yes, proceed (y)                                                           \n  2. No, and tell Codex what to do differently (esc)                            \n                                                                                \n  Press enter to confirm or esc to cancel                                       ",
+      "rollout_inventory": [
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:47:46.721Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:47:46.722Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:47:46.722Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:47:46.722Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:47:46.750Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "timestamp": "2026-09-14T07:47:48.795Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "timestamp": "2026-09-14T07:47:58.121Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "timestamp": "2026-09-14T07:47:58.155Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "timestamp": "2026-09-14T07:48:02.971Z",
+          "marker_occurrences": 0
+        },
+        {
+          "type": "custom_tool_call",
+          "role": null,
+          "timestamp": "2026-09-14T07:48:04.483Z",
+          "marker_occurrences": 0
+        }
+      ]
+    }
+  ]
+}

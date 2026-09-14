@@ -122,6 +122,13 @@ paths. This does not generalize to another Claude installation or to MCP logging
 
 ## Reproduction and cleanup
 
+Three additional Codex approval trials repeated the acceptance-only result after the reproducer
+was corrected to inspect the current terminal screen. The [repeat evidence](evidence/host-wake/codex-approval-current-screen-20260914.json)
+retains rendered approval screens, raw-terminal hashes, rollout inventories and the original
+120-second observations/classifications. The earlier approval captures remain available; their
+cumulative-screen guard could not independently exclude a cleared historical menu. The repeated
+trials supply that missing precondition check without changing the four reported outcomes.
+
 Install the pinned test dependencies and run the controlled gate first:
 
 ```sh
