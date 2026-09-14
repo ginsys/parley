@@ -14,6 +14,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from terminal_capture import terminal_screen
+
 BUSY_PROMPT = ('This is an isolated busy-state preflight. Write the integers from '
                'one through two hundred in English words, one per line, followed by '
                'HOLD COMPLETE. Do not use tools or change files.')
@@ -89,7 +91,7 @@ def approval_pending(records, screen):
 
 def require_approval(driver, thread_id):
     client = driver.live_client_for(thread_id)
-    if client is None or not approval_pending(bound_records(driver, thread_id), client.text_since(0)):
+    if client is None or not approval_pending(bound_records(driver, thread_id), terminal_screen(client)):
         raise RuntimeError('approval precondition no longer holds')
 
 
@@ -186,6 +188,8 @@ def main():
                             (trial_dir / 'rollout.jsonl').write_bytes(Path(path).read_bytes())
                         for number, client in enumerate(clients):
                             (trial_dir / f'pty-{number}.txt').write_text(client.text_since(0))
+                            with client.lock:
+                                (trial_dir / f'pty-{number}.raw').write_bytes(bytes(client.window))
                     finally:
                         super().teardown(thread_id)
                     record('deleted', thread_id=thread_id, owned=sorted(self.owned()))
@@ -228,11 +232,13 @@ def main():
                         candidate = active_turn(bound_records(driver, thread_id), before)
                     else:
                         candidate = approval_pending(bound_records(driver, thread_id),
-                                                     client.text_since(0))
+                                                     terminal_screen(client))
                     if candidate:
                         precondition.update(candidate)
                         record('precondition', state=args.state, evidence=candidate,
                                screen=client.text_since(0))
+                        if args.state == 'approval':
+                            record('approval_screen', screen=terminal_screen(client))
                         return
                     if time.monotonic() >= deadline:
                         raise RuntimeError('requested state was not observed')
