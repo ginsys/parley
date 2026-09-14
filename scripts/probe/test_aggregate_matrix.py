@@ -26,6 +26,12 @@ class AggregateTests(unittest.TestCase):
                 (path / 'journal.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
                 paths.append(path)
             self.assertTrue(all(value == 'not_observed' for value in combine(paths)['aggregate'].values()))
+            for path in paths:
+                rows = list(map(json.loads, (path / 'journal.jsonl').read_text().splitlines()))
+                rows[1]['classification_utc'] = rows[1]['utc']
+                rows[1]['utc'] = 0  # A later journal clock reading is not the checked decision instant.
+                (path / 'journal.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            self.assertTrue(all(value == 'not_observed' for value in combine(paths)['aggregate'].values()))
             with self.assertRaisesRegex(ValueError, 'distinct'):
                 combine([paths[0], paths[0], paths[2]])
             with (paths[-1] / 'journal.jsonl').open('a') as handle:

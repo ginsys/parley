@@ -95,6 +95,33 @@ class StateTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_acceptance_wait_rejects_forward_and_backward_clock_steps(self):
+        for step in (5, -5):
+            with self.subTest(step=step), tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                mono = [100.0]
+                wall = [1000.0]
+
+                def sleep(seconds):
+                    mono[0] += seconds
+                    wall[0] += seconds + step
+
+                def rejected(driver, **kwargs):
+                    return TrialRun(session_id='owned', submitted_at=1000, accepted_at=None,
+                                    outcomes={}, state='idle', marker='synthetic', supported={},
+                                    observable={'accepted': True, 'visible': False,
+                                                'turn_start': False, 'ack': False})
+
+                with patch.object(matrix.time, 'monotonic', side_effect=lambda: mono[0]), \
+                        patch.object(matrix.time, 'time', side_effect=lambda: wall[0]), \
+                        patch.object(matrix.time, 'sleep', side_effect=sleep):
+                    with self.assertRaisesRegex(RuntimeError, 'clock stepped'):
+                        self.invoke(Path(directory), rejected)
+                self.assertFalse((Path(directory) / 'capture/aggregate.json').exists())
+                rows = list(map(json.loads, (Path(directory) / 'capture/trial-1/journal.jsonl').read_text().splitlines()))
+                self.assertFalse(any(row['kind'] == 'classified' for row in rows))
+                self.assertEqual(rows[-2]['kind'], 'attempt_failed')
+                self.assertEqual(mono[0], 110)
+
     def test_fast_live_rejection_waits_for_acceptance_without_inventing_visibility(self):
         now = [1000.0]
 
@@ -111,6 +138,7 @@ class OrchestrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(dir='/tmp') as directory, \
                 patch.object(matrix.time, 'time', side_effect=lambda: now[0]), \
+                patch.object(matrix.time, 'monotonic', side_effect=lambda: now[0]), \
                 patch.object(matrix.time, 'sleep', side_effect=elapsed):
             output = self.invoke(Path(directory), rejected)
             data = json.loads((output / 'aggregate.json').read_text())

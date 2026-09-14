@@ -15,6 +15,7 @@ import urllib.request
 from pathlib import Path
 
 from host_trials import (
+    CLOCK_DRIFT_TOLERANCE,
     OpenCodeDriver,
     PtyClient,
     SessionRegistry,
@@ -32,6 +33,28 @@ BUSY_PROMPT = ('Write the integers from one through five hundred in English word
 APPROVAL_COMMAND = 'printf PARLEY_APPROVAL_PREFLIGHT'
 APPROVAL_PROMPT = ('Use the bash tool to run exactly: printf PARLEY_APPROVAL_PREFLIGHT. '
                    'Request permission and wait. Do not use other tools or change files.')
+
+
+def sample_clock():
+    return time.monotonic(), time.time(), time.monotonic()
+
+
+def checked_clock(anchor):
+    current = sample_clock()
+    wall_delta = current[1] - anchor[1]
+    drift_low = wall_delta - (current[2] - anchor[0])
+    drift_high = wall_delta - (current[0] - anchor[2])
+    if drift_low > CLOCK_DRIFT_TOLERANCE or drift_high < -CLOCK_DRIFT_TOLERANCE:
+        raise RuntimeError('wall clock stepped during OpenCode orchestration')
+    return current
+
+
+def acceptance_classification_time(submitted_at, anchor):
+    current = checked_clock(anchor)
+    deadline = current[2] + max(0, submitted_at + WINDOWS['accepted'] - current[1])
+    while (remaining := deadline - time.monotonic()) > 0:
+        time.sleep(remaining)
+    return checked_clock(anchor)[1]
 
 
 def seconds(value):
@@ -302,6 +325,7 @@ def main():
                 record('precondition', state=args.state, evidence=precondition, screen=terminal_screen(client))
 
             try:
+                clock_anchor = sample_clock()
                 trial = run_trial_with_cleanup(driver, prompt='Reply with exactly PONG. Do not call tools or change files.',
                                                state=args.state, settle=settle, poll_interval=1)
                 if rejected:
@@ -311,15 +335,13 @@ def main():
                 if trial.interrupted or trial.clock_step is not None:
                     raise RuntimeError('invalid or interrupted trial retained separately')
                 # A captured live rejection returns before the acceptance window closes.
-                # Wait real elapsed time; never classify with an invented future timestamp.
-                remaining = trial.submitted_at + WINDOWS['accepted'] - time.time()
-                if remaining > 0:
-                    time.sleep(remaining)
+                # The outer clock bracket also covers setup/cleanup and this remaining wait.
+                classification_utc = acceptance_classification_time(trial.submitted_at, clock_anchor)
                 result = classify_trial(Trial(submitted=trial.submitted_at, state=trial.state,
                                               outcomes=trial.outcomes, turn_end=trial.turn_end,
                                               turn_end_observable=trial.turn_end_observable),
-                                        time.time(), supported=trial.supported, observable=trial.observable)
-                record('classified', outcomes=result)
+                                        classification_utc, supported=trial.supported, observable=trial.observable)
+                record('classified', outcomes=result, classification_utc=classification_utc)
                 results.append(result)
             except BaseException as error:
                 record('attempt_failed', error_type=type(error).__name__, detail=str(error))
