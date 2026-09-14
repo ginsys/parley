@@ -1,2 +1,5 @@
 # Shared by mise documentation and probe verification, locally and in CI.
 PyYAML==6.0.3
+# Investigation-only terminal rendering; neither package is part of the Go runtime.
+pyte==0.8.2
+wcwidth==0.2.13

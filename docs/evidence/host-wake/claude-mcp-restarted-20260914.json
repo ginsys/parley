@@ -1,0 +1,2094 @@
+{
+  "schema": 1,
+  "host": "Claude",
+  "version": "2.1.270",
+  "mechanism": "plain MCP logging notifications",
+  "state": "restarted",
+  "sanitization": "Home, checkout, evidence and probe paths and native session/record IDs replaced consistently. Repeated status commands and unchanged observations omitted; first read, first outcome/completion observations and final observation retained. Command stdout/stderr and stripped PTY diagnostics omitted. Message record inventory retains type, timestamp, binding, model, text excerpt, original character count/hash and marker occurrences. Thinking/signatures, tool definitions and injected prompt snapshots omitted. MCP protocol journals retained. PID numbers are reproduction-local process evidence.",
+  "aggregate": {
+    "state": "restarted",
+    "trials": [
+      {
+        "visible": "not_observed",
+        "turn_start": "observed",
+        "ack": "not_observed",
+        "accepted": "unobservable"
+      },
+      {
+        "visible": "not_observed",
+        "turn_start": "observed",
+        "ack": "not_observed",
+        "accepted": "unobservable"
+      },
+      {
+        "visible": "not_observed",
+        "turn_start": "observed",
+        "ack": "not_observed",
+        "accepted": "unobservable"
+      }
+    ],
+    "aggregate": {
+      "visible": "not_observed",
+      "turn_start": "observed",
+      "ack": "not_observed",
+      "accepted": "unobservable"
+    }
+  },
+  "trials": [
+    {
+      "trial": "trial-1",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789368852.4505897,
+          "monotonic": 1009058.395559254,
+          "argv": [
+            "claude",
+            "--version"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789368852.5003452,
+          "monotonic": 1009058.445314713,
+          "argv": [
+            "claude",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789368852.5006108,
+          "monotonic": 1009058.445580217,
+          "argv": [
+            "claude",
+            "--bg",
+            "--model",
+            "haiku",
+            "--mcp-config",
+            "<evidence-root>/captures/claude-mcp-restarted-20260914/trial-1/mcp-config.json",
+            "--strict-mcp-config",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd-1>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789368853.2088447,
+          "monotonic": 1009059.153813962,
+          "argv": [
+            "claude",
+            "--bg",
+            "--model",
+            "haiku",
+            "--mcp-config",
+            "<evidence-root>/captures/claude-mcp-restarted-20260914/trial-1/mcp-config.json",
+            "--strict-mcp-config",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789368859.6400704,
+          "monotonic": 1009065.585039702,
+          "argv": [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            "--scope",
+            "--setenv=CLAUDE_MEM_SCOPE=1",
+            "-p",
+            "MemoryHigh=6G",
+            "-p",
+            "MemoryMax=12G",
+            "-p",
+            "MemorySwapMax=4G",
+            "--",
+            "<home>/.local/bin/claude",
+            "attach",
+            "<session-1>"
+          ],
+          "cwd": "<probe-cwd-1>"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789368865.455718,
+          "monotonic": 1009071.40068783,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-1>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789368866.0308852,
+          "monotonic": 1009071.975854537,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-1>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "stopped_before_notification",
+          "utc": 1789368866.477982,
+          "monotonic": 1009072.422951257,
+          "state": {
+            "id": "<session-1>",
+            "cwd": "<probe-cwd-1>",
+            "kind": "background",
+            "startedAt": 1789368852661,
+            "sessionId": "<native-id-1>",
+            "name": "pong response verification",
+            "state": "done",
+            "pid": null,
+            "status": null
+          }
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789368866.4781265,
+          "monotonic": 1009072.423095983,
+          "state": "restarted",
+          "evidence": {
+            "pid": 3559165
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789368866.4781778,
+          "monotonic": 1009072.423147107,
+          "session_id": "<session-1>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-529c36469b9d4c0cbfcc606441df805d"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789368866.7084618,
+          "monotonic": 1009072.653431231,
+          "argv": [
+            "claude",
+            "--bg",
+            "--resume",
+            "<native-id-1>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd-1>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789368867.4451184,
+          "monotonic": 1009073.39008793,
+          "argv": [
+            "claude",
+            "--bg",
+            "--resume",
+            "<native-id-1>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "explicit_restart",
+          "utc": 1789368867.445179,
+          "monotonic": 1009073.390148256,
+          "result": true
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789368871.568442,
+          "monotonic": 1009077.513411516,
+          "argv": [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            "--scope",
+            "--setenv=CLAUDE_MEM_SCOPE=1",
+            "-p",
+            "MemoryHigh=6G",
+            "-p",
+            "MemoryMax=12G",
+            "-p",
+            "MemorySwapMax=4G",
+            "--",
+            "<home>/.local/bin/claude",
+            "attach",
+            "<session-1>"
+          ],
+          "cwd": "<probe-cwd-1>"
+        },
+        {
+          "kind": "notification_unwritten",
+          "utc": 1789368875.0651448,
+          "monotonic": 1009081.010114556,
+          "reason": "control written while transport absent"
+        },
+        {
+          "kind": "observation",
+          "utc": 1789368875.47717,
+          "monotonic": 1009081.42213937,
+          "observation": {
+            "outcomes": {
+              "turn_start": 1789368869.684
+            },
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": "claude-sonnet-5"
+          },
+          "state": {
+            "pid": 3559684,
+            "id": "<session-1>",
+            "cwd": "<probe-cwd-1>",
+            "kind": "background",
+            "startedAt": 1789368867213,
+            "sessionId": "<native-id-1>",
+            "name": "pong response verification",
+            "status": "idle",
+            "state": "done"
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789368987.8810112,
+          "monotonic": 1009193.825980683,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-1>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789368988.4364715,
+          "monotonic": 1009194.381440882,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-1>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789368988.6440396,
+          "monotonic": 1009194.589009161,
+          "argv": [
+            "claude",
+            "rm",
+            "<session-1>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789368989.4017131,
+          "monotonic": 1009195.346682496,
+          "argv": [
+            "claude",
+            "rm",
+            "<session-1>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789368989.401793,
+          "monotonic": 1009195.346762241,
+          "trial": {
+            "session_id": "<session-1>",
+            "submitted_at": 1789368866.4781644,
+            "accepted_at": null,
+            "outcomes": {
+              "turn_start": 1789368869.684
+            },
+            "state": "restarted",
+            "supported": {
+              "visible": true,
+              "turn_start": true,
+              "ack": true,
+              "accepted": true
+            },
+            "observable": {
+              "accepted": false,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-529c36469b9d4c0cbfcc606441df805d",
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "2.1.270",
+            "model": "claude-sonnet-5",
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789368989.4018579,
+          "monotonic": 1009195.346827045,
+          "outcomes": {
+            "visible": "not_observed",
+            "turn_start": "observed",
+            "ack": "not_observed",
+            "accepted": "unobservable"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789368989.4018831,
+          "monotonic": 1009195.34685248,
+          "owned": [],
+          "clients": 0
+        },
+        {
+          "kind": "final_observation",
+          "utc": 1789368986.8797097,
+          "monotonic": 1009192.824679123,
+          "observation": {
+            "outcomes": {
+              "turn_start": 1789368869.684
+            },
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": "claude-sonnet-5"
+          },
+          "state": {
+            "pid": 3559684,
+            "id": "<session-1>",
+            "cwd": "<probe-cwd-1>",
+            "kind": "background",
+            "startedAt": 1789368867213,
+            "sessionId": "<native-id-1>",
+            "name": "pong response verification",
+            "status": "idle",
+            "state": "done"
+          }
+        }
+      ],
+      "host_events": [
+        {
+          "parentUuid": "<native-id-2>",
+          "type": "user",
+          "uuid": "<native-id-3>",
+          "timestamp": "2026-09-14T06:54:13.257Z",
+          "cwd": "<probe-cwd-1>",
+          "sessionId": "<native-id-1>",
+          "version": "2.1.270",
+          "role": "user",
+          "model": null,
+          "content_types": [
+            "string"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "Reply with exactly PONG. Do not call tools or change files.",
+              "characters": 59,
+              "sha256": "fcddede2204df5667c3449951e9052db2ded14c3b0e1de872aaf37be5b37e278",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-4>",
+          "type": "assistant",
+          "uuid": "<native-id-5>",
+          "timestamp": "2026-09-14T06:54:17.265Z",
+          "cwd": "<probe-cwd-1>",
+          "sessionId": "<native-id-1>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "thinking"
+          ],
+          "texts": []
+        },
+        {
+          "parentUuid": "<native-id-5>",
+          "type": "assistant",
+          "uuid": "<native-id-6>",
+          "timestamp": "2026-09-14T06:54:17.302Z",
+          "cwd": "<probe-cwd-1>",
+          "sessionId": "<native-id-1>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "text"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "PONG",
+              "characters": 4,
+              "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-7>",
+          "type": "system",
+          "subtype": "turn_duration",
+          "durationMs": 5032,
+          "timestamp": "2026-09-14T06:54:18.329Z",
+          "uuid": "<native-id-8>",
+          "cwd": "<probe-cwd-1>",
+          "sessionId": "<native-id-1>",
+          "version": "2.1.270"
+        },
+        {
+          "parentUuid": "<native-id-8>",
+          "type": "user",
+          "uuid": "<native-id-9>",
+          "timestamp": "2026-09-14T06:54:27.610Z",
+          "cwd": "<probe-cwd-1>",
+          "sessionId": "<native-id-1>",
+          "version": "2.1.270",
+          "role": "user",
+          "model": null,
+          "content_types": [
+            "string"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "Reply with exactly PONG. Do not call tools or change files.",
+              "characters": 59,
+              "sha256": "fcddede2204df5667c3449951e9052db2ded14c3b0e1de872aaf37be5b37e278",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-10>",
+          "type": "assistant",
+          "uuid": "<native-id-11>",
+          "timestamp": "2026-09-14T06:54:29.684Z",
+          "cwd": "<probe-cwd-1>",
+          "sessionId": "<native-id-1>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "text"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "PONG",
+              "characters": 4,
+              "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-12>",
+          "type": "system",
+          "subtype": "turn_duration",
+          "durationMs": 3020,
+          "timestamp": "2026-09-14T06:54:30.718Z",
+          "uuid": "<native-id-13>",
+          "cwd": "<probe-cwd-1>",
+          "sessionId": "<native-id-1>",
+          "version": "2.1.270"
+        }
+      ],
+      "server_journals": [
+        {
+          "process": "server.3559715.jsonl",
+          "records": [
+            {
+              "kind": "started",
+              "utc": 1789368853.0619884,
+              "monotonic": 1009059.00695826,
+              "pid": 3559715,
+              "protocol": "2025-06-18"
+            },
+            {
+              "kind": "received",
+              "utc": 1789368853.0620966,
+              "monotonic": 1009059.007066053,
+              "message": {
+                "method": "initialize",
+                "params": {
+                  "protocolVersion": "2025-11-25",
+                  "capabilities": {
+                    "roots": {
+                      "listChanged": true
+                    },
+                    "elicitation": {}
+                  },
+                  "clientInfo": {
+                    "name": "claude-code",
+                    "title": "Claude Code",
+                    "version": "2.1.270",
+                    "description": "Anthropic's agentic coding tool",
+                    "websiteUrl": "https://claude.com/claude-code"
+                  }
+                },
+                "jsonrpc": "2.0",
+                "id": 0
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789368853.0621507,
+              "monotonic": 1009059.007120117,
+              "message": {
+                "id": 0,
+                "result": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {
+                    "logging": {},
+                    "tools": {}
+                  },
+                  "serverInfo": {
+                    "name": "parley-notification-probe",
+                    "version": "0.1.0"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "received",
+              "utc": 1789368853.1580234,
+              "monotonic": 1009059.102993165,
+              "message": {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+              }
+            },
+            {
+              "kind": "initialized",
+              "utc": 1789368853.1580615,
+              "monotonic": 1009059.103030838
+            },
+            {
+              "kind": "received",
+              "utc": 1789368853.1580787,
+              "monotonic": 1009059.103048127,
+              "message": {
+                "method": "tools/list",
+                "jsonrpc": "2.0",
+                "id": 1
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789368853.1581054,
+              "monotonic": 1009059.103074648,
+              "message": {
+                "id": 1,
+                "result": {
+                  "tools": [
+                    {
+                      "name": "hold",
+                      "description": "Wait 30 seconds; no file, network or command access.",
+                      "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "process": "server.3561905.jsonl",
+          "records": [
+            {
+              "kind": "started",
+              "utc": 1789368867.413642,
+              "monotonic": 1009073.35861187,
+              "pid": 3561905,
+              "protocol": "2025-06-18"
+            },
+            {
+              "kind": "received",
+              "utc": 1789368867.413717,
+              "monotonic": 1009073.358686295,
+              "message": {
+                "method": "initialize",
+                "params": {
+                  "protocolVersion": "2025-11-25",
+                  "capabilities": {
+                    "roots": {
+                      "listChanged": true
+                    },
+                    "elicitation": {}
+                  },
+                  "clientInfo": {
+                    "name": "claude-code",
+                    "title": "Claude Code",
+                    "version": "2.1.270",
+                    "description": "Anthropic's agentic coding tool",
+                    "websiteUrl": "https://claude.com/claude-code"
+                  }
+                },
+                "jsonrpc": "2.0",
+                "id": 0
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789368867.4137566,
+              "monotonic": 1009073.358725953,
+              "message": {
+                "id": 0,
+                "result": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {
+                    "logging": {},
+                    "tools": {}
+                  },
+                  "serverInfo": {
+                    "name": "parley-notification-probe",
+                    "version": "0.1.0"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "received",
+              "utc": 1789368867.4560385,
+              "monotonic": 1009073.401008072,
+              "message": {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+              }
+            },
+            {
+              "kind": "initialized",
+              "utc": 1789368867.456077,
+              "monotonic": 1009073.401046288
+            },
+            {
+              "kind": "received",
+              "utc": 1789368867.4560964,
+              "monotonic": 1009073.401065803,
+              "message": {
+                "method": "tools/list",
+                "jsonrpc": "2.0",
+                "id": 1
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789368867.4561236,
+              "monotonic": 1009073.401092854,
+              "message": {
+                "id": 1,
+                "result": {
+                  "tools": [
+                    {
+                      "name": "hold",
+                      "description": "Wait 30 seconds; no file, network or command access.",
+                      "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trial": "trial-2",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789368989.4022028,
+          "monotonic": 1009195.347172165,
+          "argv": [
+            "claude",
+            "--version"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789368989.4467497,
+          "monotonic": 1009195.391719074,
+          "argv": [
+            "claude",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789368989.4469545,
+          "monotonic": 1009195.391923776,
+          "argv": [
+            "claude",
+            "--bg",
+            "--model",
+            "haiku",
+            "--mcp-config",
+            "<evidence-root>/captures/claude-mcp-restarted-20260914/trial-2/mcp-config.json",
+            "--strict-mcp-config",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd-2>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789368990.123662,
+          "monotonic": 1009196.06863165,
+          "argv": [
+            "claude",
+            "--bg",
+            "--model",
+            "haiku",
+            "--mcp-config",
+            "<evidence-root>/captures/claude-mcp-restarted-20260914/trial-2/mcp-config.json",
+            "--strict-mcp-config",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789368997.8217494,
+          "monotonic": 1009203.76671893,
+          "argv": [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            "--scope",
+            "--setenv=CLAUDE_MEM_SCOPE=1",
+            "-p",
+            "MemoryHigh=6G",
+            "-p",
+            "MemoryMax=12G",
+            "-p",
+            "MemorySwapMax=4G",
+            "--",
+            "<home>/.local/bin/claude",
+            "attach",
+            "<session-2>"
+          ],
+          "cwd": "<probe-cwd-2>"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369002.3374693,
+          "monotonic": 1009208.28243895,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-2>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369002.8798983,
+          "monotonic": 1009208.824867663,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-2>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "stopped_before_notification",
+          "utc": 1789369003.3115423,
+          "monotonic": 1009209.256511523,
+          "state": {
+            "id": "<session-2>",
+            "cwd": "<probe-cwd-2>",
+            "kind": "background",
+            "startedAt": 1789368989599,
+            "sessionId": "<native-id-14>",
+            "name": "Reply with exactly PONG. Do not call tools or change files.",
+            "state": "done",
+            "pid": null,
+            "status": null
+          }
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789369003.3116846,
+          "monotonic": 1009209.256653959,
+          "state": "restarted",
+          "evidence": {
+            "pid": 3568192
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789369003.311776,
+          "monotonic": 1009209.256745431,
+          "session_id": "<session-2>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-6c4ae4a468d945eb9032d6b9cfddd19c"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369003.5292916,
+          "monotonic": 1009209.474260839,
+          "argv": [
+            "claude",
+            "--bg",
+            "--resume",
+            "<native-id-14>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd-2>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369004.1257622,
+          "monotonic": 1009210.070731587,
+          "argv": [
+            "claude",
+            "--bg",
+            "--resume",
+            "<native-id-14>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "explicit_restart",
+          "utc": 1789369004.1258252,
+          "monotonic": 1009210.070794666,
+          "result": true
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789369008.1760066,
+          "monotonic": 1009214.120976044,
+          "argv": [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            "--scope",
+            "--setenv=CLAUDE_MEM_SCOPE=1",
+            "-p",
+            "MemoryHigh=6G",
+            "-p",
+            "MemoryMax=12G",
+            "-p",
+            "MemorySwapMax=4G",
+            "--",
+            "<home>/.local/bin/claude",
+            "attach",
+            "<session-2>"
+          ],
+          "cwd": "<probe-cwd-2>"
+        },
+        {
+          "kind": "notification_unwritten",
+          "utc": 1789369011.581777,
+          "monotonic": 1009217.526746672,
+          "reason": "control written while transport absent"
+        },
+        {
+          "kind": "observation",
+          "utc": 1789369012.0089877,
+          "monotonic": 1009217.953957021,
+          "observation": {
+            "outcomes": {
+              "turn_start": 1789369006.506
+            },
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": "claude-sonnet-5"
+          },
+          "state": {
+            "pid": 3569481,
+            "id": "<session-2>",
+            "cwd": "<probe-cwd-2>",
+            "kind": "background",
+            "startedAt": 1789369003994,
+            "sessionId": "<native-id-14>",
+            "name": "Reply with exactly PONG. Do not call tools or change files.",
+            "status": "idle",
+            "state": "done"
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369124.7303417,
+          "monotonic": 1009330.675311446,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-2>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369125.3857899,
+          "monotonic": 1009331.330759269,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-2>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369125.5946863,
+          "monotonic": 1009331.539655453,
+          "argv": [
+            "claude",
+            "rm",
+            "<session-2>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369126.3083892,
+          "monotonic": 1009332.253358595,
+          "argv": [
+            "claude",
+            "rm",
+            "<session-2>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789369126.3084762,
+          "monotonic": 1009332.25344556,
+          "trial": {
+            "session_id": "<session-2>",
+            "submitted_at": 1789369003.311744,
+            "accepted_at": null,
+            "outcomes": {
+              "turn_start": 1789369006.506
+            },
+            "state": "restarted",
+            "supported": {
+              "visible": true,
+              "turn_start": true,
+              "ack": true,
+              "accepted": true
+            },
+            "observable": {
+              "accepted": false,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-6c4ae4a468d945eb9032d6b9cfddd19c",
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "2.1.270",
+            "model": "claude-sonnet-5",
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789369126.3085277,
+          "monotonic": 1009332.253497012,
+          "outcomes": {
+            "visible": "not_observed",
+            "turn_start": "observed",
+            "ack": "not_observed",
+            "accepted": "unobservable"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789369126.3085434,
+          "monotonic": 1009332.253512813,
+          "owned": [],
+          "clients": 0
+        },
+        {
+          "kind": "final_observation",
+          "utc": 1789369123.7290132,
+          "monotonic": 1009329.673982695,
+          "observation": {
+            "outcomes": {
+              "turn_start": 1789369006.506
+            },
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": "claude-sonnet-5"
+          },
+          "state": {
+            "pid": 3569481,
+            "id": "<session-2>",
+            "cwd": "<probe-cwd-2>",
+            "kind": "background",
+            "startedAt": 1789369003994,
+            "sessionId": "<native-id-14>",
+            "name": "Reply with exactly PONG. Do not call tools or change files.",
+            "status": "idle",
+            "state": "done"
+          }
+        }
+      ],
+      "host_events": [
+        {
+          "parentUuid": "<native-id-15>",
+          "type": "user",
+          "uuid": "<native-id-16>",
+          "timestamp": "2026-09-14T06:56:30.214Z",
+          "cwd": "<probe-cwd-2>",
+          "sessionId": "<native-id-14>",
+          "version": "2.1.270",
+          "role": "user",
+          "model": null,
+          "content_types": [
+            "string"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "Reply with exactly PONG. Do not call tools or change files.",
+              "characters": 59,
+              "sha256": "fcddede2204df5667c3449951e9052db2ded14c3b0e1de872aaf37be5b37e278",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-17>",
+          "type": "assistant",
+          "uuid": "<native-id-18>",
+          "timestamp": "2026-09-14T06:56:35.752Z",
+          "cwd": "<probe-cwd-2>",
+          "sessionId": "<native-id-14>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "thinking"
+          ],
+          "texts": []
+        },
+        {
+          "parentUuid": "<native-id-18>",
+          "type": "assistant",
+          "uuid": "<native-id-19>",
+          "timestamp": "2026-09-14T06:56:35.777Z",
+          "cwd": "<probe-cwd-2>",
+          "sessionId": "<native-id-14>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "text"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "PONG",
+              "characters": 4,
+              "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-20>",
+          "type": "system",
+          "subtype": "turn_duration",
+          "durationMs": 6633,
+          "timestamp": "2026-09-14T06:56:36.893Z",
+          "uuid": "<native-id-21>",
+          "cwd": "<probe-cwd-2>",
+          "sessionId": "<native-id-14>",
+          "version": "2.1.270"
+        },
+        {
+          "parentUuid": "<native-id-21>",
+          "type": "user",
+          "uuid": "<native-id-22>",
+          "timestamp": "2026-09-14T06:56:44.418Z",
+          "cwd": "<probe-cwd-2>",
+          "sessionId": "<native-id-14>",
+          "version": "2.1.270",
+          "role": "user",
+          "model": null,
+          "content_types": [
+            "string"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "Reply with exactly PONG. Do not call tools or change files.",
+              "characters": 59,
+              "sha256": "fcddede2204df5667c3449951e9052db2ded14c3b0e1de872aaf37be5b37e278",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-23>",
+          "type": "assistant",
+          "uuid": "<native-id-24>",
+          "timestamp": "2026-09-14T06:56:46.506Z",
+          "cwd": "<probe-cwd-2>",
+          "sessionId": "<native-id-14>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "text"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "PONG",
+              "characters": 4,
+              "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-25>",
+          "type": "system",
+          "subtype": "turn_duration",
+          "durationMs": 3162,
+          "timestamp": "2026-09-14T06:56:47.641Z",
+          "uuid": "<native-id-26>",
+          "cwd": "<probe-cwd-2>",
+          "sessionId": "<native-id-14>",
+          "version": "2.1.270"
+        }
+      ],
+      "server_journals": [
+        {
+          "process": "server.3569544.jsonl",
+          "records": [
+            {
+              "kind": "started",
+              "utc": 1789368990.0321422,
+              "monotonic": 1009195.977112094,
+              "pid": 3569544,
+              "protocol": "2025-06-18"
+            },
+            {
+              "kind": "received",
+              "utc": 1789368990.0322196,
+              "monotonic": 1009195.977189147,
+              "message": {
+                "method": "initialize",
+                "params": {
+                  "protocolVersion": "2025-11-25",
+                  "capabilities": {
+                    "roots": {
+                      "listChanged": true
+                    },
+                    "elicitation": {}
+                  },
+                  "clientInfo": {
+                    "name": "claude-code",
+                    "title": "Claude Code",
+                    "version": "2.1.270",
+                    "description": "Anthropic's agentic coding tool",
+                    "websiteUrl": "https://claude.com/claude-code"
+                  }
+                },
+                "jsonrpc": "2.0",
+                "id": 0
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789368990.03226,
+              "monotonic": 1009195.977229049,
+              "message": {
+                "id": 0,
+                "result": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {
+                    "logging": {},
+                    "tools": {}
+                  },
+                  "serverInfo": {
+                    "name": "parley-notification-probe",
+                    "version": "0.1.0"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "received",
+              "utc": 1789368990.1180394,
+              "monotonic": 1009196.063009146,
+              "message": {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+              }
+            },
+            {
+              "kind": "initialized",
+              "utc": 1789368990.118098,
+              "monotonic": 1009196.06306729
+            },
+            {
+              "kind": "received",
+              "utc": 1789368990.118125,
+              "monotonic": 1009196.063094257,
+              "message": {
+                "method": "tools/list",
+                "jsonrpc": "2.0",
+                "id": 1
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789368990.1181622,
+              "monotonic": 1009196.063131605,
+              "message": {
+                "id": 1,
+                "result": {
+                  "tools": [
+                    {
+                      "name": "hold",
+                      "description": "Wait 30 seconds; no file, network or command access.",
+                      "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "process": "server.3570913.jsonl",
+          "records": [
+            {
+              "kind": "started",
+              "utc": 1789369004.206972,
+              "monotonic": 1009210.151941686,
+              "pid": 3570913,
+              "protocol": "2025-06-18"
+            },
+            {
+              "kind": "received",
+              "utc": 1789369004.2070675,
+              "monotonic": 1009210.152037002,
+              "message": {
+                "method": "initialize",
+                "params": {
+                  "protocolVersion": "2025-11-25",
+                  "capabilities": {
+                    "roots": {
+                      "listChanged": true
+                    },
+                    "elicitation": {}
+                  },
+                  "clientInfo": {
+                    "name": "claude-code",
+                    "title": "Claude Code",
+                    "version": "2.1.270",
+                    "description": "Anthropic's agentic coding tool",
+                    "websiteUrl": "https://claude.com/claude-code"
+                  }
+                },
+                "jsonrpc": "2.0",
+                "id": 0
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789369004.2071116,
+              "monotonic": 1009210.15208088,
+              "message": {
+                "id": 0,
+                "result": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {
+                    "logging": {},
+                    "tools": {}
+                  },
+                  "serverInfo": {
+                    "name": "parley-notification-probe",
+                    "version": "0.1.0"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "received",
+              "utc": 1789369004.2577772,
+              "monotonic": 1009210.20274679,
+              "message": {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+              }
+            },
+            {
+              "kind": "initialized",
+              "utc": 1789369004.2578132,
+              "monotonic": 1009210.202782605
+            },
+            {
+              "kind": "received",
+              "utc": 1789369004.2578304,
+              "monotonic": 1009210.202799745,
+              "message": {
+                "method": "tools/list",
+                "jsonrpc": "2.0",
+                "id": 1
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789369004.2578573,
+              "monotonic": 1009210.20282653,
+              "message": {
+                "id": 1,
+                "result": {
+                  "tools": [
+                    {
+                      "name": "hold",
+                      "description": "Wait 30 seconds; no file, network or command access.",
+                      "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "trial": "trial-3",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789369126.3088627,
+          "monotonic": 1009332.253832108,
+          "argv": [
+            "claude",
+            "--version"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369126.3554718,
+          "monotonic": 1009332.300441257,
+          "argv": [
+            "claude",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369126.3556616,
+          "monotonic": 1009332.30063079,
+          "argv": [
+            "claude",
+            "--bg",
+            "--model",
+            "haiku",
+            "--mcp-config",
+            "<evidence-root>/captures/claude-mcp-restarted-20260914/trial-3/mcp-config.json",
+            "--strict-mcp-config",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd-3>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369126.911312,
+          "monotonic": 1009332.856281415,
+          "argv": [
+            "claude",
+            "--bg",
+            "--model",
+            "haiku",
+            "--mcp-config",
+            "<evidence-root>/captures/claude-mcp-restarted-20260914/trial-3/mcp-config.json",
+            "--strict-mcp-config",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789369132.2679615,
+          "monotonic": 1009338.212930969,
+          "argv": [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            "--scope",
+            "--setenv=CLAUDE_MEM_SCOPE=1",
+            "-p",
+            "MemoryHigh=6G",
+            "-p",
+            "MemoryMax=12G",
+            "-p",
+            "MemorySwapMax=4G",
+            "--",
+            "<home>/.local/bin/claude",
+            "attach",
+            "<session-3>"
+          ],
+          "cwd": "<probe-cwd-3>"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369139.2851613,
+          "monotonic": 1009345.23013078,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-3>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369139.991412,
+          "monotonic": 1009345.936381309,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-3>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "stopped_before_notification",
+          "utc": 1789369140.4109666,
+          "monotonic": 1009346.355935763,
+          "state": {
+            "id": "<session-3>",
+            "cwd": "<probe-cwd-3>",
+            "kind": "background",
+            "startedAt": 1789369126521,
+            "sessionId": "<native-id-27>",
+            "name": "reply format test",
+            "state": "done",
+            "pid": null,
+            "status": null
+          }
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789369140.4110968,
+          "monotonic": 1009346.356066072,
+          "state": "restarted",
+          "evidence": {
+            "pid": 3579605
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789369140.4111395,
+          "monotonic": 1009346.356108958,
+          "session_id": "<session-3>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-2c265d07955947989be899417ed1ca2f"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369140.621346,
+          "monotonic": 1009346.566315486,
+          "argv": [
+            "claude",
+            "--bg",
+            "--resume",
+            "<native-id-27>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd-3>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369141.3820791,
+          "monotonic": 1009347.327048587,
+          "argv": [
+            "claude",
+            "--bg",
+            "--resume",
+            "<native-id-27>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "explicit_restart",
+          "utc": 1789369141.3821566,
+          "monotonic": 1009347.327125929,
+          "result": true
+        },
+        {
+          "kind": "pty_started",
+          "utc": 1789369145.4787154,
+          "monotonic": 1009351.423684717,
+          "argv": [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--collect",
+            "--scope",
+            "--setenv=CLAUDE_MEM_SCOPE=1",
+            "-p",
+            "MemoryHigh=6G",
+            "-p",
+            "MemoryMax=12G",
+            "-p",
+            "MemorySwapMax=4G",
+            "--",
+            "<home>/.local/bin/claude",
+            "attach",
+            "<session-3>"
+          ],
+          "cwd": "<probe-cwd-3>"
+        },
+        {
+          "kind": "notification_unwritten",
+          "utc": 1789369148.8892004,
+          "monotonic": 1009354.834169657,
+          "reason": "control written while transport absent"
+        },
+        {
+          "kind": "observation",
+          "utc": 1789369149.2882526,
+          "monotonic": 1009355.233221992,
+          "observation": {
+            "outcomes": {
+              "turn_start": 1789369143.221
+            },
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": "claude-sonnet-5"
+          },
+          "state": {
+            "pid": 3580863,
+            "id": "<session-3>",
+            "cwd": "<probe-cwd-3>",
+            "kind": "background",
+            "startedAt": 1789369141101,
+            "sessionId": "<native-id-27>",
+            "name": "reply format test",
+            "status": "idle",
+            "state": "done"
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369261.86488,
+          "monotonic": 1009467.809850094,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-3>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369262.5725083,
+          "monotonic": 1009468.517477765,
+          "argv": [
+            "claude",
+            "stop",
+            "<session-3>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789369262.7999542,
+          "monotonic": 1009468.744923465,
+          "argv": [
+            "claude",
+            "rm",
+            "<session-3>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789369263.5079207,
+          "monotonic": 1009469.452890078,
+          "argv": [
+            "claude",
+            "rm",
+            "<session-3>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789369263.5079923,
+          "monotonic": 1009469.452961664,
+          "trial": {
+            "session_id": "<session-3>",
+            "submitted_at": 1789369140.4111278,
+            "accepted_at": null,
+            "outcomes": {
+              "turn_start": 1789369143.221
+            },
+            "state": "restarted",
+            "supported": {
+              "visible": true,
+              "turn_start": true,
+              "ack": true,
+              "accepted": true
+            },
+            "observable": {
+              "accepted": false,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-2c265d07955947989be899417ed1ca2f",
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "2.1.270",
+            "model": "claude-sonnet-5",
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789369263.5080392,
+          "monotonic": 1009469.453008502,
+          "outcomes": {
+            "visible": "not_observed",
+            "turn_start": "observed",
+            "ack": "not_observed",
+            "accepted": "unobservable"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789369263.5080535,
+          "monotonic": 1009469.453022883,
+          "owned": [],
+          "clients": 0
+        },
+        {
+          "kind": "final_observation",
+          "utc": 1789369260.863589,
+          "monotonic": 1009466.808558558,
+          "observation": {
+            "outcomes": {
+              "turn_start": 1789369143.221
+            },
+            "signals": {
+              "turn_start": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": "claude-sonnet-5"
+          },
+          "state": {
+            "pid": 3580863,
+            "id": "<session-3>",
+            "cwd": "<probe-cwd-3>",
+            "kind": "background",
+            "startedAt": 1789369141101,
+            "sessionId": "<native-id-27>",
+            "name": "reply format test",
+            "status": "idle",
+            "state": "done"
+          }
+        }
+      ],
+      "host_events": [
+        {
+          "parentUuid": "<native-id-28>",
+          "type": "user",
+          "uuid": "<native-id-29>",
+          "timestamp": "2026-09-14T06:58:47.130Z",
+          "cwd": "<probe-cwd-3>",
+          "sessionId": "<native-id-27>",
+          "version": "2.1.270",
+          "role": "user",
+          "model": null,
+          "content_types": [
+            "string"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "Reply with exactly PONG. Do not call tools or change files.",
+              "characters": 59,
+              "sha256": "fcddede2204df5667c3449951e9052db2ded14c3b0e1de872aaf37be5b37e278",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-30>",
+          "type": "assistant",
+          "uuid": "<native-id-31>",
+          "timestamp": "2026-09-14T06:58:50.301Z",
+          "cwd": "<probe-cwd-3>",
+          "sessionId": "<native-id-27>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "thinking"
+          ],
+          "texts": []
+        },
+        {
+          "parentUuid": "<native-id-31>",
+          "type": "assistant",
+          "uuid": "<native-id-32>",
+          "timestamp": "2026-09-14T06:58:50.302Z",
+          "cwd": "<probe-cwd-3>",
+          "sessionId": "<native-id-27>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "text"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "PONG",
+              "characters": 4,
+              "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-33>",
+          "type": "system",
+          "subtype": "turn_duration",
+          "durationMs": 4133,
+          "timestamp": "2026-09-14T06:58:51.308Z",
+          "uuid": "<native-id-34>",
+          "cwd": "<probe-cwd-3>",
+          "sessionId": "<native-id-27>",
+          "version": "2.1.270"
+        },
+        {
+          "parentUuid": "<native-id-34>",
+          "type": "user",
+          "uuid": "<native-id-35>",
+          "timestamp": "2026-09-14T06:59:01.491Z",
+          "cwd": "<probe-cwd-3>",
+          "sessionId": "<native-id-27>",
+          "version": "2.1.270",
+          "role": "user",
+          "model": null,
+          "content_types": [
+            "string"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "Reply with exactly PONG. Do not call tools or change files.",
+              "characters": 59,
+              "sha256": "fcddede2204df5667c3449951e9052db2ded14c3b0e1de872aaf37be5b37e278",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-36>",
+          "type": "assistant",
+          "uuid": "<native-id-37>",
+          "timestamp": "2026-09-14T06:59:03.221Z",
+          "cwd": "<probe-cwd-3>",
+          "sessionId": "<native-id-27>",
+          "version": "2.1.270",
+          "role": "assistant",
+          "model": "claude-sonnet-5",
+          "content_types": [
+            "text"
+          ],
+          "texts": [
+            {
+              "text_excerpt": "PONG",
+              "characters": 4,
+              "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+              "marker_occurrences": 0
+            }
+          ]
+        },
+        {
+          "parentUuid": "<native-id-38>",
+          "type": "system",
+          "subtype": "turn_duration",
+          "durationMs": 2735,
+          "timestamp": "2026-09-14T06:59:04.302Z",
+          "uuid": "<native-id-39>",
+          "cwd": "<probe-cwd-3>",
+          "sessionId": "<native-id-27>",
+          "version": "2.1.270"
+        }
+      ],
+      "server_journals": [
+        {
+          "process": "server.3580892.jsonl",
+          "records": [
+            {
+              "kind": "started",
+              "utc": 1789369126.9493911,
+              "monotonic": 1009332.894360881,
+              "pid": 3580892,
+              "protocol": "2025-06-18"
+            },
+            {
+              "kind": "received",
+              "utc": 1789369126.9494698,
+              "monotonic": 1009332.894439209,
+              "message": {
+                "method": "initialize",
+                "params": {
+                  "protocolVersion": "2025-11-25",
+                  "capabilities": {
+                    "roots": {
+                      "listChanged": true
+                    },
+                    "elicitation": {}
+                  },
+                  "clientInfo": {
+                    "name": "claude-code",
+                    "title": "Claude Code",
+                    "version": "2.1.270",
+                    "description": "Anthropic's agentic coding tool",
+                    "websiteUrl": "https://claude.com/claude-code"
+                  }
+                },
+                "jsonrpc": "2.0",
+                "id": 0
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789369126.9495096,
+              "monotonic": 1009332.894479025,
+              "message": {
+                "id": 0,
+                "result": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {
+                    "logging": {},
+                    "tools": {}
+                  },
+                  "serverInfo": {
+                    "name": "parley-notification-probe",
+                    "version": "0.1.0"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "received",
+              "utc": 1789369127.032486,
+              "monotonic": 1009332.977455623,
+              "message": {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+              }
+            },
+            {
+              "kind": "initialized",
+              "utc": 1789369127.0325356,
+              "monotonic": 1009332.977504867
+            },
+            {
+              "kind": "received",
+              "utc": 1789369127.0325532,
+              "monotonic": 1009332.977522406,
+              "message": {
+                "method": "tools/list",
+                "jsonrpc": "2.0",
+                "id": 1
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789369127.0325801,
+              "monotonic": 1009332.977549424,
+              "message": {
+                "id": 1,
+                "result": {
+                  "tools": [
+                    {
+                      "name": "hold",
+                      "description": "Wait 30 seconds; no file, network or command access.",
+                      "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        {
+          "process": "server.3582456.jsonl",
+          "records": [
+            {
+              "kind": "started",
+              "utc": 1789369141.306957,
+              "monotonic": 1009347.251927097,
+              "pid": 3582456,
+              "protocol": "2025-06-18"
+            },
+            {
+              "kind": "received",
+              "utc": 1789369141.3070629,
+              "monotonic": 1009347.252032171,
+              "message": {
+                "method": "initialize",
+                "params": {
+                  "protocolVersion": "2025-11-25",
+                  "capabilities": {
+                    "roots": {
+                      "listChanged": true
+                    },
+                    "elicitation": {}
+                  },
+                  "clientInfo": {
+                    "name": "claude-code",
+                    "title": "Claude Code",
+                    "version": "2.1.270",
+                    "description": "Anthropic's agentic coding tool",
+                    "websiteUrl": "https://claude.com/claude-code"
+                  }
+                },
+                "jsonrpc": "2.0",
+                "id": 0
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789369141.3071082,
+              "monotonic": 1009347.252077309,
+              "message": {
+                "id": 0,
+                "result": {
+                  "protocolVersion": "2025-06-18",
+                  "capabilities": {
+                    "logging": {},
+                    "tools": {}
+                  },
+                  "serverInfo": {
+                    "name": "parley-notification-probe",
+                    "version": "0.1.0"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "received",
+              "utc": 1789369141.348741,
+              "monotonic": 1009347.293710951,
+              "message": {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+              }
+            },
+            {
+              "kind": "initialized",
+              "utc": 1789369141.348778,
+              "monotonic": 1009347.293747345
+            },
+            {
+              "kind": "received",
+              "utc": 1789369141.348796,
+              "monotonic": 1009347.293765241,
+              "message": {
+                "method": "tools/list",
+                "jsonrpc": "2.0",
+                "id": 1
+              }
+            },
+            {
+              "kind": "sent",
+              "utc": 1789369141.348821,
+              "monotonic": 1009347.293790142,
+              "message": {
+                "id": 1,
+                "result": {
+                  "tools": [
+                    {
+                      "name": "hold",
+                      "description": "Wait 30 seconds; no file, network or command access.",
+                      "inputSchema": {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": false
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

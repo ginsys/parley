@@ -1,0 +1,557 @@
+{
+  "schema": 1,
+  "scope": "Supplemental compatibility and unsuccessful attempt ledger, not extra independent trials in the matrix. Original cleanup failures remain visible beside the verified manual cleanup disposition. Paths/identifiers substituted; no raw injected prompts, credentials or thinking retained.",
+  "captures": [
+    {
+      "capture": "claude-mcp-approval-20260914",
+      "trials": [
+        {
+          "trial": "trial-1",
+          "records": [
+            {
+              "kind": "classified",
+              "utc": 1789368260.8877413,
+              "monotonic": 1008466.83271075,
+              "outcomes": {
+                "accepted": "unobservable",
+                "ack": "unobservable",
+                "visible": "unobservable",
+                "turn_start": "unobservable"
+              }
+            },
+            {
+              "kind": "ownership_after_cleanup",
+              "utc": 1789368260.8877583,
+              "monotonic": 1008466.832727489,
+              "owned": [],
+              "clients": 0
+            }
+          ]
+        },
+        {
+          "trial": "trial-2",
+          "records": [
+            {
+              "kind": "attempt_failed",
+              "utc": 1789368320.9697611,
+              "monotonic": 1008526.914730252,
+              "error_type": "RuntimeError",
+              "detail": "requested state not established"
+            },
+            {
+              "kind": "ownership_after_cleanup",
+              "utc": 1789368320.9697752,
+              "monotonic": 1008526.9147445,
+              "owned": [],
+              "clients": 0
+            }
+          ]
+        }
+      ],
+      "assessment": "Trial 1 reached its windows but transcript parsing was incomplete. Trial 2 failed setup because ANSI stripping lost a footer character. No aggregate."
+    },
+    {
+      "capture": "claude-mcp-approval-20260914b",
+      "trials": [
+        {
+          "trial": "trial-1",
+          "records": [
+            {
+              "kind": "attempt_failed",
+              "utc": 1789368623.5893638,
+              "monotonic": 1008829.534332913,
+              "error_type": "RuntimeError",
+              "detail": "requested state not established"
+            },
+            {
+              "kind": "ownership_after_cleanup",
+              "utc": 1789368623.589379,
+              "monotonic": 1008829.534348379,
+              "owned": [],
+              "clients": 0
+            }
+          ]
+        }
+      ],
+      "assessment": "Setup failed on another incomplete ANSI-stripped cancellation footer; no notification trial or aggregate."
+    },
+    {
+      "capture": "claude-mcp-approval-20260914c",
+      "trials": [
+        {
+          "trial": "trial-1",
+          "records": [
+            {
+              "kind": "attempt_failed",
+              "utc": 1789368824.71729,
+              "monotonic": 1009030.662259355,
+              "error_type": "RuntimeError",
+              "detail": "requested state not established"
+            },
+            {
+              "kind": "ownership_after_cleanup",
+              "utc": 1789368824.7173045,
+              "monotonic": 1009030.662273867,
+              "owned": [],
+              "clients": 0
+            }
+          ]
+        }
+      ],
+      "assessment": "Setup failed on an incomplete ANSI-stripped permission question; no notification trial or aggregate."
+    },
+    {
+      "capture": "claude-mcp-approval-20260914d",
+      "trials": [
+        {
+          "trial": "trial-1",
+          "records": [
+            {
+              "kind": "classified",
+              "utc": 1789369194.1847556,
+              "monotonic": 1009400.129724754,
+              "outcomes": {
+                "accepted": "unobservable",
+                "visible": "unobservable",
+                "ack": "unobservable",
+                "turn_start": "unobservable"
+              }
+            },
+            {
+              "kind": "ownership_after_cleanup",
+              "utc": 1789369194.1847713,
+              "monotonic": 1009400.129740582,
+              "owned": [],
+              "clients": 0
+            }
+          ]
+        },
+        {
+          "trial": "trial-2",
+          "records": [
+            {
+              "kind": "classified",
+              "utc": 1789369332.4039786,
+              "monotonic": 1009538.348947829,
+              "outcomes": {
+                "accepted": "unobservable",
+                "visible": "not_observed",
+                "ack": "not_observed",
+                "turn_start": "not_observed"
+              }
+            },
+            {
+              "kind": "ownership_after_cleanup",
+              "utc": 1789369332.4039934,
+              "monotonic": 1009538.348962548,
+              "owned": [],
+              "clients": 0
+            }
+          ]
+        },
+        {
+          "trial": "trial-3",
+          "records": [
+            {
+              "kind": "classified",
+              "utc": 1789369476.5482934,
+              "monotonic": 1009682.493262776,
+              "outcomes": {
+                "accepted": "unobservable",
+                "visible": "not_observed",
+                "ack": "not_observed",
+                "turn_start": "not_observed"
+              }
+            },
+            {
+              "kind": "ownership_after_cleanup",
+              "utc": 1789369476.548317,
+              "monotonic": 1009682.493286311,
+              "owned": [],
+              "clients": 0
+            }
+          ]
+        }
+      ],
+      "assessment": "Three completed trials with current terminal rendering, but a late-persisted pending hold record exceeded the then-captured parser. Retained as parser-limited; not substituted for the final row."
+    },
+    {
+      "capture": "claude-mcp-busy-native-preflight-20260914",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789367703.1193159,
+          "monotonic": 1007909.064285244,
+          "failures": [],
+          "owned": [],
+          "clients": 0,
+          "cwd": "<probe-cwd-1>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [],
+      "assessment": "Native attach identified the correct background process. The requested hold waited at approval, never ran, and was not answered. Valid approval-shape capture; failed busy setup."
+    },
+    {
+      "capture": "claude-mcp-busy-preflight-20260914",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789367276.447183,
+          "monotonic": 1007482.392152046,
+          "failures": [],
+          "owned": [],
+          "clients": 0,
+          "cwd": "<probe-cwd-2>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [],
+      "assessment": "Busy setup failed: the local launcher created a distinct interactive conversation instead of attaching. Background session removed; held client closed."
+    },
+    {
+      "capture": "claude-mcp-busy-preflight-20260914b",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789367555.1655161,
+          "monotonic": 1007761.11048544,
+          "failures": [],
+          "owned": [],
+          "clients": 0,
+          "cwd": "<probe-cwd-3>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [],
+      "assessment": "Same launcher failure captured on the final screen; the requested MCP tool was absent from the distinct interactive conversation."
+    },
+    {
+      "capture": "claude-mcp-busy-text-preflight-20260914",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789367943.8046832,
+          "monotonic": 1008149.749652582,
+          "failures": [],
+          "owned": [],
+          "clients": 0,
+          "cwd": "<probe-cwd-4>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [
+        {
+          "kind": "notification_requested",
+          "utc": 1789367815.4037561,
+          "monotonic": 1008021.348725453,
+          "marker": "PARLEY-PROBE-61d437390b274969aa4e1a2abf611d8a"
+        },
+        {
+          "kind": "observation_finished",
+          "utc": 1789367941.255079,
+          "monotonic": 1008147.200048104
+        }
+      ],
+      "assessment": "Successful compatibility capture: exact bound user/turn-duration ancestry, working-to-done state, one notification and complete cleanup. Not one of the repeated matrix trials."
+    },
+    {
+      "capture": "claude-mcp-disconnected-preflight-20260914",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789368626.248954,
+          "monotonic": 1008832.193923331,
+          "failures": [],
+          "owned": [],
+          "clients": 0,
+          "cwd": "<probe-cwd-5>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [
+        {
+          "kind": "transport_disconnected",
+          "utc": 1789368498.179428,
+          "monotonic": 1008704.124397423
+        },
+        {
+          "kind": "notification_requested",
+          "utc": 1789368498.39496,
+          "monotonic": 1008704.33992911,
+          "marker": "PARLEY-PROBE-01cf2c41fd2044ffbcb079230293b589"
+        },
+        {
+          "kind": "observation_finished",
+          "utc": 1789368623.6135292,
+          "monotonic": 1008829.558498386
+        }
+      ],
+      "assessment": "Successful compatibility capture: fixture exited on its private disconnect control, host remained idle, no reconnection or notification write, cleanup complete."
+    },
+    {
+      "capture": "claude-mcp-idle-preflight-20260914",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789365344.2179074,
+          "monotonic": 1005550.162876881,
+          "failures": [
+            [
+              "<owned-session-1>",
+              "claude agents --json produced a malformed listing entry"
+            ]
+          ],
+          "owned": [
+            "<owned-session-1>"
+          ],
+          "clients": 0
+        }
+      ],
+      "milestones": [],
+      "manual_cleanup_evidence": "removed <owned-session-1>\n",
+      "assessment": "Failed before notification on interactive listing shape, then stopped-listing parsing. Fresh exact created UUID/cwd/stopped verification preceded manual removal; the final filtered listing was empty."
+    },
+    {
+      "capture": "claude-mcp-idle-preflight-20260914b",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789365875.8232691,
+          "monotonic": 1006081.768238506,
+          "failures": [
+            [
+              "<owned-session-2>",
+              "claude agents --json produced a malformed listing entry"
+            ]
+          ],
+          "owned": [
+            "<owned-session-2>"
+          ],
+          "clients": 0,
+          "cwd": "<probe-cwd-6>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [],
+      "manual_cleanup_evidence": "removed <owned-session-2>\n",
+      "assessment": "Failed creation on working metadata without pid/status; stop changed state to stopped. Exact created UUID/cwd/state verified before manual removal; final filtered listing empty."
+    },
+    {
+      "capture": "claude-mcp-idle-preflight-20260914c",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789366455.2221215,
+          "monotonic": 1006661.167090707,
+          "failures": [],
+          "owned": [],
+          "clients": 0,
+          "cwd": "<probe-cwd-7>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [
+        {
+          "kind": "notification_requested",
+          "utc": 1789366327.2644928,
+          "monotonic": 1006533.209462152,
+          "marker": "PARLEY-PROBE-ecfda97d657f4f48b1618276a89ac3ba"
+        },
+        {
+          "kind": "observation_finished",
+          "utc": 1789366452.527729,
+          "monotonic": 1006658.472698479
+        }
+      ],
+      "assessment": "Notification write and 125-second background observation completed, but launcher-created client was not attached to that session. Excluded from attached-idle matrix trials."
+    },
+    {
+      "capture": "claude-mcp-restarted-preflight-20260914",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789368266.220535,
+          "monotonic": 1008472.16550436,
+          "failures": [],
+          "owned": [],
+          "clients": 0,
+          "cwd": "<probe-cwd-8>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [
+        {
+          "kind": "notification_requested",
+          "utc": 1789368263.7236395,
+          "monotonic": 1008469.668608928,
+          "marker": "PARLEY-PROBE-ad0a7284c3764cdfabc4533be3eb245e"
+        }
+      ],
+      "assessment": "Resume woke the original session with saved MCP options, but the display-name suffix exceeded the parser. Cleanup removed the owned original; failed preflight, not a matrix result."
+    },
+    {
+      "capture": "claude-mcp-restarted-preflight-20260914b",
+      "versions": [
+        "2.1.270 (Claude Code)"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789368641.265692,
+          "monotonic": 1008847.210661258,
+          "failures": [],
+          "owned": [],
+          "clients": 0,
+          "cwd": "<probe-cwd-9>",
+          "cwd_retained_for_hook_evidence": true
+        }
+      ],
+      "milestones": [
+        {
+          "kind": "notification_requested",
+          "utc": 1789368504.8630917,
+          "monotonic": 1008710.808061258,
+          "marker": "PARLEY-PROBE-ac036de1a7c847329f15e6a793d99fcb"
+        },
+        {
+          "kind": "resumed_after_notification",
+          "utc": 1789368506.0353734,
+          "monotonic": 1008711.980343007,
+          "result": true
+        },
+        {
+          "kind": "observation_finished",
+          "utc": 1789368638.6116135,
+          "monotonic": 1008844.556582864
+        }
+      ],
+      "assessment": "Successful same-session restart compatibility capture. A new MCP process initialized without replaying the earlier control; complete cleanup."
+    },
+    {
+      "capture": "codex-approval-preflight-20260914",
+      "versions": [
+        "codex-cli 0.154.0"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789366489.7528403,
+          "monotonic": 1006695.697809578,
+          "failures": [],
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "milestones": [],
+      "assessment": "Successful captured approval screen and unresolved synthetic tool call; no approval answered. Both advertised IPC paths absent while owned TUI ready; complete cleanup."
+    },
+    {
+      "capture": "codex-busy-preflight-20260914",
+      "versions": [
+        "codex-cli 0.154.0"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789365931.2941415,
+          "monotonic": 1006137.239110663,
+          "failures": [],
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "milestones": [],
+      "assessment": "Requested sleep tool was rejected under the child's never approval policy. No sleep process started; intended busy-tool setup failed and cleanup completed."
+    },
+    {
+      "capture": "codex-busy-preflight-20260914b",
+      "versions": [
+        "codex-cli 0.154.0"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789366319.463563,
+          "monotonic": 1006525.408532292,
+          "failures": [],
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "milestones": [],
+      "assessment": "Successful 27.660-second text-generation turn with matching native start/completion ID and complete cleanup."
+    },
+    {
+      "capture": "codex-pending-delete-20260914",
+      "versions": [
+        "codex-cli 0.154.0"
+      ],
+      "cleanup": [
+        {
+          "kind": "cleanup",
+          "utc": 1789365242.6231778,
+          "monotonic": 1005448.568147002,
+          "failures": [],
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "milestones": [
+        {
+          "kind": "pending_before",
+          "utc": 1789365241.7464578,
+          "monotonic": 1005447.691427313
+        },
+        {
+          "kind": "pending_after",
+          "utc": 1789365242.6231492,
+          "monotonic": 1005448.568118467
+        }
+      ],
+      "assessment": "Successful pending queue deletion: exact owned-thread item count one before delete, zero after; rollout removed and cleanup complete."
+    },
+    {
+      "capture": "claude-mcp-approval-20260914e",
+      "assessment": "Trials 1 and 2 completed with all transcript outcomes not observed and acceptance unobservable, and are explicitly included in the final row. Trial 3 never reached the approval menu within 45 seconds; it sent no marker and cleanup completed. A separate additional trial used a 180-second setup allowance; observation windows were unchanged.",
+      "trials": [
+        {
+          "trial": "trial-3",
+          "outcome": "failed_precondition",
+          "error": "requested state not established",
+          "cleanup": {
+            "owned": [],
+            "clients": 0
+          }
+        }
+      ]
+    }
+  ]
+}

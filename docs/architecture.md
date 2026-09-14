@@ -689,6 +689,14 @@ released. Every matrix cell this produces therefore carries the developer's real
 configuration and must be sanitized before publication — see
 [host probes](host-probes.md#matrix-runner) for the driver contract and outcome detectors.
 
+The [Claude/Codex wake matrix](host-wake-matrix.md) records direct-host outcomes at the tested
+versions and configurations. In particular, queue acceptance can coexist with no observed wake,
+and a logging notification has no host-acceptance response. These observations do not change
+`Transport` or the readiness handshake. Capability recommendations and the additional host
+belong to the investigation's subsequent synthesis. The native attachment and current-screen
+checks are necessary because a local launcher can display an idle composer for a different
+conversation than the requested background session.
+
 Ordinary probe tests inject host processes and use controlled Python children. The fresh-repository
 check is a deliberate exception for installed Git, using synthetic directories and neutral Git
 configuration. Comparing against actual `git init` output is owner-required evidence; replacing

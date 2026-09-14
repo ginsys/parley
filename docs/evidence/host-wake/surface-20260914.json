@@ -1,0 +1,51 @@
+{
+  "utc": 1789369195.939155,
+  "checks": [
+    {
+      "argv": [
+        "claude",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "2.1.270 (Claude Code)"
+    },
+    {
+      "argv": [
+        "claude",
+        "--help"
+      ],
+      "returncode": 0,
+      "channel_matching_lines": [],
+      "help_line_count": 302
+    },
+    {
+      "argv": [
+        "codex",
+        "--version"
+      ],
+      "returncode": 0,
+      "stdout": "codex-cli 0.154.0"
+    }
+  ],
+  "external_plugin_caches": [
+    {
+      "cache": "claude-plugins-official",
+      "names": [
+        "asana",
+        "context7",
+        "discord",
+        "fakechat",
+        "firebase",
+        "github",
+        "gitlab",
+        "imessage",
+        "laravel-boost",
+        "linear",
+        "playwright",
+        "serena",
+        "telegram",
+        "terraform"
+      ]
+    }
+  ]
+}

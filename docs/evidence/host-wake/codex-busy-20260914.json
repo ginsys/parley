@@ -1,0 +1,1022 @@
+{
+  "schema": 1,
+  "host": "Codex",
+  "version": "0.154.0",
+  "state": "busy",
+  "sanitization": "Home and probe paths, native session/turn IDs and tool-call IDs replaced consistently. Command stdout/stderr and PTY screens omitted; relevant command exit codes retained. Repeated unchanged observations omitted; first outcome/turn-end observations and the final observation retained. Native message excerpts contain the fresh marker with original offset, not injected environment context. Serving model remains unknown where TrialRun.model is null.",
+  "aggregate": {
+    "state": "busy",
+    "trials": [
+      {
+        "accepted": "observed",
+        "ack": "observed",
+        "turn_start": "observed",
+        "visible": "observed"
+      },
+      {
+        "accepted": "observed",
+        "ack": "observed",
+        "turn_start": "observed",
+        "visible": "observed"
+      },
+      {
+        "accepted": "observed",
+        "ack": "observed",
+        "turn_start": "observed",
+        "visible": "observed"
+      }
+    ],
+    "aggregate": {
+      "accepted": "observed",
+      "visible": "observed",
+      "turn_start": "observed",
+      "ack": "observed"
+    }
+  },
+  "trials": [
+    {
+      "trial": "trial-1",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789367516.6378386,
+          "monotonic": 1007722.582808256,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367516.6712227,
+          "monotonic": 1007722.616192261,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367516.6714542,
+          "monotonic": 1007722.616423402,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd-1>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367516.6734285,
+          "monotonic": 1007722.618397755,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd-1>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367516.6787643,
+          "monotonic": 1007722.623733575,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd-1>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": null,
+          "stdin_devnull": true
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367524.157308,
+          "monotonic": 1007730.102277535,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd-1>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789367532.4811728,
+          "monotonic": 1007738.426142581,
+          "state": "busy",
+          "evidence": {
+            "turn_id": "<native-id-1>",
+            "started_at": 1789367532.378
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789367532.4812305,
+          "monotonic": 1007738.426199991,
+          "thread_id": "<native-id-2>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-2e1fa14a05ac4ba4a0e1524cd634d5f0"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367532.4812596,
+          "monotonic": 1007738.426228698,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<native-id-2>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-2e1fa14a05ac4ba4a0e1524cd634d5f0"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367532.723093,
+          "monotonic": 1007738.668062394,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<native-id-2>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-2e1fa14a05ac4ba4a0e1524cd634d5f0"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "submission_returned",
+          "utc": 1789367532.723141,
+          "monotonic": 1007738.66811008,
+          "result": true
+        },
+        {
+          "kind": "observation",
+          "utc": 1789367562.867667,
+          "monotonic": 1007768.812636603,
+          "thread_id": "<native-id-2>",
+          "observation": {
+            "outcomes": {
+              "visible": 1789367562.374,
+              "turn_start": 1789367562.303
+            },
+            "signals": {
+              "turn_start": "turn_boundary_event",
+              "visible": "user_message"
+            },
+            "observable": true,
+            "turn_end": 1789367562.301,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789367569.9010606,
+          "monotonic": 1007775.846030139,
+          "thread_id": "<native-id-2>",
+          "observation": {
+            "outcomes": {
+              "visible": 1789367562.374,
+              "ack": 1789367569.534,
+              "turn_start": 1789367562.303
+            },
+            "signals": {
+              "turn_start": "turn_boundary_event",
+              "visible": "user_message",
+              "ack": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": 1789367562.301,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367569.96548,
+          "monotonic": 1007775.910449826,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<native-id-2>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367570.4387186,
+          "monotonic": 1007776.383687812,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<native-id-2>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789367570.4388185,
+          "monotonic": 1007776.383787848,
+          "trial": {
+            "session_id": "<native-id-2>",
+            "submitted_at": 1789367532.48122,
+            "accepted_at": 1789367532.7231526,
+            "outcomes": {
+              "visible": 1789367562.374,
+              "turn_start": 1789367562.303,
+              "ack": 1789367569.534,
+              "accepted": 1789367532.7231526
+            },
+            "state": "busy",
+            "supported": {
+              "accepted": true,
+              "ack": true,
+              "turn_start": true,
+              "visible": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-2e1fa14a05ac4ba4a0e1524cd634d5f0",
+            "signals": {
+              "visible": "user_message",
+              "turn_start": "turn_boundary_event",
+              "ack": "assistant_message",
+              "accepted": "submit_exit_status"
+            },
+            "turn_end": 1789367562.301,
+            "turn_end_observable": true,
+            "version": "0.154.0",
+            "model": null,
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789367570.4398997,
+          "monotonic": 1007776.384869055,
+          "outcomes": {
+            "accepted": "observed",
+            "ack": "observed",
+            "turn_start": "observed",
+            "visible": "observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789367570.4399247,
+          "monotonic": 1007776.384894143,
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "host_events": [
+        {
+          "timestamp": "2026-09-14T06:31:57.000Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-3>",
+            "started_at": 1789367516
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:32:03.759Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-3>",
+            "started_at": 1789367516,
+            "completed_at": 1789367523,
+            "duration_ms": 6770
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:32:12.378Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-1>",
+            "started_at": 1789367532
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:32:42.301Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-1>",
+            "started_at": 1789367532,
+            "completed_at": 1789367562,
+            "duration_ms": 29923
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:32:42.303Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-4>",
+            "started_at": 1789367562
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:32:49.548Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-4>",
+            "started_at": 1789367562,
+            "completed_at": 1789367569,
+            "duration_ms": 7244
+          }
+        }
+      ]
+    },
+    {
+      "trial": "trial-2",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789367570.4401028,
+          "monotonic": 1007776.385072148,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367570.476884,
+          "monotonic": 1007776.421853454,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367570.477156,
+          "monotonic": 1007776.422125069,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd-2>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367570.4793377,
+          "monotonic": 1007776.424306939,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd-2>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367570.484318,
+          "monotonic": 1007776.429287403,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd-2>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": null,
+          "stdin_devnull": true
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367574.3105128,
+          "monotonic": 1007780.255482222,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd-2>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789367582.5350204,
+          "monotonic": 1007788.479989856,
+          "state": "busy",
+          "evidence": {
+            "turn_id": "<native-id-5>",
+            "started_at": 1789367582.434
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789367582.5350902,
+          "monotonic": 1007788.480059588,
+          "thread_id": "<native-id-6>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-c66ec727306e432e8898c8911f726135"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367582.5351212,
+          "monotonic": 1007788.480090469,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<native-id-6>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-c66ec727306e432e8898c8911f726135"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367582.7795138,
+          "monotonic": 1007788.724483276,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<native-id-6>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-c66ec727306e432e8898c8911f726135"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "submission_returned",
+          "utc": 1789367582.779561,
+          "monotonic": 1007788.724530268,
+          "result": true
+        },
+        {
+          "kind": "observation",
+          "utc": 1789367610.9127905,
+          "monotonic": 1007816.857759952,
+          "thread_id": "<native-id-6>",
+          "observation": {
+            "outcomes": {
+              "visible": 1789367610.553,
+              "turn_start": 1789367610.472
+            },
+            "signals": {
+              "turn_start": "turn_boundary_event",
+              "visible": "user_message"
+            },
+            "observable": true,
+            "turn_end": 1789367610.47,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789367613.9264405,
+          "monotonic": 1007819.871409996,
+          "thread_id": "<native-id-6>",
+          "observation": {
+            "outcomes": {
+              "visible": 1789367610.553,
+              "ack": 1789367613.856,
+              "turn_start": 1789367610.472
+            },
+            "signals": {
+              "turn_start": "turn_boundary_event",
+              "visible": "user_message",
+              "ack": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": 1789367610.47,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367614.0971506,
+          "monotonic": 1007820.04212057,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<native-id-6>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367614.5670912,
+          "monotonic": 1007820.512060652,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<native-id-6>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789367614.5671878,
+          "monotonic": 1007820.512156915,
+          "trial": {
+            "session_id": "<native-id-6>",
+            "submitted_at": 1789367582.5350797,
+            "accepted_at": 1789367582.7795737,
+            "outcomes": {
+              "visible": 1789367610.553,
+              "turn_start": 1789367610.472,
+              "ack": 1789367613.856,
+              "accepted": 1789367582.7795737
+            },
+            "state": "busy",
+            "supported": {
+              "accepted": true,
+              "ack": true,
+              "turn_start": true,
+              "visible": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-c66ec727306e432e8898c8911f726135",
+            "signals": {
+              "visible": "user_message",
+              "turn_start": "turn_boundary_event",
+              "ack": "assistant_message",
+              "accepted": "submit_exit_status"
+            },
+            "turn_end": 1789367610.47,
+            "turn_end_observable": true,
+            "version": "0.154.0",
+            "model": null,
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789367614.5680497,
+          "monotonic": 1007820.513018932,
+          "outcomes": {
+            "accepted": "observed",
+            "ack": "observed",
+            "turn_start": "observed",
+            "visible": "observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789367614.568071,
+          "monotonic": 1007820.513040322,
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "host_events": [
+        {
+          "timestamp": "2026-09-14T06:32:50.775Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-7>",
+            "started_at": 1789367570
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:32:53.915Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-7>",
+            "started_at": 1789367570,
+            "completed_at": 1789367573,
+            "duration_ms": 3153
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:33:02.434Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-5>",
+            "started_at": 1789367582
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:33:30.470Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-5>",
+            "started_at": 1789367582,
+            "completed_at": 1789367610,
+            "duration_ms": 28036
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:33:30.472Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-8>",
+            "started_at": 1789367610
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:33:33.877Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-8>",
+            "started_at": 1789367610,
+            "completed_at": 1789367613,
+            "duration_ms": 3405
+          }
+        }
+      ]
+    },
+    {
+      "trial": "trial-3",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789367614.5682187,
+          "monotonic": 1007820.513188023,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367614.6040819,
+          "monotonic": 1007820.549051334,
+          "argv": [
+            "codex",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367614.6042829,
+          "monotonic": 1007820.549252087,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd-3>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367614.6064734,
+          "monotonic": 1007820.551442851,
+          "argv": [
+            "git",
+            "init",
+            "--quiet",
+            "<probe-cwd-3>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367614.6114001,
+          "monotonic": 1007820.556369546,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd-3>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": null,
+          "stdin_devnull": true
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367619.460809,
+          "monotonic": 1007825.405778274,
+          "argv": [
+            "codex",
+            "exec",
+            "--json",
+            "-s",
+            "read-only",
+            "--skip-git-repo-check",
+            "-C",
+            "<probe-cwd-3>",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789367627.685875,
+          "monotonic": 1007833.630844474,
+          "state": "busy",
+          "evidence": {
+            "turn_id": "<native-id-9>",
+            "started_at": 1789367627.582
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789367627.685929,
+          "monotonic": 1007833.630898347,
+          "thread_id": "<native-id-10>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-10b95e79c1cf4b4d9db93d0fa025ca83"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367627.685956,
+          "monotonic": 1007833.630925265,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<native-id-10>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-10b95e79c1cf4b4d9db93d0fa025ca83"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367627.9244027,
+          "monotonic": 1007833.869372059,
+          "argv": [
+            "codex",
+            "queue",
+            "--thread",
+            "<native-id-10>",
+            "--message",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-10b95e79c1cf4b4d9db93d0fa025ca83"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "submission_returned",
+          "utc": 1789367627.9244475,
+          "monotonic": 1007833.869416685,
+          "result": true
+        },
+        {
+          "kind": "observation",
+          "utc": 1789367658.067331,
+          "monotonic": 1007864.012300407,
+          "thread_id": "<native-id-10>",
+          "observation": {
+            "outcomes": {
+              "visible": 1789367657.122,
+              "turn_start": 1789367657.081
+            },
+            "signals": {
+              "turn_start": "turn_boundary_event",
+              "visible": "user_message"
+            },
+            "observable": true,
+            "turn_end": 1789367657.078,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789367662.0877538,
+          "monotonic": 1007868.032723266,
+          "thread_id": "<native-id-10>",
+          "observation": {
+            "outcomes": {
+              "visible": 1789367657.122,
+              "ack": 1789367661.094,
+              "turn_start": 1789367657.081
+            },
+            "signals": {
+              "turn_start": "turn_boundary_event",
+              "visible": "user_message",
+              "ack": "assistant_message"
+            },
+            "observable": true,
+            "turn_end": 1789367657.078,
+            "turn_stream": true,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789367662.114865,
+          "monotonic": 1007868.059835143,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<native-id-10>"
+          ],
+          "cwd": null,
+          "stdin_devnull": false
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789367662.5184793,
+          "monotonic": 1007868.463448754,
+          "argv": [
+            "codex",
+            "delete",
+            "--force",
+            "<native-id-10>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789367662.5185742,
+          "monotonic": 1007868.463543647,
+          "trial": {
+            "session_id": "<native-id-10>",
+            "submitted_at": 1789367627.6859174,
+            "accepted_at": 1789367627.9244587,
+            "outcomes": {
+              "visible": 1789367657.122,
+              "turn_start": 1789367657.081,
+              "ack": 1789367661.094,
+              "accepted": 1789367627.9244587
+            },
+            "state": "busy",
+            "supported": {
+              "accepted": true,
+              "ack": true,
+              "turn_start": true,
+              "visible": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-10b95e79c1cf4b4d9db93d0fa025ca83",
+            "signals": {
+              "visible": "user_message",
+              "turn_start": "turn_boundary_event",
+              "ack": "assistant_message",
+              "accepted": "submit_exit_status"
+            },
+            "turn_end": 1789367657.078,
+            "turn_end_observable": true,
+            "version": "0.154.0",
+            "model": null,
+            "submission_diagnostic": null,
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789367662.519535,
+          "monotonic": 1007868.464504441,
+          "outcomes": {
+            "accepted": "observed",
+            "ack": "observed",
+            "turn_start": "observed",
+            "visible": "observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789367662.5195591,
+          "monotonic": 1007868.464528478,
+          "owned": [],
+          "clients": 0
+        }
+      ],
+      "host_events": [
+        {
+          "timestamp": "2026-09-14T06:33:34.949Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-11>",
+            "started_at": 1789367614
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:33:39.017Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-11>",
+            "started_at": 1789367614,
+            "completed_at": 1789367619,
+            "duration_ms": 4085
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:33:47.582Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-9>",
+            "started_at": 1789367627
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:34:17.078Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-9>",
+            "started_at": 1789367627,
+            "completed_at": 1789367657,
+            "duration_ms": 29495
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:34:17.081Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_started",
+            "turn_id": "<native-id-12>",
+            "started_at": 1789367657
+          }
+        },
+        {
+          "timestamp": "2026-09-14T06:34:21.099Z",
+          "type": "event_msg",
+          "payload": {
+            "type": "task_complete",
+            "turn_id": "<native-id-12>",
+            "started_at": 1789367657,
+            "completed_at": 1789367661,
+            "duration_ms": 4018
+          }
+        }
+      ]
+    }
+  ]
+}
