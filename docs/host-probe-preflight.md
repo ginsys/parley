@@ -467,6 +467,8 @@ and `Error: Session not found`. Restarting the owned server on the same port aft
 did not replay the marker; no resubmission was made. The investigation observes all four windows
 independently, including after this captured rejection. Unexpected server death still fails the
 ordinary driver; intentional disconnection is an explicit investigation state.
+Other captured live-server rejections retain the shared driver's unobservable transcript outcomes;
+the reproducer waits out the acceptance window before classifying their negative acceptance.
 
 `scripts/probe/opencode_matrix.py --state <state> --output-directory <new-evidence-directory>`
 reproduces three trials of each state using these captured shapes and the fixed windows. Run it

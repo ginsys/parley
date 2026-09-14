@@ -95,6 +95,29 @@ class StateTests(unittest.TestCase):
 
 
 class OrchestrationTests(unittest.TestCase):
+    def test_fast_live_rejection_waits_for_acceptance_without_inventing_visibility(self):
+        now = [1000.0]
+
+        def rejected(driver, **kwargs):
+            return TrialRun(session_id='synthetic-owned', submitted_at=now[0], accepted_at=None,
+                            outcomes={}, state='idle', marker='synthetic-marker',
+                            supported={key: True for key in ('accepted', 'visible', 'turn_start', 'ack')},
+                            observable={key: key == 'accepted' for key in ('accepted', 'visible', 'turn_start', 'ack')},
+                            turn_end_observable=False)
+
+        def elapsed(seconds):
+            self.assertGreater(seconds, 0)
+            now[0] += seconds
+
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory, \
+                patch.object(matrix.time, 'time', side_effect=lambda: now[0]), \
+                patch.object(matrix.time, 'sleep', side_effect=elapsed):
+            output = self.invoke(Path(directory), rejected)
+            data = json.loads((output / 'aggregate.json').read_text())
+            self.assertEqual(data['aggregate'], {'accepted': 'not_observed', 'visible': 'unobservable',
+                                                  'turn_start': 'unobservable', 'ack': 'unobservable'})
+            self.assertEqual(now[0], 1030)
+
     def test_disconnected_rejection_keeps_polling_and_records_acceptance_independently(self):
         with tempfile.TemporaryDirectory(dir='/tmp') as directory:
             root = Path(directory)
