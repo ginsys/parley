@@ -838,16 +838,19 @@ def backgrounded_id(stdout):
 
 
 def _claude_tool_search_content(kind, content):
-    """The captured ToolSearch call/reference result, excluding text from both tool payloads."""
+    """Captured discovery and synthetic hold calls, excluding text from tool payloads."""
     if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
         return False
     part = content[0]
     if kind == 'assistant':
         arguments = part.get('input')
-        return (part.get('type') == 'tool_use' and part.get('name') == 'ToolSearch'
+        known_arguments = ((part.get('name') == 'mcp__parleyprobe__hold' and arguments == {})
+                           or (part.get('name') == 'ToolSearch' and isinstance(arguments, dict)
+                               and isinstance(arguments.get('query'), str)
+                               and type(arguments.get('max_results')) is int
+                               and arguments['max_results'] > 0))
+        return (part.get('type') == 'tool_use' and known_arguments
                 and isinstance(part.get('id'), str) and bool(part['id'])
-                and isinstance(arguments, dict) and isinstance(arguments.get('query'), str)
-                and type(arguments.get('max_results')) is int and arguments['max_results'] > 0
                 and part.get('caller') == {'type': 'direct'})
     references = part.get('content')
     return (part.get('type') == 'tool_result' and isinstance(part.get('tool_use_id'), str)
@@ -877,8 +880,8 @@ def claude_transcript_events(lines):
     acknowledgement instead of making the read unobservable. The caller reports such a read
     unobservable rather than letting absent outcomes become negative evidence.
 
-    The 2026-09-14 approval capture adds one bounded exception: ToolSearch's assistant
-    tool_use and user tool_reference result. They expose no message text. A tool call remains
+    The 2026-09-14 approval captures add ToolSearch's assistant tool_use, its user
+    tool_reference result and the synthetic hold call. They expose no message text. A tool call remains
     assistant activity; a reference result cannot establish user-message visibility.
     """
     events = []

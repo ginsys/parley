@@ -292,6 +292,15 @@ class ClaudeParsingTests(unittest.TestCase):
             role = 'assistant' if part['type'] == 'tool_use' else 'user'
             self.assertEqual(claude_transcript_events([claude_record(role, [part])]), ([], 1))
 
+    def test_captured_pending_hold_is_activity_without_payload_text(self):
+        part = dict(type='tool_use', id='toolu_hold', name='mcp__parleyprobe__hold',
+                    input={}, caller=dict(type='direct'))
+        events, unusable = claude_transcript_events([claude_record('assistant', [part])])
+        self.assertEqual(unusable, 0)
+        self.assertEqual([(event.role, event.text) for event in events], [('assistant', '')])
+        self.assertEqual(claude_transcript_events([
+            claude_record('assistant', [dict(part, input=dict(text=MARKER))])]), ([], 1))
+
     def test_backgrounded_line_yields_the_short_id_from_line_one_only(self):
         # Captured stdout: `backgrounded · 69aa52ed` then four hint lines.
         stdout = 'backgrounded · 69aa52ed\n  claude attach 69aa52ed\n  claude logs 69aa52ed\n'
