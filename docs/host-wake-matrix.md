@@ -1,9 +1,9 @@
 # Host wake investigation
 
-This records the Claude/Codex portion of [investigation #18](https://github.com/ginsys/parley/issues/18).
+This records [investigation #18](https://github.com/ginsys/parley/issues/18) across Claude, Codex
+and OpenCode, with recommendations for the subsequent wake-strategy decision.
 It measures direct host invocations in disposable sessions under real HOME. No session was
 connected through Parley and no production adapter or wake-strategy decision is implemented.
-OpenCode and the cross-host recommendation are the following stage.
 
 ## Protocol and evidence
 
@@ -31,8 +31,9 @@ are never acknowledgement text. The still-blocked approval turn cannot count as 
 Synthetic creation/resume input: `Reply with exactly PONG. Do not call tools or change files.`
 Each trial generates its own `PARLEY-PROBE-<32 hex digits>` marker and asks for that exact marker
 back, through the shared [marker helper](../scripts/probe/host_trials.py). Busy input requests
-the integers one through two hundred in English, followed by `HOLD COMPLETE`, with no tools or
-file changes. Approval input requests only the isolated print command (Codex) or no-side-effect
+the integers one through two hundred in English (five hundred for OpenCode), followed by
+`HOLD COMPLETE`, with no tools or file changes. Approval input requests only an isolated print
+command (Codex/OpenCode) or no-side-effect
 hold tool (Claude); no approval is answered. See the [captured state shapes](host-probe-preflight.md#codex-state-captures-2026-09-14).
 
 Evidence is intentionally sanitized: private paths and native identifiers are substituted;
@@ -120,6 +121,52 @@ scope decision, Channels is unsupported for all five states/four outcomes on thi
 No runtime trial is invented for an absent mechanism; the three-trial rule applies to available
 paths. This does not generalize to another Claude installation or to MCP logging itself.
 
+## OpenCode 1.18.30
+
+The CLI and every exported session report `1.18.30`. Creation and marker generation use
+`opencode/ling-3.0-flash-fin-free`; assistant records confirm it when a marker turn exists.
+Negative marker rows retain an unknown serving model. Each trial supplies a generated Basic
+authentication password only to its own server/client children, under real HOME with `--pure`.
+Approval trials additionally set child-only `OPENCODE_CONFIG_CONTENT` to
+`{"permission":{"*":"ask"}}`. No permission menu is answered.
+
+| State and mechanism | Accepted | Visible | New turn | Acknowledged | Trials / evidence |
+| --- | --- | --- | --- | --- | --- |
+| Idle, external run attached to the owned server/session | inconclusive | observed | observed | observed | [3 trials](evidence/host-wake/opencode-idle-20260914.json) |
+| Busy text generation, same external attach | not observed | observed | observed | observed | [3/3](evidence/host-wake/opencode-busy-20260914.json) |
+| Approval blocked, same external attach | unobservable | observed | not observed | not observed | [3/3](evidence/host-wake/opencode-approval-20260914.json) |
+| Disconnected, attach attempted after the owned server stops | not observed | not observed | not observed | not observed | [3/3](evidence/host-wake/opencode-disconnected-20260914.json) |
+| Restarted, same failed attach then server restarted on the same port | not observed | not observed | not observed | not observed | [3/3](evidence/host-wake/opencode-restarted-20260914.json) |
+
+The idle trials' command exits were late once and within ten seconds twice, so acceptance
+aggregates to inconclusive. Every busy command exited zero after ten seconds. These late
+successful exits remain in the artifacts: “not observed” in that acceptance window is not an
+observed rejection. The command can wait for generation after the marker is already visible.
+The busy precondition binds the exact original request/assistant and verifies submission inside
+its start/completion interval; only a subsequent assistant supplies the new-turn observation.
+OpenCode's new-turn signal is assistant creation in the export, not a native turn-boundary event.
+
+Approval submissions timed out at 60 seconds without an acceptance response. Independently,
+the export showed the marker user message within 30 seconds; the original permission menu and
+exact pending bash call remained blocked throughout 120 seconds. Its incomplete assistant
+record is excluded from new-turn/ACK detection only while that bound precondition still holds.
+The timeout supplies no negative acceptance evidence; the host's exit signal is unobservable
+for those attempts. The request was made through external attach, never by typing into the menu.
+
+Disconnected and restarted submissions returned exit 1 with `Session not found` and empty
+stdout. Each trial still observed the independent 30/60/120-second windows. Restarted trials
+started the owned server on its original port only after that rejection; they did not resubmit
+the marker. No marker or new turn subsequently appeared. These rows measure an absent transport
+and restart without replay in this exact command sequence, not a product-wide durability limit.
+
+The [OpenCode compatibility ledger](evidence/host-wake/opencode-attempts-20260914.json) retains
+eight preflights separately, including provider retries, the approval parser limitation and
+authentication status checks. These captures establish command/state shapes, not additional
+matrix trials. Idle/busy matrix runs used orchestration commit `879a0bc`; the remaining states
+used `393c0f9`, which added liveness and intentional-rejection guards without changing those
+positive paths or observation windows. Approval/disconnected/restarted windows overlapped in
+separate owned sessions; the idle/busy runs were sequential. This is not an isolated load benchmark.
+
 ## Reproduction and cleanup
 
 Three additional Codex approval trials repeated the acceptance-only result after the reproducer
@@ -140,9 +187,10 @@ Then invoke one state at a time, using a new private evidence directory for each
 ```sh
 .venv/bin/python scripts/probe/codex_matrix.py --state idle --output-directory <new-evidence-directory>
 .venv/bin/python scripts/probe/claude_mcp_matrix.py --state idle --output-directory <new-evidence-directory>
+.venv/bin/python scripts/probe/opencode_matrix.py --state idle --output-directory <new-evidence-directory>
 ```
 
-Both commands accept `idle`, `busy`, `approval`, `disconnected`, and `restarted`; each invocation
+All three commands accept `idle`, `busy`, `approval`, `disconnected`, and `restarted`; each invocation
 defaults to three trials. They require the exact recorded host version, real-HOME authentication and
 the captured configuration. Fresh tiny probe directories are created privately under the sticky
 temporary-directory root; evidence and build caches belong on disk. Codex probe directories
@@ -191,13 +239,52 @@ The relevant fixtures are `test_replaced_pane_and_approval_prompt_reject_before_
 [the PTY tests](../scripts/probe/test_wake_probe.py). An idle composer or successful write alone
 cannot bind a real pane to a native session. The launcher failure above reproduced that limitation.
 The investigation's host-specific probes intentionally establish busy/approval states outside
-this generic fallback; approval marker injection uses the external queue/MCP transport.
+this generic fallback; approval marker injection uses external queue, MCP or authenticated attach.
 
-## Interpretation boundary
+## Recommendations and decision enabled
 
-The completed Codex rows distinguish host acceptance, wake and acknowledgement. The Claude rows
-distinguish a server write, transcript observability and actual message receipt. Lack of a wake
-observation in these windows does not prove a host lacks wake capability. Inspecting a transcript
-is deterministic polling of evidence, but this investigation has not shown that an idle agent
-will itself poll an inbox or act on a logging event. The additional host and cross-host synthesis
-remain for the next stage of #18; this document does not choose the production wake strategy.
+Keep handoff, visibility, new-turn activity and acknowledgement separate. In the tested Codex
+configuration, queue acceptance can coexist with no observed wake. In OpenCode's busy trials,
+the fresh marker was visible before the successful command exit supplied the acceptance signal.
+For Claude's logging fixture there is no host acceptance response at all. A single boolean
+cannot describe these outcomes, and their observation order is not a universal delivery sequence.
+
+The current [`Transport.Deliver`](../internal/dispatch/dispatch.go) reports acceptance by its
+error result; successful settlement records `handed_off`. Authenticated
+[`connection.Ingestor`](../internal/connection/ingestion_linux.go) separately validates reply
+provenance and records `acked` transactionally with the reply. Preserve those guarantees.
+The synthetic marker echoes here establish an observable host reply, not that Parley's ingestion
+or readiness protocol worked against a live host.
+
+Recommend that the follow-up host contract expose optional, independently timestamped
+visibility and turn-start observations alongside acceptance, with native session/generation,
+attempt and evidence provenance. These asynchronous observations need not be added as blocking
+requirements to `Deliver`: waiting for a turn to finish would conflate handoff with generation,
+and a host with no observable turn boundary must still be representable. Missing or late
+observations must not trigger retries of an uncertain handoff or silently promote it to `acked`.
+This investigation changes no runtime interface or envelope state.
+
+Declare wake support separately from turn-start observability, scoped to host version,
+mechanism, configuration and required session state. Distinguish unavailable, untested and
+observed capabilities; these three-trial results are evidence, not reliability guarantees.
+An absent IPC socket is an unreachable path in this installation, while the accepted Channels
+scope decision is unsupported on the tested installation. Neither missing turn evidence nor
+plain-MCP logging's negative result establishes that an entire host product cannot wake.
+
+Deterministic external polling is viable for **observing persisted host evidence**: the runners
+read bound transcripts/exports at a fixed cadence and recover marker observations independently
+of command exit. A production observer would additionally need authenticated binding, durable
+cursors, deduplication and recovery. Polling alone is not a demonstrated wake fallback: none of
+these trials makes an idle agent poll Parley's inbox, makes a stopped process start itself, or
+makes a logging notification become a user turn. Codex's successful restarted row required an
+explicit resume action. A scheduler that launches/resumes a host would itself be an authorized
+host action, with stale-session and approval-state checks, rather than proof of autonomous wake.
+
+Prefer host-specific delivery and observation contracts where the measured signals exist.
+A shared PTY fallback trades signal precision for reach and still requires host-specific
+identity/state evidence; the rejection table above rules out treating a generic pane write as
+safe delivery. The decision may choose bespoke adapters or combine them with a guarded fallback,
+but every mode must declare its guarantees and refuse unsafe or unbound targets.
+[Decision #23](https://github.com/ginsys/parley/issues/23) selects the strategy;
+[specification #24](https://github.com/ginsys/parley/issues/24) defines those contracts.
+These recommendations do not implement either follow-up or lift the live-connection fixture gate.

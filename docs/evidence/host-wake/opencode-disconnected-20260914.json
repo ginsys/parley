@@ -1,0 +1,1322 @@
+{
+  "schema": 1,
+  "host": "OpenCode",
+  "version": "1.18.30",
+  "state": "disconnected",
+  "sanitization": "Home/probe paths and native IDs replaced consistently. Child password and Authorization header never retained. Command stdout/stderr omitted; exit codes and explicit diagnostics retained. Repeated identical export commands omitted. Unchanged intermediate observations omitted; first, changed and final observations retained. Native message bodies replaced by SHA256, length and fresh-marker counts, except exact PONG or marker text. Reasoning omitted. Full raw terminal retained privately; SHA256 and rendered final screen included.",
+  "aggregate": {
+    "state": "disconnected",
+    "trials": [
+      {
+        "visible": "not_observed",
+        "ack": "not_observed",
+        "accepted": "not_observed",
+        "turn_start": "not_observed"
+      },
+      {
+        "visible": "not_observed",
+        "ack": "not_observed",
+        "accepted": "not_observed",
+        "turn_start": "not_observed"
+      },
+      {
+        "visible": "not_observed",
+        "ack": "not_observed",
+        "accepted": "not_observed",
+        "turn_start": "not_observed"
+      }
+    ],
+    "aggregate": {
+      "visible": "not_observed",
+      "ack": "not_observed",
+      "accepted": "not_observed",
+      "turn_start": "not_observed"
+    }
+  },
+  "trials": [
+    {
+      "trial": "trial-1",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789374253.3541987,
+          "monotonic": 1014459.299168433,
+          "argv": [
+            "opencode",
+            "--version"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374253.8328044,
+          "monotonic": 1014459.777773709,
+          "argv": [
+            "opencode",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "probe_directory",
+          "utc": 1789374253.832926,
+          "monotonic": 1014459.777895282,
+          "cwd": "<probe-cwd>",
+          "permission_override": null
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374253.8330207,
+          "monotonic": 1014459.7779899,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--dir",
+            "<probe-cwd>",
+            "--title",
+            "parley-probe-aae937417733",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374257.666705,
+          "monotonic": 1014463.611674222,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--dir",
+            "<probe-cwd>",
+            "--title",
+            "parley-probe-aae937417733",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374257.6668005,
+          "monotonic": 1014463.61176963,
+          "argv": [
+            "opencode",
+            "--pure",
+            "export",
+            "<session-1>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374258.5826275,
+          "monotonic": 1014464.527596898,
+          "argv": [
+            "opencode",
+            "--pure",
+            "export",
+            "<session-1>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "server_started",
+          "utc": 1789374258.5849464,
+          "monotonic": 1014464.529915859,
+          "argv": [
+            "opencode",
+            "serve",
+            "--pure",
+            "--port",
+            "56207"
+          ]
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789374259.7851112,
+          "monotonic": 1014465.730080983,
+          "state": "disconnected",
+          "evidence": {
+            "url": "http://127.0.0.1:56207"
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789374259.7851634,
+          "monotonic": 1014465.730132886,
+          "session_id": "<session-1>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-bd543a7b33fa4b46bae6c235848408e0"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374259.785179,
+          "monotonic": 1014465.730148233,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--attach",
+            "http://127.0.0.1:56207",
+            "--session",
+            "<session-1>",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-bd543a7b33fa4b46bae6c235848408e0"
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374260.6044607,
+          "monotonic": 1014466.549430168,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--attach",
+            "http://127.0.0.1:56207",
+            "--session",
+            "<session-1>",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-bd543a7b33fa4b46bae6c235848408e0"
+          ],
+          "returncode": 1
+        },
+        {
+          "kind": "observed_rejection",
+          "utc": 1789374260.6045296,
+          "monotonic": 1014466.549498938,
+          "returncode": 1,
+          "reason": "Session not found"
+        },
+        {
+          "kind": "observation",
+          "utc": 1789374261.5245645,
+          "monotonic": 1014467.469533885,
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789374380.4434056,
+          "monotonic": 1014586.388374862,
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374381.3999386,
+          "monotonic": 1014587.344907832,
+          "argv": [
+            "opencode",
+            "--pure",
+            "session",
+            "delete",
+            "<session-1>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374382.381786,
+          "monotonic": 1014588.32675548,
+          "argv": [
+            "opencode",
+            "--pure",
+            "session",
+            "delete",
+            "<session-1>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789374382.3818612,
+          "monotonic": 1014588.326830351,
+          "trial": {
+            "session_id": "<session-1>",
+            "submitted_at": 1789374259.7851524,
+            "accepted_at": null,
+            "outcomes": {},
+            "state": "disconnected",
+            "supported": {
+              "visible": true,
+              "ack": true,
+              "accepted": true,
+              "turn_start": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-bd543a7b33fa4b46bae6c235848408e0",
+            "signals": {},
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "1.18.30",
+            "model": null,
+            "submission_diagnostic": "exit 1: Session not found; independent windows still observed",
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789374382.3819182,
+          "monotonic": 1014588.326887495,
+          "outcomes": {
+            "visible": "not_observed",
+            "ack": "not_observed",
+            "accepted": "not_observed",
+            "turn_start": "not_observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789374382.3819447,
+          "monotonic": 1014588.326913912,
+          "owned": [],
+          "clients": 0,
+          "server_held": false
+        }
+      ],
+      "exports": {
+        "export-last.json": {
+          "info": {
+            "id": "<session-1>",
+            "directory": "<probe-cwd>",
+            "version": "1.18.30"
+          },
+          "messages": [
+            {
+              "info": {
+                "id": "<message-1>",
+                "sessionID": "<session-1>",
+                "role": "user",
+                "time": {
+                  "created": 1789374254875
+                }
+              },
+              "parts": [
+                {
+                  "type": "text",
+                  "id": "<part-1>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-1>",
+                  "length": 61,
+                  "sha256": "e4c9d6f69d8f185d44caca391adadd626237da2c5f412c2763716d03126540ff",
+                  "marker_occurrences": 0
+                }
+              ]
+            },
+            {
+              "info": {
+                "id": "<message-2>",
+                "sessionID": "<session-1>",
+                "parentID": "<message-1>",
+                "role": "assistant",
+                "time": {
+                  "created": 1789374255293,
+                  "completed": 1789374257593
+                },
+                "providerID": "opencode",
+                "modelID": "ling-3.0-flash-fin-free",
+                "finish": "stop"
+              },
+              "parts": [
+                {
+                  "type": "step-start",
+                  "id": "<part-2>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-2>"
+                },
+                {
+                  "type": "reasoning",
+                  "id": "<part-3>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-2>"
+                },
+                {
+                  "type": "text",
+                  "id": "<part-4>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-2>",
+                  "length": 4,
+                  "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+                  "marker_occurrences": 0,
+                  "text": "PONG"
+                },
+                {
+                  "type": "step-finish",
+                  "id": "<part-5>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-2>"
+                }
+              ]
+            }
+          ]
+        },
+        "export-<session-1>.json": {
+          "info": {
+            "id": "<session-1>",
+            "directory": "<probe-cwd>",
+            "version": "1.18.30"
+          },
+          "messages": [
+            {
+              "info": {
+                "id": "<message-1>",
+                "sessionID": "<session-1>",
+                "role": "user",
+                "time": {
+                  "created": 1789374254875
+                }
+              },
+              "parts": [
+                {
+                  "type": "text",
+                  "id": "<part-1>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-1>",
+                  "length": 61,
+                  "sha256": "e4c9d6f69d8f185d44caca391adadd626237da2c5f412c2763716d03126540ff",
+                  "marker_occurrences": 0
+                }
+              ]
+            },
+            {
+              "info": {
+                "id": "<message-2>",
+                "sessionID": "<session-1>",
+                "parentID": "<message-1>",
+                "role": "assistant",
+                "time": {
+                  "created": 1789374255293,
+                  "completed": 1789374257593
+                },
+                "providerID": "opencode",
+                "modelID": "ling-3.0-flash-fin-free",
+                "finish": "stop"
+              },
+              "parts": [
+                {
+                  "type": "step-start",
+                  "id": "<part-2>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-2>"
+                },
+                {
+                  "type": "reasoning",
+                  "id": "<part-3>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-2>"
+                },
+                {
+                  "type": "text",
+                  "id": "<part-4>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-2>",
+                  "length": 4,
+                  "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+                  "marker_occurrences": 0,
+                  "text": "PONG"
+                },
+                {
+                  "type": "step-finish",
+                  "id": "<part-5>",
+                  "sessionID": "<session-1>",
+                  "messageID": "<message-2>"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "terminals": []
+    },
+    {
+      "trial": "trial-2",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789374382.3821979,
+          "monotonic": 1014588.327167094,
+          "argv": [
+            "opencode",
+            "--version"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374382.8933349,
+          "monotonic": 1014588.838304205,
+          "argv": [
+            "opencode",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "probe_directory",
+          "utc": 1789374382.8934436,
+          "monotonic": 1014588.838412985,
+          "cwd": "<probe-cwd>",
+          "permission_override": null
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374382.8935473,
+          "monotonic": 1014588.838516571,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--dir",
+            "<probe-cwd>",
+            "--title",
+            "parley-probe-43d0a3af7ef4",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374406.3215096,
+          "monotonic": 1014612.266479013,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--dir",
+            "<probe-cwd>",
+            "--title",
+            "parley-probe-43d0a3af7ef4",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374406.3216565,
+          "monotonic": 1014612.266626015,
+          "argv": [
+            "opencode",
+            "--pure",
+            "export",
+            "<session-2>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374408.5598092,
+          "monotonic": 1014614.504778812,
+          "argv": [
+            "opencode",
+            "--pure",
+            "export",
+            "<session-2>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "server_started",
+          "utc": 1789374408.5638006,
+          "monotonic": 1014614.50876996,
+          "argv": [
+            "opencode",
+            "serve",
+            "--pure",
+            "--port",
+            "47253"
+          ]
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789374411.3506746,
+          "monotonic": 1014617.295644611,
+          "state": "disconnected",
+          "evidence": {
+            "url": "http://127.0.0.1:47253"
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789374411.3507392,
+          "monotonic": 1014617.295708521,
+          "session_id": "<session-2>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-225d9423be3b42a98c03b63c515cc5f1"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374411.3507652,
+          "monotonic": 1014617.295734602,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--attach",
+            "http://127.0.0.1:47253",
+            "--session",
+            "<session-2>",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-225d9423be3b42a98c03b63c515cc5f1"
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374412.7217476,
+          "monotonic": 1014618.666717097,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--attach",
+            "http://127.0.0.1:47253",
+            "--session",
+            "<session-2>",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-225d9423be3b42a98c03b63c515cc5f1"
+          ],
+          "returncode": 1
+        },
+        {
+          "kind": "observed_rejection",
+          "utc": 1789374412.721827,
+          "monotonic": 1014618.666796545,
+          "returncode": 1,
+          "reason": "Session not found"
+        },
+        {
+          "kind": "observation",
+          "utc": 1789374414.1956863,
+          "monotonic": 1014620.140655772,
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789374532.0356736,
+          "monotonic": 1014737.98064305,
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374532.9299796,
+          "monotonic": 1014738.874949103,
+          "argv": [
+            "opencode",
+            "--pure",
+            "session",
+            "delete",
+            "<session-2>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374533.8911533,
+          "monotonic": 1014739.836122687,
+          "argv": [
+            "opencode",
+            "--pure",
+            "session",
+            "delete",
+            "<session-2>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789374533.8912306,
+          "monotonic": 1014739.836199788,
+          "trial": {
+            "session_id": "<session-2>",
+            "submitted_at": 1789374411.3507233,
+            "accepted_at": null,
+            "outcomes": {},
+            "state": "disconnected",
+            "supported": {
+              "visible": true,
+              "ack": true,
+              "accepted": true,
+              "turn_start": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-225d9423be3b42a98c03b63c515cc5f1",
+            "signals": {},
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "1.18.30",
+            "model": null,
+            "submission_diagnostic": "exit 1: Session not found; independent windows still observed",
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789374533.8912723,
+          "monotonic": 1014739.836241457,
+          "outcomes": {
+            "visible": "not_observed",
+            "ack": "not_observed",
+            "accepted": "not_observed",
+            "turn_start": "not_observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789374533.8912888,
+          "monotonic": 1014739.83625823,
+          "owned": [],
+          "clients": 0,
+          "server_held": false
+        }
+      ],
+      "exports": {
+        "export-last.json": {
+          "info": {
+            "id": "<session-2>",
+            "directory": "<probe-cwd>",
+            "version": "1.18.30"
+          },
+          "messages": [
+            {
+              "info": {
+                "id": "<message-3>",
+                "sessionID": "<session-2>",
+                "role": "user",
+                "time": {
+                  "created": 1789374384030
+                }
+              },
+              "parts": [
+                {
+                  "type": "text",
+                  "id": "<part-6>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-3>",
+                  "length": 61,
+                  "sha256": "e4c9d6f69d8f185d44caca391adadd626237da2c5f412c2763716d03126540ff",
+                  "marker_occurrences": 0
+                }
+              ]
+            },
+            {
+              "info": {
+                "id": "<message-4>",
+                "sessionID": "<session-2>",
+                "parentID": "<message-3>",
+                "role": "assistant",
+                "time": {
+                  "created": 1789374384407,
+                  "completed": 1789374406209
+                },
+                "providerID": "opencode",
+                "modelID": "ling-3.0-flash-fin-free",
+                "finish": "stop"
+              },
+              "parts": [
+                {
+                  "type": "step-start",
+                  "id": "<part-7>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-4>"
+                },
+                {
+                  "type": "reasoning",
+                  "id": "<part-8>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-4>"
+                },
+                {
+                  "type": "text",
+                  "id": "<part-9>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-4>",
+                  "length": 4,
+                  "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+                  "marker_occurrences": 0,
+                  "text": "PONG"
+                },
+                {
+                  "type": "step-finish",
+                  "id": "<part-10>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-4>"
+                }
+              ]
+            }
+          ]
+        },
+        "export-<session-2>.json": {
+          "info": {
+            "id": "<session-2>",
+            "directory": "<probe-cwd>",
+            "version": "1.18.30"
+          },
+          "messages": [
+            {
+              "info": {
+                "id": "<message-3>",
+                "sessionID": "<session-2>",
+                "role": "user",
+                "time": {
+                  "created": 1789374384030
+                }
+              },
+              "parts": [
+                {
+                  "type": "text",
+                  "id": "<part-6>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-3>",
+                  "length": 61,
+                  "sha256": "e4c9d6f69d8f185d44caca391adadd626237da2c5f412c2763716d03126540ff",
+                  "marker_occurrences": 0
+                }
+              ]
+            },
+            {
+              "info": {
+                "id": "<message-4>",
+                "sessionID": "<session-2>",
+                "parentID": "<message-3>",
+                "role": "assistant",
+                "time": {
+                  "created": 1789374384407,
+                  "completed": 1789374406209
+                },
+                "providerID": "opencode",
+                "modelID": "ling-3.0-flash-fin-free",
+                "finish": "stop"
+              },
+              "parts": [
+                {
+                  "type": "step-start",
+                  "id": "<part-7>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-4>"
+                },
+                {
+                  "type": "reasoning",
+                  "id": "<part-8>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-4>"
+                },
+                {
+                  "type": "text",
+                  "id": "<part-9>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-4>",
+                  "length": 4,
+                  "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+                  "marker_occurrences": 0,
+                  "text": "PONG"
+                },
+                {
+                  "type": "step-finish",
+                  "id": "<part-10>",
+                  "sessionID": "<session-2>",
+                  "messageID": "<message-4>"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "terminals": []
+    },
+    {
+      "trial": "trial-3",
+      "journal": [
+        {
+          "kind": "command_started",
+          "utc": 1789374533.891563,
+          "monotonic": 1014739.836532306,
+          "argv": [
+            "opencode",
+            "--version"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374534.3630147,
+          "monotonic": 1014740.30798394,
+          "argv": [
+            "opencode",
+            "--version"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "probe_directory",
+          "utc": 1789374534.3631196,
+          "monotonic": 1014740.308089027,
+          "cwd": "<probe-cwd>",
+          "permission_override": null
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374534.3632054,
+          "monotonic": 1014740.308174831,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--dir",
+            "<probe-cwd>",
+            "--title",
+            "parley-probe-fb5939652353",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374538.4158492,
+          "monotonic": 1014744.360818618,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--dir",
+            "<probe-cwd>",
+            "--title",
+            "parley-probe-fb5939652353",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Reply with exactly PONG. Do not call tools or change files."
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374538.4159591,
+          "monotonic": 1014744.360928418,
+          "argv": [
+            "opencode",
+            "--pure",
+            "export",
+            "<session-3>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374539.3804252,
+          "monotonic": 1014745.325394604,
+          "argv": [
+            "opencode",
+            "--pure",
+            "export",
+            "<session-3>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "server_started",
+          "utc": 1789374539.3812382,
+          "monotonic": 1014745.326207672,
+          "argv": [
+            "opencode",
+            "serve",
+            "--pure",
+            "--port",
+            "50117"
+          ]
+        },
+        {
+          "kind": "precondition",
+          "utc": 1789374540.598806,
+          "monotonic": 1014746.543775372,
+          "state": "disconnected",
+          "evidence": {
+            "url": "http://127.0.0.1:50117"
+          }
+        },
+        {
+          "kind": "submission_started",
+          "utc": 1789374540.598849,
+          "monotonic": 1014746.543818218,
+          "session_id": "<session-3>",
+          "message": "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-9b5ef8abc955470fae1cd7e783b113e2"
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374540.5988631,
+          "monotonic": 1014746.543832488,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--attach",
+            "http://127.0.0.1:50117",
+            "--session",
+            "<session-3>",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-9b5ef8abc955470fae1cd7e783b113e2"
+          ],
+          "cwd": "<probe-cwd>"
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374541.4000013,
+          "monotonic": 1014747.344970646,
+          "argv": [
+            "opencode",
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--attach",
+            "http://127.0.0.1:50117",
+            "--session",
+            "<session-3>",
+            "-m",
+            "opencode/ling-3.0-flash-fin-free",
+            "Automated probe: reply with exactly this token to confirm receipt: PARLEY-PROBE-9b5ef8abc955470fae1cd7e783b113e2"
+          ],
+          "returncode": 1
+        },
+        {
+          "kind": "observed_rejection",
+          "utc": 1789374541.4000502,
+          "monotonic": 1014747.34501947,
+          "returncode": 1,
+          "reason": "Session not found"
+        },
+        {
+          "kind": "observation",
+          "utc": 1789374542.3506827,
+          "monotonic": 1014748.29565183,
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": null
+          }
+        },
+        {
+          "kind": "observation",
+          "utc": 1789374661.5186305,
+          "monotonic": 1014867.463599894,
+          "observation": {
+            "outcomes": {},
+            "signals": {},
+            "observable": true,
+            "turn_end": null,
+            "turn_stream": false,
+            "model": null
+          }
+        },
+        {
+          "kind": "command_started",
+          "utc": 1789374662.5011425,
+          "monotonic": 1014868.446111937,
+          "argv": [
+            "opencode",
+            "--pure",
+            "session",
+            "delete",
+            "<session-3>"
+          ],
+          "cwd": null
+        },
+        {
+          "kind": "command_finished",
+          "utc": 1789374663.6632273,
+          "monotonic": 1014869.608196881,
+          "argv": [
+            "opencode",
+            "--pure",
+            "session",
+            "delete",
+            "<session-3>"
+          ],
+          "returncode": 0
+        },
+        {
+          "kind": "trial",
+          "utc": 1789374663.6633608,
+          "monotonic": 1014869.608330157,
+          "trial": {
+            "session_id": "<session-3>",
+            "submitted_at": 1789374540.5988405,
+            "accepted_at": null,
+            "outcomes": {},
+            "state": "disconnected",
+            "supported": {
+              "visible": true,
+              "ack": true,
+              "accepted": true,
+              "turn_start": true
+            },
+            "observable": {
+              "accepted": true,
+              "visible": true,
+              "turn_start": true,
+              "ack": true
+            },
+            "marker": "PARLEY-PROBE-9b5ef8abc955470fae1cd7e783b113e2",
+            "signals": {},
+            "turn_end": null,
+            "turn_end_observable": true,
+            "version": "1.18.30",
+            "model": null,
+            "submission_diagnostic": "exit 1: Session not found; independent windows still observed",
+            "interrupted": false,
+            "clock_step": null
+          }
+        },
+        {
+          "kind": "classified",
+          "utc": 1789374663.6634228,
+          "monotonic": 1014869.608391911,
+          "outcomes": {
+            "visible": "not_observed",
+            "ack": "not_observed",
+            "accepted": "not_observed",
+            "turn_start": "not_observed"
+          }
+        },
+        {
+          "kind": "ownership_after_cleanup",
+          "utc": 1789374663.6634414,
+          "monotonic": 1014869.608410704,
+          "owned": [],
+          "clients": 0,
+          "server_held": false
+        }
+      ],
+      "exports": {
+        "export-last.json": {
+          "info": {
+            "id": "<session-3>",
+            "directory": "<probe-cwd>",
+            "version": "1.18.30"
+          },
+          "messages": [
+            {
+              "info": {
+                "id": "<message-5>",
+                "sessionID": "<session-3>",
+                "role": "user",
+                "time": {
+                  "created": 1789374535395
+                }
+              },
+              "parts": [
+                {
+                  "type": "text",
+                  "id": "<part-11>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-5>",
+                  "length": 61,
+                  "sha256": "e4c9d6f69d8f185d44caca391adadd626237da2c5f412c2763716d03126540ff",
+                  "marker_occurrences": 0
+                }
+              ]
+            },
+            {
+              "info": {
+                "id": "<message-6>",
+                "sessionID": "<session-3>",
+                "parentID": "<message-5>",
+                "role": "assistant",
+                "time": {
+                  "created": 1789374535805,
+                  "completed": 1789374538334
+                },
+                "providerID": "opencode",
+                "modelID": "ling-3.0-flash-fin-free",
+                "finish": "stop"
+              },
+              "parts": [
+                {
+                  "type": "step-start",
+                  "id": "<part-12>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-6>"
+                },
+                {
+                  "type": "reasoning",
+                  "id": "<part-13>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-6>"
+                },
+                {
+                  "type": "text",
+                  "id": "<part-14>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-6>",
+                  "length": 4,
+                  "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+                  "marker_occurrences": 0,
+                  "text": "PONG"
+                },
+                {
+                  "type": "step-finish",
+                  "id": "<part-15>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-6>"
+                }
+              ]
+            }
+          ]
+        },
+        "export-<session-3>.json": {
+          "info": {
+            "id": "<session-3>",
+            "directory": "<probe-cwd>",
+            "version": "1.18.30"
+          },
+          "messages": [
+            {
+              "info": {
+                "id": "<message-5>",
+                "sessionID": "<session-3>",
+                "role": "user",
+                "time": {
+                  "created": 1789374535395
+                }
+              },
+              "parts": [
+                {
+                  "type": "text",
+                  "id": "<part-11>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-5>",
+                  "length": 61,
+                  "sha256": "e4c9d6f69d8f185d44caca391adadd626237da2c5f412c2763716d03126540ff",
+                  "marker_occurrences": 0
+                }
+              ]
+            },
+            {
+              "info": {
+                "id": "<message-6>",
+                "sessionID": "<session-3>",
+                "parentID": "<message-5>",
+                "role": "assistant",
+                "time": {
+                  "created": 1789374535805,
+                  "completed": 1789374538334
+                },
+                "providerID": "opencode",
+                "modelID": "ling-3.0-flash-fin-free",
+                "finish": "stop"
+              },
+              "parts": [
+                {
+                  "type": "step-start",
+                  "id": "<part-12>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-6>"
+                },
+                {
+                  "type": "reasoning",
+                  "id": "<part-13>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-6>"
+                },
+                {
+                  "type": "text",
+                  "id": "<part-14>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-6>",
+                  "length": 4,
+                  "sha256": "95784973cc639977bff93619700168505cb8f7855e44fa643d34622a43706c87",
+                  "marker_occurrences": 0,
+                  "text": "PONG"
+                },
+                {
+                  "type": "step-finish",
+                  "id": "<part-15>",
+                  "sessionID": "<session-3>",
+                  "messageID": "<message-6>"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "terminals": []
+    }
+  ]
+}
