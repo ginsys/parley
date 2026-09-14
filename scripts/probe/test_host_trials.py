@@ -1920,12 +1920,44 @@ class ClaudeDriverTests(DriverTestCase):
                 with self.assertRaisesRegex(RuntimeError, 'malformed'):
                     driver._listing()
 
+    def test_creation_waits_for_captured_working_metadata_without_live_fields(self):
+        pending = self.entry(state='working')
+        pending.pop('pid')
+        pending.pop('status')
+        entries = iter([listing([pending]), listing([self.entry()])])
+        run = FakeRun([(['claude', '--bg', '--model'], FakeResult(0, 'backgrounded · 69aa52ed\n')),
+                       (['claude', 'agents'], lambda argv: next(entries))])
+        driver = self.driver(run)
+        self.assertEqual(driver.create('hello'), '69aa52ed')
+        self.assertEqual(len(run.argv('claude', 'agents')), 2)
+
+    def test_captured_cancelled_creation_requires_stopped_state_before_removal(self):
+        for state in ('working', 'stopped'):
+            with self.subTest(state=state):
+                self.registry = SessionRegistry()
+                entry = self.entry(state=state)
+                entry.pop('pid')
+                entry.pop('status')
+                run = FakeRun([(['claude', 'agents'], listing([entry])),
+                               (['claude', 'stop'], FakeResult(0, 'stopped 69aa52ed\n')),
+                               (['claude', 'rm'], FakeResult(0, 'removed 69aa52ed\n'))])
+                driver = self.driver(run)
+                driver._mint('69aa52ed')
+                if state == 'working':
+                    with self.assertRaisesRegex(RuntimeError, 'stopped state'):
+                        driver.teardown('69aa52ed')
+                    self.assertEqual(run.argv('claude', 'rm'), [])
+                    self.assertEqual(driver.owned(), {'69aa52ed'})
+                else:
+                    driver.teardown('69aa52ed')
+                    self.assertEqual(driver.owned(), set())
+
     def test_malformed_claude_listings_never_authorize_rm_after_a_failed_stop(self):
         missing_pid = self.entry(pid=None, status=None)
         missing_pid.pop('pid')
         missing_id = self.entry(pid=None, status=None)
         missing_id.pop('id')
-        missing_live_fields = self.entry(state='working')
+        missing_live_fields = self.entry(state='unknown')
         missing_live_fields.pop('pid')
         missing_live_fields.pop('status')
         for entries in ([missing_pid], [None], [missing_id], [missing_live_fields],

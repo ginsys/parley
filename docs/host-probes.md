@@ -326,8 +326,11 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   positive PID and nonempty status are checked; it must lack background `id`/`state` fields.
   It is excluded from the background view and never grants ownership or deletion authority.
   Background rows require nonempty string identity/state fields and a `pid` that is null or a
-  positive integer. The captured stopped form has `state: "done"` and omits both `pid` and
-  `status`; only this pair of omissions is normalized to null. Short IDs must
+  positive integer. Captured persisted metadata omits both `pid` and `status` during startup
+  (`state: "working"`) and after stopping (`done` or `stopped`); only this pair of omissions in
+  those states is normalized to null. A working row without a PID is pending and cannot prove
+  that the process stopped. Creation keeps waiting for `done`; cleanup requires `done` or
+  `stopped` with no live PID, or an absent owned row, before removal. Short IDs must
   have the captured eight-hex-digit shape and full IDs the lowercase hyphenated UUID shape.
   The short ID must equal the full UUID's first eight digits, as captured; once bound, the full
   UUID cannot change under the same owned short ID. Neither malformed nor changed bindings

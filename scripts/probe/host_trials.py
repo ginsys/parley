@@ -1018,9 +1018,10 @@ class ClaudeDriver(Driver):
                     raise RuntimeError('claude agents --json produced a malformed listing entry')
                 continue
             if (isinstance(entry, dict) and entry.get('kind') == 'background' and
-                    entry.get('state') == 'done' and 'pid' not in entry and 'status' not in entry):
-                # The stopped row in that capture omits both live-only fields. Normalize only
-                # this observed pair of omissions; an arbitrary missing PID remains invalid.
+                    entry.get('state') in ('working', 'done', 'stopped') and
+                    'pid' not in entry and 'status' not in entry):
+                # Captured persisted metadata omits both live fields during startup and after
+                # stopping. A missing PID alone is not stopped evidence: stop checks state too.
                 entry = entry | {'pid': None, 'status': None}
             if (not isinstance(entry, dict) or 'pid' not in entry or
                     any(not isinstance(entry.get(key), str) or not entry[key]
@@ -1041,7 +1042,8 @@ class ClaudeDriver(Driver):
         """The `claude agents --json --all --cwd <cwd>` entry for an owned id, or None if absent.
 
         Captured fields: `pid` (None once stopped), `status` (`idle`/`busy`, None once stopped;
-        both omitted in the 2026-09-14 stopped capture and normalized to None),
+        both omitted in the 2026-09-14 persisted metadata and normalized to None).
+        A working row with no PID is still pending, not proven stopped.
         `state` (`working`/`done`), `sessionId`, exact `cwd`. Settle callbacks use it to establish or check a
         precondition; what an approval-parked session shows, and how reliable `busy` is, are
         uncaptured. Only this driver's own `--cwd`-filtered listing is ever read.
@@ -1384,6 +1386,9 @@ class ClaudeDriver(Driver):
         if entry is not None and entry.get('pid') is not None:
             raise RuntimeError(f'claude stop exited {result.returncode} and left {session_id} running '
                                f'(pid {entry["pid"]}): {result.stderr}')
+        if entry is not None and entry.get('state') not in ('done', 'stopped'):
+            raise RuntimeError(f'claude stop did not confirm a stopped state for {session_id}: '
+                               f'{entry.get("state")!r}')
         return entry
 
     def teardown(self, session_id):

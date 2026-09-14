@@ -242,8 +242,21 @@ finishing cleanup with `claude rm <short-id>`. That exited 0; the filtered listi
 Hook-generated files remained in the disposable cwd and were retained with the failed attempt.
 
 The runner now validates and excludes the distinct interactive shape without minting it. For
-background rows, only `state: "done"` with both live fields absent is normalized to null; a
-working row missing its PID, a partial omission or malformed identity still refuses the listing.
+background rows, both absent live fields are normalized to null only in the captured states
+described here; a partial omission or malformed identity still refuses the listing.
 Controlled fixtures reproduce both failures and verify that removal remains confined to the
 created background ID. This expands the earlier captured contract; it does not adopt a session
 from a listing or infer a permission-prompt shape.
+
+A second fresh session with the same command/configuration captured the startup race: its first
+listing had the same background identity fields, `state: "working"`, and neither `pid` nor
+`status`. This is persisted metadata before a live PID is published, not proof of a stopped
+process. Cancelling with `claude stop <short-id>` returned exit 0 and changed that row to
+`state: "stopped"`, still without the two live fields. The exact created UUID/cwd was checked
+before removal; `claude rm` exited 0 and the filtered listing became `[]`.
+
+Creation therefore accepts this metadata shape and continues its bounded wait for `done`.
+Cleanup checks state as well as PID: a surviving `working` row never authorizes removal, even
+when the stop command returned 0. Both `done` and the newly captured `stopped` state can confirm
+stopping when there is no live PID. Controlled startup and stop/removal fixtures cover the
+distinction. The failed second attempt also sent no notification and fills no matrix cell.
