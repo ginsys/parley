@@ -475,3 +475,43 @@ func TestAuthenticatedBudgetDiagnosticOverridesPriorAttemptWithoutRewritingIt(t 
 		t.Fatalf("unattempted claim rewrote history=%+v %v", saved, err)
 	}
 }
+
+func TestAuthenticatedFailedClaimIsNotAssumedExhausted(t *testing.T) {
+	f := authenticatedSetup(t)
+	makeReady(t, f.manager, f.recipient)
+	id := f.send(t)
+	ctx := context.Background()
+	var before *store.Envelope
+	_, err := f.db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		var err error
+		before, err = store.GetByID(ctx, tx, id)
+		if err != nil {
+			return store.TransitionResult{}, err
+		}
+		// Controlled storage fault: the guarded update reports zero rows even
+		// though this active grant still has budget available.
+		_, err = tx.ExecContext(ctx, "CREATE TRIGGER suppress_budget_claim BEFORE UPDATE OF exchanges_used ON grants BEGIN SELECT RAISE(IGNORE); END")
+		return store.TransitionResult{Changed: true}, err
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := NewAuthenticated(f.db, f.manager, func(*connection.Session) Transport { t.Fatal("failed claim reached transport"); return nil }, func() time.Time { return time.Unix(110, 0) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := b.DispatchOutcome(ctx, id)
+	if err != store.TemporarilyUnavailable || out.Attempted || out.State != store.Queued || out.ErrorCode == "budget_exhausted" {
+		t.Fatalf("failed claim misclassified=%+v %v", out, err)
+	}
+	f.assertBudget(t, 0)
+	if err := f.db.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		after, err := store.GetByID(ctx, tx, id)
+		if err == nil && !reflect.DeepEqual(before, after) {
+			t.Error("failed claim changed queued work")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

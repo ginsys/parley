@@ -333,7 +333,7 @@ the repository's live-connection fixture gate.
 
 ## Source basis
 
-At `27e0c9707d64b500b9c4bb530ec098f596017de6`, [Send](../internal/dispatch/dispatch.go) and
+At `27e0c9707d64b500b9c4bb530ec098f596017de6`, [Send](https://github.com/ginsys/parley/blob/27e0c9707d64b500b9c4bb530ec098f596017de6/internal/dispatch/dispatch.go) and
 [IngestTurn](https://github.com/ginsys/parley/blob/27e0c9707d64b500b9c4bb530ec098f596017de6/internal/adapter/codex/ingest.go) accept peer identity from their caller;
 [Codex transport](../internal/adapter/codex/transport.go) separately stores native thread and peer
 IDs. [Claude readiness](../internal/adapter/claude/handshake.go) has process-local generations;
