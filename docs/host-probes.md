@@ -503,13 +503,13 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   child's cleanup boundary, and successful process-group cleanup also closes its reader.
   Read timeouts after spawning retry within the startup deadline. A preflight read timeout
   remains a refusal: it cannot prove that the port is free of another listener.
-  The password variable is uncaptured, so the server is
-  the captured unsecured loopback listener for the trial's duration. Session ownership protects
-  what this driver may operate on; it does not authenticate local API clients. Other local
-  principals can reach that listener and could read or alter evidence. Before new live OpenCode
-  matrix trials, capture authenticated server, attach and readiness behavior together; do not
-  infer support from the password warning or treat loopback binding as authenticated isolation.
-  This captured-path rewrite adds no guessed authentication settings. The child is spawned and
+  The default driver retains its initial unsecured-loopback behavior; session ownership alone
+  does not authenticate local API clients. The separate `opencode_matrix.py` reproducer uses
+  the [captured authenticated path](host-probe-preflight.md#2026-09-14--authenticated-opencode-state-captures):
+  a generated child-only password, authenticated attach and readiness, with 401/401/200 evidence.
+  It never sends that credential during the preexisting-listener check. These matrix trials
+  require authenticated children; loopback binding alone is not authenticated isolation.
+  The child is spawned and
   held in one statement inside the handler that closes it, so any failure or Ctrl-C during that
   wait closes it before re-raising — and, as in `close_servers()`, the handle is dropped only
   once the close succeeded, so a child that survived SIGKILL stays held for the sweep to retry

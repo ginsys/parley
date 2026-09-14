@@ -199,6 +199,8 @@ def main():
                 def submit(self, session_id, message):
                     nonlocal rejected
                     self.require_owned(session_id)
+                    if args.state in ('idle', 'busy') and self.live_client_for(session_id) is None:
+                        raise RuntimeError('the client establishing the submission state disappeared')
                     if args.state == 'approval':
                         self.require_approval(session_id, self.document(session_id))
                     record('submission_started', session_id=session_id, message=message)
@@ -223,6 +225,8 @@ def main():
 
                 def observe(self, session_id, **kwargs):
                     document = self.document(session_id)
+                    if args.state == 'disconnected' and self.server is not None:
+                        raise RuntimeError('disconnected server unexpectedly restarted')
                     if args.state != 'disconnected':
                         if self.server is None or self.server.process.poll() is not None:
                             raise RuntimeError('owned server unexpectedly disappeared')
@@ -268,6 +272,8 @@ def main():
                 client.serves = session_id
                 deadline = time.monotonic() + 45
                 while True:
+                    if client.eof:
+                        raise RuntimeError('owned terminal exited before idle readiness')
                     screen = terminal_screen(client)
                     if (all(text in screen for text in ('PONG', 'Ling 3.0 Flash Fin Free', cwd))
                             and 'esc interrupt' not in screen and 'Permission required' not in screen
