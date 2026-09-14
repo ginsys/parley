@@ -16,13 +16,41 @@ from claude_mcp_matrix import (
     HOLD_PROMPT,
     approval_pending,
     busy_completion,
+    capture_transcript,
     terminal_screen,
     verify_binaries,
 )
-from host_trials import TrialRun
+from host_trials import ClaudeDriver, ForeignSessionError, SessionRegistry, TrialRun
 
 
 class StateEvidenceTests(unittest.TestCase):
+    def test_resume_copy_is_bound_and_captured_without_overwriting_original(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+            root = Path(directory)
+            cwd = root / 'cwd'
+            cwd.mkdir(mode=0o700)
+            driver = ClaudeDriver(SessionRegistry(), cwd=str(cwd))
+            ids = ('11111111', '22222222')
+            for short_id in ids:
+                driver._mint(short_id)
+                (root / f'{short_id}-source').write_text(short_id)
+            bound = []
+
+            def status(short_id):
+                driver.require_owned(short_id)
+                bound.append(short_id)
+                driver.sessions[short_id] = short_id + '-full-uuid'
+
+            with patch.object(driver, 'status', side_effect=status), \
+                    patch.object(driver, 'transcript_path_for',
+                                 side_effect=lambda full: root / f'{full[:8]}-source'):
+                targets = [capture_transcript(driver, short_id, root) for short_id in ids]
+            self.assertEqual(bound, list(ids))
+            self.assertNotEqual(*targets)
+            self.assertEqual([target.read_text() for target in targets], list(ids))
+            with self.assertRaises(ForeignSessionError):
+                capture_transcript(driver, 'foreign', root)
+
     def test_native_attach_binary_is_independently_pinned(self):
         for native_result in (subprocess.CompletedProcess([], 0, '2.1.271 (Claude Code)', ''),
                               subprocess.CompletedProcess([], 1, '', 'missing')):
