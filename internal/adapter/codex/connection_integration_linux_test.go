@@ -464,8 +464,47 @@ func TestConnectionRuntimeOldSnapshotCannotReplayLostEffects(t *testing.T) {
 	if _, err := bridgefixture.IngestTurn(t, ctx, second.resources.Writer, "first", "recipient", "author", marker); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := controller.New(second.resources.Writer).Revoke(ctx, "first"); err != nil {
+	var binding store.BindingRecord
+	var credential store.CredentialRecord
+	if err := second.resources.Writer.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var id string
+		if err := tx.QueryRowContext(ctx, "SELECT binding_id FROM bindings WHERE peer_id='recipient'").Scan(&id); err != nil {
+			return err
+		}
+		var err error
+		binding, err = store.ReadBinding(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		credential, err = store.LatestCredential(ctx, tx, id)
+		return err
+	}); err != nil {
 		t.Fatal(err)
+	}
+	principal := store.CommandPrincipal{ID: uuid.NewString()}
+	lifecycle, err := connection.NewLifecycle(connection.LifecycleConfig{
+		Store: second.resources.Writer,
+		Authorize: func(_ context.Context, _ *sql.Tx, p store.CommandPrincipal) error {
+			if p.ID != principal.ID {
+				return store.Forbidden
+			}
+			return nil
+		},
+		Guard:              func(context.Context, *sql.Tx, string) error { return nil },
+		Invalidate:         second.bridge.Identity.Manager.Invalidate,
+		PendingWork:        func(context.Context, *sql.Tx, string) ([]store.WorkRef, error) { return nil, nil },
+		PendingDisposition: func(context.Context, *sql.Tx, store.WorkRef, string) error { return store.Forbidden },
+		LegacyEvidence:     func(context.Context, connection.LegacyDispositionRequest) error { return store.Forbidden },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoked, err := lifecycle.Revoke(ctx, principal, connection.BindingLifecycleRequest{
+		OperationID: uuid.NewString(), BindingID: binding.ID,
+		ExpectedBindingVersion: binding.Version, ExpectedCredentialVersion: credential.Version,
+	})
+	if err != nil || revoked.Result.Code != "" {
+		t.Fatalf("binding revoke=%+v %v", revoked, err)
 	}
 	if err := second.resources.Writer.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		saved, err := store.GetByID(ctx, tx, e.ID)
@@ -473,12 +512,15 @@ func TestConnectionRuntimeOldSnapshotCannotReplayLostEffects(t *testing.T) {
 			return err
 		}
 		var used int64
-		var status string
-		if err := tx.QueryRowContext(ctx, "SELECT exchanges_used,status FROM grants WHERE conversation='first' AND grant_version=1").Scan(&used, &status); err != nil {
+		if err := tx.QueryRowContext(ctx, "SELECT exchanges_used FROM grants WHERE conversation='first' AND grant_version=1").Scan(&used); err != nil {
 			return err
 		}
-		if saved.State != store.Acked || used != 1 || status != "revoked" {
-			t.Errorf("post-snapshot evidence missing: state=%s used=%d status=%s", saved.State, used, status)
+		current, err := store.ReadBinding(ctx, tx, binding.ID)
+		if err != nil {
+			return err
+		}
+		if saved.State != store.Acked || used != 1 || current.Status != "revoked" || current.Version != binding.Version+1 {
+			t.Errorf("post-snapshot evidence missing: state=%s used=%d binding=%+v", saved.State, used, current)
 		}
 		return nil
 	}); err != nil {
@@ -517,6 +559,13 @@ func TestConnectionRuntimeOldSnapshotCannotReplayLostEffects(t *testing.T) {
 		grant, err := store.CurrentGrant(ctx, tx, "first")
 		if err != nil {
 			return err
+		}
+		current, err := store.ReadBinding(ctx, tx, binding.ID)
+		if err != nil {
+			return err
+		}
+		if current.Status != "enabled" || current.Version != binding.Version {
+			t.Errorf("fixture did not restore pre-revocation binding: %+v", current)
 		}
 		if saved.State != store.Queued || saved.DispatchAttempt != 0 || grant.ExchangesUsed != 0 || record.Status != "held" {
 			t.Errorf("restored evidence was silently reconciled: %+v %+v %+v", saved, grant, record)
