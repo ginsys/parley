@@ -3,7 +3,7 @@
 The investigation protocol is owned by [#18](https://github.com/ginsys/parley/issues/18).
 The tooling here records evidence; it is not a production host adapter or session authenticator.
 The controlled fixtures launch only Python children, never installed Claude, Codex or OpenCode.
-The [Claude/Codex matrix](host-wake-matrix.md) records direct-host results, sanitized evidence,
+The [host wake matrix](host-wake-matrix.md) records direct-host results, sanitized evidence,
 reproduction commands and the measured limits of the available mechanisms.
 
 ## Reproduce controlled fixtures
@@ -167,13 +167,11 @@ established each positive result, not just a timestamp.
 [`host_trials.py`](../scripts/probe/host_trials.py) drives a real host through one trial —
 create a session, submit a synthetic marker message, observe the four outcomes — and feeds the
 result into `wake_probe.py`'s own `Trial`/`aggregate` classification unmodified. It is tooling
-only: filling the matrix (running it against installed hosts three times per mechanism/state)
-is separate evidence, landed in a later change once trials actually run. Filling it is staged in
-three changes: stage 1 was the first version of this tooling, built before any host had been
-driven; the 2026-09-13 live captures (docs/host-probe-preflight.md) then replaced its guessed
-shapes and it was trimmed to what those captures support; stage 2 runs the Claude and Codex rows
-and lands `docs/host-wake-matrix.md`; stage 3 runs the OpenCode row and writes the synthesis #18
-asks for. The stage numbers in docs/host-probe-preflight.md refer to that list.
+only: repeated trials and their conclusions are separate evidence in the
+[wake matrix](host-wake-matrix.md). The historical stage numbers in the preflight record refer
+to the tooling, Claude/Codex trials, and OpenCode trials plus synthesis respectively. The
+2026-09-13 live captures replaced the initial tooling's guessed host shapes; the explicit
+per-host reproducers then added only subsequently captured state/configuration paths.
 
 ### Ownership and isolation
 

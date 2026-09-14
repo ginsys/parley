@@ -690,11 +690,15 @@ released. Every matrix cell this produces therefore carries the developer's real
 configuration and must be sanitized before publication — see
 [host probes](host-probes.md#matrix-runner) for the driver contract and outcome detectors.
 
-The [Claude/Codex wake matrix](host-wake-matrix.md) records direct-host outcomes at the tested
+The [host wake matrix](host-wake-matrix.md) records Claude, Codex and OpenCode outcomes at the tested
 versions and configurations. In particular, queue acceptance can coexist with no observed wake,
 and a logging notification has no host-acceptance response. These observations do not change
-`Transport` or the readiness handshake. Capability recommendations and the additional host
-belong to the investigation's subsequent synthesis. The native attachment and current-screen
+`Transport` or the readiness handshake. Its [recommendation](host-wake-matrix.md#recommendations-and-decision-enabled)
+is to preserve acceptance/validated ACK and expose independent optional visibility/turn activity
+with provenance, declaring wake capability separately from observability for each tested
+version/configuration. External transcript polling observes evidence; it does not establish
+that an idle or stopped host wakes itself. The subsequent decision and specification own the
+runtime contract. The native attachment and current-screen
 checks are necessary because a local launcher can display an idle composer for a different
 conversation than the requested background session.
 
