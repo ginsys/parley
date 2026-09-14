@@ -25,23 +25,51 @@ import (
 
 // This is controlled composition, not a shipped daemon/service or host verifier.
 type connectionRuntimeService struct {
-	t         *testing.T
-	transport dispatch.Transport
-	resources runtimeowner.Resources
-	bridge    *bridgefixture.Fixture
-	started   bool
-	stopped   atomic.Bool
-	workers   sync.WaitGroup
+	t               *testing.T
+	transport       dispatch.Transport
+	resources       runtimeowner.Resources
+	bridge          *bridgefixture.Fixture
+	started         bool
+	stopped         atomic.Bool
+	admissionClosed chan struct{}
+	admission       sync.Mutex
+	workers         sync.WaitGroup
 }
 
 func (s *connectionRuntimeService) Start(_ context.Context, r runtimeowner.Resources) error {
 	s.resources = r
+	s.admissionClosed = make(chan struct{})
 	s.bridge = bridgefixture.New(s.t, r.Writer, s.transport)
 	s.started = true
 	return nil
 }
-func (s *connectionRuntimeService) StopAdmission() error { s.stopped.Store(true); return nil }
-func (s *connectionRuntimeService) Wait() error          { s.workers.Wait(); return nil }
+func (s *connectionRuntimeService) StopAdmission() error {
+	s.admission.Lock()
+	defer s.admission.Unlock()
+	if !s.stopped.Swap(true) && s.admissionClosed != nil {
+		close(s.admissionClosed)
+	}
+	return nil
+}
+func (s *connectionRuntimeService) beginWork() bool {
+	s.admission.Lock()
+	defer s.admission.Unlock()
+	if !s.started || s.stopped.Load() {
+		return false
+	}
+	// StopAdmission closes this gate before runtime calls Wait: no later
+	// work can Add after draining begins, including when the count is zero.
+	s.workers.Add(1)
+	return true
+}
+func (s *connectionRuntimeService) send(ctx context.Context, conversation, from, to, text string) (*store.Envelope, error) {
+	if !s.beginWork() {
+		return nil, store.TemporarilyUnavailable
+	}
+	defer s.workers.Done()
+	return s.bridge.Send(ctx, conversation, from, to, text, nil)
+}
+func (s *connectionRuntimeService) Wait() error { s.workers.Wait(); return nil }
 
 type integratedResult struct {
 	out dispatch.Outcome
@@ -50,7 +78,10 @@ type integratedResult struct {
 
 func (s *connectionRuntimeService) dispatch(id string) <-chan integratedResult {
 	result := make(chan integratedResult, 1)
-	s.workers.Add(1)
+	if !s.beginWork() {
+		result <- integratedResult{out: dispatch.Outcome{ID: id}, err: store.TemporarilyUnavailable}
+		return result
+	}
 	go func() {
 		defer s.workers.Done()
 		out, err := s.bridge.DispatchOutcome(s.resources.WorkerContext, id)
@@ -155,13 +186,13 @@ func TestConnectionRuntimeMultipleConversationsAndAtomicReply(t *testing.T) {
 	ctx := context.Background()
 	var originals []string
 	for _, conversation := range []string{"first", "second"} {
-		e, err := service.bridge.Send(ctx, conversation, "author", "recipient", "synthetic", nil)
+		e, err := service.send(ctx, conversation, "author", "recipient", "synthetic")
 		if err != nil {
 			t.Fatal(err)
 		}
-		out, err := service.bridge.DispatchOutcome(ctx, e.ID)
-		if err != nil || out.State != store.HandedOff || !out.Attempted {
-			t.Fatalf("handoff=%+v %v", out, err)
+		result := <-service.dispatch(e.ID)
+		if result.err != nil || result.out.State != store.HandedOff || !result.out.Attempted {
+			t.Fatalf("handoff=%+v %v", result.out, result.err)
 		}
 		originals = append(originals, e.ID)
 	}
@@ -267,7 +298,7 @@ func TestConnectionRuntimeCancellationAfterChildStartup(t *testing.T) {
 			service := &connectionRuntimeService{t: t, transport: transport}
 			r, _ := f.start(t, service, f.markers, func() { t.Error("unexpected fail-stop") })
 			t.Cleanup(func() { release.Do(func() { close(allowSettlement) }) })
-			e, err := service.bridge.Send(context.Background(), "first", "author", "recipient", "synthetic", nil)
+			e, err := service.send(context.Background(), "first", "author", "recipient", "synthetic")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -312,6 +343,18 @@ func TestConnectionRuntimeCancellationAfterChildStartup(t *testing.T) {
 				t.Fatalf("writer lease released before settlement: %v", err)
 			}
 			if mode == "shutdown" {
+				awaitIntegration(t, service.admissionClosed)
+				if _, err := service.send(context.Background(), "first", "author", "recipient", "late"); err != store.TemporarilyUnavailable {
+					t.Fatalf("shutdown admitted late send: %v", err)
+				}
+				select {
+				case late := <-service.dispatch(e.ID):
+					if late.err != store.TemporarilyUnavailable || late.out.Attempted {
+						t.Fatalf("shutdown admitted late dispatch: %+v", late)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("late dispatch was not rejected")
+				}
 				select {
 				case err := <-stopped:
 					t.Fatalf("shutdown bypassed pending settlement: %v", err)
@@ -354,6 +397,13 @@ func TestConnectionRuntimeCancellationAfterChildStartup(t *testing.T) {
 				grant, err := store.CurrentGrant(ctx, tx, "first")
 				if err != nil {
 					return err
+				}
+				var count int
+				if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM envelopes").Scan(&count); err != nil {
+					return err
+				}
+				if count != 1 {
+					t.Errorf("shutdown admitted extra work: %d envelopes", count)
 				}
 				if saved.State != store.Uncertain || saved.DispatchAttempt != 1 || grant.ExchangesUsed != 1 {
 					t.Errorf("lost attempt/budget evidence=%+v %+v", saved, grant)
@@ -400,7 +450,7 @@ func TestConnectionRuntimeClockPersistenceFailureSignalsSupervisedStop(t *testin
 		}
 	})
 	f.now.Add(-int64(time.Second))
-	if _, err := service.bridge.Send(context.Background(), "first", "author", "recipient", "held", nil); err != store.RecoveryRequired {
+	if _, err := service.send(context.Background(), "first", "author", "recipient", "held"); err != store.RecoveryRequired {
 		t.Fatalf("failed clock evidence admitted work=%v", err)
 	}
 	awaitIntegration(t, stops)
@@ -411,6 +461,9 @@ func TestConnectionRuntimeClockPersistenceFailureSignalsSupervisedStop(t *testin
 	}
 	if !service.stopped.Load() {
 		t.Fatal("supervisor did not stop admission")
+	}
+	if _, err := service.send(context.Background(), "first", "author", "recipient", "late"); err != store.TemporarilyUnavailable {
+		t.Fatalf("stopped supervisor admitted work: %v", err)
 	}
 	db, err := store.OpenExisting(context.Background(), f.path)
 	if err != nil {
@@ -439,7 +492,7 @@ func TestConnectionRuntimeOldSnapshotCannotReplayLostEffects(t *testing.T) {
 	transport := NewTransport(integrationQueue(func(context.Context, string, string) error { return nil }), "synthetic-native", "author", "recipient")
 	first := &connectionRuntimeService{t: t, transport: transport}
 	r, _ := f.start(t, first, f.markers, func() { t.Error("unexpected stop") })
-	e, err := first.bridge.Send(ctx, "first", "author", "recipient", "snapshot-original", nil)
+	e, err := first.send(ctx, "first", "author", "recipient", "snapshot-original")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,8 +510,8 @@ func TestConnectionRuntimeOldSnapshotCannotReplayLostEffects(t *testing.T) {
 	}
 	second := &connectionRuntimeService{t: t, transport: transport}
 	r, _ = f.start(t, second, f.markers, func() { t.Error("unexpected stop") })
-	if out, err := second.bridge.DispatchOutcome(ctx, e.ID); err != nil || out.State != store.HandedOff {
-		t.Fatalf("post-snapshot delivery=%+v %v", out, err)
+	if result := <-second.dispatch(e.ID); result.err != nil || result.out.State != store.HandedOff {
+		t.Fatalf("post-snapshot delivery=%+v %v", result.out, result.err)
 	}
 	marker := fmt.Sprintf("```BRIDGE-REPLY\n{\"in_reply_to\":%q,\"to\":\"author\",\"text\":\"reply\"}\n```", e.ID)
 	if _, err := bridgefixture.IngestTurn(t, ctx, second.resources.Writer, "first", "recipient", "author", marker); err != nil {
