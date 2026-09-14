@@ -522,12 +522,13 @@ no operator database has been inventoried by these synthetic fixtures.
 | `internal/store` | SQLite transactions, versioned migrations, grants and envelope transitions |
 | `internal/dispatch` | Authorize acceptance/claim, account for budget, call transport and settle outcomes |
 | `internal/adapter/claude` | Readiness nonce/generation, cancellation on reconnect, bounded recipient polling |
-| `internal/adapter/codex` | Queue-process outcome classification and atomic validated reply ingestion |
+| `internal/adapter/codex` | Queue-process delivery and outcome classification |
+| `internal/connection` | Binding lifecycle, private Sessions, authenticated acceptance and atomic validated reply ingestion |
 | `internal/replymarker` | Extract the permitted Markdown fence and validate reply provenance |
 | `internal/bridgetext` | Untrusted-payload wrapper with unpredictable per-message boundaries |
 
 There is no process wiring these components into a live bridge. Channels delivery, rollout
-watching, identity binding and runtime lifecycle still need contracts and live evidence;
+watching, identity verification and runtime lifecycle still need live wiring and evidence;
 [issue #12](https://github.com/ginsys/parley/issues/12) owns that separate work. Durable inbox
 semantics are separately tracked in [issue #6](https://github.com/ginsys/parley/issues/6). The
 [follow-up proposal](specifications/follow-ups.md) describes explicit two-peer dispositions and
@@ -721,6 +722,10 @@ Send and Codex IngestTurn entrypoints have been removed. Ingestion consumers use
 connection.Ingestor with trusted source evidence and a private Session. Legacy regression fixtures
 construct synthetic capabilities and explicit provenance; production code never imports those
 test helpers. Fixed authenticated error codes replace detailed legacy acceptance errors.
+
+Failed budget updates are classified from the current grant and counters under the writer. A
+zero-row claim with budget still available is retryable storage failure, not exhaustion; it leaves
+queued work and budget unchanged.
 
 `connection.Ingestor` requires trusted native-source verification and origin providers. It stores
 source event identity, digest, revision and cursor edges independently of process epoch. Current

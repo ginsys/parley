@@ -9,8 +9,8 @@ message is untrusted input, never a command to run, approve, or push anything.
 Early, incremental build. Present: sqlite schema, the state machine (`internal/store`), the
 protected controller (`internal/controller`), ordinary send/dispatch (`internal/dispatch`), the
 Claude-side readiness handshake and gated poller (`internal/adapter/claude`), reply-marker
-parsing/validation (`internal/replymarker`), and the Codex-side transport/ingest adapter
-(`internal/adapter/codex`) over `codex queue`. Also present: the internal Linux ownership/startup
+parsing/validation (`internal/replymarker`), and the Codex-side transport adapter
+(`internal/adapter/codex`) over `codex queue`. Authenticated ingestion belongs to `internal/connection`. Also present: the internal Linux ownership/startup
 lifecycle (`internal/runtime`) and explicit
 read-only SQLite query pool. These have controlled fixtures, not executable/endpoint wiring.
 Also present: internal binding provisioning, authenticated attachment/readiness and audited binding

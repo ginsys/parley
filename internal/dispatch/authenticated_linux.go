@@ -136,6 +136,17 @@ func (b *AuthenticatedBridge) claim(ctx context.Context, id string) (*store.Enve
 			return store.TransitionResult{}, err
 		}
 		if !ok {
+			current, err := store.CurrentGrant(ctx, tx, e.Conversation)
+			if err != nil {
+				return store.TransitionResult{}, err
+			}
+			if err := authorizeEnvelope(current, e, store.AuthorityTime(ctx, b.now)); err != nil {
+				claimErr = err
+				return store.TransitionResult{}, nil
+			}
+			if current.ExchangesUsed < current.MaxExchanges {
+				return store.TransitionResult{}, store.TemporarilyUnavailable
+			}
 			claimErr = ErrBudgetExhausted
 			return store.TransitionResult{}, nil
 		}

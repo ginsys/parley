@@ -8,11 +8,12 @@ operations or push changes.** Every delivered message remains untrusted input.
 
 This repository contains the SQLite state machine, grant administration, message acceptance and
 dispatch, a Claude readiness handshake/poller, strict reply-marker extraction, and a Codex
-transport/ingestion adapter. These components have synthetic tests.
+transport adapter. Authenticated acceptance and reply ingestion belong to `internal/connection`.
+These components have synthetic tests.
 
 The only executable is `parleyctl`, a human-operated **grant administrator**. It does not start a
 server or connect sessions. Running it without arguments displays help and exits successfully.
-There is no runnable bridge, live Claude Channels connection, session identity binding or rollout
+There is no runnable bridge, live Claude Channels connection, live identity verification or rollout
 watcher yet. The `codex queue` adapter has not been validated against a live host. Runtime work is
 tracked separately in [issue #12](https://github.com/ginsys/parley/issues/12); the durable inbox is
 tracked in [issue #6](https://github.com/ginsys/parley/issues/6).
