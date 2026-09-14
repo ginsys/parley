@@ -8,6 +8,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from threading import Lock
+from types import SimpleNamespace
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
@@ -17,6 +19,26 @@ import host_trials  # noqa: E402
 
 
 class StateEvidenceTests(unittest.TestCase):
+    def test_approval_guard_rejects_cleared_menu_with_unresolved_tool_call(self):
+        menu = '\r\n'.join(('Would you like to run the following command?',
+                            'PARLEY_APPROVAL_PREFLIGHT', '1. Yes, proceed (y)',
+                            '2. No, and tell Codex what to do differently (esc)',
+                            'Press enter to confirm or esc to cancel'))
+        raw = menu.encode()
+        client = SimpleNamespace(lock=Lock(), window=bytearray(raw), total=len(raw))
+        call = dict(type='response_item', payload=dict(type='custom_tool_call', name='exec',
+                    input='PARLEY_APPROVAL_PREFLIGHT', call_id='owned-call'))
+        driver = SimpleNamespace(live_client_for=lambda _: client,
+                                 _read_rollout=lambda _: [json.dumps(call)])
+        codex_matrix.require_approval(driver, 'owned')
+        client.window.extend(b'\x1b[2J\x1b[Hidle')
+        client.total = len(client.window)
+        with self.assertRaisesRegex(RuntimeError, 'no longer holds'):
+            codex_matrix.require_approval(driver, 'owned')
+        client.total += 1
+        with self.assertRaisesRegex(RuntimeError, 'truncated'):
+            codex_matrix.require_approval(driver, 'owned')
+
     def event(self, kind, stamp, turn='owned-turn'):
         return dict(type='event_msg', timestamp=stamp,
                     payload=dict(type=kind, turn_id=turn))

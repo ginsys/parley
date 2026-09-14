@@ -13,7 +13,6 @@ import tempfile
 import time
 from pathlib import Path
 
-import pyte
 from codex_matrix import BUSY_PROMPT
 from host_trials import (
     ClaudeDriver,
@@ -25,6 +24,7 @@ from host_trials import (
     record_time,
     run_trial_with_cleanup,
 )
+from terminal_capture import terminal_screen
 from wake_probe import Trial, aggregate
 
 HOLD_PROMPT = ('Call the parleyprobe hold tool exactly once with empty arguments. '
@@ -70,16 +70,6 @@ def approval_pending(records, screen):
     requests = [record.get('uuid') for record in records if record.get('type') == 'user'
                 and record.get('message', {}).get('content') == HOLD_PROMPT]
     return requests[0] if len(requests) == 1 else None
-
-
-def terminal_screen(client):
-    with client.lock:
-        if client.total != len(client.window):
-            raise RuntimeError('terminal history was truncated; cannot reconstruct approval screen')
-        raw = bytes(client.window)
-    screen = pyte.Screen(80, 24)  # wake_probe.PTY_SIZE; no terminal resize is sent.
-    pyte.ByteStream(screen).feed(raw)
-    return '\n'.join(screen.display)
 
 
 def main():

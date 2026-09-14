@@ -405,6 +405,11 @@ requires both this complete menu and the unresolved call, and sends its marker t
 external queue command. The child-specific approval configuration and local review hook are
 part of the result; no global configuration was changed.
 
+The reproducer renders the current 80×24 terminal from complete raw PTY bytes before certifying
+this menu at setup, submission and observation. Cleared historical menu text cannot establish
+approval state, and truncated terminal history refuses the attempt. It retains raw terminal
+bytes and the rendered precondition alongside the rollout.
+
 Both `$CODEX_HOME/ipc/ipc.sock` and
 `$CODEX_HOME/app-server-control/app-server-control.sock` were absent before creation and while
 an owned TUI was ready. Earlier `codex app-server daemon version` reported ENOENT for the latter.
