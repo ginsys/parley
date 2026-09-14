@@ -27,6 +27,18 @@ def message(identity, role, created, text='', parent=None, completed=None):
 
 
 class StateTests(unittest.TestCase):
+    def test_published_approval_precondition_preserves_keys_and_exact_call_binding(self):
+        artifact = Path(__file__).resolve().parents[2] / 'docs/evidence/host-wake/opencode-approval-20260914.json'
+        for trial in json.loads(artifact.read_text())['trials']:
+            evidence = next(row['evidence'] for row in trial['journal'] if row['kind'] == 'precondition')
+            self.assertEqual(set(evidence), {'user_id', 'assistant_id', 'started_at', 'call_id'})
+            for exported in trial['exports'].values():
+                pending = next(m for m in exported['messages'] if m['info']['id'] == evidence['assistant_id'])
+                self.assertEqual(pending['info']['parentID'], evidence['user_id'])
+                self.assertEqual(pending['info']['time']['created'] / 1000, evidence['started_at'])
+                calls = [part['callID'] for part in pending['parts'] if part['type'] == 'tool']
+                self.assertEqual(calls, [evidence['call_id']])
+
     def approval(self):
         original = message('pending', 'assistant', 900000, parent='request')
         original['parts'] = [dict(type='tool', tool='bash', callID='call-owned',
