@@ -215,11 +215,11 @@ Baseline `3ca5030218a3a33b3c57c9a77118af39ed517185`, Claude Code `2.1.270`, dire
 session under real HOME. A plain-MCP compatibility preflight created its own background session
 with `claude --bg --model haiku --mcp-config <fixture-config> --strict-mcp-config '<prompt>'`
 from an empty private `<probe-cwd>`. The prompt was “Reply with exactly PONG. Do not call tools
-or change files.” It attached with `claude attach <short-id>`. MCP initialization was observed,
+or change files.” It invoked `claude attach <short-id>`. MCP initialization was observed,
 but the preflight failed before sending a notification; it supplies no wake-matrix result.
 
 The repeated command `claude agents --json --all --cwd <probe-cwd>` returned a background row
-plus the attach client's own transient interactive registration. Relevant raw shapes, with only
+plus the invocation's transient interactive registration. Relevant raw shapes, with only
 paths, PIDs, display names and identifiers substituted consistently:
 
 ```json
@@ -260,3 +260,147 @@ Cleanup checks state as well as PID: a surviving `working` row never authorizes 
 when the stop command returned 0. Both `done` and the newly captured `stopped` state can confirm
 stopping when there is no live PID. Controlled startup and stop/removal fixtures cover the
 distinction. The failed second attempt also sent no notification and fills no matrix cell.
+
+### Local launcher invalidates the apparent attach
+
+Two subsequent busy-state preflights never called the configured MCP hold tool. The second
+retained the final client screen: its conversation began with the user text `attach`, and the
+assistant later reported that the hold tool was absent. The background transcript still contained
+only the original PONG exchange. The installed launcher prepended `--enable-auto-mode
+--autocompact 300000 --effort high` to every terminal invocation, including the `attach`
+subcommand. The resulting interactive conversation was distinct from the created background
+session. A composer alone did not prove attachment to the requested session.
+
+The listing shapes above remain captured, but the interactive row is not evidence of a valid
+background attachment. An intervening idle-MCP preflight sent its notification and observed no
+marker in the background transcript for 125 seconds; its apparent attached-client precondition
+was affected by the same launcher and is not a valid attached-idle matrix trial. All these failed
+preconditions remain separate from the three-trial results. Their created background sessions
+were removed and their held client processes closed. No session from a listing was adopted.
+
+### Native attach, busy completion and approval records
+
+A new capture invoked the native `claude attach <short-id>` inside a systemd user scope with
+the launcher's unchanged limits (`MemoryHigh=6G`, `MemoryMax=12G`, `MemorySwapMax=4G`,
+`CLAUDE_MEM_SCOPE=1`). Its screen showed the existing PONG exchange, the background process PID
+and the created session's six-character display prefix. The subsequently typed request appeared
+in that exact background transcript. This established the attachment that the wrapper invocation
+had failed to provide; no launcher or global configuration was edited.
+
+The hold-tool request reached a permission menu even with `--allowedTools
+mcp__parleyprobe__hold` on creation. The inherited session was in plan mode. The menu showed
+`parleyprobe — Hold Tool: (MCP)`, `Do you want to proceed?`, `1. Yes`, `3. No`, and
+`Esc to cancel`. No choice was answered. The actual hold call was not yet persisted in the
+transcript or received by the server; the exact preceding user request, menu and absence of
+`hold_started` together establish this precondition. Tool discovery had already emitted:
+
+```json
+{"type":"assistant","timestamp":"2026-09-14T06:42:16.832Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_synthetic","name":"ToolSearch","input":{"query":"select:mcp__parleyprobe__hold","max_results":3},"caller":{"type":"direct"}}]}}
+{"type":"user","timestamp":"2026-09-14T06:42:16.863Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_synthetic","content":[{"type":"tool_reference","tool_name":"mcp__parleyprobe__hold"}]}]}}
+```
+
+These newly captured shapes initially made the ordinary message parser report an unreadable
+transcript. It now validates the bounded ToolSearch/reference exchange without treating tool
+arguments or references as message text. Assistant tool use can establish assistant activity;
+the reference result cannot establish transcript visibility or acknowledgement. Unknown tool
+result content and malformed fields still make the read unobservable. The original approval
+run retains its first parser-limited trial and its second failed setup separately from any rerun.
+That second screen's ANSI-stripped footer read `Ec to cancel`; further failed setups showed
+`Ec to canel` and `Do you want to proced?`. Cursor movement reused unchanged characters that
+escape stripping lost. Enumerating truncated text variants was unreliable. Approval detection
+therefore reconstructs the current 80×24 terminal with pinned [pyte 0.8.2](https://pypi.org/project/pyte/0.8.2/)
+and `wcwidth 0.2.13`, using the documented [screen and byte-stream API](https://pyte.readthedocs.io/en/latest/api.html).
+Both are investigation/test dependencies, not Go runtime dependencies. The renderer refuses a
+truncated byte history. Controlled cursor-reuse and screen-clear tests ensure it preserves text
+and does not keep a vanished menu. Detection still requires the captured tool label, question,
+Yes/No choices, exact bound request and absence of tool execution. The initial idle-composer
+readiness pattern is unchanged. All failed setup artifacts are retained separately.
+
+For busy state, the same number-generation prompt used by Codex produced a user record at
+`2026-09-14T06:36:55.007Z` and a descendant `system` / `turn_duration` record at
+`2026-09-14T06:37:16.075Z`, with `durationMs: 21016`. The listing changed from `working` to
+`done` while the same background PID remained live. The notification was requested while
+`working`. The orchestration follows the exact busy user record's `parentUuid` ancestry to
+completion, checks the session UUID/cwd, and excludes the existing turn's assistant tail from
+new-turn evidence. Host wall timestamps and local first-observation times remain separate.
+
+### Resume retains saved MCP options
+
+A stopped idle session received a synthetic control-file message while its MCP server was gone.
+The existing no-flags `claude --bg --resume <full-uuid> '<PONG-prompt>'` command then printed:
+
+```text
+backgrounded · af28df35 · reply protocol test
+  claude agents             list sessions
+  claude attach af28df35    open in this terminal
+  claude logs af28df35      show recent output
+  claude stop af28df35      stop this session
+```
+
+Its stderr reported that it woke the same session with saved `--mcp-config`,
+`--strict-mcp-config` and `--model` options. A second fixture process initialized. The previous
+first-line parser refused the display-name suffix; cleanup still removed the owned original
+session. This failed preflight supplies the resume output/configuration shape, not a completed
+restart matrix cell. The parser now accepts a title only after the captured second `·` separator,
+and still extracts only the first line's exact short ID. Controlled tests reject an unseparated
+suffix. Full UUID/cwd checks and copy detection remain in place.
+
+## Codex state captures 2026-09-14
+
+Installed and rollout-recorded version: `codex-cli 0.154.0`. Each capture used a fresh private
+Git directory, real HOME, a driver-created thread, and controlled cleanup. Creation was
+`codex exec --json -s read-only --skip-git-repo-check -C <probe-cwd> '<PONG-prompt>'`
+with stdin closed. The TUI command was `codex --no-alt-screen -s read-only -a never
+-C <probe-cwd> resume <thread-id>`; the captured trust dialog was answered only for that new cwd.
+
+A disconnected cleanup preflight queued one synthetic message with
+`codex queue --thread <thread-id> --message '<marker-message>'`, then ran
+`codex delete --force <thread-id>` while the item was pending. A read-only query of the queue
+database, restricted to that exact created thread UUID, counted one item before deletion and
+zero afterward. The rollout disappeared and ownership was empty. This permits a deliberate
+disconnected investigation without resuming merely to drain pending cleanup data.
+
+The busy precondition used this prompt in the owned ready TUI:
+
+> This is an isolated busy-state preflight. Write the integers from one through two hundred in
+> English words, one per line, followed by HOLD COMPLETE. Do not use tools or change files.
+
+The raw rollout emitted `event_msg` / `task_started` at `2026-09-14T06:11:13.685Z` and
+`task_complete` at `2026-09-14T06:11:41.345Z`, with the same `payload.turn_id`: 27.660 seconds.
+The orchestration requires a pending start before submission and verifies afterward that
+submission fell strictly inside that exact turn's interval. A prior request for a timed tool
+sleep was rejected because the child's approval policy was `never`; it did not establish the
+intended busy tool state and is retained as a failed precondition.
+
+The approval capture changed only the child TUI invocation to
+`codex -c 'approvals_reviewer="user"' --no-alt-screen -s read-only -a on-request
+-C <probe-cwd> resume <thread-id>`. It requested an escalated synthetic command
+`python3 -c 'print("PARLEY_APPROVAL_PREFLIGHT")'`. The client displayed:
+
+```text
+Would you like to run the following command?
+Environment: local
+Reason: ... nah requires review of this command before execution.
+$ python3 -c 'print("PARLEY_APPROVAL_PREFLIGHT")'
+1. Yes, proceed (y)
+2. No, and tell Codex what to do differently (esc)
+Press enter to confirm or esc to cancel
+```
+
+The bound rollout contained the corresponding `response_item` / `custom_tool_call`, name
+`exec`, with no matching `custom_tool_call_output`. No approval was answered. A matrix trial
+requires both this complete menu and the unresolved call, and sends its marker through the
+external queue command. The child-specific approval configuration and local review hook are
+part of the result; no global configuration was changed.
+
+Both `$CODEX_HOME/ipc/ipc.sock` and
+`$CODEX_HOME/app-server-control/app-server-control.sock` were absent before creation and while
+an owned TUI was ready. Earlier `codex app-server daemon version` reported ENOENT for the latter.
+No daemon was started and no other session was enumerated. This is scoped reachability evidence,
+not proof that Codex has no IPC mechanism.
+
+`scripts/probe/codex_matrix.py` reproduces three trials for each of `idle`, `busy`, `approval`,
+`disconnected` and `restarted`. It preserves individual observations, UTC and monotonic journal
+times, raw rollout/client evidence and failed attempts, then applies the fixed trial protocol.
+Run it explicitly with `--state <state> --output-directory <new-private-evidence-directory>`.
+Ordinary tests inject every process creator; they do not launch a host.

@@ -818,7 +818,7 @@ class Driver:
 
 # stdout line 1 of `claude --bg ...` (captured: `backgrounded · 69aa52ed`); the short id is the
 # first 8 hex digits of the listing's `sessionId`.
-BACKGROUNDED_PATTERN = re.compile(r'^backgrounded\s+\S+\s+([0-9a-f]{8})\s*$')
+BACKGROUNDED_PATTERN = re.compile(r'^backgrounded\s+·\s+([0-9a-f]{8})(?:\s+·\s+[^\x00-\x1f\x7f]+)?\s*$')
 # The idle composer line of `claude attach` (captured: `❯` followed by a non-breaking space, alone
 # on its line, under a rule of `─`). An earlier `❯ <text>` line is the previous prompt echoed back
 # and does not match; a permission dialog's layout is uncaptured.
@@ -837,6 +837,26 @@ def backgrounded_id(stdout):
     return match.group(1) if match else None
 
 
+def _claude_tool_search_content(kind, content):
+    """The captured ToolSearch call/reference result, excluding text from both tool payloads."""
+    if not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict):
+        return False
+    part = content[0]
+    if kind == 'assistant':
+        arguments = part.get('input')
+        return (part.get('type') == 'tool_use' and part.get('name') == 'ToolSearch'
+                and isinstance(part.get('id'), str) and bool(part['id'])
+                and isinstance(arguments, dict) and isinstance(arguments.get('query'), str)
+                and type(arguments.get('max_results')) is int and arguments['max_results'] > 0
+                and part.get('caller') == {'type': 'direct'})
+    references = part.get('content')
+    return (part.get('type') == 'tool_result' and isinstance(part.get('tool_use_id'), str)
+            and bool(part['tool_use_id']) and isinstance(references, list) and bool(references)
+            and all(isinstance(item, dict) and item.get('type') == 'tool_reference'
+                    and isinstance(item.get('tool_name'), str) and bool(item['tool_name'])
+                    for item in references))
+
+
 def claude_transcript_events(lines):
     """Extract user/assistant Events from a Claude session transcript; returns `(events, unusable)`.
 
@@ -852,10 +872,14 @@ def claude_transcript_events(lines):
     record that is not an object or whose `type` is not a string, or a user/assistant record
     whose timestamp is missing/naive, whose `message.role` disagrees with its type, or whose
     content does not carry its own role's captured shape. The shapes are role-specific and
-    checked as such: an assistant string or a user part list is a changed or malformed
+    checked as such: an assistant string or an ordinary user text-part list is changed or malformed
     transcript, and promoting one would let a marker in the wrong shape establish an
     acknowledgement instead of making the read unobservable. The caller reports such a read
     unobservable rather than letting absent outcomes become negative evidence.
+
+    The 2026-09-14 approval capture adds one bounded exception: ToolSearch's assistant
+    tool_use and user tool_reference result. They expose no message text. A tool call remains
+    assistant activity; a reference result cannot establish user-message visibility.
     """
     events = []
     unusable = 0
@@ -880,7 +904,11 @@ def claude_transcript_events(lines):
             unusable += 1
             continue
         content = message.get('content')
-        if kind == 'user' and isinstance(content, str):
+        if _claude_tool_search_content(kind, content):
+            if kind == 'user':
+                continue  # Tool references are not a newly visible user message.
+            text = ''  # Assistant activity, but tool arguments are never acknowledgement text.
+        elif kind == 'user' and isinstance(content, str):
             text = content
         elif kind == 'assistant' and isinstance(content, list):
             texts = []
