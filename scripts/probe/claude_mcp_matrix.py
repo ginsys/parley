@@ -44,6 +44,17 @@ def records_in(path):
             if line.endswith('\n')]
 
 
+def capture_transcript(driver, session_id, directory):
+    driver.require_owned(session_id)
+    # A newly minted resume copy has no UUID until the owned, cwd-filtered listing binds it.
+    path = driver._transcript_path(session_id)
+    if path is None:
+        raise RuntimeError(f'no bound transcript path for owned session {session_id}')
+    target = directory / f'transcript-{session_id}.jsonl'
+    target.write_bytes(Path(path).read_bytes())
+    return target
+
+
 def busy_completion(records, user_uuid, session_uuid, cwd):
     descendants = {user_uuid}
     for record in records:
@@ -218,9 +229,8 @@ def main():
 
                 def teardown(self, session_id):
                     try:
-                        path = self.transcript_path_for(self.sessions[session_id])
-                        if path:
-                            (trial_dir / 'transcript.jsonl').write_bytes(Path(path).read_bytes())
+                        target = capture_transcript(self, session_id, trial_dir)
+                        record('transcript_captured', session_id=session_id, path=str(target))
                         for number, client in enumerate(clients):
                             (trial_dir / f'pty-{number}.txt').write_text(client.text_since(0))
                             with client.lock:

@@ -284,6 +284,11 @@ The MCP reproducer checks both the PATH launcher and the native attachment execu
 `--version` before creating any session. Both must report `2.1.270 (Claude Code)`; a missing
 or differently versioned native executable refuses the attempt before host creation.
 
+Before teardown, the MCP reproducer binds any newly created resume copy through the owned,
+cwd-filtered listing and saves `transcript-<owned-short-id>.jsonl`. Separate filenames preserve
+both the original and copied session evidence. A missing binding or unreadable transcript
+surfaces a capture failure while the cleanup attempt still runs.
+
 A new capture invoked the native `claude attach <short-id>` inside a systemd user scope with
 the launcher's unchanged limits (`MemoryHigh=6G`, `MemoryMax=12G`, `MemorySwapMax=4G`,
 `CLAUDE_MEM_SCOPE=1`). Its screen showed the existing PONG exchange, the background process PID
