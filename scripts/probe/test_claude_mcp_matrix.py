@@ -17,14 +17,29 @@ from claude_mcp_matrix import (
     approval_pending,
     busy_completion,
     terminal_screen,
+    verify_binaries,
 )
 from host_trials import TrialRun
 
 
 class StateEvidenceTests(unittest.TestCase):
+    def test_native_attach_binary_is_independently_pinned(self):
+        for native_result in (subprocess.CompletedProcess([], 0, '2.1.271 (Claude Code)', ''),
+                              subprocess.CompletedProcess([], 1, '', 'missing')):
+            calls = []
+
+            def run(argv, **kwargs):
+                calls.append(argv)
+                return (subprocess.CompletedProcess(argv, 0, '2.1.270 (Claude Code)', '')
+                        if argv[0] == 'claude' else native_result)
+
+            with self.assertRaisesRegex(RuntimeError, 'version changed'):
+                verify_binaries(run, Path('/synthetic/native/claude'))
+            self.assertEqual(calls, [['claude', '--version'], ['/synthetic/native/claude', '--version']])
+
     def test_explicit_single_trial_never_publishes_three_trial_aggregate(self):
         def controlled_run(argv, **kwargs):
-            if argv == ['claude', '--version']:
+            if argv in (['claude', '--version'], [str(Path.home() / '.local/bin/claude'), '--version']):
                 return subprocess.CompletedProcess(argv, 0, '2.1.270 (Claude Code)\n', '')
             raise AssertionError(f'host launch forbidden: {argv}')
 

@@ -280,6 +280,10 @@ were removed and their held client processes closed. No session from a listing w
 
 ### Native attach, busy completion and approval records
 
+The MCP reproducer checks both the PATH launcher and the native attachment executable with
+`--version` before creating any session. Both must report `2.1.270 (Claude Code)`; a missing
+or differently versioned native executable refuses the attempt before host creation.
+
 A new capture invoked the native `claude attach <short-id>` inside a systemd user scope with
 the launcher's unchanged limits (`MemoryHigh=6G`, `MemoryMax=12G`, `MemorySwapMax=4G`,
 `CLAUDE_MEM_SCOPE=1`). Its screen showed the existing PONG exchange, the background process PID
