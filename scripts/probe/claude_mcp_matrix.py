@@ -31,6 +31,13 @@ HOLD_PROMPT = ('Call the parleyprobe hold tool exactly once with empty arguments
                'Do not call any other tool. Wait for it to finish, then reply HOLD COMPLETE.')
 
 
+def verify_binaries(run, native):
+    for executable in ('claude', str(native)):
+        version = run([executable, '--version'], capture_output=True, text=True, timeout=15)
+        if version.returncode or version.stdout.strip() != '2.1.270 (Claude Code)':
+            raise RuntimeError(f'Claude version changed for {executable}; capture compatibility first')
+
+
 def records_in(path):
     # A live writer may be between write and newline; the next poll includes that record.
     return [json.loads(line) for line in path.read_text().splitlines(keepends=True)
@@ -120,7 +127,7 @@ def main():
                 argv = ['systemd-run', '--user', '--quiet', '--collect', '--scope',
                         '--setenv=CLAUDE_MEM_SCOPE=1', '-p', 'MemoryHigh=6G',
                         '-p', 'MemoryMax=12G', '-p', 'MemorySwapMax=4G', '--',
-                        str(Path.home() / '.local/bin/claude'), *argv[1:]]
+                        str(native), *argv[1:]]
                 record('pty_started', argv=argv, cwd=kwargs.get('cwd'))
                 client = PtyClient(argv, **kwargs)
                 clients.append(client)
@@ -231,9 +238,8 @@ def main():
                     finally:
                         super().teardown(session_id)
 
-            version = run(['claude', '--version'], capture_output=True, text=True, timeout=15)
-            if version.returncode or version.stdout.strip() != '2.1.270 (Claude Code)':
-                raise RuntimeError('version changed; capture compatibility first')
+            native = Path.home() / '.local/bin/claude'
+            verify_binaries(run, native)
             cwd = tempfile.mkdtemp(prefix='parley-probe-', dir='/tmp')
             record('probe_directory', cwd=cwd, retained_for_hook_evidence=True)
             driver = RecordedDriver(SessionRegistry(), cwd=cwd, run=run, pty=pty)
