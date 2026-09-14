@@ -334,15 +334,17 @@ measure (what an approval-parked session lists as, mid-turn queue delivery) is n
   have the captured eight-hex-digit shape and full IDs the lowercase hyphenated UUID shape.
   The short ID must equal the full UUID's first eight digits, as captured; once bound, the full
   UUID cannot change under the same owned short ID. Neither malformed nor changed bindings
-  may redirect transcript reads. Assistant content parts must use the captured `text` or
-  `thinking` types; missing, malformed or unknown types make the record unusable instead of
+  may redirect transcript reads. Assistant message text uses the captured `text` or
+  `thinking` parts. The [2026-09-14 capture](host-probe-preflight.md#native-attach-busy-completion-and-approval-records)
+  adds the bounded ToolSearch call and reference-result shapes, without promoting tool payloads
+  to message text. Missing, malformed or unknown types make the record unusable instead of
   silently hiding a marker and producing negative evidence. Malformed rows,
   duplicate background IDs and any other missing-PID shape fail the listing; they never prove that a session is absent or
   stopped and cannot authorize `rm` after a failed `stop`. A transcript candidate disappearing
   between discovery and stat makes that read unobservable; later polls retry discovery and a
   version read remains unknown. Identity-binding/listing failures remain fatal lifecycle errors.
   `observe()` reads the session's own transcript
-  (`$HOME/.claude/projects/*/<sessionId>.jsonl`): `user` records carry a string `content`,
+  (`$HOME/.claude/projects/*/<sessionId>.jsonl`): user messages carry a string `content`,
   `assistant` records a list of typed parts, both a UTC ISO `timestamp`. Every message record is
   bound to the owned full UUID and exact probe cwd by its captured `sessionId`
   and `cwd`. Missing or conflicting bindings invalidate the entire snapshot before outcomes,

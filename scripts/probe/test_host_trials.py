@@ -273,6 +273,25 @@ def claude_record(kind, content, *, stamp='2026-09-13T09:00:00.000Z', version='2
 
 
 class ClaudeParsingTests(unittest.TestCase):
+    def test_backgrounded_resume_line_may_include_captured_display_name(self):
+        self.assertEqual(backgrounded_id('backgrounded · af28df35 · reply protocol test\n'), 'af28df35')
+        self.assertIsNone(backgrounded_id('backgrounded · af28df35 unexpected suffix\n'))
+
+    def test_captured_tool_search_exchange_is_not_message_visibility_or_ack(self):
+        use = dict(type='tool_use', id='toolu_synthetic', name='ToolSearch',
+                   input=dict(query='select:mcp__parleyprobe__hold', max_results=3),
+                   caller=dict(type='direct'))
+        result = dict(type='tool_result', tool_use_id='toolu_synthetic',
+                      content=[dict(type='tool_reference', tool_name='mcp__parleyprobe__hold')])
+        lines = [claude_record('assistant', [use]), claude_record('user', [result])]
+        events, unusable = claude_transcript_events(lines)
+        self.assertEqual(unusable, 0)
+        self.assertEqual([(event.role, event.text) for event in events], [('assistant', '')])
+        for part in (dict(use, id=None), dict(use, input=None),
+                     dict(result, content=[dict(type='text', text=MARKER)])):
+            role = 'assistant' if part['type'] == 'tool_use' else 'user'
+            self.assertEqual(claude_transcript_events([claude_record(role, [part])]), ([], 1))
+
     def test_backgrounded_line_yields_the_short_id_from_line_one_only(self):
         # Captured stdout: `backgrounded · 69aa52ed` then four hint lines.
         stdout = 'backgrounded · 69aa52ed\n  claude attach 69aa52ed\n  claude logs 69aa52ed\n'
