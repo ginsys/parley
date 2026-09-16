@@ -66,7 +66,12 @@ func (c Config) Administrators() map[string]uint32 {
 	return copied
 }
 
-func validAdminID(s string) bool {
+func validAdminID(s string) bool { return canonicalUUID(s) }
+
+// canonicalUUID reports whether s is exactly the lowercase, hyphenated
+// canonical rendering of a non-nil UUID -- the wire profile's identifier
+// form (see docs/specifications/control.md's UUID/exact-key rules).
+func canonicalUUID(s string) bool {
 	id, err := uuid.Parse(s)
 	return err == nil && id != uuid.Nil && id.String() == s
 }
