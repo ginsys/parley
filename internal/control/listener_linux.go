@@ -45,6 +45,9 @@ var (
 // (0600, or 0660 with an explicitly provisioned administrator-only group
 // -- provisioning that group is the caller's responsibility).
 func Listen(cfg Config, mode os.FileMode) (net.Listener, error) {
+	if mode != 0600 && mode != 0660 {
+		return nil, fmt.Errorf("control: admin_socket mode must be exactly 0600 or 0660, got %v", mode)
+	}
 	dir := filepath.Dir(cfg.AdminSocket)
 	name := filepath.Base(cfg.AdminSocket)
 	parent, err := connection.TrustedDirectory(dir, cfg.ServerUID)
@@ -139,11 +142,12 @@ func probeConnectionRefused(parent int, name string) (bool, error) {
 // request in flight per socket -- at the cost of not implementing
 // per-socket request pipelining in PR1.
 type Listener struct {
-	listener net.Listener
-	cfg      Config
-	epoch    string
+	cfg   Config
+	mode  os.FileMode
+	epoch string
 
 	mu           sync.Mutex
+	listener     net.Listener // nil until Start binds it
 	server       *Server
 	stopped      bool
 	totalSockets int
@@ -151,18 +155,25 @@ type Listener struct {
 	wg           sync.WaitGroup
 }
 
-// NewListenerService wraps l for runtime.Start's Registration.Service.
-// epoch is resolved by the caller (cmd/parleyd) before construction, minted
-// once per process start. serverID is not a constructor argument: Start
-// reads the installation row itself from the writer runtime.Start supplies
-// (Resources.Writer), the same one-shot pattern recovery.Service.New uses
-// for the same row -- this avoids requiring the caller to open the store a
-// second time before runtime.Start's own ownership acquisition ever runs.
-func NewListenerService(l net.Listener, cfg Config, epoch string) *Listener {
-	return &Listener{listener: l, cfg: cfg, epoch: epoch, perAdmin: make(map[string]int)}
+// NewListenerService builds a Listener for runtime.Start's
+// Registration.Service. epoch is resolved by the caller (cmd/parleyd)
+// before construction, minted once per process start. Unlike an
+// already-bound net.Listener, cfg/mode are only turned into a bound socket
+// inside Start, after runtime.Start has already acquired exclusive
+// database ownership -- a process that loses that race never creates,
+// probes or replaces the admin socket at all. serverID is not a
+// constructor argument either: Start reads the installation row itself
+// from the writer runtime.Start supplies (Resources.Writer), the same
+// one-shot pattern recovery.Service.New uses for the same row.
+func NewListenerService(cfg Config, mode os.FileMode, epoch string) *Listener {
+	return &Listener{cfg: cfg, mode: mode, epoch: epoch, perAdmin: make(map[string]int)}
 }
 
 func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
+	listener, err := Listen(ln.cfg, ln.mode)
+	if err != nil {
+		return fmt.Errorf("control: bind admin socket: %w", err)
+	}
 	state := StateRunning
 	if res.Mode == runtime.Held {
 		state = StateRecoveryOnly
@@ -171,9 +182,11 @@ func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
 	if err := res.Writer.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
 		return tx.QueryRowContext(ctx, "SELECT server_id FROM installation WHERE singleton=1").Scan(&serverID)
 	}); err != nil {
+		listener.Close()
 		return fmt.Errorf("control: read installation identity: %w", err)
 	}
 	ln.mu.Lock()
+	ln.listener = listener
 	ln.server = NewServer(ln.cfg, res.Queries, serverID, ln.epoch, state)
 	ln.mu.Unlock()
 	ln.wg.Add(1)
@@ -181,11 +194,19 @@ func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
 	return nil
 }
 
+// StopAdmission is safe even when Start never got as far as binding a
+// listener (e.g. Listen itself failed): runtime.Start registers a service
+// for cleanup before calling its Start (internal/runtime/runtime.go), so a
+// failed Start still receives a StopAdmission/Wait pair.
 func (ln *Listener) StopAdmission() error {
 	ln.mu.Lock()
 	ln.stopped = true
+	listener := ln.listener
 	ln.mu.Unlock()
-	return ln.listener.Close()
+	if listener == nil {
+		return nil
+	}
+	return listener.Close()
 }
 
 func (ln *Listener) Wait() error {

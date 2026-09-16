@@ -171,15 +171,11 @@ func newListenerFixture(t *testing.T) *listenerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := Listen(cfg, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
 	db := controlTestDB(t)
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(l, cfg, "epoch-fixture")
+	service := NewListenerService(cfg, 0600, "epoch-fixture")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
@@ -248,15 +244,11 @@ func TestListenerServiceUnconfiguredUIDIsRefusedSilently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := Listen(cfg, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
 	db := controlTestDB(t)
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(l, cfg, "epoch-fixture")
+	service := NewListenerService(cfg, 0600, "epoch-fixture")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
@@ -309,15 +301,11 @@ func TestListenerServiceRecoveryOnlyState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := Listen(cfg, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
 	db := controlTestDB(t)
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(l, cfg, "epoch-fixture")
+	service := NewListenerService(cfg, 0600, "epoch-fixture")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Held}); err != nil {
