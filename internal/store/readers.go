@@ -153,3 +153,43 @@ func (q Queries) Outcome(ctx context.Context, id string) (out EnvelopeOutcome, e
 	}
 	return out, nil
 }
+
+// ErrOperationNotFound reports that no durable receipt exists for the
+// given principal/operation pair -- absence, not a rejection. A caller
+// that retried a timed-out mutation and gets this must not treat it as
+// proof the mutation never committed; retry (with the same operation ID)
+// or escalate, but never conclude non-occurrence from a missing record.
+var ErrOperationNotFound = errors.New("operation not found")
+
+// OperationRecord is a read-only projection of one durable command
+// receipt, joined against its permanent audit row. It mirrors
+// lookupReceipt's join (see coordinator.go) but runs through the
+// read-only reader pool, never the writer.
+type OperationRecord struct {
+	OperationKind  string
+	ResultJSON     string
+	AuditID        string
+	AuditSequence  int64
+	CommitEpoch    string
+	CommitRevision int64
+}
+
+// OperationRecord looks up the durable receipt for one principal's
+// operation ID. Scoping to principalID is the caller's responsibility to
+// enforce as an authorization boundary (control's operation.get must pass
+// only the authenticated administrator's own principal ID, never a
+// client-supplied one).
+func (q Queries) OperationRecord(ctx context.Context, principalID, operationID string) (rec OperationRecord, err error) {
+	err = q.snapshot(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		e := tx.QueryRowContext(ctx, `SELECT o.operation_kind,o.result_json,a.audit_id,a.audit_sequence,a.commit_epoch,a.commit_revision FROM operation_results o JOIN command_audit a USING(principal_id,operation_id) WHERE o.principal_id=? AND o.operation_id=?`, principalID, operationID).
+			Scan(&rec.OperationKind, &rec.ResultJSON, &rec.AuditID, &rec.AuditSequence, &rec.CommitEpoch, &rec.CommitRevision)
+		if errors.Is(e, sql.ErrNoRows) {
+			return ErrOperationNotFound
+		}
+		return e
+	})
+	if err != nil {
+		return OperationRecord{}, err
+	}
+	return rec, nil
+}

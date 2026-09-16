@@ -463,6 +463,55 @@ func TestRuntimeWriterRejectsEmptyCatalogAtEveryVersion(t *testing.T) {
 	}
 }
 
+func TestOperationRecordReadsThroughReaderPool(t *testing.T) {
+	db := commandDB(t)
+	ctx := context.Background()
+	req := testRequest(t, testOperation, Field{"peer_id", "exact "})
+	p := CommandPrincipal{ID: testPrincipal, ConnectorUID: 1000}
+	receipt, err := db.Coordinator().Execute(ctx, p, req, allowed, insertSynthetic, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.OpenReaders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := db.Queries().OperationRecord(ctx, testPrincipal, testOperation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.OperationKind != "binding.register" || rec.AuditID != receipt.AuditID || rec.AuditSequence != receipt.AuditSequence {
+		t.Fatalf("%#v vs receipt %#v", rec, receipt)
+	}
+	if rec.CommitEpoch != receipt.View.Epoch || rec.CommitRevision != receipt.View.Revision {
+		t.Fatalf("%#v vs view %#v", rec, receipt.View)
+	}
+}
+
+func TestOperationRecordNotFoundForMissingOperation(t *testing.T) {
+	d := readerTestDB(t)
+	_, err := d.Queries().OperationRecord(context.Background(), testPrincipal, testOperation)
+	if !errors.Is(err, ErrOperationNotFound) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestOperationRecordScopedToExactPrincipal(t *testing.T) {
+	db := commandDB(t)
+	ctx := context.Background()
+	req := testRequest(t, testOperation, Field{"peer_id", "exact "})
+	p := CommandPrincipal{ID: testPrincipal, ConnectorUID: 1000}
+	if _, err := db.Coordinator().Execute(ctx, p, req, allowed, insertSynthetic, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.OpenReaders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	otherPrincipal := "30000000-0000-4000-8000-000000000001"
+	if _, err := db.Queries().OperationRecord(ctx, otherPrincipal, testOperation); !errors.Is(err, ErrOperationNotFound) {
+		t.Fatalf("a differently-scoped principal must not see another principal's operation record: %v", err)
+	}
+}
+
 func TestReaderEnablesRecursiveTriggers(t *testing.T) {
 	d := readerTestDB(t)
 	if err := d.Queries().snapshot(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
