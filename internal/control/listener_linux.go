@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -298,22 +299,31 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		}
 	}()
 
+	// preHelloTimer enforces docs/specifications/control.md's "After
+	// kernel authentication, the first call within five seconds is
+	// server.hello" as a single absolute deadline for the whole
+	// connection, independent of ReadFrame's own per-frame deadline.
+	// Renewing a read deadline on every loop iteration is not enough:
+	// ReadFrame resets its own deadline to now+FrameDeadline once a
+	// frame's first byte arrives (frame.go), which can push a slow-
+	// trickled or repeatedly rejected pre-hello frame's effective
+	// deadline past the original cutoff. This timer fires exactly once,
+	// unconditionally, and is stopped only after hello actually
+	// succeeds -- matching the existing ctx.Done() goroutine above,
+	// which closes the connection the same way to unblock a pending
+	// read.
+	var helloDone atomic.Bool
+	preHelloTimer := time.AfterFunc(FrameDeadline, func() {
+		if !helloDone.Load() {
+			conn.Close()
+		}
+	})
+	defer preHelloTimer.Stop()
+
 	br := bufio.NewReader(conn)
 	for {
 		if ctx.Err() != nil {
 			return
-		}
-		if !sess.negotiated {
-			// docs/specifications/control.md: "After kernel authentication,
-			// the first call within five seconds is server.hello." Without
-			// a deadline here, an accepted-but-silent authenticated
-			// connection could hold its socket slot indefinitely without
-			// ever negotiating. ReadFrame's own deadline only starts once
-			// its first byte arrives; this covers the wait for that byte
-			// too.
-			if err := conn.SetReadDeadline(time.Now().Add(FrameDeadline)); err != nil {
-				return
-			}
 		}
 		frame, err := ReadFrame(br, conn, FrameDeadline)
 		if err != nil {
@@ -334,6 +344,13 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			continue
 		}
 		resp, closeAfter := sess.Handle(ctx, req)
+		if sess.negotiated {
+			// sess.negotiated is only ever written by this goroutine
+			// (inside Handle -> handleHello); helloDone is the only field
+			// preHelloTimer's separate goroutine reads, so this stays
+			// race-free without sharing sess itself across goroutines.
+			helloDone.Store(true)
+		}
 		if writeResponse(conn, resp) != nil || closeAfter {
 			return
 		}
