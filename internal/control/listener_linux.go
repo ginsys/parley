@@ -303,13 +303,29 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		if ctx.Err() != nil {
 			return
 		}
+		if !sess.negotiated {
+			// docs/specifications/control.md: "After kernel authentication,
+			// the first call within five seconds is server.hello." Without
+			// a deadline here, an accepted-but-silent authenticated
+			// connection could hold its socket slot indefinitely without
+			// ever negotiating. ReadFrame's own deadline only starts once
+			// its first byte arrives; this covers the wait for that byte
+			// too.
+			if err := conn.SetReadDeadline(time.Now().Add(FrameDeadline)); err != nil {
+				return
+			}
+		}
 		frame, err := ReadFrame(br, conn, FrameDeadline)
 		if err != nil {
 			return
 		}
 		req, violation, idless := classifyEnvelope(frame)
 		if idless {
-			continue // no response, per profile; connection stays open
+			// docs/specifications/control.md:64-65: "ID-less client
+			// objects (including notifications) are not executed and
+			// receive no response; close with a bounded operational
+			// diagnostic." The deferred conn.Close() above is that close.
+			return
 		}
 		if violation != nil {
 			if writeResponse(conn, responseForViolation(violation)) != nil {
@@ -328,6 +344,15 @@ func writeResponse(conn *net.UnixConn, resp Response) error {
 	data, err := resp.Encode()
 	if err != nil {
 		return err
+	}
+	if len(data)+1 > MaxFrameBytes {
+		// A response that cannot fit the profile's own frame bound must
+		// never be written truncated or oversized; replace it with a
+		// bounded internal-error response instead.
+		data, err = envelopeErrorResponse(InternalError, resp.ID).Encode()
+		if err != nil {
+			return err
+		}
 	}
 	if err := conn.SetWriteDeadline(time.Now().Add(WriteDeadline)); err != nil {
 		return err
