@@ -110,7 +110,11 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	}
 	return &Manager{pending: make(chan struct{}, cfg.MaxNonattached), afterFunc: cfg.AfterFunc, store: cfg.Store, now: cfg.Now, guard: cfg.Guard, verify: cfg.Verify, sockets: make(map[*Socket]struct{}), slots: make(map[string]*Session)}, nil
 }
-func peerUID(conn *net.UnixConn) (uint32, error) {
+
+// PeerUID reads the kernel-verified SO_PEERCRED UID of an accepted Unix stream
+// connection. Exported so internal/control's listener can reuse this one
+// read instead of duplicating it for the human control socket.
+func PeerUID(conn *net.UnixConn) (uint32, error) {
 	if conn == nil {
 		return 0, store.AuthenticationFailed
 	}
@@ -162,7 +166,7 @@ func (m *Manager) Accept(ctx context.Context, conn *net.UnixConn) (*Socket, erro
 	defer stopWait()
 	stopLifetime := context.AfterFunc(life, stopWait)
 	defer stopLifetime()
-	uid, err := peerUID(conn)
+	uid, err := PeerUID(conn)
 	var rejected bool
 	if err == nil {
 		s.uid = uid

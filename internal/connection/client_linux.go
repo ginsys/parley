@@ -40,7 +40,7 @@ func DialTrustedServer(ctx context.Context, path string, serverUID uint32) (*net
 		raw.Close()
 		return nil, store.AuthenticationFailed
 	}
-	uid, err := peerUID(conn)
+	uid, err := PeerUID(conn)
 	if err != nil || uid != serverUID {
 		conn.Close()
 		return nil, store.AuthenticationFailed
