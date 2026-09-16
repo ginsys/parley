@@ -113,7 +113,28 @@ The tests cover reader/VFS isolation, replacement connections, pool/query/materi
 cancellation, concurrent WAL snapshots and writer commit, candidate authorization races, startup
 failure cleanup, held-mode admission, shutdown ordering, cancelled shutdown waiting, process
 contention, crash release and exec noninheritance. These establish the internal foundation, not a
-running bridge or production isolation. There is no daemon, listener/socket implementation, human
-initialization command, CLI conversion, binding migration or live host connection in this slice.
-The executable and human initialization use this ownership lifecycle in subsequent administration
-work; authenticated connection and durable recovery integration remain separate work.
+running bridge or production isolation. There is no CLI conversion, binding migration or live host
+connection in this slice (see the PR1 status note below for what changed).
+
+## PR1 status (2026-09-16)
+
+`cmd/parleyd` is now the first executable built on this lifecycle. `parleyd init -database PATH`
+creates a private (mode 0600), empty database file -- refusing outright if anything already exists
+there -- then runs its migrations exactly once and prints the minted `installation.server_id` for
+the operator to record. `parleyd serve` binds `internal/control`'s Unix listener
+(`control.Listen`/`control.NewListenerService`) as the sole `runtime.Registration` and constructs a
+real `recovery.Directory`-backed `Markers` implementation for `recovery.Config.Markers` --
+replacing this document's earlier "concrete durable clock/restore markers... are not implemented by
+this slice" note for the authenticated human-server-executable path specifically. `serve` uses
+`runtime.Start` exactly as this document describes: ownership, the existing writer, migration,
+recovery inspection, readers, then services: a missing deployment database fails startup rather
+than being silently created, and an interrupt/TERM signal (or the recovery `FailStop` callback)
+triggers `Runtime.Stop`'s own ordered shutdown.
+
+`parleyctl` is not yet converted to a client: `grant`/`revoke`/`renew` still open the database
+directly, transitionally (EP-02's ownership-lock join), pending PR2. There is still no membership
+or admission wiring, no agent-facing listener, and no live host connection -- see
+[Architecture's accepted human control protocol](architecture.md#accepted-human-control-protocol)
+for the exact `parley-control/1` method surface PR1 wires (`server.hello`, `operation.get` only),
+and [Operations](operations.md) for `parleyd`'s initialization, configuration and stopped-service
+backup procedure.
