@@ -68,15 +68,24 @@ func TestInitRejectsRelativePath(t *testing.T) {
 	}
 }
 
+// TestInitHelpTouchesNoFile passes a real, disposable -database path before
+// -h (rather than omitting the flag entirely, as an earlier version of this
+// test did): omitting it proved only that init works with no -database at
+// all, never that a help request ignores one that was actually supplied.
+// The lock file is checked too, not just the database file itself, since
+// runtime.Acquire creates a separate <path>.lock entry.
 func TestInitHelpTouchesNoFile(t *testing.T) {
 	dir := privateDir(t, "parleyd-init-help-")
 	path := filepath.Join(dir, "parley.db")
 	var out, errOut bytes.Buffer
-	if code := runInit([]string{"-h"}, &out, &errOut); code != 0 {
+	if code := runInit([]string{"-database", path, "-h"}, &out, &errOut); code != 0 {
 		t.Fatalf("code=%d err=%q", code, errOut.String())
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("help touched the database path")
+	}
+	if _, err := os.Stat(path + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("help touched the ownership lock path")
 	}
 }
 
@@ -179,7 +188,10 @@ func TestServeRejectsOverflowAndReservedServerUID(t *testing.T) {
 
 // initTestDeps builds initDeps with every function overridden by an
 // explicit failure marker, so a test that expects a given phase never to
-// be reached fails loudly (not silently) if that assumption is wrong.
+// be reached fails loudly (not silently) if that assumption is wrong. A
+// test exercising a phase past acquire/openStore must explicitly override
+// closeStore/closeOwner with the real thing (or its own injected failure),
+// since those are reached on paths this default deliberately refuses.
 func initTestDeps(t *testing.T) initDeps {
 	t.Helper()
 	unreachable := func(name string) func() { return func() { t.Fatalf("%s should not have been called", name) } }
@@ -195,6 +207,14 @@ func initTestDeps(t *testing.T) initDeps {
 		readID: func(context.Context, *store.DB) (string, error) {
 			unreachable("readID")()
 			return "", nil
+		},
+		closeStore: func(*store.DB) error {
+			unreachable("closeStore")()
+			return nil
+		},
+		closeOwner: func(*runtime.Ownership) error {
+			unreachable("closeOwner")()
+			return nil
 		},
 	}
 }
@@ -289,9 +309,12 @@ func TestInitDatabaseWithForeignOwnershipFailurePreservesFile(t *testing.T) {
 // TestInitDatabaseWithSchemaFailurePreservesFile covers a named
 // post-create failure phase (store.Open/schema migration): the file must
 // be retained and the message must not claim the database is definitely
-// empty or unusable -- store.Open's migration steps each commit in their
-// own immediate transaction, so a failure here can still mean a
-// partially-but-genuinely-committed schema.
+// empty or unusable -- store.Open's migration runs as a single atomic
+// transaction (internal/store/migrations.go's migrate: one BEGIN, every
+// step, one final Commit, with defer tx.Rollback() covering every early
+// return), so a failure here normally means nothing at all was committed,
+// not a partial schema -- but this phase still never asserts that as fact
+// on the file's own behalf, only reports the phase that failed.
 func TestInitDatabaseWithSchemaFailurePreservesFile(t *testing.T) {
 	dir := privateDir(t, "parleyd-initdeps-schema-")
 	path := filepath.Join(dir, "parley.db")
@@ -299,6 +322,7 @@ func TestInitDatabaseWithSchemaFailurePreservesFile(t *testing.T) {
 	deps := initTestDeps(t)
 	deps.acquire = runtime.Acquire
 	deps.openStore = func(context.Context, string) (*store.DB, error) { return nil, sentinel }
+	deps.closeOwner = func(o *runtime.Ownership) error { return o.Close() }
 
 	var out, errOut bytes.Buffer
 	code := initDatabaseWith(context.Background(), path, &out, &errOut, deps)
@@ -338,9 +362,11 @@ func TestInitDatabaseWithIdentityReadFailureAfterRealCommitIsHonest(t *testing.T
 	path := filepath.Join(dir, "parley.db")
 	sentinel := errors.New("synthetic: identity readback failed")
 	deps := initDeps{
-		acquire:   runtime.Acquire,
-		openStore: store.Open,
-		readID:    func(context.Context, *store.DB) (string, error) { return "", sentinel },
+		acquire:    runtime.Acquire,
+		openStore:  store.Open,
+		readID:     func(context.Context, *store.DB) (string, error) { return "", sentinel },
+		closeStore: func(db *store.DB) error { return db.Close() },
+		closeOwner: func(o *runtime.Ownership) error { return o.Close() },
 	}
 
 	var out, errOut bytes.Buffer
@@ -349,7 +375,14 @@ func TestInitDatabaseWithIdentityReadFailureAfterRealCommitIsHonest(t *testing.T
 		t.Fatalf("code=%d err=%q", code, errOut.String())
 	}
 	msg := errOut.String()
-	if !strings.Contains(msg, "schema committed") || !strings.Contains(msg, "diagnostic-read failure, not a corrupt database") {
+	// The message must name which earlier phase succeeded (store.Open) and
+	// which later, distinct observation failed (the identity read) -- and
+	// must not claim a failed read establishes either corruption or its
+	// absence.
+	if !strings.Contains(msg, "store.Open") || !strings.Contains(msg, "reported success") {
+		t.Fatalf("err=%q", msg)
+	}
+	if !strings.Contains(msg, "does not by itself establish whether the database is corrupt") {
 		t.Fatalf("err=%q", msg)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -375,6 +408,201 @@ func TestInitDatabaseWithIdentityReadFailureAfterRealCommitIsHonest(t *testing.T
 		return tx.QueryRowContext(ctx, "SELECT server_id FROM installation WHERE singleton=1").Scan(&serverID)
 	}); err != nil || serverID == "" {
 		t.Fatalf("installation row missing after reported success: err=%v serverID=%q", err, serverID)
+	}
+}
+
+// TestInitDatabaseWithStoreCloseFailureIsReportedAndOwnershipStillReleased
+// covers R1's close-failure requirement through the closeStore/closeOwner
+// seam: store.DB.Close and Ownership.Close are both idempotent, so a real
+// second close after a genuinely successful first one cannot be made to
+// fail through the public API -- there is no OS-level fault to inject here
+// without faking the filesystem. Injecting closeStore directly forces this
+// specific, distinct failure deterministically. The failure must be
+// reported (not swallowed), and ownership must still be released
+// afterward: initDatabaseWith's own code always calls closeOwner next
+// regardless of closeStore's outcome, so the fixture confirms that
+// wiring, not just that closeStore ran.
+func TestInitDatabaseWithStoreCloseFailureIsReportedAndOwnershipStillReleased(t *testing.T) {
+	dir := privateDir(t, "parleyd-initdeps-storeclose-")
+	path := filepath.Join(dir, "parley.db")
+	sentinel := errors.New("synthetic: store close failed")
+	ownerClosed := false
+	deps := initDeps{
+		acquire:    runtime.Acquire,
+		openStore:  store.Open,
+		readID:     readServerID,
+		closeStore: func(*store.DB) error { return sentinel },
+		closeOwner: func(o *runtime.Ownership) error { ownerClosed = true; return o.Close() },
+	}
+
+	var out, errOut bytes.Buffer
+	code := initDatabaseWith(context.Background(), path, &out, &errOut, deps)
+	if code != 1 {
+		t.Fatalf("code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	msg := errOut.String()
+	if !strings.Contains(msg, "failed to close cleanly") || !strings.Contains(msg, sentinel.Error()) {
+		t.Fatalf("err=%q", msg)
+	}
+	if !ownerClosed {
+		t.Fatal("ownership was not released after a store-close failure")
+	}
+	// Ownership must actually be free (not merely reported as released): a
+	// fresh acquire at the same path must succeed.
+	owner, err := runtime.Acquire(path)
+	if err != nil {
+		t.Fatalf("ownership was not actually released: %v", err)
+	}
+	owner.Close()
+}
+
+// TestInitDatabaseWithOwnerCloseFailureAfterStoreCloseSucceedsIsReported
+// covers the second, independent close-failure path: a successful
+// store.DB.Close followed by a failing Ownership.Close. Distinguishing
+// this from the previous test proves both close calls are independently
+// checked and reported, not folded into one combined check that could mask
+// which one actually failed.
+func TestInitDatabaseWithOwnerCloseFailureAfterStoreCloseSucceedsIsReported(t *testing.T) {
+	dir := privateDir(t, "parleyd-initdeps-ownerclose-")
+	path := filepath.Join(dir, "parley.db")
+	sentinel := errors.New("synthetic: ownership close failed")
+	storeClosed := false
+	deps := initDeps{
+		acquire:    runtime.Acquire,
+		openStore:  store.Open,
+		readID:     readServerID,
+		closeStore: func(db *store.DB) error { storeClosed = true; return db.Close() },
+		closeOwner: func(*runtime.Ownership) error { return sentinel },
+	}
+
+	var out, errOut bytes.Buffer
+	code := initDatabaseWith(context.Background(), path, &out, &errOut, deps)
+	if code != 1 {
+		t.Fatalf("code=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	if !storeClosed {
+		t.Fatal("store was not closed before the ownership-close failure was reported")
+	}
+	msg := errOut.String()
+	if !strings.Contains(msg, "failed to release ownership cleanly") || !strings.Contains(msg, sentinel.Error()) {
+		t.Fatalf("err=%q", msg)
+	}
+}
+
+// TestInitDatabaseWithOpensTheCanonicalOwnershipPathNotTheRawInput covers
+// R1's canonical-path rule directly: deps.openStore must receive
+// owner.Path() (the resolved path runtime.Acquire actually locked), not
+// initDatabaseWith's raw path argument. A symlinked parent directory makes
+// the two differ textually while still naming the same on-disk file, so a
+// regression back to passing the raw path is caught even though both
+// strings would happen to open the identical database today.
+func TestInitDatabaseWithOpensTheCanonicalOwnershipPathNotTheRawInput(t *testing.T) {
+	realDir := privateDir(t, "parleyd-initdeps-canonical-real-")
+	linkParent := privateDir(t, "parleyd-initdeps-canonical-link-")
+	aliasDir := filepath.Join(linkParent, "alias")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatal(err)
+	}
+	rawPath := filepath.Join(aliasDir, "parley.db")
+
+	var openedPath string
+	deps := initTestDeps(t)
+	deps.acquire = runtime.Acquire
+	deps.openStore = func(_ context.Context, p string) (*store.DB, error) {
+		openedPath = p
+		return nil, errors.New("synthetic: stop before a real store.Open")
+	}
+	deps.closeOwner = func(o *runtime.Ownership) error { return o.Close() }
+
+	var out, errOut bytes.Buffer
+	code := initDatabaseWith(context.Background(), rawPath, &out, &errOut, deps)
+	if code != 1 {
+		t.Fatalf("code=%d err=%q", code, errOut.String())
+	}
+	if openedPath == "" {
+		t.Fatal("openStore was never called")
+	}
+	if openedPath == rawPath {
+		t.Fatalf("openStore received the raw symlinked path %q instead of the resolved canonical path", rawPath)
+	}
+	if want := filepath.Join(realDir, "parley.db"); openedPath != want {
+		t.Fatalf("openStore path=%q, want the canonical resolved path %q", openedPath, want)
+	}
+}
+
+// failAfterWriter fails on its failAt'th call to Write (1-indexed),
+// succeeding on every earlier call by delegating to an underlying buffer.
+// This lets a test force a stdout failure either on the very first status
+// line or only on a later one, distinguishing "nothing was reported" from
+// "the success line already got out before a later write failed".
+type failAfterWriter struct {
+	buf    bytes.Buffer
+	failAt int
+	calls  int
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls == w.failAt {
+		return 0, errors.New("synthetic: stdout write failed")
+	}
+	return w.buf.Write(p)
+}
+
+// TestInitDatabaseWithStdoutFailurePreservesDatabaseAndReportsFailure covers
+// R1's output/publication requirement directly: initDatabaseWith previously
+// ignored the final fmt.Fprintf/Fprintln errors and always returned 0, so a
+// failing output sink could be reported as successful completion. Both the
+// first write (the success/server_id line) and the second (the follow-up
+// backup guidance) are exercised, proving the check is not limited to only
+// the very first write. In every case the database itself, already
+// initialized and closed before either write runs, must remain usable --
+// this is a status-output failure, never a reason to reinitialize or delete
+// anything.
+func TestInitDatabaseWithStdoutFailurePreservesDatabaseAndReportsFailure(t *testing.T) {
+	cases := []struct {
+		name    string
+		failAt  int
+		wantMsg string
+	}{
+		{"first write (success/server_id line)", 1, "success message could not be written"},
+		{"second write (follow-up backup guidance)", 2, "follow-up guidance could not be written"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := privateDir(t, "parleyd-initdeps-stdoutfail-")
+			path := filepath.Join(dir, "parley.db")
+			stdout := &failAfterWriter{failAt: c.failAt}
+			var errOut bytes.Buffer
+			code := initDatabaseWith(context.Background(), path, stdout, &errOut, realInitDeps())
+			if code != 1 {
+				t.Fatalf("code=%d err=%q", code, errOut.String())
+			}
+			if !strings.Contains(errOut.String(), c.wantMsg) {
+				t.Fatalf("err=%q, want substring %q", errOut.String(), c.wantMsg)
+			}
+			if !strings.Contains(errOut.String(), "Do not reinitialize or delete it") {
+				t.Fatalf("err=%q", errOut.String())
+			}
+
+			// The database is genuinely usable despite the reported failure.
+			owner, err := runtime.Acquire(path)
+			if err != nil {
+				t.Fatalf("reacquire after reported output failure: %v", err)
+			}
+			defer owner.Close()
+			db, err := store.OpenExisting(context.Background(), path)
+			if err != nil {
+				t.Fatalf("reopen after reported output failure: %v", err)
+			}
+			defer db.Close()
+			var serverID string
+			if err := db.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+				return tx.QueryRowContext(ctx, "SELECT server_id FROM installation WHERE singleton=1").Scan(&serverID)
+			}); err != nil || serverID == "" {
+				t.Fatalf("installation row missing after reported output failure: err=%v serverID=%q", err, serverID)
+			}
+		})
 	}
 }
 
@@ -407,19 +635,37 @@ func TestServeRequiresFlagsBeforeAnyIO(t *testing.T) {
 	}
 }
 
+// TestServeHelpTouchesNoFileOrSocket supplies every other required flag with
+// real, disposable, otherwise-valid paths before -h -- an earlier version of
+// this test passed only "-h" alone, which proves nothing about a help
+// request that arrives alongside real arguments, since runServe never
+// reaches any I/O until after flag parsing regardless of what those
+// arguments are.
 func TestServeHelpTouchesNoFileOrSocket(t *testing.T) {
 	dir := privateDir(t, "parleyd-serve-help-")
 	dbPath := filepath.Join(dir, "parley.db")
 	socketPath := filepath.Join(dir, "admin.sock")
+	markersDir := filepath.Join(dir, "markers")
+	const admin = "-administrator=70000000-0000-4000-8000-000000000001=1000"
+	args := []string{
+		"-database=" + dbPath, "-admin-socket=" + socketPath, admin,
+		"-recovery-markers-dir=" + markersDir, "-h",
+	}
 	var out, errOut bytes.Buffer
-	if code := runServe([]string{"-h"}, &out, &errOut); code != 0 {
+	if code := runServe(args, &out, &errOut); code != 0 {
 		t.Fatalf("code=%d err=%q", code, errOut.String())
 	}
 	if _, err := os.Stat(dbPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("help touched the database path")
 	}
+	if _, err := os.Stat(dbPath + ".lock"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("help touched the ownership lock path")
+	}
 	if _, err := os.Stat(socketPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("help touched the socket path")
+	}
+	if _, err := os.Stat(markersDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("help touched the recovery markers directory")
 	}
 }
 

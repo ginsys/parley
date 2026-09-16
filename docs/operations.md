@@ -43,10 +43,14 @@ that failed and what to do next; the file is always left in place for inspection
   step, one final `COMMIT`), so this normally means no schema was committed at all, not a partial
   one. Do not delete the file blindly regardless; inspect it manually before deciding how to
   proceed.
-- **Schema committed but the installation identity could not be read back** -- this is a
-  diagnostic-read failure, not evidence of a corrupt database: the schema-commit step already
-  succeeded. Verify the database independently with `parleyctl hello` before deciding whether the
-  file is usable.
+- **Schema committed but the installation identity could not be read back** -- `store.Open`
+  (schema initialization) already reported success; only this later, separate read failed. A
+  failed read does not by itself establish whether the database is corrupt or intact either way.
+  Verify the database independently with `parleyctl hello` before deciding whether the file is
+  usable.
+- **Initialized but the success message or follow-up guidance could not be written to stdout** --
+  the database itself was written and closed successfully before either write ran; only this
+  status output failed. Do not reinitialize or delete the file -- verify it with `parleyctl hello`.
 
 In every case, retrying `init` against the same path fails again with "already exists" (per the
 non-overwrite rule above), so a failed attempt never silently becomes a fresh, empty database on

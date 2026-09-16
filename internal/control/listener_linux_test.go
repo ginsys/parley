@@ -455,9 +455,13 @@ func TestListenerServiceUnconfiguredUIDIsRefusedSilently(t *testing.T) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected the connection to be closed for an unconfigured UID")
-	}
+	_, err = conn.Read(buf)
+	// assertConnectionActuallyClosed, not a bare err==nil check: an earlier
+	// version of this test accepted any non-nil read error, including the
+	// caller's own read-deadline timeout -- which would also pass if the
+	// server never closed the connection at all and this test's deadline
+	// simply expired first.
+	assertConnectionActuallyClosed(t, err)
 }
 
 func TestListenerServiceStopAdmissionDrainsCleanly(t *testing.T) {

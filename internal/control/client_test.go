@@ -434,24 +434,36 @@ func TestClientCallCancellationRaceWithResponseHasCoherentOutcomeAndNoLeak(t *te
 		go cancel()
 		err := client.Call(ctx, "operation.get", map[string]any{"operation_id": "60000000-0000-4000-8000-000000000099"}, nil)
 		var remote *RemoteError
+		var timeout *TimeoutError
 		switch {
 		case err == nil:
 			// Success: the response won the race before cancellation took
 			// effect.
-		case errors.Is(err, context.Canceled):
-			// Pre-dispatch: cancellation was already observed before
-			// anything was sent -- correctly left unbroken.
+		case errors.As(err, &timeout):
+			// Mid-flight: the request may already have been dispatched
+			// before cancellation interrupted a blocked read/write.
+			// wrapCancel/wrapTimeout always surface this as *TimeoutError,
+			// wrapping the same context.Canceled cause a pre-dispatch
+			// refusal also carries -- errors.Is(err, context.Canceled)
+			// alone cannot distinguish the two outcomes (mandate H4), so
+			// the concrete *TimeoutError type is checked first, and the
+			// connection must be broken here, never left usable.
+			if !client.broken {
+				t.Fatalf("iteration %d: mid-flight cancellation outcome was not marked broken: %#v", i, err)
+			}
 		case errors.As(err, &remote):
 			// The response (a domain error) won the race.
-		case client.broken:
-			// Cancellation was observed mid-flight, racing an in-flight
-			// read/write. The exact error shape here (a raw net error,
-			// *TimeoutError, etc.) depends on precisely when the forced
-			// deadline reset raced the connection; what matters is that
-			// the connection is consistently marked broken so a later
-			// call can never mistake a stale response for its own.
+		case errors.Is(err, context.Canceled):
+			// Pre-dispatch: Call's own ctx.Err() check refused before
+			// writing anything, so this must never be marked broken --
+			// checked only after ruling out *TimeoutError above, since
+			// the bare cause-chain match is shared with the mid-flight
+			// case and would otherwise misclassify it (mandate H4).
+			if client.broken {
+				t.Fatalf("iteration %d: a pre-dispatch cancellation must never mark the connection broken: %#v", i, err)
+			}
 		default:
-			t.Fatalf("iteration %d: incoherent outcome (not nil, not remote, not cancelled-pre-dispatch, not broken): %#v", i, err)
+			t.Fatalf("iteration %d: incoherent outcome (not nil, not remote, not timeout, not cancelled-pre-dispatch): %#v", i, err)
 		}
 		if client.broken {
 			// This connection can no longer be reused; redial so later
@@ -501,6 +513,17 @@ func TestClientCallRejectsMalformedResponseEnvelopes(t *testing.T) {
 		{"matching id but neither result nor error", `{"jsonrpc":"2.0","id":"1"}` + "\n"},
 		{"both result and error", `{"jsonrpc":"2.0","id":"1","result":{},"error":{"code":-32000,"message":"x"}}` + "\n"},
 		{"result present with an explicit null error", `{"jsonrpc":"2.0","id":"1","result":{},"error":null}` + "\n"},
+		{"result null and error present (both keys, per JSON-RPC exclusivity)", `{"jsonrpc":"2.0","id":"1","result":null,"error":{"code":-32601,"message":"unknown"}}` + "\n"},
+		{"error alone, explicit null", `{"jsonrpc":"2.0","id":"1","error":null}` + "\n"},
+		{"error alone, empty object", `{"jsonrpc":"2.0","id":"1","error":{}}` + "\n"},
+		{"error missing required code", `{"jsonrpc":"2.0","id":"1","error":{"message":"x"}}` + "\n"},
+		{"error missing required message", `{"jsonrpc":"2.0","id":"1","error":{"code":-32601}}` + "\n"},
+		{"error with null message", `{"jsonrpc":"2.0","id":"1","error":{"code":-32601,"message":null}}` + "\n"},
+		{"error with mistyped code", `{"jsonrpc":"2.0","id":"1","error":{"code":"not-a-number","message":"x"}}` + "\n"},
+		{"error with unrecognized code", `{"jsonrpc":"2.0","id":"1","error":{"code":-1,"message":"x"}}` + "\n"},
+		{"domain error missing required data.code", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x"}}` + "\n"},
+		{"domain error with blank data.code", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":""}}}` + "\n"},
+		{"envelope error must not carry data", `{"jsonrpc":"2.0","id":"1","error":{"code":-32601,"message":"x","data":{"code":"forbidden"}}}` + "\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -520,6 +543,118 @@ func TestClientCallRejectsMalformedResponseEnvelopes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// rawSequentialResponder starts a raw Unix listener that accepts exactly
+// one connection and answers each request line, in order, with the
+// matching entry in responses (already including its own trailing
+// newline) -- unlike rawResponder, which only ever answers one request.
+// It returns the listener's path.
+func rawSequentialResponder(t *testing.T, responses []string) string {
+	t.Helper()
+	dir := privateSocketDir(t)
+	path := dir + "/admin.sock"
+	raw, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+	go func() {
+		conn, err := raw.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		for _, resp := range responses {
+			if _, err := br.ReadBytes('\n'); err != nil {
+				return
+			}
+			if _, err := conn.Write([]byte(resp)); err != nil {
+				return
+			}
+		}
+	}()
+	return path
+}
+
+// TestClientCallAcceptsWellFormedResultsAndErrorsAndKeepsConnectionUsable is
+// R5's positive control: the stricter presence-based exclusivity and error-
+// object validation added above must not make rejection unconditional. A
+// well-formed null result, a well-formed envelope error and a well-formed
+// domain error must each be accepted on their own terms without marking the
+// connection broken, and a genuine domain/envelope error must still leave
+// the connection usable for a subsequent, ordinary successful call --
+// distinguishing a valid rejection (RemoteError) from the malformed-
+// transport rejections above, which do mark the connection broken.
+func TestClientCallAcceptsWellFormedResultsAndErrorsAndKeepsConnectionUsable(t *testing.T) {
+	uid := uint32(os.Getuid())
+
+	t.Run("null result is a legitimate success value", func(t *testing.T) {
+		path := rawResponder(t, `{"jsonrpc":"2.0","id":"1","result":null}`+"\n")
+		conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client := &Client{conn: conn, br: bufio.NewReader(conn)}
+		defer client.Close()
+		if err := client.Call(context.Background(), "server.hello", nil, nil); err != nil {
+			t.Fatalf("unexpected rejection of a legitimate null result: %v", err)
+		}
+		if client.broken {
+			t.Fatal("a legitimate null result must not mark the connection broken")
+		}
+	})
+
+	t.Run("well-formed envelope error, then a subsequent successful call", func(t *testing.T) {
+		path := rawSequentialResponder(t, []string{
+			`{"jsonrpc":"2.0","id":"1","error":{"code":-32601,"message":"unknown method"}}` + "\n",
+			`{"jsonrpc":"2.0","id":"2","result":{}}` + "\n",
+		})
+		conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client := &Client{conn: conn, br: bufio.NewReader(conn)}
+		defer client.Close()
+
+		err = client.Call(context.Background(), "bogus.method", nil, nil)
+		var remote *RemoteError
+		if !errors.As(err, &remote) || remote.RPC != MethodNotFound || remote.Message != "unknown method" {
+			t.Fatalf("err=%#v", err)
+		}
+		if client.broken {
+			t.Fatal("a well-formed envelope error must not mark the connection broken")
+		}
+		if err := client.Call(context.Background(), "server.hello", nil, nil); err != nil {
+			t.Fatalf("connection unusable after a well-formed envelope error: %v", err)
+		}
+	})
+
+	t.Run("well-formed domain error, then a subsequent successful call", func(t *testing.T) {
+		path := rawSequentialResponder(t, []string{
+			`{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"forbidden","data":{"code":"forbidden"}}}` + "\n",
+			`{"jsonrpc":"2.0","id":"2","result":{}}` + "\n",
+		})
+		conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client := &Client{conn: conn, br: bufio.NewReader(conn)}
+		defer client.Close()
+
+		err = client.Call(context.Background(), "operation.get", nil, nil)
+		var remote *RemoteError
+		if !errors.As(err, &remote) || remote.RPC != ServerError || remote.Domain != DomainCode("forbidden") {
+			t.Fatalf("err=%#v", err)
+		}
+		if client.broken {
+			t.Fatal("a well-formed domain error must not mark the connection broken")
+		}
+		if err := client.Call(context.Background(), "server.hello", nil, nil); err != nil {
+			t.Fatalf("connection unusable after a well-formed domain error: %v", err)
+		}
+	})
 }
 
 // TestDialRejectsInvalidHelloResult covers mandate R5's requirement that
