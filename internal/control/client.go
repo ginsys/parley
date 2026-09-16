@@ -157,7 +157,15 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		return fmt.Errorf("control: malformed response: %w", err)
 	}
 	hasResult := len(resp.Result) > 0 && string(resp.Result) != "null"
-	hasError := resp.Error != nil
+	// error's presence, not its value, is what makes an envelope
+	// self-contradictory: per JSON-RPC 2.0, the error member "MUST NOT
+	// exist if there was no error triggered during invocation" -- a
+	// conformant peer never emits `"error":null` at all, so treating it
+	// the same as absent (as result's own null-tolerant check does, since
+	// a null result can be a legitimate success value) would let a
+	// self-contradictory `result` + `error:null` envelope slip through as
+	// success (mandate R5).
+	hasError := len(resp.Error) > 0
 	if resp.JSONRPC != "2.0" {
 		c.broken = true
 		return fmt.Errorf("control: response has unsupported jsonrpc version %q", resp.JSONRPC)
@@ -179,10 +187,15 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		c.broken = true
 		return fmt.Errorf("control: response id %v does not match request id %q", resp.ID, id)
 	}
-	if resp.Error != nil {
-		remote := &RemoteError{RPC: resp.Error.Code, Message: resp.Error.Message}
-		if resp.Error.Data != nil {
-			remote.Domain = resp.Error.Data.Code
+	if hasError {
+		var wireErr incomingError
+		if err := json.Unmarshal(resp.Error, &wireErr); err != nil {
+			c.broken = true
+			return fmt.Errorf("control: malformed error object: %w", err)
+		}
+		remote := &RemoteError{RPC: wireErr.Code, Message: wireErr.Message}
+		if wireErr.Data != nil {
+			remote.Domain = wireErr.Data.Code
 		}
 		return remote
 	}
@@ -218,11 +231,19 @@ func readBoundedFrame(br *bufio.Reader) ([]byte, error) {
 // than encoding: json.RawMessage on Result defers the shape to the caller's
 // out value, and Error uses its own struct since wireError's Code/Message
 // are unexported-shape-compatible but Data must round-trip DomainCode.
+//
+// Error is also json.RawMessage, not *incomingError: unmarshaling JSON
+// `null` into a pointer field sets it to nil, indistinguishable from the
+// key being absent entirely. That would let a self-contradictory envelope
+// carrying both a real result and an explicit `"error":null` slip past the
+// result/error exclusivity check below as if error had never been present
+// (mandate R5) -- exclusivity must be judged on presence, not on the
+// decoded pointer's zero value.
 type incomingResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      *string         `json:"id"`
 	Result  json.RawMessage `json:"result"`
-	Error   *incomingError  `json:"error"`
+	Error   json.RawMessage `json:"error"`
 }
 
 type incomingError struct {

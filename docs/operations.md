@@ -34,13 +34,15 @@ by silently reopening or overwriting on a second attempt. Every failure message 
 that failed and what to do next; the file is always left in place for inspection:
 
 - **Ownership already held by another process** -- another `parleyd`/`parleyctl` instance is
-  running against this path. Stop the other process, or investigate a stale lock manually; `init`
-  will not guess.
+  running against this path. This attempt did not initialize the file; its current contents are
+  unverified, since another owner may already be using or have replaced it. Stop the other
+  process, or investigate a stale lock manually; `init` will not guess.
 - **Ownership could not otherwise be established** -- do not delete the file blindly. Something
   else (permissions, filesystem state) is preventing exclusive access; diagnose that first.
-- **Schema initialization failed** -- the database file may be partially initialized (migrations
-  commit in ordered, individually durable steps). Do not delete it blindly; a partially committed
-  schema is still real state that a blind retry over the same path would silently reopen.
+- **Schema initialization failed** -- migration runs as a single transaction (one `BEGIN`, every
+  step, one final `COMMIT`), so this normally means no schema was committed at all, not a partial
+  one. Do not delete the file blindly regardless; inspect it manually before deciding how to
+  proceed.
 - **Schema committed but the installation identity could not be read back** -- this is a
   diagnostic-read failure, not evidence of a corrupt database: the schema-commit step already
   succeeded. Verify the database independently with `parleyctl hello` before deciding whether the
