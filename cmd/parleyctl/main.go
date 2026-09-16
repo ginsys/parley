@@ -14,6 +14,7 @@ import (
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/controller"
+	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -26,12 +27,45 @@ type controllerFactory func(context.Context, string) (controllerAPI, io.Closer, 
 
 func main() { os.Exit(run(os.Args[1:], os.Getenv("PARLEY_DB"), os.Stdout, os.Stderr, openController)) }
 
+// openController is the legacy direct-database writer path (transitional:
+// PR2 removes it once membership.* wire commands replace grant/revoke/renew).
+// It joins the same canonical ownership exclusion the server uses so a
+// running parleyd cannot have its database opened out from under it by this
+// client.
 func openController(ctx context.Context, path string) (controllerAPI, io.Closer, error) {
-	db, err := store.Open(ctx, path)
+	return openControllerWith(ctx, path, runtime.Acquire, store.Open)
+}
+
+// openControllerWith is openController's actual body, with the underlying
+// database-open operation as the only injectable seam. This lets a test
+// exercise the real ownership-lock-then-open sequence -- refusal before the
+// store is ever opened, and the lock retained for the returned controller's
+// full lifetime, not just at acquisition -- without invoking the production
+// CLI or reimplementing the locking logic in the test. acquire and openStore
+// both receive the identical path value, so the lock and the store opener
+// always target the same canonical database.
+func openControllerWith(ctx context.Context, path string, acquire func(string) (*runtime.Ownership, error), openStore func(context.Context, string) (*store.DB, error)) (controllerAPI, io.Closer, error) {
+	owner, err := acquire(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	return controller.New(db), db, nil
+	db, err := openStore(ctx, path)
+	if err != nil {
+		return nil, nil, errors.Join(err, owner.Close())
+	}
+	return controller.New(db), &ownedController{db: db, owner: owner}, nil
+}
+
+// ownedController closes the store before releasing ownership: the lock
+// protects the database for the controller's entire lifetime, not merely
+// until the factory returns.
+type ownedController struct {
+	db    *store.DB
+	owner *runtime.Ownership
+}
+
+func (c *ownedController) Close() error {
+	return errors.Join(c.db.Close(), c.owner.Close())
 }
 
 type command struct {
