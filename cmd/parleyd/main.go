@@ -110,14 +110,33 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 // initDatabaseWith without faking OS-level errors. realInitDeps wires the
 // true production functions; initDatabase always uses it -- production
 // behavior is exactly initDatabaseWith(realInitDeps()).
+//
+// closeStore/closeOwner are their own seam, distinct from openStore/acquire:
+// store.DB.Close and Ownership.Close are both idempotent, so a test cannot
+// force a *second*, distinct close failure through the public API by
+// repeating a call the production code already made once successfully.
+// Injecting the close functions themselves lets a test make one specific
+// close fail deterministically without OS-level fault injection (e.g.
+// closing the underlying fd out from under the driver), while
+// realInitDeps's versions are exactly db.Close()/owner.Close() -- there is
+// no behavior difference in the production path, only a place for a test to
+// intercept it.
 type initDeps struct {
-	acquire   func(path string) (*runtime.Ownership, error)
-	openStore func(ctx context.Context, path string) (*store.DB, error)
-	readID    func(ctx context.Context, db *store.DB) (string, error)
+	acquire    func(path string) (*runtime.Ownership, error)
+	openStore  func(ctx context.Context, path string) (*store.DB, error)
+	readID     func(ctx context.Context, db *store.DB) (string, error)
+	closeStore func(db *store.DB) error
+	closeOwner func(owner *runtime.Ownership) error
 }
 
 func realInitDeps() initDeps {
-	return initDeps{acquire: runtime.Acquire, openStore: store.Open, readID: readServerID}
+	return initDeps{
+		acquire:    runtime.Acquire,
+		openStore:  store.Open,
+		readID:     readServerID,
+		closeStore: func(db *store.DB) error { return db.Close() },
+		closeOwner: func(owner *runtime.Ownership) error { return owner.Close() },
+	}
 }
 
 // initDatabase performs the actual initialization; see initDatabaseWith.
@@ -180,22 +199,34 @@ func initDatabaseWith(ctx context.Context, path string, stdout, stderr io.Writer
 		return 1
 	}
 
-	db, err := deps.openStore(ctx, path)
+	// owner.Path() is the canonical, trust-walked target runtime.Acquire
+	// just resolved -- the same rule cmd/parleyctl's EP-02 openControllerWith
+	// applies (acquire and the store opener must target the identical
+	// resolved path, not merely the original input string). This is not a
+	// claim of protection against a malicious same-UID writer relocating or
+	// replacing the target between acquire and open; it only keeps the lock
+	// and the opened database pointed at the same entry this attempt itself
+	// established, per the deployment's no-replacement/no-relocation
+	// assumption.
+	db, err := deps.openStore(ctx, owner.Path())
 	if err != nil {
-		owner.Close()
+		ownerCloseErr := deps.closeOwner(owner)
 		fmt.Fprintf(stderr, "parleyd init: created %s, but schema initialization failed: %v\n", path, err)
 		fmt.Fprintln(stderr, "parleyd init: the file is retained. Migration runs as a single transaction, so this failure normally means no schema was committed, but do not delete it blindly -- inspect it manually; init will refuse to overwrite this file on retry.")
+		if ownerCloseErr != nil {
+			fmt.Fprintf(stderr, "parleyd init: additionally failed to release ownership cleanly: %v\n", ownerCloseErr)
+		}
 		return 1
 	}
 
 	serverID, err := deps.readID(ctx, db)
 	if err != nil {
-		closeErr := errors.Join(db.Close(), owner.Close())
-		fmt.Fprintf(stderr, "parleyd init: %s was initialized (schema committed) but its installation identity could not be read back: %v\n", path, err)
+		closeErr := errors.Join(deps.closeStore(db), deps.closeOwner(owner))
+		fmt.Fprintf(stderr, "parleyd init: created %s: schema initialization (store.Open) reported success, but the subsequent installation-identity read failed: %v\n", path, err)
 		if closeErr != nil {
 			fmt.Fprintf(stderr, "parleyd init: additionally failed to close cleanly: %v\n", closeErr)
 		}
-		fmt.Fprintln(stderr, "parleyd init: this is a diagnostic-read failure, not a corrupt database -- verify with `parleyctl hello` against a `parleyd serve` on this file, or inspect the installation table directly.")
+		fmt.Fprintln(stderr, "parleyd init: a failed read does not by itself establish whether the database is corrupt or intact -- verify independently with `parleyctl hello` against a `parleyd serve` on this file, or inspect the installation table directly.")
 		return 1
 	}
 
@@ -205,20 +236,34 @@ func initDatabaseWith(ctx context.Context, path string, stdout, stderr io.Writer
 	// conflict with anything else, and it lets a post-success close
 	// failure be reported truthfully instead of silently swallowed by a
 	// bare defer.
-	if err := db.Close(); err != nil {
-		owner.Close()
+	if err := deps.closeStore(db); err != nil {
+		ownerCloseErr := deps.closeOwner(owner)
 		fmt.Fprintf(stderr, "parleyd init: %s was initialized (server_id: %s) but failed to close cleanly: %v\n", path, serverID, err)
 		fmt.Fprintln(stderr, "parleyd init: the database was written successfully; this failure is limited to closing this handle. Verify before relying on it.")
+		if ownerCloseErr != nil {
+			fmt.Fprintf(stderr, "parleyd init: additionally failed to release ownership cleanly: %v\n", ownerCloseErr)
+		}
 		return 1
 	}
-	if err := owner.Close(); err != nil {
+	if err := deps.closeOwner(owner); err != nil {
 		fmt.Fprintf(stderr, "parleyd init: %s was initialized (server_id: %s) but failed to release ownership cleanly: %v\n", path, serverID, err)
 		fmt.Fprintln(stderr, "parleyd init: the database was written successfully; this failure is limited to releasing the ownership lock. Verify no stale lock blocks a subsequent `parleyd serve` before relying on it.")
 		return 1
 	}
 
-	fmt.Fprintf(stdout, "initialized %s\ninstallation server_id: %s\n", path, serverID)
-	fmt.Fprintln(stdout, "Record this server_id. Back up this file only while parleyd is stopped, preserving its -wal/-shm sidecars and ownership (see docs/operations.md).")
+	// The database is fully initialized and closed at this point; a failure
+	// from here on is confined to reporting that fact, and must never be
+	// answered by reinitializing, reopening or deleting anything.
+	if _, err := fmt.Fprintf(stdout, "initialized %s\ninstallation server_id: %s\n", path, serverID); err != nil {
+		fmt.Fprintf(stderr, "parleyd init: %s was initialized (server_id: %s), but the success message could not be written: %v\n", path, serverID, err)
+		fmt.Fprintln(stderr, "parleyd init: the database itself was written and closed successfully; only this status output failed. Do not reinitialize or delete it -- verify with `parleyctl hello`.")
+		return 1
+	}
+	if _, err := fmt.Fprintln(stdout, "Record this server_id. Back up this file only while parleyd is stopped, preserving its -wal/-shm sidecars and ownership (see docs/operations.md)."); err != nil {
+		fmt.Fprintf(stderr, "parleyd init: %s was initialized (server_id: %s), but the follow-up guidance could not be written: %v\n", path, serverID, err)
+		fmt.Fprintln(stderr, "parleyd init: the database itself was written and closed successfully; only this status output failed. Do not reinitialize or delete it -- verify with `parleyctl hello`.")
+		return 1
+	}
 	return 0
 }
 

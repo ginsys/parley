@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ginsys/parley/internal/connection"
@@ -156,21 +157,22 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		c.broken = true
 		return fmt.Errorf("control: malformed response: %w", err)
 	}
-	hasResult := len(resp.Result) > 0 && string(resp.Result) != "null"
-	// error's presence, not its value, is what makes an envelope
-	// self-contradictory: per JSON-RPC 2.0, the error member "MUST NOT
-	// exist if there was no error triggered during invocation" -- a
-	// conformant peer never emits `"error":null` at all, so treating it
-	// the same as absent (as result's own null-tolerant check does, since
-	// a null result can be a legitimate success value) would let a
-	// self-contradictory `result` + `error:null` envelope slip through as
-	// success (mandate R5).
-	hasError := len(resp.Error) > 0
+	// Exclusivity is judged on key presence for both members, not on
+	// either member's decoded value: presence and an allowed nullable
+	// value are separate schema questions (mandate R5). A conformant peer
+	// never emits `"error":null` or `"error":{}` at all, so error's mere
+	// presence is already self-contradictory alongside a result -- but a
+	// legitimately present `"result":null` (a success value) must not be
+	// confused with result being absent, which is why both checks are
+	// presence-only here and null-tolerance is applied later, only to a
+	// present error's own value, and only to reject it.
+	resultPresent := len(resp.Result) > 0
+	errorPresent := len(resp.Error) > 0
 	if resp.JSONRPC != "2.0" {
 		c.broken = true
 		return fmt.Errorf("control: response has unsupported jsonrpc version %q", resp.JSONRPC)
 	}
-	if hasResult == hasError {
+	if resultPresent == errorPresent {
 		// Exactly one of result/error must be present -- neither (a bare
 		// `{"id":"1"}`) is not a completed call, and both is a
 		// self-contradictory envelope (mandate R5). Neither is safe to
@@ -185,13 +187,27 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		// not merely that a request was skipped -- never proceed as if the
 		// mismatched response belonged to this call.
 		c.broken = true
-		return fmt.Errorf("control: response id %v does not match request id %q", resp.ID, id)
+		return fmt.Errorf("control: response id %s does not match request id %q", formatResponseID(resp.ID), id)
 	}
-	if hasError {
+	if errorPresent {
+		// A present error must be an actual, valid error object -- a bare
+		// `"error":null` or `"error":{}` reaches here only because it is
+		// present (not absent), and must still be rejected rather than
+		// decoded into a zero-valued incomingError and returned as if it
+		// were a genuine RemoteError with code 0 and an empty message
+		// (mandate R5).
+		if string(resp.Error) == "null" {
+			c.broken = true
+			return errors.New("control: response carries an explicit null error, not a valid error object")
+		}
 		var wireErr incomingError
 		if err := json.Unmarshal(resp.Error, &wireErr); err != nil {
 			c.broken = true
 			return fmt.Errorf("control: malformed error object: %w", err)
+		}
+		if err := wireErr.validate(); err != nil {
+			c.broken = true
+			return err
 		}
 		remote := &RemoteError{RPC: wireErr.Code, Message: wireErr.Message}
 		if wireErr.Data != nil {
@@ -203,6 +219,19 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		return nil
 	}
 	return json.Unmarshal(resp.Result, out)
+}
+
+// formatResponseID renders resp.ID for a diagnostic message without
+// dereferencing a nil pointer and without printing its address: an earlier
+// version passed the *string itself to %v, printing a pointer address
+// (e.g. "0xc0001a2030") instead of the id it carried, or "<nil>" for a
+// missing id -- neither is useful in an error message a human has to act
+// on (mandate H3).
+func formatResponseID(id *string) string {
+	if id == nil {
+		return "<missing>"
+	}
+	return strconv.Quote(*id)
 }
 
 // readBoundedFrame reads one LF-terminated response line, refusing to grow
@@ -232,13 +261,15 @@ func readBoundedFrame(br *bufio.Reader) ([]byte, error) {
 // out value, and Error uses its own struct since wireError's Code/Message
 // are unexported-shape-compatible but Data must round-trip DomainCode.
 //
-// Error is also json.RawMessage, not *incomingError: unmarshaling JSON
-// `null` into a pointer field sets it to nil, indistinguishable from the
-// key being absent entirely. That would let a self-contradictory envelope
-// carrying both a real result and an explicit `"error":null` slip past the
-// result/error exclusivity check below as if error had never been present
-// (mandate R5) -- exclusivity must be judged on presence, not on the
-// decoded pointer's zero value.
+// Both Result and Error are json.RawMessage, not typed/pointer fields:
+// unmarshaling JSON `null` into a pointer field sets it to nil,
+// indistinguishable from the key being absent entirely. json.RawMessage
+// instead captures the raw bytes ("null", length 4) whenever the key is
+// present at all, so presence can be judged uniformly for both members
+// (len(raw) > 0) before either one's value is inspected (mandate R5) --
+// without this, a self-contradictory envelope carrying both a real result
+// and an explicit `"error":null` could slip past the result/error
+// exclusivity check as if error had never been present.
 type incomingResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      *string         `json:"id"`
@@ -250,6 +281,39 @@ type incomingError struct {
 	Code    RPCCode    `json:"code"`
 	Message string     `json:"message"`
 	Data    *errorData `json:"data"`
+}
+
+// validate enforces the error object's own required shape (mandate R5):
+// unmarshaling `{}` or a partially-typed object into incomingError succeeds
+// with Go zero values (Code 0, empty Message, nil Data) with no decode
+// error at all, so this is the only thing standing between a malformed
+// error object and a RemoteError carrying code 0 and an empty message.
+// Reuses the server's own envelope/domain code vocabulary
+// (internal/control/errors.go) rather than inventing a second one: a
+// genuine peer only ever emits one of the five envelope RPCCodes or
+// ServerError, so any other value -- including the zero value a missing or
+// null "code" decodes to -- is rejected outright.
+func (e incomingError) validate() error {
+	switch e.Code {
+	case ParseError, InvalidRequest, MethodNotFound, InvalidParams, InternalError:
+		if e.Data != nil {
+			return fmt.Errorf("control: envelope error %d must not carry error.data", e.Code)
+		}
+	case ServerError:
+		// domainErrorResponse (response.go) always sets Data on a
+		// ServerError; a missing or blank data.code is malformed, not a
+		// legitimate domain error this client has simply never seen
+		// before.
+		if e.Data == nil || strings.TrimSpace(string(e.Data.Code)) == "" {
+			return errors.New("control: domain error is missing its required error.data.code")
+		}
+	default:
+		return fmt.Errorf("control: response carries an unrecognized error code %d", e.Code)
+	}
+	if strings.TrimSpace(e.Message) == "" {
+		return errors.New("control: error object is missing a required message")
+	}
+	return nil
 }
 
 // RemoteError is a well-formed error response from the server: either an
