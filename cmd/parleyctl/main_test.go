@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ginsys/parley/internal/controller"
+	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
 )
 
@@ -202,6 +205,123 @@ func TestCLIIdentifiersRemainExactAndVisible(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOpenControllerAcquiresCanonicalLockForItsFullLifetime is the EP-02
+// acceptance test: it exercises openController's actual production body
+// (openControllerWith) with the real runtime.Acquire and a real on-disk
+// database, injecting only the underlying store-open call -- never the whole
+// lock-bearing function, and never a reimplementation of the lock itself.
+func TestOpenControllerAcquiresCanonicalLockForItsFullLifetime(t *testing.T) {
+	// runtime.Acquire requires a private, non-group/other-writable parent
+	// directory (internal/runtime/ownership_linux.go trustedParents).
+	// t.TempDir()'s shared per-package work directory can be group-writable
+	// under this host's umask; use the same disposable-private-directory
+	// pattern as internal/runtime/ownership_linux_test.go's privateDB instead.
+	dir, err := os.MkdirTemp("/tmp", "parleyctl-ownership-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "parley.db")
+	// Seed a real, already-initialized database (mirrors `parleyd init`).
+	// runtime.Acquire requires the private (owner-only, 0600) mode
+	// internal/runtime/ownership_linux.go's openPrivate enforces; pre-create
+	// the file with that mode so store.Open's migration writes into it
+	// without SQLite's own (looser) create-mode ever taking effect.
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	seed, err := store.Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("refuses_before_store_open_when_already_owned", func(t *testing.T) {
+		owner, err := runtime.Acquire(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer owner.Close()
+		opened := false
+		_, _, err = openControllerWith(context.Background(), path, runtime.Acquire, func(ctx context.Context, p string) (*store.DB, error) {
+			opened = true
+			return store.Open(ctx, p)
+		})
+		if !errors.Is(err, runtime.ErrAlreadyRunning) {
+			t.Fatalf("err=%v, want ErrAlreadyRunning", err)
+		}
+		if opened {
+			t.Fatal("store opener called despite a contended lock")
+		}
+	})
+
+	t.Run("lock_and_opener_target_the_same_canonical_path", func(t *testing.T) {
+		var openedWith string
+		_, closer, err := openControllerWith(context.Background(), path, func(p string) (*runtime.Ownership, error) {
+			owner, err := runtime.Acquire(p)
+			if err == nil && owner.Path() != canonical {
+				t.Fatalf("lock path=%q, want %q", owner.Path(), canonical)
+			}
+			return owner, err
+		}, func(ctx context.Context, p string) (*store.DB, error) {
+			openedWith = p
+			return store.Open(ctx, p)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer closer.Close()
+		if openedWith != path {
+			t.Fatalf("store opener path=%q, want %q", openedWith, path)
+		}
+	})
+
+	t.Run("ownership_retained_until_close_not_just_acquisition", func(t *testing.T) {
+		_, closer, err := openControllerWith(context.Background(), path, runtime.Acquire, store.Open)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The resource lifetime, not just acquisition order, is the acceptance
+		// condition: a contender must still be refused after the factory has
+		// already returned a live controller.
+		if _, err := runtime.Acquire(path); !errors.Is(err, runtime.ErrAlreadyRunning) {
+			t.Fatalf("contender acquired the lock before close: %v", err)
+		}
+		if err := closer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		released, err := runtime.Acquire(path)
+		if err != nil {
+			t.Fatalf("lock not released after close: %v", err)
+		}
+		released.Close()
+	})
+
+	t.Run("store_open_failure_unwinds_the_lock_without_deleting_it", func(t *testing.T) {
+		synthetic := errors.New("synthetic store open failure")
+		_, _, err := openControllerWith(context.Background(), path, runtime.Acquire, func(context.Context, string) (*store.DB, error) {
+			return nil, synthetic
+		})
+		if !errors.Is(err, synthetic) {
+			t.Fatalf("err=%v, want synthetic store open failure", err)
+		}
+		if _, statErr := os.Stat(canonical + ".lock"); statErr != nil {
+			t.Fatalf("lock file removed on unwind: %v", statErr)
+		}
+		released, err := runtime.Acquire(path)
+		if err != nil {
+			t.Fatalf("lock not released after store-open failure: %v", err)
+		}
+		released.Close()
+	})
 }
 
 func TestCLIRenewRejectsIncompatibleNamesButRevokeKeepsExactKey(t *testing.T) {
