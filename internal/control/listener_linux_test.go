@@ -75,6 +75,17 @@ func TestListenRefusesLiveSocket(t *testing.T) {
 	}
 }
 
+func TestListenRefusesUnsupportedModes(t *testing.T) {
+	for _, mode := range []os.FileMode{0777, 0644, 0700, 0} {
+		dir := privateSocketDir(t)
+		path := filepath.Join(dir, "admin.sock")
+		_, err := Listen(Config{AdminSocket: path, ServerUID: uint32(os.Getuid())}, mode)
+		if err == nil {
+			t.Fatalf("mode %v: expected refusal, got none", mode)
+		}
+	}
+}
+
 func TestListenReplacesProvablyStaleSocket(t *testing.T) {
 	dir := privateSocketDir(t)
 	path := filepath.Join(dir, "admin.sock")
@@ -316,5 +327,106 @@ func TestListenerServiceRecoveryOnlyState(t *testing.T) {
 	result, ok := resp["result"].(map[string]any)
 	if !ok || result["state"] != string(StateRecoveryOnly) {
 		t.Fatalf("%#v", resp)
+	}
+}
+
+// TestListenerServiceClosesConnectionOnIdlessObject proves
+// docs/specifications/control.md:64-65's "not executed and receive no
+// response; close" -- an earlier version of serveSession merely
+// `continue`d, leaving the connection (and the client's socket slot)
+// open indefinitely after an ID-less object.
+func TestListenerServiceClosesConnectionOnIdlessObject(t *testing.T) {
+	fx := newListenerFixture(t)
+	conn, err := connection.DialTrustedServer(context.Background(), fx.socketPath, fx.serverUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","method":"server.hello","params":{"protocol":"parley-control/1"}}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("expected the connection to be closed after an ID-less object")
+	}
+}
+
+// TestListenerServiceDisconnectsSilentPreHelloConnection proves
+// docs/specifications/control.md:77's "the first call within five
+// seconds is server.hello" is actually enforced -- a connection that is
+// accepted (kernel-authenticated) but never sends a single byte must not
+// hold its socket slot forever.
+func TestListenerServiceDisconnectsSilentPreHelloConnection(t *testing.T) {
+	fx := newListenerFixture(t)
+	conn, err := connection.DialTrustedServer(context.Background(), fx.socketPath, fx.serverUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(FrameDeadline + 3*time.Second))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("expected the silent connection to be closed once FrameDeadline elapsed")
+	}
+}
+
+// TestWriteResponseReplacesOversizedResponseWithInternalError proves
+// writeResponse never puts an over-MaxFrameBytes frame on the wire: a
+// response whose encoded body would exceed the profile's own frame bound
+// is replaced with a bounded InternalError before writing, preserving the
+// original request's ID.
+func TestWriteResponseReplacesOversizedResponseWithInternalError(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := filepath.Join(dir, "admin.sock")
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan *net.UnixConn, 1)
+	go func() {
+		c, err := ln.AcceptUnix()
+		if err != nil {
+			return
+		}
+		accepted <- c
+	}()
+	dialed, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dialed.Close()
+	serverConn := <-accepted
+	defer serverConn.Close()
+
+	id := "1"
+	oversized := make([]byte, MaxFrameBytes)
+	resp := successResponse(id, map[string]string{"padding": string(oversized)})
+	writeErr := make(chan error, 1)
+	go func() { writeErr <- writeResponse(serverConn, resp) }()
+
+	dialed.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := bufio.NewReader(dialed).ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
+	}
+	if len(line) >= MaxFrameBytes {
+		t.Fatalf("wrote an oversized frame: %d bytes", len(line))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(line, &decoded); err != nil {
+		t.Fatalf("response %q: %v", line, err)
+	}
+	if decoded["id"] != id {
+		t.Fatalf("id=%v, want %q", decoded["id"], id)
+	}
+	errObj, ok := decoded["error"].(map[string]any)
+	if !ok || int(errObj["code"].(float64)) != int(InternalError) {
+		t.Fatalf("%#v", decoded)
 	}
 }
