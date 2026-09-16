@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,6 +18,27 @@ import (
 	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
 )
+
+// assertConnectionActuallyClosed fails t unless err proves the server
+// actually closed the connection (io.EOF, the error a peer's Read sees
+// once the other side closes) -- never merely that the caller's own read
+// deadline expired. A prior version of these tests accepted any non-nil
+// read error, including the caller's own timeout; removing the fix under
+// test still made both pass, since an un-fixed server that never closes
+// the connection would just make the caller's own deadline fire instead.
+func assertConnectionActuallyClosed(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected the connection to be closed, got no error")
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatalf("connection was not actually closed within the deadline; the caller's own read deadline expired instead: %v", err)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("expected EOF from the server closing the connection, got: %v", err)
+	}
+}
 
 func privateSocketDir(t *testing.T) string {
 	t.Helper()
@@ -347,9 +370,8 @@ func TestListenerServiceClosesConnectionOnIdlessObject(t *testing.T) {
 	}
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected the connection to be closed after an ID-less object")
-	}
+	_, err = conn.Read(buf)
+	assertConnectionActuallyClosed(t, err)
 }
 
 // TestListenerServiceDisconnectsSilentPreHelloConnection proves
@@ -366,9 +388,8 @@ func TestListenerServiceDisconnectsSilentPreHelloConnection(t *testing.T) {
 	defer conn.Close()
 	conn.SetReadDeadline(time.Now().Add(FrameDeadline + 3*time.Second))
 	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err == nil {
-		t.Fatal("expected the silent connection to be closed once FrameDeadline elapsed")
-	}
+	_, err = conn.Read(buf)
+	assertConnectionActuallyClosed(t, err)
 }
 
 // TestWriteResponseReplacesOversizedResponseWithInternalError proves
@@ -376,6 +397,39 @@ func TestListenerServiceDisconnectsSilentPreHelloConnection(t *testing.T) {
 // response whose encoded body would exceed the profile's own frame bound
 // is replaced with a bounded InternalError before writing, preserving the
 // original request's ID.
+// TestListenerServicePreHelloDeadlineIsAbsoluteDespiteSlowFrame proves the
+// pre-hello negotiation window is a single absolute deadline, not
+// renewable by ongoing traffic. Before this fix, ReadFrame's own
+// per-frame deadline (reset to now+FrameDeadline once a frame's first
+// byte arrives -- frame.go) let a slow-trickled frame push the effective
+// negotiation window past its documented five-second bound; a synthetic
+// fixture demonstrated hello succeeding at six seconds through exactly
+// this path.
+func TestListenerServicePreHelloDeadlineIsAbsoluteDespiteSlowFrame(t *testing.T) {
+	fx := newListenerFixture(t)
+	conn, err := connection.DialTrustedServer(context.Background(), fx.socketPath, fx.serverUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Send only a frame's opening byte, then withhold the rest (including
+	// the terminating LF) well past FrameDeadline. This keeps ReadFrame
+	// itself blocked mid-frame -- exercising its own internal deadline
+	// reset -- rather than exercising the already-covered "never sends a
+	// single byte" case.
+	if _, err := conn.Write([]byte("{")); err != nil {
+		t.Fatal(err)
+	}
+	// A read deadline comfortably past FrameDeadline but short of what
+	// the pre-fix behavior would have allowed (up to roughly
+	// 2*FrameDeadline): if the fix regresses, this read times out on the
+	// caller's own deadline instead of observing the server's close.
+	conn.SetReadDeadline(time.Now().Add(FrameDeadline + 2*time.Second))
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	assertConnectionActuallyClosed(t, err)
+}
+
 func TestWriteResponseReplacesOversizedResponseWithInternalError(t *testing.T) {
 	dir := privateSocketDir(t)
 	path := filepath.Join(dir, "admin.sock")
