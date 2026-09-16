@@ -271,6 +271,12 @@ func TestOpenControllerAcquiresCanonicalLockForItsFullLifetime(t *testing.T) {
 	})
 
 	t.Run("lock_and_opener_target_the_same_canonical_path", func(t *testing.T) {
+		// openControllerWith passes owner.Path() -- runtime.Acquire's
+		// resolved canonical path -- to openStore, never the caller's raw
+		// path: Acquire resolves symlinks before taking the lock, while
+		// store.Open only lexically cleans its input, so a path reaching
+		// the database through a symlinked ancestor could otherwise name a
+		// different file to each of them.
 		var openedWith string
 		_, closer, err := openControllerWith(context.Background(), path, func(p string) (*runtime.Ownership, error) {
 			owner, err := runtime.Acquire(p)
@@ -286,8 +292,8 @@ func TestOpenControllerAcquiresCanonicalLockForItsFullLifetime(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer closer.Close()
-		if openedWith != path {
-			t.Fatalf("store opener path=%q, want %q", openedWith, path)
+		if openedWith != canonical {
+			t.Fatalf("store opener path=%q, want the lock's resolved canonical path %q", openedWith, canonical)
 		}
 	})
 
@@ -428,10 +434,6 @@ func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	listener, err := control.Listen(controlCfg, 0600)
-	if err != nil {
-		t.Fatal(err)
-	}
 	db, err := store.Open(context.Background(), dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -440,7 +442,7 @@ func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := control.NewListenerService(listener, controlCfg, "epoch-fixture")
+	service := control.NewListenerService(controlCfg, 0600, "epoch-fixture")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	if err := service.Start(ctx, runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
