@@ -369,6 +369,22 @@ The [control specification](specifications/control.md) develops exact framing, o
 snapshot coordination, concurrency, ownership and failure fixtures for review. Neither this
 decision nor its specification claims an implemented server or proven production isolation.
 
+### PR1 implementation status (2026-09-16)
+
+`internal/control` implements this section's wire foundation: absolute-path `admin_socket`/
+`server_uid`/administrator-UUID configuration, LF-framed 1 MiB profile parsing with the
+ID-less-object-precedence and exact-envelope rules, the `-32700`..`-32603`/`-32000`+
+`error.data.code` error contract, and a Linux listener authenticating each connection's kernel UID
+via `SO_PEERCRED` with per-administrator/total socket caps and a bounded, proven-abandonment-only
+stale-socket replacement. `cmd/parleyd` (`init`/`serve`) is the first standing server executable;
+`parleyctl` gained `-endpoint`/`-server-uid` and a `hello` diagnostic. **Only `server.hello` and
+`operation.get` are wired and advertised.** Every other method this section and
+[control.md](specifications/control.md) describe -- membership, admission, identity/recovery
+mutation, subscriptions and snapshots -- remains unimplemented; PR1 does not claim them, and
+`parleyctl grant|revoke|renew` still open the database directly (transitional, removed in PR2). See
+[Runtime foundation](runtime.md) for the exact startup/shutdown sequence `parleyd serve` uses, and
+[Operations](operations.md) for initialization and stopped-service backup guidance.
+
 ## Accepted conversation admission
 
 The owner approved the actual-pair admission direction in

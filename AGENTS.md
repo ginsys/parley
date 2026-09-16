@@ -14,12 +14,20 @@ parsing/validation (`internal/replymarker`), and the Codex-side transport adapte
 lifecycle (`internal/runtime`) and explicit
 read-only SQLite query pool. These have controlled fixtures, not executable/endpoint wiring.
 Also present: internal binding provisioning, authenticated attachment/readiness and audited binding
-lifecycle/holds, authenticated ordinary-work APIs and the migrated poller. Human operations still
-have controlled fixture callers; a runnable bridge remains pending. Do not treat anything below
-`internal/` as wired to a live session yet —
+lifecycle/holds, authenticated ordinary-work APIs and the migrated poller. Also present (PR1):
+`internal/control` (the `parley-control/1` wire foundation — framing, profile validation, the error
+vocabulary and a Linux `SO_PEERCRED` listener) and `cmd/parleyd` (`init`/`serve`), the first
+standing server executable; `parleyctl` gained `-endpoint`/`-server-uid` and a `hello` diagnostic
+that opens no database. **Only `server.hello` and `operation.get` are wired.** `parleyctl
+grant|revoke|renew` still open the database directly (transitional, removed in PR2's client
+conversion); there is no membership, admission, agent-facing listener or live host connection yet.
+Do not treat anything below
+`internal/` as wired to a live agent session yet —
 `dispatch.Transport` is an interface with no real Channels implementation in this repo so far,
 `Handshake.sendProbe`/`Ack` are not wired to an actual Channels connection or the `reply` tool, and
 `codex.ExecSender` and the native-source ingestion providers are untested against an actual `codex` CLI or rollout file.
+See [Architecture's PR1 implementation status](docs/architecture.md#accepted-human-control-protocol)
+and [Operations](docs/operations.md) for what `cmd/parleyd`/`parleyctl` actually do.
 
 ## The protected controller
 
