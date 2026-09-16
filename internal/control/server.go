@@ -165,10 +165,14 @@ func (sess *Session) handleOperationGet(ctx context.Context, req Request) (Respo
 		}
 		return domainErrorResponse(&req.ID, domainCode(err)), false
 	}
+	resultJSON, err := recodeCommandResult(rec.ResultJSON)
+	if err != nil {
+		return envelopeErrorResponse(InternalError, &req.ID), false
+	}
 	result := OperationGetResult{
 		OperationID:   operationID,
 		OperationKind: rec.OperationKind,
-		Result:        json.RawMessage(rec.ResultJSON),
+		Result:        resultJSON,
 		AuditID:       rec.AuditID,
 		CommitView: CommitView{
 			Epoch:    rec.CommitEpoch,
@@ -176,6 +180,44 @@ func (sess *Session) handleOperationGet(ctx context.Context, req Request) (Respo
 		},
 	}
 	return successResponse(req.ID, result), false
+}
+
+// wireResourceChange mirrors store.ResourceChange but encodes Before/After
+// as canonical decimal strings, per the profile's 64-bit codec
+// (docs/specifications/control.md): store.ResourceChange keeps plain int64
+// fields for safe internal Go round-trips, but republishing them as bare
+// JSON numbers to an external client risks silent precision loss past
+// 2^53 for a client that decodes into float64.
+type wireResourceChange struct {
+	Kind   string `json:"kind"`
+	ID     string `json:"id"`
+	Before string `json:"before"`
+	After  string `json:"after"`
+}
+
+type wireCommandResult struct {
+	Code      store.Code           `json:"code"`
+	Resources []wireResourceChange `json:"resources"`
+}
+
+// recodeCommandResult reinterprets a stored store.CommandResult's raw JSON
+// and re-encodes it with decimal-string Before/After fields instead of
+// republishing the stored bytes verbatim.
+func recodeCommandResult(raw string) (json.RawMessage, error) {
+	var stored store.CommandResult
+	if err := json.Unmarshal([]byte(raw), &stored); err != nil {
+		return nil, err
+	}
+	resources := make([]wireResourceChange, len(stored.Resources))
+	for i, r := range stored.Resources {
+		resources[i] = wireResourceChange{
+			Kind:   r.Kind,
+			ID:     r.ID,
+			Before: strconv.FormatInt(r.Before, 10),
+			After:  strconv.FormatInt(r.After, 10),
+		}
+	}
+	return json.Marshal(wireCommandResult{Code: stored.Code, Resources: resources})
 }
 
 // exactlyOneStringParam reports the value of key when params contains

@@ -198,6 +198,69 @@ func TestHandleOperationGetEndToEndAndScoping(t *testing.T) {
 	}
 }
 
+// insertSyntheticCommandWithLargeCounters mirrors insertSyntheticCommand
+// but returns resource changes whose Before/After exceed 2^53 -- the point
+// past which a client decoding a bare JSON number into float64 silently
+// loses precision. This is what the decimal-string codec test below relies
+// on to prove the wire encoding, not just the Go value, is a string.
+func insertSyntheticCommandWithLargeCounters(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO conversations(id,name,created_at) VALUES('synthetic','synthetic','2026-01-01T00:00:00Z')"); err != nil {
+		return store.CommandResult{}, err
+	}
+	return store.CommandResult{
+		Code: store.Code(""),
+		Resources: []store.ResourceChange{
+			{Kind: "budget", ID: "synthetic", Before: 9007199254740993, After: 9007199254740994},
+		},
+	}, nil
+}
+
+func TestHandleOperationGetRepublishesResourceChangesAsDecimalStrings(t *testing.T) {
+	db := controlTestDB(t)
+	ctx := context.Background()
+	req, err := store.NewCommandRequest("binding.register", testHandleOperation, store.Field{Name: "peer_id", Value: "exact "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := store.CommandPrincipal{ID: testHelloAdmin, ConnectorUID: 1001}
+	if _, err := db.Coordinator().Execute(ctx, principal, req, allowedCommand, insertSyntheticCommandWithLargeCounters, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.OpenReaders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewConfig("/run/parley/admin.sock", 1000, map[string]uint32{testHelloAdmin: 1001})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(cfg, db.Queries(), "server-id-fixture", "epoch-fixture", StateRunning)
+	sess := srv.NewSession(Identity{PrincipalID: testHelloAdmin, UID: 1001})
+	sess.negotiated = true
+	resp, _ := sess.Handle(ctx, Request{ID: "1", Method: "operation.get", Params: map[string]any{"operation_id": testHandleOperation}})
+	if resp.Err != nil {
+		t.Fatalf("%#v", resp.Err)
+	}
+	result := decodeResult[OperationGetResult](t, resp)
+
+	// Decode Result (still json.RawMessage at this layer) into a map of
+	// raw JSON to inspect the literal wire representation, not a Go value
+	// that would silently normalize a bare number back to a string type.
+	var decoded struct {
+		Resources []map[string]json.RawMessage `json:"resources"`
+	}
+	if err := json.Unmarshal(result.Result, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Resources) != 1 {
+		t.Fatalf("resources=%#v", decoded.Resources)
+	}
+	before := string(decoded.Resources[0]["before"])
+	after := string(decoded.Resources[0]["after"])
+	if before != `"9007199254740993"` || after != `"9007199254740994"` {
+		t.Fatalf("before=%s after=%s, want quoted decimal strings", before, after)
+	}
+}
+
 func TestHandleOperationGetNotFound(t *testing.T) {
 	srv := testServer(t)
 	// A reader pool is required for this call; use a real empty DB.
