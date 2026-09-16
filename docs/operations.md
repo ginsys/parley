@@ -27,6 +27,29 @@ Run `parleyd init -database PATH` exactly once per deployment, before the first 
 not be group- or other-writable (the same trust walk `runtime.Acquire` enforces for the database
 itself). Help and invalid arguments touch neither a database nor a socket.
 
+### If `init` fails partway through
+
+`init` never deletes the target file to "recover" from a failure, at any phase, and never retries
+by silently reopening or overwriting on a second attempt. Every failure message names the phase
+that failed and what to do next; the file is always left in place for inspection:
+
+- **Ownership already held by another process** -- another `parleyd`/`parleyctl` instance is
+  running against this path. Stop the other process, or investigate a stale lock manually; `init`
+  will not guess.
+- **Ownership could not otherwise be established** -- do not delete the file blindly. Something
+  else (permissions, filesystem state) is preventing exclusive access; diagnose that first.
+- **Schema initialization failed** -- the database file may be partially initialized (migrations
+  commit in ordered, individually durable steps). Do not delete it blindly; a partially committed
+  schema is still real state that a blind retry over the same path would silently reopen.
+- **Schema committed but the installation identity could not be read back** -- this is a
+  diagnostic-read failure, not evidence of a corrupt database: the schema-commit step already
+  succeeded. Verify the database independently with `parleyctl hello` before deciding whether the
+  file is usable.
+
+In every case, retrying `init` against the same path fails again with "already exists" (per the
+non-overwrite rule above), so a failed attempt never silently becomes a fresh, empty database on
+retry.
+
 ## Configuration and starting the server
 
 ```

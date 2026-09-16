@@ -28,7 +28,38 @@ var (
 	errNoAdministrators   = errors.New("control: at least one administrator is required")
 	errDuplicateAdminUID  = errors.New("control: a UID cannot be shared by two administrators")
 	errInvalidAdminID     = errors.New("control: administrator ID must be a canonical UUID")
+	errInvalidUID         = errors.New("control: UID must be a platform UID, not the reserved (uid_t)-1 sentinel")
 )
+
+// reservedUID is the POSIX (uid_t)-1 sentinel meaning "no such user" / "do
+// not change" -- never a legitimate connecting or serving account. UID 0
+// (root) is a legitimately supported administrator/server identity and is
+// deliberately not rejected here (docs/specifications/control.md: "UIDs
+// are JSON integers in the platform UID range, rejecting reserved/
+// unmapped identities").
+const reservedUID = ^uint32(0)
+
+func validUID(uid uint32) bool { return uid != reservedUID }
+
+// ParseUID parses text as a decimal UID, rejecting anything that does not
+// fit a 32-bit platform UID (negative, non-numeric, empty, >= 2^32) via
+// strconv's own bitSize=32 bound, and the reserved sentinel above -- one
+// validator reused by every UID-bearing flag/environment/config input
+// across parleyd and parleyctl (administrator UIDs, the server's own UID,
+// and the client's resolved server UID) so a single place governs the
+// whole class instead of each caller narrowing an unbounded value on its
+// own (mandate R2).
+func ParseUID(text string) (uint32, error) {
+	v, err := strconv.ParseUint(text, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("control: invalid UID %q: %w", text, err)
+	}
+	uid := uint32(v)
+	if !validUID(uid) {
+		return 0, fmt.Errorf("%w: %d", errInvalidUID, uid)
+	}
+	return uid, nil
+}
 
 // NewConfig validates and returns an immutable server Config. SO_PEERCRED
 // can only prove a connecting UID, so a UID shared by two administrator
@@ -41,11 +72,17 @@ func NewConfig(adminSocket string, serverUID uint32, administrators map[string]u
 	if len(administrators) == 0 {
 		return Config{}, errNoAdministrators
 	}
+	if !validUID(serverUID) {
+		return Config{}, fmt.Errorf("%w: %d", errInvalidUID, serverUID)
+	}
 	seenUID := make(map[uint32]string, len(administrators))
 	copied := make(map[string]uint32, len(administrators))
 	for id, uid := range administrators {
 		if !validAdminID(id) {
 			return Config{}, fmt.Errorf("%w: %q", errInvalidAdminID, id)
+		}
+		if !validUID(uid) {
+			return Config{}, fmt.Errorf("%w: %d", errInvalidUID, uid)
 		}
 		if other, dup := seenUID[uid]; dup {
 			return Config{}, fmt.Errorf("%w: uid %d claimed by both %q and %q", errDuplicateAdminUID, uid, other, id)
@@ -126,9 +163,9 @@ func ResolveClientConfig(opts ClientOptions) (ClientConfig, error) {
 	if uidStr == "" {
 		return ClientConfig{}, errors.New("control: no server UID configured; use --server-uid or PARLEY_SERVER_UID (a trusted client configuration file is not implemented yet)")
 	}
-	uid, err := strconv.ParseUint(uidStr, 10, 32)
+	uid, err := ParseUID(uidStr)
 	if err != nil {
-		return ClientConfig{}, fmt.Errorf("control: invalid server UID %q: %w", uidStr, err)
+		return ClientConfig{}, err
 	}
-	return ClientConfig{Endpoint: endpoint, ServerUID: uint32(uid)}, nil
+	return ClientConfig{Endpoint: endpoint, ServerUID: uid}, nil
 }

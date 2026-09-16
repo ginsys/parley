@@ -161,3 +161,79 @@ func TestResolveClientConfigRejectsInvalidServerUID(t *testing.T) {
 		t.Fatal("expected an error")
 	}
 }
+
+// TestParseUIDBoundaries is mandate R2's regression matrix for the shared
+// UID validator: the exact supported boundary, the reserved sentinel,
+// 2^32, 2^32+a valid-looking UID, a very large value, and malformed input
+// must all be handled correctly -- none of this narrows through an
+// unchecked conversion the way fs.Uint's uint32(*serverUID) once did.
+func TestParseUIDBoundaries(t *testing.T) {
+	valid := []struct {
+		text string
+		want uint32
+	}{
+		{"0", 0},                   // root: a legitimately supported identity, not rejected
+		{"1000", 1000},             // an ordinary synthetic/current UID
+		{"4294967294", 4294967294}, // the supported upper boundary (2^32-2)
+	}
+	for _, tc := range valid {
+		got, err := ParseUID(tc.text)
+		if err != nil || got != tc.want {
+			t.Fatalf("ParseUID(%q) = %d, %v; want %d, nil", tc.text, got, err, tc.want)
+		}
+	}
+	invalid := []string{
+		"4294967295",           // reserved (uid_t)-1 sentinel
+		"4294967296",           // 2^32: the exact silent-narrowing overflow
+		"4294967296000000001",  // 2^32 + a valid-looking UID, still overflow
+		"18446744073709551615", // a very large value (max uint64)
+		"-1",                   // negative
+		"not-a-number",         // malformed
+		"",                     // empty
+		"1.5",                  // non-integer
+	}
+	for _, text := range invalid {
+		if _, err := ParseUID(text); err == nil {
+			t.Fatalf("ParseUID(%q): expected rejection", text)
+		}
+	}
+}
+
+// TestNewConfigValidatesServerUID sweeps the same UID class onto the
+// server's own UID field (mandate R2), not just administrator entries.
+func TestNewConfigValidatesServerUID(t *testing.T) {
+	if _, err := NewConfig("/run/parley/admin.sock", ^uint32(0), map[string]uint32{adminA: 1001}); !errors.Is(err, errInvalidUID) {
+		t.Fatalf("got %v", err)
+	}
+	// UID 0 (root) must remain accepted as the server's own UID.
+	if _, err := NewConfig("/run/parley/admin.sock", 0, map[string]uint32{adminA: 1001}); err != nil {
+		t.Fatalf("unexpected rejection of server UID 0: %v", err)
+	}
+}
+
+// TestNewConfigRejectsReservedAdministratorUID sweeps the reserved
+// sentinel onto an administrator entry, alongside the existing duplicate/
+// invalid-ID coverage above.
+func TestNewConfigRejectsReservedAdministratorUID(t *testing.T) {
+	_, err := NewConfig("/run/parley/admin.sock", 1000, map[string]uint32{adminA: ^uint32(0)})
+	if !errors.Is(err, errInvalidUID) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// TestResolveClientConfigRejectsOverflowServerUID exercises R2's sweep
+// onto the client's resolved server UID: an overflowing or reserved value
+// must be rejected as a configuration error before ClientConfig is ever
+// returned, never silently narrowed.
+func TestResolveClientConfigRejectsOverflowServerUID(t *testing.T) {
+	for _, bad := range []string{"4294967296", "4294967295"} {
+		_, err := ResolveClientConfig(ClientOptions{
+			EndpointFlag:  "/run/parley/admin.sock",
+			ServerUIDFlag: bad,
+			Getenv:        fakeGetenv(nil),
+		})
+		if err == nil {
+			t.Fatalf("uid=%q: expected rejection", bad)
+		}
+	}
+}
