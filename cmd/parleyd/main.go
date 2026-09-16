@@ -52,7 +52,9 @@ func isHelp(s string) bool { return s == "help" || s == "-h" || s == "--help" }
 
 func usage(output io.Writer) {
 	fmt.Fprintln(output, `parleyd: the Parley administration server.
-Owns the database exclusively; parleyctl never opens it directly.
+Owns the database exclusively. parleyctl's control-endpoint client (-endpoint,
+-server-uid, hello) never opens it directly; its legacy grant/revoke/renew
+commands still do, transitionally, until PR2 converts them to the endpoint.
 
 Usage:
   parleyd init  -database PATH
@@ -281,16 +283,14 @@ func serve(ctx context.Context, cfg serveConfig, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	listener, err := control.Listen(cfg.control, cfg.socketMode)
-	if err != nil {
-		fmt.Fprintf(stderr, "parleyd serve: bind admin socket: %v\n", err)
-		return 1
-	}
-	listenerService := control.NewListenerService(listener, cfg.control, uuid.NewString())
+	// listenerService does not bind cfg.control's socket yet -- Start does,
+	// once runtime.Start has already acquired exclusive database ownership.
+	// A process that loses that race must never create, probe or replace
+	// the admin socket at all (docs/runtime.md's startup ordering).
+	listenerService := control.NewListenerService(cfg.control, cfg.socketMode, uuid.NewString())
 
 	markers, err := recovery.NewDirectory(cfg.markersDir, cfg.markersUID, cfg.markersCapacity)
 	if err != nil {
-		listener.Close()
 		fmt.Fprintf(stderr, "parleyd serve: open recovery marker directory: %v\n", err)
 		return 1
 	}
@@ -313,12 +313,17 @@ func serve(ctx context.Context, cfg serveConfig, stdout, stderr io.Writer) int {
 			}
 			return recoveryService.InspectRecovery(ctx, writer)
 		},
-		Services: []runtime.Registration{{Service: listenerService}},
+		// RecoveryOnly: the administration endpoint must still answer
+		// server.hello/operation.get under a recovery hold -- this is the
+		// limited human-recovery surface docs/architecture.md's D3 note
+		// describes -- rather than runtime.Start silently skipping this
+		// registration the way it does for ordinary (non-RecoveryOnly)
+		// services while held.
+		Services: []runtime.Registration{{Service: listenerService, RecoveryOnly: true}},
 	}
 
 	running, err := runtime.Start(ctx, runtimeCfg)
 	if err != nil {
-		listener.Close()
 		fmt.Fprintf(stderr, "parleyd serve: %v\n", err)
 		return 1
 	}
