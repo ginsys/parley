@@ -7,14 +7,21 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ginsys/parley/internal/control"
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
 )
+
+// noEnv is passed to run in every test not exercising hello's environment
+// resolution, so an ambient PARLEY_ENDPOINT/PARLEY_SERVER_UID in the actual
+// process environment can never leak into these tests.
+func noEnv(string) string { return "" }
 
 type fakeController struct {
 	grant         controller.GrantParams
@@ -68,7 +75,7 @@ func TestHelpAndInvalidArgumentsNeverOpenDatabase(t *testing.T) {
 				t.Fatal("opened database before argument validation")
 				return nil, nil, nil
 			}
-			if code := run(tt.args, "unused.db", &stdout, &stderr, factory); code != tt.code {
+			if code := run(tt.args, "unused.db", &stdout, &stderr, factory, noEnv); code != tt.code {
 				t.Fatalf("exit=%d: %s %s", code, &stdout, &stderr)
 			}
 			if tt.code == 0 && (stdout.Len() == 0 || stderr.Len() != 0) {
@@ -91,7 +98,7 @@ func TestUnsafePeerIdentifiersRejectedBeforeStorage(t *testing.T) {
 					t.Fatal("opened storage for unsafe peer identifier")
 					return nil, nil, nil
 				}
-				if code := run(args, "unused.db", &out, &errOut, factory); code != 2 {
+				if code := run(args, "unused.db", &out, &errOut, factory, noEnv); code != 2 {
 					t.Fatalf("exit=%d: %s", code, &errOut)
 				}
 			})
@@ -124,7 +131,7 @@ func TestRoutingUsesValidatedParametersAndClosesStorage(t *testing.T) {
 				}
 				var out, errOut bytes.Buffer
 				before := time.Now()
-				code := run(args, "selected.db", &out, &errOut, factory)
+				code := run(args, "selected.db", &out, &errOut, factory, noEnv)
 				expected := 0
 				if fails {
 					expected = 1
@@ -168,7 +175,7 @@ func TestDatabaseOpenFailureAndDefaultPath(t *testing.T) {
 		}
 		return nil, nil, errors.New("synthetic open failure")
 	}
-	if code := run([]string{"revoke", "-conversation", "fixture"}, "", &out, &errOut, factory); code != 1 || out.Len() != 0 || !strings.Contains(errOut.String(), "synthetic open failure") {
+	if code := run([]string{"revoke", "-conversation", "fixture"}, "", &out, &errOut, factory, noEnv); code != 1 || out.Len() != 0 || !strings.Contains(errOut.String(), "synthetic open failure") {
 		t.Fatalf("exit=%d: %s %s", code, &out, &errOut)
 	}
 }
@@ -183,7 +190,7 @@ func TestCLIIdentifiersRemainExactAndVisible(t *testing.T) {
 				args = append(args, "-peer-a", "a", "-peer-b", "a ", "-max-exchanges", "1")
 			}
 			var out, errOut bytes.Buffer
-			if code := run(args, "unused", &out, &errOut, factory); code != 0 {
+			if code := run(args, "unused", &out, &errOut, factory, noEnv); code != 0 {
 				t.Fatalf("exit %d: %s", code, &errOut)
 			}
 			if !strings.Contains(out.String(), `" x"`) {
@@ -334,7 +341,7 @@ func TestCLIRenewRejectsIncompatibleNamesButRevokeKeepsExactKey(t *testing.T) {
 				return fake, fake, nil
 			}
 			var out, errOut bytes.Buffer
-			code := run([]string{operation, "-conversation", name}, "unused", &out, &errOut, factory)
+			code := run([]string{operation, "-conversation", name}, "unused", &out, &errOut, factory, noEnv)
 			if operation == "renew" {
 				if code != 2 || opened {
 					t.Fatalf("renew opened storage for %x: exit=%d", name, code)
@@ -343,5 +350,113 @@ func TestCLIRenewRejectsIncompatibleNamesButRevokeKeepsExactKey(t *testing.T) {
 				t.Fatalf("revoke changed key %x: %+v, exit=%d", name, fake, code)
 			}
 		}
+	}
+}
+
+// fatalIfOpened is a controllerFactory that fails the test if hello -- a
+// pure client diagnostic -- ever reaches the legacy database-opening path.
+func fatalIfOpened(t *testing.T) controllerFactory {
+	return func(context.Context, string) (controllerAPI, io.Closer, error) {
+		t.Fatal("hello opened a database through the legacy controller factory")
+		return nil, nil, nil
+	}
+}
+
+func TestHelloRequiresEndpointConfiguration(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run([]string{"hello"}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	if code != 2 || !strings.Contains(errOut.String(), "no endpoint configured") {
+		t.Fatalf("exit=%d err=%q", code, errOut.String())
+	}
+}
+
+func TestHelloRefusesPARLEYDBAsClientSource(t *testing.T) {
+	getenv := func(key string) string {
+		if key == "PARLEY_DB" {
+			return "parley.db"
+		}
+		return ""
+	}
+	var out, errOut bytes.Buffer
+	code := run([]string{"hello", "-endpoint", "/tmp/x", "-server-uid", "1000"}, "unused.db", &out, &errOut, fatalIfOpened(t), getenv)
+	if code != 2 || !strings.Contains(errOut.String(), "PARLEY_DB") {
+		t.Fatalf("exit=%d err=%q", code, errOut.String())
+	}
+}
+
+func TestHelloHelpTouchesNoDatabase(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := run([]string{"hello", "-h"}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	if code != 0 || out.Len() == 0 {
+		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+}
+
+func TestHelloDialFailureReportsOperationalErrorNotArgumentError(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "parleyctl-hello-nodial-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "admin.sock")
+	var out, errOut bytes.Buffer
+	code := run([]string{"hello", "-endpoint", path, "-server-uid", "1000"}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	if code != 1 || out.Len() != 0 || errOut.Len() == 0 {
+		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+}
+
+// TestHelloEndToEndRoundTripNeverOpensDatabase wires a real control.Listen
+// socket, control.Listener service and store.DB (control's own exported
+// surface, mirroring what cmd/parleyd assembles) and runs the actual
+// parleyctl hello command against it end to end, proving both the rendered
+// output and that the legacy controllerFactory is never invoked.
+func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "parleyctl-hello-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	socketPath := filepath.Join(dir, "admin.sock")
+	dbPath := filepath.Join(dir, "parley.db")
+	if err := os.WriteFile(dbPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	uid := uint32(os.Getuid())
+	adminID := "80000000-0000-4000-8000-000000000001"
+	controlCfg, err := control.NewConfig(socketPath, uid, map[string]uint32{adminID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := control.Listen(controlCfg, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(context.Background(), dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := db.OpenReaders(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	service := control.NewListenerService(listener, controlCfg, "epoch-fixture")
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := service.Start(ctx, runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { service.StopAdmission(); cancel(); service.Wait() })
+
+	var out, errOut bytes.Buffer
+	code := run([]string{"hello", "-endpoint", socketPath, "-server-uid", strconv.FormatUint(uint64(uid), 10)}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	if code != 0 {
+		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(out.String(), "administrator_id:") || !strings.Contains(out.String(), adminID) {
+		t.Fatalf("out=%q", out.String())
+	}
+	if !strings.Contains(out.String(), "protocol:") || !strings.Contains(out.String(), control.ProtocolVersion) {
+		t.Fatalf("out=%q", out.String())
 	}
 }

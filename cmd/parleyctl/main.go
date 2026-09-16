@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ginsys/parley/internal/bridgetext"
+	"github.com/ginsys/parley/internal/control"
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
@@ -25,7 +26,9 @@ type controllerAPI interface {
 }
 type controllerFactory func(context.Context, string) (controllerAPI, io.Closer, error)
 
-func main() { os.Exit(run(os.Args[1:], os.Getenv("PARLEY_DB"), os.Stdout, os.Stderr, openController)) }
+func main() {
+	os.Exit(run(os.Args[1:], os.Getenv("PARLEY_DB"), os.Stdout, os.Stderr, openController, os.Getenv))
+}
 
 // openController is the legacy direct-database writer path (transitional:
 // PR2 removes it once membership.* wire commands replace grant/revoke/renew).
@@ -136,10 +139,15 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 
 // run validates everything before opening storage. Tests inject a fake controller;
 // they never execute the protected CLI or write grants through its production factory.
-func run(args []string, dbPath string, stdout, stderr io.Writer, factory controllerFactory) int {
+func run(args []string, dbPath string, stdout, stderr io.Writer, factory controllerFactory, getenv func(string) string) int {
 	if len(args) == 0 || (len(args) == 1 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help")) {
 		usage(stdout)
 		return 0
+	}
+	// hello is a pure client diagnostic: it never opens a database and does
+	// not go through parseCommand/factory at all.
+	if args[0] == "hello" {
+		return runHello(args[1:], stdout, stderr, getenv)
 	}
 	// FlagSet sends help to the chosen writer and does not exit the process.
 	var parseOutput strings.Builder
@@ -197,6 +205,67 @@ func run(args []string, dbPath string, stdout, stderr io.Writer, factory control
 	return 0
 }
 
+// runHello is the client-side diagnostic added in mandate PR1 §4.D: it
+// resolves an endpoint/server-uid from -endpoint/-server-uid flags or the
+// PARLEY_ENDPOINT/PARLEY_SERVER_UID environment (control.ResolveClientConfig
+// refuses PARLEY_DB outright), dials, performs the required server.hello
+// handshake, and renders the result deterministically -- one field per
+// line, in a fixed order, never a dumped map. It opens no database and
+// takes no lock.
+func runHello(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
+	var output strings.Builder
+	fs := flag.NewFlagSet("hello", flag.ContinueOnError)
+	fs.SetOutput(&output)
+	endpoint := fs.String("endpoint", "", "administration socket path (or $PARLEY_ENDPOINT)")
+	serverUID := fs.String("server-uid", "", "the server process's UID (or $PARLEY_SERVER_UID)")
+	if err := fs.Parse(args); errors.Is(err, flag.ErrHelp) {
+		fmt.Fprint(stdout, output.String())
+		return 0
+	} else if err != nil {
+		fmt.Fprint(stderr, output.String())
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "parleyctl hello: unexpected positional arguments")
+		return 2
+	}
+	cfg, err := control.ResolveClientConfig(control.ClientOptions{EndpointFlag: *endpoint, ServerUIDFlag: *serverUID, Getenv: getenv})
+	if err != nil {
+		fmt.Fprintf(stderr, "parleyctl hello: %v\n", err)
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, hello, err := control.Dial(ctx, cfg)
+	if err != nil {
+		var timeout *control.TimeoutError
+		if errors.As(err, &timeout) {
+			fmt.Fprintf(stderr, "parleyctl hello: %v (outcome unknown, not a proven failure)\n", err)
+		} else {
+			fmt.Fprintf(stderr, "parleyctl hello: %v\n", err)
+		}
+		return 1
+	}
+	defer client.Close()
+	printHello(stdout, hello)
+	return 0
+}
+
+func printHello(w io.Writer, h control.HelloResult) {
+	fmt.Fprintf(w, "protocol:                      %s\n", h.Protocol)
+	fmt.Fprintf(w, "server_id:                     %s\n", h.ServerID)
+	fmt.Fprintf(w, "server_epoch:                  %s\n", h.ServerEpoch)
+	fmt.Fprintf(w, "administrator_id:              %s\n", h.AdministratorID)
+	fmt.Fprintf(w, "state:                         %s\n", h.State)
+	fmt.Fprintf(w, "max_frame_bytes:               %d\n", h.Limits.MaxFrameBytes)
+	fmt.Fprintf(w, "max_nesting_depth:             %d\n", h.Limits.MaxNestingDepth)
+	fmt.Fprintf(w, "max_sockets_per_administrator: %d\n", h.Limits.MaxSocketsPerAdministrator)
+	fmt.Fprintf(w, "max_sockets_total:             %d\n", h.Limits.MaxSocketsTotal)
+	fmt.Fprintf(w, "max_executing_per_socket:      %d\n", h.Limits.MaxExecutingPerSocket)
+	fmt.Fprintf(w, "max_queued_per_socket:         %d\n", h.Limits.MaxQueuedPerSocket)
+	fmt.Fprintf(w, "methods:                       %s\n", strings.Join(h.Methods, ", "))
+}
+
 func orNever(value *string) string {
 	if value == nil {
 		return "never"
@@ -213,11 +282,16 @@ Usage:
   parleyctl grant  -conversation NAME -peer-a ID -peer-b ID -max-exchanges N [-direction bidirectional|a_to_b|b_to_a] [-expires-in DURATION]
   parleyctl revoke -conversation NAME
   parleyctl renew  -conversation NAME [-max-exchanges N] [-expires-in DURATION] [-cancel-pending-replies]
+  parleyctl hello  [-endpoint PATH] [-server-uid UID]
   parleyctl [help|-h|--help]
 
 Use a subcommand's -h for flag details. Grant budget must be positive.
 Renewal uses 0 to keep budget/expiry; negative values are invalid.
 Renewal carries eligible trusted replies forward unless -cancel-pending-replies is set.
-Database path: $PARLEY_DB (default ./parley.db)
+grant/revoke/renew open the database directly (transitional; see AGENTS.md) --
+database path: $PARLEY_DB (default ./parley.db).
+hello is a pure client diagnostic against parleyd's administration socket; it
+never opens a database. Endpoint/server UID: -endpoint/-server-uid flags, else
+$PARLEY_ENDPOINT/$PARLEY_SERVER_UID; $PARLEY_DB is refused as a client source.
 Help exits 0, invalid arguments exit 2, operational failures exit 1.`)
 }
