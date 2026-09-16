@@ -44,15 +44,19 @@ func openController(ctx context.Context, path string) (controllerAPI, io.Closer,
 // exercise the real ownership-lock-then-open sequence -- refusal before the
 // store is ever opened, and the lock retained for the returned controller's
 // full lifetime, not just at acquisition -- without invoking the production
-// CLI or reimplementing the locking logic in the test. acquire and openStore
-// both receive the identical path value, so the lock and the store opener
-// always target the same canonical database.
+// CLI or reimplementing the locking logic in the test. openStore is given
+// owner.Path(), not the caller's raw path: acquire resolves symlinks before
+// taking the lock (runtime.Acquire's canonical path), while store.Open only
+// lexically cleans its input, so a path reaching the database through a
+// symlinked ancestor could otherwise name a different file to each of them.
+// Passing the already-resolved canonical path to both guarantees they can
+// never diverge.
 func openControllerWith(ctx context.Context, path string, acquire func(string) (*runtime.Ownership, error), openStore func(context.Context, string) (*store.DB, error)) (controllerAPI, io.Closer, error) {
 	owner, err := acquire(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	db, err := openStore(ctx, path)
+	db, err := openStore(ctx, owner.Path())
 	if err != nil {
 		return nil, nil, errors.Join(err, owner.Close())
 	}
