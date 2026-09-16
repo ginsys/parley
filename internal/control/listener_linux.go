@@ -5,6 +5,7 @@ package control
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net"
@@ -140,7 +141,6 @@ func probeConnectionRefused(parent int, name string) (bool, error) {
 type Listener struct {
 	listener net.Listener
 	cfg      Config
-	serverID string
 	epoch    string
 
 	mu           sync.Mutex
@@ -152,20 +152,29 @@ type Listener struct {
 }
 
 // NewListenerService wraps l for runtime.Start's Registration.Service.
-// serverID and epoch are resolved by the caller (cmd/parleyd) before
-// construction: serverID from the installation row, epoch minted once per
-// process start.
-func NewListenerService(l net.Listener, cfg Config, serverID, epoch string) *Listener {
-	return &Listener{listener: l, cfg: cfg, serverID: serverID, epoch: epoch, perAdmin: make(map[string]int)}
+// epoch is resolved by the caller (cmd/parleyd) before construction, minted
+// once per process start. serverID is not a constructor argument: Start
+// reads the installation row itself from the writer runtime.Start supplies
+// (Resources.Writer), the same one-shot pattern recovery.Service.New uses
+// for the same row -- this avoids requiring the caller to open the store a
+// second time before runtime.Start's own ownership acquisition ever runs.
+func NewListenerService(l net.Listener, cfg Config, epoch string) *Listener {
+	return &Listener{listener: l, cfg: cfg, epoch: epoch, perAdmin: make(map[string]int)}
 }
 
-func (ln *Listener) Start(_ context.Context, res runtime.Resources) error {
+func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
 	state := StateRunning
 	if res.Mode == runtime.Held {
 		state = StateRecoveryOnly
 	}
+	var serverID string
+	if err := res.Writer.Coordinator().Inspect(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT server_id FROM installation WHERE singleton=1").Scan(&serverID)
+	}); err != nil {
+		return fmt.Errorf("control: read installation identity: %w", err)
+	}
 	ln.mu.Lock()
-	ln.server = NewServer(ln.cfg, res.Queries, ln.serverID, ln.epoch, state)
+	ln.server = NewServer(ln.cfg, res.Queries, serverID, ln.epoch, state)
 	ln.mu.Unlock()
 	ln.wg.Add(1)
 	go ln.acceptLoop(res.WorkerContext)

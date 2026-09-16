@@ -179,10 +179,10 @@ func newListenerFixture(t *testing.T) *listenerFixture {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(l, cfg, "server-id-fixture", "epoch-fixture")
+	service := NewListenerService(l, cfg, "epoch-fixture")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
+	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -256,10 +256,10 @@ func TestListenerServiceUnconfiguredUIDIsRefusedSilently(t *testing.T) {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(l, cfg, "server-id-fixture", "epoch-fixture")
+	service := NewListenerService(l, cfg, "epoch-fixture")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
+	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { service.StopAdmission(); cancel(); service.Wait() }()
@@ -317,10 +317,10 @@ func TestListenerServiceRecoveryOnlyState(t *testing.T) {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(l, cfg, "server-id-fixture", "epoch-fixture")
+	service := NewListenerService(l, cfg, "epoch-fixture")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Queries: db.Queries(), Mode: runtime.Held}); err != nil {
+	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Held}); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { service.StopAdmission(); cancel(); service.Wait() }()
