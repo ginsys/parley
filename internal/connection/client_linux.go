@@ -19,7 +19,7 @@ func DialTrustedServer(ctx context.Context, path string, serverUID uint32) (*net
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.ContainsRune(path, 0) {
 		return nil, store.AuthenticationFailed
 	}
-	parent, err := protectedSocketDirectory(filepath.Dir(path), serverUID)
+	parent, err := TrustedDirectory(filepath.Dir(path), serverUID)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +47,16 @@ func DialTrustedServer(ctx context.Context, path string, serverUID uint32) (*net
 	}
 	return conn, nil
 }
-func protectedSocketDirectory(path string, uid uint32) (int, error) {
+
+// TrustedDirectory walks path from "/" down, opening each component
+// descriptor-relative to the previous one (never re-resolving the whole
+// path, so a mid-walk rename cannot retarget an earlier segment), and
+// requires every ancestor to be owned by root or uid and not
+// group/other-writable except a root-owned sticky ancestor. It returns an
+// open descriptor to the final directory, or store.AuthenticationFailed
+// if any ancestor is untrusted. Exported so internal/control's listener
+// can reuse this one walk instead of duplicating it for socket binding.
+func TrustedDirectory(path string, uid uint32) (int, error) {
 	if path == "/" {
 		return -1, store.AuthenticationFailed
 	}
