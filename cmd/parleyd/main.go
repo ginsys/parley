@@ -135,18 +135,23 @@ func initDatabase(ctx context.Context, path string, stdout, stderr io.Writer) in
 //
 // It never deletes the file it created, on any failure path (mandate R1):
 // runtime.Acquire requires a pre-existing target, so ownership structurally
-// cannot be proven before creation, and store.Open's migration steps each
-// commit in their own immediate transaction, so a failure there can still
-// mean a partially-but-genuinely-committed schema -- no phase here can
-// prove "nothing was committed, therefore safe to delete." Every failure
-// message instead names exactly which phase failed, states plainly that the
-// file is retained, and gives safe, actionable next steps; it never claims
-// the file is empty or unusable when that has not been established, and
-// never instructs blind deletion. A later store-close or identity-read
-// failure after a successful commit is reported as exactly that -- a
-// diagnostic problem, not a lost database -- since store.Open succeeding at
-// all means the installation row is guaranteed durably committed
-// (internal/store/registry.go's addConnectionRegistry migration step).
+// cannot be proven before creation. store.Open's migration runs as a single
+// atomic transaction (internal/store/migrations.go's migrate: one BEGIN,
+// every step, one final Commit, with defer tx.Rollback() covering every
+// early return) -- a store.Open failure here means nothing was committed,
+// not a partial schema, but this phase still never deletes the file: the
+// file's exact on-disk state after a failed migration is not otherwise
+// independently re-verified here, and no phase in this function treats
+// "nothing should have committed" as license to act on the file without
+// inspection. Every failure message instead names exactly which phase
+// failed, states plainly that the file is retained, and gives safe,
+// actionable next steps; it never claims the file is empty or unusable when
+// that has not been established, and never instructs blind deletion. A
+// later store-close or identity-read failure after a successful commit is
+// reported as exactly that -- a diagnostic problem, not a lost database --
+// since store.Open succeeding at all means the installation row is
+// guaranteed durably committed (internal/store/registry.go's
+// addConnectionRegistry migration step).
 func initDatabaseWith(ctx context.Context, path string, stdout, stderr io.Writer, deps initDeps) int {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -167,10 +172,10 @@ func initDatabaseWith(ctx context.Context, path string, stdout, stderr io.Writer
 	if err != nil {
 		if errors.Is(err, runtime.ErrAlreadyRunning) {
 			fmt.Fprintf(stderr, "parleyd init: created %s, but its ownership is already held by another process\n", path)
-			fmt.Fprintln(stderr, "parleyd init: the file exists and is retained, uninitialized. Stop the other process before retrying, or investigate a stale lock manually (see docs/operations.md) -- init will refuse to overwrite this file.")
+			fmt.Fprintln(stderr, "parleyd init: the file exists and is retained. This attempt did not initialize it; its current contents are unverified -- another owner may already be using or have replaced it. Stop the other process before retrying, or investigate a stale lock manually (see docs/operations.md) -- init will refuse to overwrite this file.")
 		} else {
 			fmt.Fprintf(stderr, "parleyd init: created %s, but ownership could not be established: %v\n", path, err)
-			fmt.Fprintln(stderr, "parleyd init: the file exists and is retained, uninitialized. Do not delete it blindly -- inspect it manually before deciding how to proceed.")
+			fmt.Fprintln(stderr, "parleyd init: the file exists and is retained. This attempt did not initialize it; its current contents are unverified. Do not delete it blindly -- inspect it manually before deciding how to proceed.")
 		}
 		return 1
 	}
@@ -179,7 +184,7 @@ func initDatabaseWith(ctx context.Context, path string, stdout, stderr io.Writer
 	if err != nil {
 		owner.Close()
 		fmt.Fprintf(stderr, "parleyd init: created %s, but schema initialization failed: %v\n", path, err)
-		fmt.Fprintln(stderr, "parleyd init: the file is retained and may be partially initialized. Do not delete it blindly -- inspect it manually; init will refuse to overwrite this file on retry.")
+		fmt.Fprintln(stderr, "parleyd init: the file is retained. Migration runs as a single transaction, so this failure normally means no schema was committed, but do not delete it blindly -- inspect it manually; init will refuse to overwrite this file on retry.")
 		return 1
 	}
 

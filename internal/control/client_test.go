@@ -500,6 +500,7 @@ func TestClientCallRejectsMalformedResponseEnvelopes(t *testing.T) {
 		{"wrong version", `{"jsonrpc":"1.0","id":"1","result":{}}` + "\n"},
 		{"matching id but neither result nor error", `{"jsonrpc":"2.0","id":"1"}` + "\n"},
 		{"both result and error", `{"jsonrpc":"2.0","id":"1","result":{},"error":{"code":-32000,"message":"x"}}` + "\n"},
+		{"result present with an explicit null error", `{"jsonrpc":"2.0","id":"1","result":{},"error":null}` + "\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -524,21 +525,29 @@ func TestClientCallRejectsMalformedResponseEnvelopes(t *testing.T) {
 // TestDialRejectsInvalidHelloResult covers mandate R5's requirement that
 // Dial validate the decoded HelloResult itself, not just the envelope
 // Call's own checks already accept: a bare `{"result":{}}`, an
-// unsupported protocol, a missing required identity field, an unknown
-// state and an invalid (non-positive) limits shape must all fail
-// negotiation.
+// unsupported protocol, a missing/malformed required identity field, an
+// unknown state, an invalid (non-positive) limits shape, and a missing or
+// blank advertised method must all fail negotiation. server_id and
+// administrator_id use valid canonical UUIDs except in the cases that
+// specifically target those fields, so each case fails for the reason it
+// claims to test, not incidentally for a different one.
 func TestDialRejectsInvalidHelloResult(t *testing.T) {
 	uid := uint32(os.Getuid())
+	const validID = "60000000-0000-4000-8000-000000000001"
 	const validLimits = `"limits":{"max_frame_bytes":1,"max_nesting_depth":1,"max_sockets_per_administrator":1,"max_sockets_total":1,"max_executing_per_socket":1,"max_queued_per_socket":1}`
 	cases := []struct {
 		name     string
 		response string
 	}{
 		{"null hello result", `{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"},
-		{"unsupported protocol", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"other","server_id":"s","server_epoch":"e","administrator_id":"a","state":"running",` + validLimits + `,"methods":[]}}` + "\n"},
-		{"missing server_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_epoch":"e","administrator_id":"a","state":"running",` + validLimits + `,"methods":[]}}` + "\n"},
-		{"unknown state", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"s","server_epoch":"e","administrator_id":"a","state":"unknown",` + validLimits + `,"methods":[]}}` + "\n"},
-		{"invalid limits shape", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"s","server_epoch":"e","administrator_id":"a","state":"running","limits":{},"methods":[]}}` + "\n"},
+		{"unsupported protocol", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"other","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
+		{"missing server_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
+		{"non-uuid server_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"  ","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
+		{"non-uuid administrator_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"not-a-uuid","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
+		{"unknown state", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"unknown",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
+		{"invalid limits shape", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running","limits":{},"methods":["server.hello"]}}` + "\n"},
+		{"missing methods", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `}}` + "\n"},
+		{"blank method name", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["  "]}}` + "\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

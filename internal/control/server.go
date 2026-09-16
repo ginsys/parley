@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/ginsys/parley/internal/store"
 )
@@ -265,7 +266,13 @@ func (h HelloResult) validate() error {
 	if h.Protocol != ProtocolVersion {
 		return fmt.Errorf("control: hello result claims unsupported protocol %q", h.Protocol)
 	}
-	if h.ServerID == "" || h.ServerEpoch == "" || h.AdministratorID == "" {
+	if !canonicalUUID(h.ServerID) {
+		return fmt.Errorf("control: hello result has an invalid server_id %q", h.ServerID)
+	}
+	if !canonicalUUID(h.AdministratorID) {
+		return fmt.Errorf("control: hello result has an invalid administrator_id %q", h.AdministratorID)
+	}
+	if strings.TrimSpace(h.ServerEpoch) == "" {
 		return errors.New("control: hello result is missing a required identity field")
 	}
 	if h.State != string(StateRunning) && h.State != string(StateRecoveryOnly) {
@@ -274,6 +281,14 @@ func (h HelloResult) validate() error {
 	if h.Limits.MaxFrameBytes <= 0 || h.Limits.MaxNestingDepth <= 0 || h.Limits.MaxSocketsPerAdministrator <= 0 ||
 		h.Limits.MaxSocketsTotal <= 0 || h.Limits.MaxExecutingPerSocket <= 0 || h.Limits.MaxQueuedPerSocket <= 0 {
 		return errors.New("control: hello result has invalid (non-positive) profile limits")
+	}
+	if len(h.Methods) == 0 {
+		return errors.New("control: hello result advertises no methods")
+	}
+	for _, m := range h.Methods {
+		if strings.TrimSpace(m) == "" {
+			return errors.New("control: hello result advertises a blank method name")
+		}
 	}
 	return nil
 }
