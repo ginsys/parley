@@ -91,6 +91,19 @@ copy:
 `parleyd` never creates a replacement database at a new location on its own; a missing or
 unreadable `-database` path is always a startup failure, never a silent fresh start.
 
+**Starting a restored or relocated copy will very likely trigger an automatic recovery hold.**
+Restoring a backup taken at an earlier point moves the database's own clock backward relative to
+what it last observed running; the runtime's clock-rollback detection (see
+[Runtime foundation](runtime.md)) treats this as a possible tamper or restore event and enters a
+held recovery mode rather than resuming ordinary work silently. In `parleyd serve` started on a
+restored copy, this means the control endpoint comes up in `recovery_only` state (`parleyctl hello`
+reports `state: recovery_only`) and `operation.get` continues to work, but **PR1 provides no
+wire-level way to clear this hold**: `recovery.complete` and the other recovery-disposition methods
+are PR5 scope and are not wired yet. An operator who restores a database with this slice alone has
+no client-side path out of the hold; only a later release that wires those methods, or direct
+database intervention outside `parleyctl`/`parleyd`, can clear it. Plan restore drills accordingly
+until PR5 lands.
+
 ## Diagnostics
 
 `parleyctl hello [-endpoint PATH] [-server-uid UID]` is a pure client diagnostic: it dials the
