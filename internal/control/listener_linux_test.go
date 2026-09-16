@@ -11,6 +11,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,162 @@ import (
 	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
 )
+
+// fakeListener implements net.Listener with a scripted queue of Accept
+// results, letting R4's tests inject exact Accept errors deterministically
+// -- the mandate requires injecting Accept errors, never exhausting real
+// host file descriptors.
+type fakeListener struct {
+	mu      sync.Mutex
+	results []fakeAcceptResult
+	acceptN int
+}
+
+type fakeAcceptResult struct {
+	conn net.Conn
+	err  error
+}
+
+func (f *fakeListener) Accept() (net.Conn, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.acceptN++
+	if len(f.results) == 0 {
+		return nil, errors.New("fakeListener: accept results exhausted")
+	}
+	r := f.results[0]
+	f.results = f.results[1:]
+	return r.conn, r.err
+}
+
+func (f *fakeListener) Close() error { return nil }
+
+func (f *fakeListener) Addr() net.Addr { return &net.UnixAddr{Name: "fake", Net: "unix"} }
+
+func (f *fakeListener) acceptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.acceptN
+}
+
+// syntheticAcceptError is a controlled net.Error for injecting a specific
+// Temporary()/Timeout() classification without needing a real syscall
+// errno (mandate R4: inject Accept errors, never exhaust real fds).
+type syntheticAcceptError struct {
+	msg              string
+	temporary, timeo bool
+}
+
+func (e *syntheticAcceptError) Error() string { return e.msg }
+func (e *syntheticAcceptError) Timeout() bool { return e.timeo }
+
+//nolint:staticcheck // SA1019: intentional -- matches isTemporaryAcceptError's own use of Temporary()
+func (e *syntheticAcceptError) Temporary() bool { return e.temporary }
+
+func TestAcceptLoopReturnsCleanlyOnOwnedStop(t *testing.T) {
+	fl := &fakeListener{results: []fakeAcceptResult{{err: net.ErrClosed}}}
+	ln := &Listener{listener: fl, perAdmin: make(map[string]int), stopped: true}
+	done := make(chan struct{})
+	ln.wg.Add(1)
+	go func() { ln.acceptLoop(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("acceptLoop did not return on an owned stop")
+	}
+	ln.wg.Wait()
+	if err := ln.Wait(); err != nil {
+		t.Fatalf("owned stop must not be surfaced as a failure: %v", err)
+	}
+}
+
+func TestAcceptLoopEscalatesAfterBoundedTemporaryRetries(t *testing.T) {
+	sentinel := &syntheticAcceptError{msg: "synthetic: resource exhaustion", temporary: true}
+	results := make([]fakeAcceptResult, maxAcceptRetries+1)
+	for i := range results {
+		results[i] = fakeAcceptResult{err: sentinel}
+	}
+	fl := &fakeListener{results: results}
+	ln := &Listener{listener: fl, perAdmin: make(map[string]int)}
+	var failed atomic.Pointer[error]
+	ln.OnAcceptFailure(func(err error) { e := err; failed.Store(&e) })
+	ln.wg.Add(1)
+	done := make(chan struct{})
+	go func() { ln.acceptLoop(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("acceptLoop did not escalate within the bound")
+	}
+	if fl.acceptCount() != maxAcceptRetries+1 {
+		t.Fatalf("accept called %d times, want exactly %d (bounded retry)", fl.acceptCount(), maxAcceptRetries+1)
+	}
+	got := failed.Load()
+	if got == nil || !errors.Is(*got, error(sentinel)) {
+		t.Fatalf("OnAcceptFailure not invoked with the synthetic error: %v", got)
+	}
+	if err := ln.Wait(); !errors.Is(err, sentinel) {
+		t.Fatalf("Wait()=%v, want the synthetic error", err)
+	}
+}
+
+func TestAcceptLoopSurfacesUnexpectedNonTemporaryFailureImmediately(t *testing.T) {
+	sentinel := errors.New("synthetic: permanent accept failure")
+	fl := &fakeListener{results: []fakeAcceptResult{{err: sentinel}}}
+	ln := &Listener{listener: fl, perAdmin: make(map[string]int)}
+	var failed atomic.Pointer[error]
+	ln.OnAcceptFailure(func(err error) { e := err; failed.Store(&e) })
+	ln.wg.Add(1)
+	done := make(chan struct{})
+	go func() { ln.acceptLoop(context.Background()); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("acceptLoop did not surface an unexpected non-temporary failure")
+	}
+	if fl.acceptCount() != 1 {
+		t.Fatalf("accept called %d times, want exactly 1 (no retry for a non-temporary error)", fl.acceptCount())
+	}
+	got := failed.Load()
+	if got == nil || !errors.Is(*got, sentinel) {
+		t.Fatalf("OnAcceptFailure not invoked with the synthetic error: %v", got)
+	}
+	if err := ln.Wait(); !errors.Is(err, sentinel) {
+		t.Fatalf("Wait()=%v, want the synthetic error", err)
+	}
+}
+
+func TestAcceptLoopBackoffIsCancellable(t *testing.T) {
+	sentinel := &syntheticAcceptError{msg: "synthetic: transient", temporary: true}
+	results := make([]fakeAcceptResult, maxAcceptRetries)
+	for i := range results {
+		results[i] = fakeAcceptResult{err: sentinel}
+	}
+	fl := &fakeListener{results: results}
+	ln := &Listener{listener: fl, perAdmin: make(map[string]int)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	ln.wg.Add(1)
+	go func() { ln.acceptLoop(ctx); close(done) }()
+
+	// Cancel partway through the bounded retry sequence (well before its
+	// full worst-case backoff, ~2.5s for 8 retries) and confirm the loop
+	// exits promptly rather than waiting out the remaining delays.
+	time.Sleep(300 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation did not interrupt the accept retry backoff")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("backoff was not interrupted promptly: %v", elapsed)
+	}
+	if err := ln.Wait(); err != nil {
+		t.Fatalf("a cancelled backoff must not be surfaced as a failure: %v", err)
+	}
+}
 
 // assertConnectionActuallyClosed fails t unless err proves the server
 // actually closed the connection (io.EOF, the error a peer's Read sees
@@ -209,7 +367,7 @@ func newListenerFixture(t *testing.T) *listenerFixture {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(cfg, 0600, "epoch-fixture")
+	service := NewListenerService(cfg, 0600)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
@@ -282,7 +440,7 @@ func TestListenerServiceUnconfiguredUIDIsRefusedSilently(t *testing.T) {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(cfg, 0600, "epoch-fixture")
+	service := NewListenerService(cfg, 0600)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
@@ -339,7 +497,7 @@ func TestListenerServiceRecoveryOnlyState(t *testing.T) {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := NewListenerService(cfg, 0600, "epoch-fixture")
+	service := NewListenerService(cfg, 0600)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Held}); err != nil {
@@ -482,5 +640,173 @@ func TestWriteResponseReplacesOversizedResponseWithInternalError(t *testing.T) {
 	errObj, ok := decoded["error"].(map[string]any)
 	if !ok || int(errObj["code"].(float64)) != int(InternalError) {
 		t.Fatalf("%#v", decoded)
+	}
+}
+
+// TestListenerServiceHelloEpochMatchesCoordinatorEpoch is mandate R6's core
+// regression: the control surface must use the owning coordinator's own
+// process-local epoch, not a second, independently minted identity for the
+// same server incarnation.
+func TestListenerServiceHelloEpochMatchesCoordinatorEpoch(t *testing.T) {
+	fx := newListenerFixture(t)
+	resp := dialAndRoundTrip(t, fx.socketPath, fx.serverUID, `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
+	result, ok := resp["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("%#v", resp)
+	}
+	helloEpoch, _ := result["server_epoch"].(string)
+	if helloEpoch == "" {
+		t.Fatalf("missing server_epoch: %#v", result)
+	}
+	coordEpoch, err := fx.db.Coordinator().Epoch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if helloEpoch != coordEpoch {
+		t.Fatalf("hello server_epoch %q != coordinator epoch %q", helloEpoch, coordEpoch)
+	}
+}
+
+// TestListenerServiceReceiptEpochMatchesHelloEpoch confirms a receipt
+// generated through the same runtime carries that same coordinator epoch,
+// not some other value -- the epoch hello reports is the epoch mutations
+// are actually committed under.
+func TestListenerServiceReceiptEpochMatchesHelloEpoch(t *testing.T) {
+	fx := newListenerFixture(t)
+	resp := dialAndRoundTrip(t, fx.socketPath, fx.serverUID, `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
+	result := resp["result"].(map[string]any)
+	helloEpoch, _ := result["server_epoch"].(string)
+	if helloEpoch == "" {
+		t.Fatalf("missing server_epoch: %#v", result)
+	}
+
+	req, err := store.NewCommandRequest("binding.register", "60000000-0000-4000-8000-000000000050")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := store.CommandPrincipal{ID: fx.adminID, ConnectorUID: fx.serverUID}
+	receipt, err := fx.db.Coordinator().Execute(context.Background(), principal, req, allowedCommand, insertSyntheticCommand, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.View.Epoch != helloEpoch {
+		t.Fatalf("receipt epoch %q != hello epoch %q", receipt.View.Epoch, helloEpoch)
+	}
+}
+
+// TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory exercises
+// an actual restart: reopening the same on-disk database and starting a
+// fresh Listener/coordinator produces a new epoch (mandate R6: "restarting
+// creates a new epoch"), while server_id and previously committed receipt
+// history are preserved untouched -- a historical receipt's commit_epoch
+// legitimately differs from today's hello and must never be rewritten or
+// rejected merely for that difference.
+func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T) {
+	ctx := context.Background()
+	dir := privateSocketDir(t)
+	dbPath := filepath.Join(dir, "parley.db")
+	adminID := "60000000-0000-4000-8000-000000000001"
+	uid := uint32(os.Getuid())
+	req, err := store.NewCommandRequest("binding.register", "60000000-0000-4000-8000-000000000060")
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := store.CommandPrincipal{ID: adminID, ConnectorUID: uid}
+
+	// First incarnation: init, serve, capture hello's epoch/server_id and a
+	// real committed receipt.
+	db1, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.OpenReaders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	socketPath1 := filepath.Join(dir, "admin1.sock")
+	cfg1, err := NewConfig(socketPath1, uid, map[string]uint32{adminID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc1 := NewListenerService(cfg1, 0600)
+	wctx1, cancel1 := context.WithCancel(ctx)
+	if err := svc1.Start(ctx, runtime.Resources{WorkerContext: wctx1, Writer: db1, Queries: db1.Queries(), Mode: runtime.Normal}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp1 := dialAndRoundTrip(t, socketPath1, uid, `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
+	result1 := resp1["result"].(map[string]any)
+	serverID1, _ := result1["server_id"].(string)
+	epoch1, _ := result1["server_epoch"].(string)
+	if epoch1 == "" || serverID1 == "" {
+		t.Fatalf("missing epoch/server_id: %#v", result1)
+	}
+
+	receipt1, err := db1.Coordinator().Execute(ctx, principal, req, allowedCommand, insertSyntheticCommand, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt1.View.Epoch != epoch1 {
+		t.Fatalf("receipt epoch %q != hello epoch %q", receipt1.View.Epoch, epoch1)
+	}
+
+	svc1.StopAdmission()
+	cancel1()
+	svc1.Wait()
+	if err := db1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second incarnation: a real restart against the same on-disk file.
+	db2, err := store.OpenExisting(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.OpenReaders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db2.Close() })
+	socketPath2 := filepath.Join(dir, "admin2.sock")
+	cfg2, err := NewConfig(socketPath2, uid, map[string]uint32{adminID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc2 := NewListenerService(cfg2, 0600)
+	wctx2, cancel2 := context.WithCancel(ctx)
+	t.Cleanup(cancel2)
+	if err := svc2.Start(ctx, runtime.Resources{WorkerContext: wctx2, Writer: db2, Queries: db2.Queries(), Mode: runtime.Normal}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		svc2.StopAdmission()
+		cancel2()
+		svc2.Wait()
+	})
+
+	resp2 := dialAndRoundTrip(t, socketPath2, uid, `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
+	result2 := resp2["result"].(map[string]any)
+	epoch2, _ := result2["server_epoch"].(string)
+	serverID2, _ := result2["server_id"].(string)
+	if epoch2 == "" || serverID2 == "" {
+		t.Fatalf("missing epoch/server_id: %#v", result2)
+	}
+
+	if epoch2 == epoch1 {
+		t.Fatal("restart did not mint a new epoch")
+	}
+	if serverID2 != serverID1 {
+		t.Fatalf("server_id changed across restart: %q -> %q", serverID1, serverID2)
+	}
+
+	// Replaying the same operation through the new coordinator must return
+	// the original, historical receipt untouched -- proving history is
+	// preserved and not rewritten or rejected merely because its
+	// commit_epoch differs from today's hello.
+	replay, err := db2.Coordinator().Execute(ctx, principal, req, allowedCommand, insertSyntheticCommand, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replay.Replayed || replay.AuditID != receipt1.AuditID || replay.View.Epoch != epoch1 {
+		t.Fatalf("historical receipt not preserved: replayed=%v auditID=%q (want %q) epoch=%q (want %q)",
+			replay.Replayed, replay.AuditID, receipt1.AuditID, replay.View.Epoch, epoch1)
 	}
 }

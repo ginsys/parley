@@ -143,9 +143,8 @@ func probeConnectionRefused(parent int, name string) (bool, error) {
 // request in flight per socket -- at the cost of not implementing
 // per-socket request pipelining in PR1.
 type Listener struct {
-	cfg   Config
-	mode  os.FileMode
-	epoch string
+	cfg  Config
+	mode os.FileMode
 
 	mu           sync.Mutex
 	listener     net.Listener // nil until Start binds it
@@ -153,21 +152,38 @@ type Listener struct {
 	stopped      bool
 	totalSockets int
 	perAdmin     map[string]int
+	acceptErr    error       // recorded by fail; returned by Wait
+	onFailure    func(error) // optional, set via OnAcceptFailure before Start
 	wg           sync.WaitGroup
 }
 
 // NewListenerService builds a Listener for runtime.Start's
-// Registration.Service. epoch is resolved by the caller (cmd/parleyd)
-// before construction, minted once per process start. Unlike an
-// already-bound net.Listener, cfg/mode are only turned into a bound socket
-// inside Start, after runtime.Start has already acquired exclusive
-// database ownership -- a process that loses that race never creates,
-// probes or replaces the admin socket at all. serverID is not a
-// constructor argument either: Start reads the installation row itself
-// from the writer runtime.Start supplies (Resources.Writer), the same
-// one-shot pattern recovery.Service.New uses for the same row.
-func NewListenerService(cfg Config, mode os.FileMode, epoch string) *Listener {
-	return &Listener{cfg: cfg, mode: mode, epoch: epoch, perAdmin: make(map[string]int)}
+// Registration.Service. Unlike an already-bound net.Listener, cfg/mode are
+// only turned into a bound socket inside Start, after runtime.Start has
+// already acquired exclusive database ownership -- a process that loses
+// that race never creates, probes or replaces the admin socket at all.
+// Neither serverID nor epoch are constructor arguments: Start resolves
+// both itself from the writer runtime.Start supplies (Resources.Writer) --
+// serverID by reading the installation row directly (the same one-shot
+// pattern recovery.Service.New uses for the same row), and epoch via
+// Coordinator().Epoch, the owning coordinator's own process-local identity
+// (mandate R6), never a second, independently minted one for the same
+// server incarnation.
+func NewListenerService(cfg Config, mode os.FileMode) *Listener {
+	return &Listener{cfg: cfg, mode: mode, perAdmin: make(map[string]int)}
+}
+
+// OnAcceptFailure registers f to be invoked, at most once, the first time
+// acceptLoop gives up on an Accept error that is neither an owned stop
+// (StopAdmission) nor a bounded transient condition. f is called directly
+// from the accept goroutine, without ln.mu held; like
+// recovery.Config.FailStop, it must be nonblocking, perform no I/O and
+// never reenter the store. Call before Start; a call after Start races
+// acceptLoop's own read of it and is not supported.
+func (ln *Listener) OnAcceptFailure(f func(error)) {
+	ln.mu.Lock()
+	ln.onFailure = f
+	ln.mu.Unlock()
 }
 
 func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
@@ -186,9 +202,14 @@ func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
 		listener.Close()
 		return fmt.Errorf("control: read installation identity: %w", err)
 	}
+	epoch, err := res.Writer.Coordinator().Epoch(ctx)
+	if err != nil {
+		listener.Close()
+		return fmt.Errorf("control: read coordinator epoch: %w", err)
+	}
 	ln.mu.Lock()
 	ln.listener = listener
-	ln.server = NewServer(ln.cfg, res.Queries, serverID, ln.epoch, state)
+	ln.server = NewServer(ln.cfg, res.Queries, serverID, epoch, state)
 	ln.mu.Unlock()
 	ln.wg.Add(1)
 	go ln.acceptLoop(res.WorkerContext)
@@ -198,7 +219,10 @@ func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
 // StopAdmission is safe even when Start never got as far as binding a
 // listener (e.g. Listen itself failed): runtime.Start registers a service
 // for cleanup before calling its Start (internal/runtime/runtime.go), so a
-// failed Start still receives a StopAdmission/Wait pair.
+// failed Start still receives a StopAdmission/Wait pair. Setting ln.stopped
+// before closing the listener is what lets acceptLoop distinguish this
+// intentional close from an unexpected one -- net.ErrClosed alone is never
+// sufficient proof of an owned stop (mandate R4).
 func (ln *Listener) StopAdmission() error {
 	ln.mu.Lock()
 	ln.stopped = true
@@ -210,18 +234,90 @@ func (ln *Listener) StopAdmission() error {
 	return listener.Close()
 }
 
+// Wait returns the accept failure acceptLoop recorded, if any (mandate
+// R4): a persistent or unexpected Accept error must be surfaced through
+// the normal service-failure path, not silently swallowed as if shutdown
+// were always clean.
 func (ln *Listener) Wait() error {
 	ln.wg.Wait()
-	return nil
+	ln.mu.Lock()
+	defer ln.mu.Unlock()
+	return ln.acceptErr
+}
+
+// maxAcceptRetries bounds a resource-exhaustion (EMFILE/ENFILE/EINTR-class)
+// accept retry loop before escalating to failure -- never an unbounded
+// retry or busy-loop.
+const maxAcceptRetries = 8
+
+// acceptRetryBaseDelay is the first backoff delay for a transient accept
+// error; it doubles each subsequent retry up to maxAcceptRetries.
+const acceptRetryBaseDelay = 10 * time.Millisecond
+
+// isTemporaryAcceptError reports whether err is a bounded, retry-worthy
+// accept-time condition (EINTR, EMFILE, ENFILE, or any Timeout()-true
+// errno) rather than a permanent failure. net.Error.Temporary() is
+// deprecated but remains the functionally correct predicate for exactly
+// this class: net.OpError.Temporary() treats accept-time ECONNRESET/
+// ECONNABORTED as temporary and otherwise delegates to
+// syscall.Errno.Temporary(), which is true for EINTR/EMFILE/ENFILE or any
+// Timeout()-true errno (verified against the Go 1.27.1 stdlib source).
+func isTemporaryAcceptError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Temporary() //nolint:staticcheck // SA1019: intentional, see comment above
+}
+
+// fail records an unexpected, non-owned-stop, non-transient accept
+// failure for Wait to return, and notifies the optional OnAcceptFailure
+// callback at most once. Never called while holding ln.mu; never blocks.
+func (ln *Listener) fail(err error) {
+	ln.mu.Lock()
+	if ln.acceptErr != nil {
+		ln.mu.Unlock()
+		return
+	}
+	ln.acceptErr = err
+	onFailure := ln.onFailure
+	ln.mu.Unlock()
+	if onFailure != nil {
+		onFailure(err)
+	}
 }
 
 func (ln *Listener) acceptLoop(ctx context.Context) {
 	defer ln.wg.Done()
+	retries := 0
 	for {
 		conn, err := ln.listener.Accept()
 		if err != nil {
-			return // listener closed by StopAdmission
+			ln.mu.Lock()
+			stopped := ln.stopped
+			ln.mu.Unlock()
+			if stopped || ctx.Err() != nil {
+				// An owned stop (StopAdmission set ln.stopped before
+				// closing the listener) or runtime shutdown -- clean, not
+				// a failure to surface.
+				return
+			}
+			if isTemporaryAcceptError(err) && retries < maxAcceptRetries {
+				retries++
+				delay := acceptRetryBaseDelay * time.Duration(uint(1)<<uint(retries-1))
+				select {
+				case <-time.After(delay):
+					continue
+				case <-ctx.Done():
+					return
+				}
+			}
+			// Neither an owned stop nor a bounded-retryable transient
+			// condition: an unexpected failure that would otherwise leave
+			// the process apparently listening while nothing accepts
+			// further administrators. Surface it rather than silently
+			// returning, busy-looping or retrying forever.
+			ln.fail(err)
+			return
 		}
+		retries = 0
 		uconn, ok := conn.(*net.UnixConn)
 		if !ok {
 			conn.Close()

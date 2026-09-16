@@ -26,7 +26,6 @@ import (
 	"github.com/ginsys/parley/internal/recovery"
 	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
-	"github.com/google/uuid"
 )
 
 func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
@@ -107,15 +106,48 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	return initDatabase(context.Background(), *dbPath, stdout, stderr)
 }
 
-// initDatabase performs the actual initialization: it is explicit and
-// non-overwriting (O_EXCL refuses any existing entry, of any kind, at path),
-// establishes the file at the private mode runtime.Acquire requires before
-// Acquire or store.Open ever run (so no looser default mode is briefly in
-// effect), then joins the same ownership lock cmd/parleyctl's EP-02 path
-// uses before opening the store, and finally reads back the installation
-// identity it just created so the operator can record it (see
-// docs/operations.md).
+// initDeps lets tests inject a deterministic failure at each phase of
+// initDatabaseWith without faking OS-level errors. realInitDeps wires the
+// true production functions; initDatabase always uses it -- production
+// behavior is exactly initDatabaseWith(realInitDeps()).
+type initDeps struct {
+	acquire   func(path string) (*runtime.Ownership, error)
+	openStore func(ctx context.Context, path string) (*store.DB, error)
+	readID    func(ctx context.Context, db *store.DB) (string, error)
+}
+
+func realInitDeps() initDeps {
+	return initDeps{acquire: runtime.Acquire, openStore: store.Open, readID: readServerID}
+}
+
+// initDatabase performs the actual initialization; see initDatabaseWith.
 func initDatabase(ctx context.Context, path string, stdout, stderr io.Writer) int {
+	return initDatabaseWith(ctx, path, stdout, stderr, realInitDeps())
+}
+
+// initDatabaseWith is explicit and non-overwriting (O_EXCL refuses any
+// existing entry, of any kind, at path), establishes the file at the
+// private mode runtime.Acquire requires before Acquire or store.Open ever
+// run (so no looser default mode is briefly in effect), then joins the same
+// ownership lock cmd/parleyctl's EP-02 path uses before opening the store,
+// and finally reads back the installation identity it just created so the
+// operator can record it (see docs/operations.md).
+//
+// It never deletes the file it created, on any failure path (mandate R1):
+// runtime.Acquire requires a pre-existing target, so ownership structurally
+// cannot be proven before creation, and store.Open's migration steps each
+// commit in their own immediate transaction, so a failure there can still
+// mean a partially-but-genuinely-committed schema -- no phase here can
+// prove "nothing was committed, therefore safe to delete." Every failure
+// message instead names exactly which phase failed, states plainly that the
+// file is retained, and gives safe, actionable next steps; it never claims
+// the file is empty or unusable when that has not been established, and
+// never instructs blind deletion. A later store-close or identity-read
+// failure after a successful commit is reported as exactly that -- a
+// diagnostic problem, not a lost database -- since store.Open succeeding at
+// all means the installation row is guaranteed durably committed
+// (internal/store/registry.go's addConnectionRegistry migration step).
+func initDatabaseWith(ctx context.Context, path string, stdout, stderr io.Writer, deps initDeps) int {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
@@ -126,27 +158,57 @@ func initDatabase(ctx context.Context, path string, stdout, stderr io.Writer) in
 		return 1
 	}
 	if err := f.Close(); err != nil {
-		fmt.Fprintf(stderr, "parleyd init: %v\n", err)
+		fmt.Fprintf(stderr, "parleyd init: created %s but failed to finalize it (close failed): %v\n", path, err)
+		fmt.Fprintln(stderr, "parleyd init: the file exists and is retained; it may be incomplete. Inspect it manually -- init will refuse to overwrite it on retry.")
 		return 1
 	}
 
-	owner, err := runtime.Acquire(path)
+	owner, err := deps.acquire(path)
 	if err != nil {
-		fmt.Fprintf(stderr, "parleyd init: acquire ownership: %v\n", err)
+		if errors.Is(err, runtime.ErrAlreadyRunning) {
+			fmt.Fprintf(stderr, "parleyd init: created %s, but its ownership is already held by another process\n", path)
+			fmt.Fprintln(stderr, "parleyd init: the file exists and is retained, uninitialized. Stop the other process before retrying, or investigate a stale lock manually (see docs/operations.md) -- init will refuse to overwrite this file.")
+		} else {
+			fmt.Fprintf(stderr, "parleyd init: created %s, but ownership could not be established: %v\n", path, err)
+			fmt.Fprintln(stderr, "parleyd init: the file exists and is retained, uninitialized. Do not delete it blindly -- inspect it manually before deciding how to proceed.")
+		}
 		return 1
 	}
-	defer owner.Close()
 
-	db, err := store.Open(ctx, path)
+	db, err := deps.openStore(ctx, path)
 	if err != nil {
-		fmt.Fprintf(stderr, "parleyd init: initialize schema: %v\n", err)
+		owner.Close()
+		fmt.Fprintf(stderr, "parleyd init: created %s, but schema initialization failed: %v\n", path, err)
+		fmt.Fprintln(stderr, "parleyd init: the file is retained and may be partially initialized. Do not delete it blindly -- inspect it manually; init will refuse to overwrite this file on retry.")
 		return 1
 	}
-	defer db.Close()
 
-	serverID, err := readServerID(ctx, db)
+	serverID, err := deps.readID(ctx, db)
 	if err != nil {
-		fmt.Fprintf(stderr, "parleyd init: read installation identity: %v\n", err)
+		closeErr := errors.Join(db.Close(), owner.Close())
+		fmt.Fprintf(stderr, "parleyd init: %s was initialized (schema committed) but its installation identity could not be read back: %v\n", path, err)
+		if closeErr != nil {
+			fmt.Fprintf(stderr, "parleyd init: additionally failed to close cleanly: %v\n", closeErr)
+		}
+		fmt.Fprintln(stderr, "parleyd init: this is a diagnostic-read failure, not a corrupt database -- verify with `parleyctl hello` against a `parleyd serve` on this file, or inspect the installation table directly.")
+		return 1
+	}
+
+	// Explicit close-and-check on the success path, distinct from any
+	// deferred cleanup a failure path above used: both Ownership.Close and
+	// store.DB.Close are safe to call more than once, so this cannot
+	// conflict with anything else, and it lets a post-success close
+	// failure be reported truthfully instead of silently swallowed by a
+	// bare defer.
+	if err := db.Close(); err != nil {
+		owner.Close()
+		fmt.Fprintf(stderr, "parleyd init: %s was initialized (server_id: %s) but failed to close cleanly: %v\n", path, serverID, err)
+		fmt.Fprintln(stderr, "parleyd init: the database was written successfully; this failure is limited to closing this handle. Verify before relying on it.")
+		return 1
+	}
+	if err := owner.Close(); err != nil {
+		fmt.Fprintf(stderr, "parleyd init: %s was initialized (server_id: %s) but failed to release ownership cleanly: %v\n", path, serverID, err)
+		fmt.Fprintln(stderr, "parleyd init: the database was written successfully; this failure is limited to releasing the ownership lock. Verify no stale lock blocks a subsequent `parleyd serve` before relying on it.")
 		return 1
 	}
 
@@ -188,11 +250,15 @@ func (a administrators) Set(value string) error {
 	if _, exists := a[id]; exists {
 		return fmt.Errorf("administrator %q repeated", id)
 	}
-	uid, err := strconv.ParseUint(uidText, 10, 32)
+	// control.ParseUID rejects anything that does not fit a 32-bit
+	// platform UID (mandate R2) -- the shared validator every UID-bearing
+	// input in this binary and parleyctl reuses, rather than each caller
+	// narrowing an unbounded value on its own.
+	uid, err := control.ParseUID(uidText)
 	if err != nil {
 		return fmt.Errorf("invalid UID in %q: %w", value, err)
 	}
-	a[id] = uint32(uid)
+	a[id] = uid
 	return nil
 }
 
@@ -205,7 +271,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(&output)
 	dbPath := fs.String("database", "", "absolute path to an already-initialized database (required; see parleyd init)")
 	adminSocket := fs.String("admin-socket", "", "absolute path for the administration Unix socket (required)")
-	serverUID := fs.Uint("server-uid", uint(os.Getuid()), "this process's own UID, as administrators/clients verify it")
+	serverUIDText := fs.String("server-uid", strconv.Itoa(os.Getuid()), "this process's own UID, as administrators/clients verify it")
 	socketMode := fs.String("socket-mode", "0600", "administration socket file mode: 0600, or 0660 with an explicitly provisioned administrator-only group")
 	markersDir := fs.String("recovery-markers-dir", "", "absolute path to a private (mode 0700), server-owned directory for durable recovery markers (required)")
 	markersCapacity := fs.Int("recovery-markers-capacity", 64, "bounded materialization capacity for recovery marker listing")
@@ -237,6 +303,14 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "parleyd serve: invalid -socket-mode %q: %v\n", *socketMode, err)
 		return 2
 	}
+	// control.ParseUID validates the full value before any narrowing
+	// (mandate R2): fs.Uint's unchecked uint32(*serverUID) conversion let
+	// 2^32 silently become 0 (root) on a 64-bit host.
+	serverUID, err := control.ParseUID(*serverUIDText)
+	if err != nil {
+		fmt.Fprintf(stderr, "parleyd serve: invalid -server-uid %q: %v\n", *serverUIDText, err)
+		return 2
+	}
 	// -admin-socket's absoluteness is enforced by control.NewConfig below.
 	// -database and -recovery-markers-dir are checked here so behavior does
 	// not depend on the server's working directory across restarts.
@@ -248,7 +322,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "parleyd serve: -recovery-markers-dir must be an absolute, clean path")
 		return 2
 	}
-	controlCfg, err := control.NewConfig(*adminSocket, uint32(*serverUID), admins)
+	controlCfg, err := control.NewConfig(*adminSocket, serverUID, admins)
 	if err != nil {
 		fmt.Fprintf(stderr, "parleyd serve: %v\n", err)
 		return 2
@@ -259,7 +333,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		control:         controlCfg,
 		socketMode:      os.FileMode(mode),
 		markersDir:      *markersDir,
-		markersUID:      uint32(*serverUID),
+		markersUID:      serverUID,
 		markersCapacity: *markersCapacity,
 	}, stdout, stderr)
 }
@@ -286,8 +360,10 @@ func serve(ctx context.Context, cfg serveConfig, stdout, stderr io.Writer) int {
 	// listenerService does not bind cfg.control's socket yet -- Start does,
 	// once runtime.Start has already acquired exclusive database ownership.
 	// A process that loses that race must never create, probe or replace
-	// the admin socket at all (docs/runtime.md's startup ordering).
-	listenerService := control.NewListenerService(cfg.control, cfg.socketMode, uuid.NewString())
+	// the admin socket at all (docs/runtime.md's startup ordering). It
+	// resolves its own server/epoch identity from the writer runtime.Start
+	// supplies (mandate R6) rather than being handed a separately minted one.
+	listenerService := control.NewListenerService(cfg.control, cfg.socketMode)
 
 	markers, err := recovery.NewDirectory(cfg.markersDir, cfg.markersUID, cfg.markersCapacity)
 	if err != nil {
@@ -295,13 +371,29 @@ func serve(ctx context.Context, cfg serveConfig, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// failStop must be nonblocking, perform no I/O and never reenter the
-	// store (internal/recovery/service.go's Config.FailStop contract). It
-	// only signals; the actual shutdown/exit-code reaction happens in the
-	// select loop below, outside this callback.
-	failStopSignal := make(chan struct{})
-	var failStopOnce sync.Once
-	failStop := func() { failStopOnce.Do(func() { close(failStopSignal) }) }
+	// stopSignal generalizes the previous failStop-only signal (mandate
+	// R4) to carry an optional message and to be triggerable from either
+	// of two independent sources -- recovery's own fail-stop callback, or
+	// the listener's accept loop giving up on an unexpected error -- while
+	// remaining exactly one "wake main and stop" mechanism, not two. Both
+	// callbacks must stay nonblocking, perform no I/O and never reenter the
+	// store; the actual shutdown/exit-code reaction happens in the select
+	// loop below, outside either callback.
+	stopSignal := make(chan struct{})
+	var stopOnce sync.Once
+	var stopMessage string
+	triggerStop := func(message string) {
+		stopOnce.Do(func() {
+			stopMessage = message
+			close(stopSignal)
+		})
+	}
+	failStop := func() {
+		triggerStop("recovery evidence could not be made durable; stopping for supervised recovery")
+	}
+	listenerService.OnAcceptFailure(func(err error) {
+		triggerStop(fmt.Sprintf("administration listener stopped accepting connections: %v", err))
+	})
 
 	var recoveryService *recovery.Service
 	runtimeCfg := runtime.Config{
@@ -330,15 +422,15 @@ func serve(ctx context.Context, cfg serveConfig, stdout, stderr io.Writer) int {
 
 	select {
 	case <-ctx.Done():
-	case <-failStopSignal:
-		fmt.Fprintln(stderr, "parleyd serve: recovery evidence could not be made durable; stopping for supervised recovery")
+	case <-stopSignal:
+		fmt.Fprintf(stderr, "parleyd serve: %s\n", stopMessage)
 	}
 	if err := running.Stop(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "parleyd serve: shutdown: %v\n", err)
 		return 1
 	}
 	select {
-	case <-failStopSignal:
+	case <-stopSignal:
 		return 1
 	default:
 		return 0

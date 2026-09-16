@@ -64,6 +64,23 @@ type Coordinator struct {
 }
 
 func (d *DB) Coordinator() *Coordinator { return d.coordinator }
+
+// Epoch returns this writer's process-local coordinator epoch, the same
+// value every Execute/Transition/Settle/Inspect call publishes and audits
+// under. It mints the epoch via the same one-time lock() initialization
+// those calls use if no mutation has run yet, so a caller that reads Epoch
+// before any other coordinator activity still observes the epoch that will
+// govern every later commit -- never a second, independently generated
+// identity for the same runtime (see internal/control's server.hello,
+// which must publish this exact value, not a value of its own).
+func (c *Coordinator) Epoch(ctx context.Context) (string, error) {
+	if err := c.lock(ctx); err != nil {
+		return "", storageCode(err)
+	}
+	defer func() { <-c.gate }()
+	return c.epoch, nil
+}
+
 func (c *Coordinator) lock(ctx context.Context) error {
 	select {
 	case c.gate <- struct{}{}:

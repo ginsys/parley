@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 
 	"github.com/ginsys/parley/internal/store"
@@ -249,6 +250,32 @@ type HelloResult struct {
 	State           string   `json:"state"` // "running" or "recovery_only"
 	Limits          Limits   `json:"limits"`
 	Methods         []string `json:"methods"`
+}
+
+// validate reports whether h is a well-formed, negotiated hello result:
+// the exact supported protocol, a real (non-zero-value) server/epoch/
+// administrator identity, a known operational state, and sane profile
+// limits. A response that already passed Call's own envelope/success
+// checks can still carry a zero-value or otherwise nonsensical result (a
+// bare `{"result":{}}` decodes into a HelloResult with every field at its
+// zero value without error); Dial must not treat a merely well-formed
+// JSON-RPC success as a completed protocol negotiation (mandate R5). A
+// matching correlation ID alone is not proof of negotiation either.
+func (h HelloResult) validate() error {
+	if h.Protocol != ProtocolVersion {
+		return fmt.Errorf("control: hello result claims unsupported protocol %q", h.Protocol)
+	}
+	if h.ServerID == "" || h.ServerEpoch == "" || h.AdministratorID == "" {
+		return errors.New("control: hello result is missing a required identity field")
+	}
+	if h.State != string(StateRunning) && h.State != string(StateRecoveryOnly) {
+		return fmt.Errorf("control: hello result has an unknown state %q", h.State)
+	}
+	if h.Limits.MaxFrameBytes <= 0 || h.Limits.MaxNestingDepth <= 0 || h.Limits.MaxSocketsPerAdministrator <= 0 ||
+		h.Limits.MaxSocketsTotal <= 0 || h.Limits.MaxExecutingPerSocket <= 0 || h.Limits.MaxQueuedPerSocket <= 0 {
+		return errors.New("control: hello result has invalid (non-positive) profile limits")
+	}
+	return nil
 }
 
 // Limits mirrors the profile constants advertised at hello.

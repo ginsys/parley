@@ -442,7 +442,7 @@ func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	service := control.NewListenerService(controlCfg, 0600, "epoch-fixture")
+	service := control.NewListenerService(controlCfg, 0600)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	if err := service.Start(ctx, runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
