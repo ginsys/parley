@@ -173,12 +173,17 @@ func (l *Lifecycle) LegacyDisposition(ctx context.Context, p store.CommandPrinci
 	return l.disposition(ctx, p, request, store.DispositionRequest{Legacy: true, Work: store.WorkRef{Kind: "envelope", ID: r.WorkID}, IncidentID: r.MigrationIncidentID, ExpectedVersion: r.ExpectedQuarantineVersion, Action: r.Action, ReasonCode: "owner_reviewed", EvidenceRef: r.DispositionRef, PrincipalID: p.ID, OperationID: r.OperationID}, evidenceErr)
 }
 func (l *Lifecycle) disposition(ctx context.Context, p store.CommandPrincipal, request store.CommandRequest, r store.DispositionRequest, evidenceErr error) (store.CommandReceipt, error) {
-	kind := "hold.disposition"
-	if r.Legacy {
-		kind = "legacy.disposition"
-	}
 	return l.config.Store.Coordinator().Execute(ctx, p, request, l.authorization(p), func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
-		if err := l.config.Guard(ctx, tx, kind); err != nil {
+		// hold.disposition/legacy.disposition are reachable during a global
+		// recovery hold (D3, internal/recovery/service.go humanRecovery), which
+		// also exempts them from that package's automatic per-command retirement
+		// lookup. Perform the equivalent check here explicitly, against the
+		// actual trusted command principal p, never against the operation kind:
+		// an operation-name string is not a namespace and must not be treated as
+		// one. This mirrors recovery.RestoreAdministration.Complete and
+		// recovery.Administration.ClockReconcile, the other Execute-based
+		// commands humanRecovery exempts from the automatic check.
+		if err := store.CheckRetiredMutation(ctx, tx, p.ID); err != nil {
 			return domainRejection(err)
 		}
 		if evidenceErr != nil {

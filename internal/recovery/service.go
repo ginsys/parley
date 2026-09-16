@@ -61,8 +61,26 @@ func New(ctx context.Context, c Config) (*Service, error) {
 	s.initialized.Store(true)
 	return s, nil
 }
+
+// humanRecovery controls which operation kinds remain reachable while the
+// global recovery hold applies (before's held-gate and transactionTime's own
+// held-gate/auto-retirement-check exemption below). It is not itself proof
+// that any specific authenticated administrator may perform a new mutation.
+//
+// hold.disposition and legacy.disposition are reachable here (D3: bounded,
+// reviewed item dispositions may accumulate under an incident while the
+// global hold remains), but unlike human_inspection/clock.reconcile/
+// recovery.complete they mutate on behalf of a namespace-scoped
+// administrator, so they perform their own explicit store.CheckRetiredMutation
+// call at the mutation site (internal/connection/lifecycle.go) instead of
+// relying on this predicate to skip retirement enforcement. Do not use
+// membership in this predicate as a substitute for that explicit check.
 func humanRecovery(kind string) bool {
-	return kind == "human_inspection" || kind == "clock.reconcile" || kind == "recovery.complete"
+	switch kind {
+	case "human_inspection", "clock.reconcile", "recovery.complete", "hold.disposition", "legacy.disposition":
+		return true
+	}
+	return false
 }
 func (s *Service) before(ctx context.Context, kind string) error {
 	if !s.initialized.Load() {
