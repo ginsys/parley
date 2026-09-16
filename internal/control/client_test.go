@@ -99,6 +99,136 @@ func TestDialFailsWhenAdministratorUIDUnconfigured(t *testing.T) {
 // accepts but never responds, proving Call reports *TimeoutError -- never a
 // *RemoteError -- when ctx's deadline elapses. The caller must not treat
 // this as proof the request failed on the server.
+// TestClientCallRejectsMismatchedResponseIDAndBreaksTheConnection proves a
+// response whose id does not match the outstanding request's id is never
+// treated as this call's own result -- the call fails and the connection
+// is marked broken so no later call can read whatever response was
+// actually meant for the mismatched id.
+func TestClientCallRejectsMismatchedResponseIDAndBreaksTheConnection(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := dir + "/admin.sock"
+	uid := uint32(os.Getuid())
+	raw, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	go func() {
+		conn, err := raw.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		bufio.NewReader(conn).ReadBytes('\n')
+		conn.Write([]byte(`{"jsonrpc":"2.0","id":"not-the-request-id","result":{}}` + "\n"))
+	}()
+
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+	defer client.Close()
+
+	err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	if err == nil {
+		t.Fatal("expected a mismatched response id to be rejected")
+	}
+	if !client.broken {
+		t.Fatal("connection not marked broken after a mismatched response id")
+	}
+	if err := client.Call(context.Background(), "server.hello", nil, nil); !errors.Is(err, errClientBroken) {
+		t.Fatalf("err=%v, want errClientBroken", err)
+	}
+}
+
+// TestClientCallMarksConnectionBrokenAfterTimeout proves a timed-out call
+// leaves the connection unusable for a subsequent call: the response, if
+// the server eventually sends one, is still unread on the wire and must
+// never be attributed to a later, unrelated call.
+func TestClientCallMarksConnectionBrokenAfterTimeout(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := dir + "/admin.sock"
+	uid := uint32(os.Getuid())
+	raw, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	release := make(chan struct{})
+	defer close(release)
+	go func() {
+		conn, err := raw.Accept()
+		if err != nil {
+			return
+		}
+		<-release
+		conn.Close()
+	}()
+
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err = client.Call(ctx, "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	var timeout *TimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatalf("err=%v, want *TimeoutError", err)
+	}
+	if !client.broken {
+		t.Fatal("connection not marked broken after a timeout")
+	}
+	if err := client.Call(context.Background(), "server.hello", nil, nil); !errors.Is(err, errClientBroken) {
+		t.Fatalf("err=%v, want errClientBroken", err)
+	}
+}
+
+// TestReadBoundedFrameRefusesOversizedUnterminatedStream proves the
+// client's response reader will not buffer without limit -- mirroring the
+// server's own MaxFrameBytes write bound (writeResponse in
+// listener_linux.go) -- when a peer never sends the terminating LF.
+func TestReadBoundedFrameRefusesOversizedUnterminatedStream(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := dir + "/admin.sock"
+	raw, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	go func() {
+		conn, err := raw.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		chunk := make([]byte, 4096)
+		for i := range chunk {
+			chunk[i] = 'x'
+		}
+		for {
+			if _, err := conn.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+
+	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, err = readBoundedFrame(bufio.NewReader(conn))
+	if err == nil {
+		t.Fatal("expected refusal of an unbounded unterminated stream")
+	}
+}
+
 func TestClientCallTimesOutWithoutFalseFailureSemantics(t *testing.T) {
 	dir := privateSocketDir(t)
 	path := dir + "/admin.sock"

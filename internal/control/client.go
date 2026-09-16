@@ -21,7 +21,19 @@ type Client struct {
 	conn   *net.UnixConn
 	br     *bufio.Reader
 	nextID uint64
+
+	// broken is set once this connection's request/response correlation
+	// can no longer be trusted (a write/read/decode failure, or a
+	// response whose ID did not match the outstanding request). Once
+	// set, every subsequent Call refuses immediately rather than risk
+	// reading a stale, unread response left on the wire from an earlier
+	// call as if it belonged to a new one.
+	broken bool
 }
+
+// errClientBroken is returned by Call once a prior call left this
+// connection's request/response correlation in an unknown state.
+var errClientBroken = errors.New("control: connection is no longer usable after a prior unresolved call")
 
 // Dial connects to cfg.Endpoint, authenticating the server's kernel UID via
 // connection.DialTrustedServer, then performs the first-call server.hello
@@ -54,6 +66,9 @@ func (c *Client) Close() error { return c.conn.Close() }
 // client-observed timeout as proof the request failed on the server (see
 // docs/specifications/control.md's outcome-uncertainty guidance).
 func (c *Client) Call(ctx context.Context, method string, params map[string]any, out any) error {
+	if c.broken {
+		return errClientBroken
+	}
 	c.nextID++
 	id := strconv.FormatUint(c.nextID, 10)
 	if params == nil {
@@ -74,15 +89,33 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 
 	request = append(request, '\n')
 	if _, err := c.conn.Write(request); err != nil {
+		// A partially written request leaves the server's read position
+		// unknown to us; a later call on this connection could read
+		// whatever response the server eventually sends for it.
+		c.broken = true
 		return wrapTimeout(err)
 	}
-	line, err := c.br.ReadBytes('\n')
+	line, err := readBoundedFrame(c.br)
 	if err != nil {
+		// Timeout or any other read failure: the response, if any, is
+		// unread and still on the wire. A later call must never read it
+		// mistaking it for its own.
+		c.broken = true
 		return wrapTimeout(err)
 	}
 	var resp incomingResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
+		c.broken = true
 		return fmt.Errorf("control: malformed response: %w", err)
+	}
+	if resp.ID == nil || *resp.ID != id {
+		// The server's own serialization (internal/control/listener_linux.go)
+		// never has more than one request in flight per socket, so a
+		// mismatched ID means this connection's framing is desynchronized,
+		// not merely that a request was skipped -- never proceed as if the
+		// mismatched response belonged to this call.
+		c.broken = true
+		return fmt.Errorf("control: response id %v does not match request id %q", resp.ID, id)
 	}
 	if resp.Error != nil {
 		remote := &RemoteError{RPC: resp.Error.Code, Message: resp.Error.Message}
@@ -95,6 +128,28 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		return nil
 	}
 	return json.Unmarshal(resp.Result, out)
+}
+
+// readBoundedFrame reads one LF-terminated response line, refusing to grow
+// past MaxFrameBytes -- the same bound the server enforces on its own
+// writes (see writeResponse in listener_linux.go). Without this, a
+// malformed or hostile peer sending an unterminated stream would make
+// bufio.Reader.ReadBytes buffer without limit.
+func readBoundedFrame(br *bufio.Reader) ([]byte, error) {
+	var buf []byte
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		buf = append(buf, b)
+		if b == '\n' {
+			return buf, nil
+		}
+		if len(buf) >= MaxFrameBytes {
+			return nil, fmt.Errorf("control: response exceeds the frame bound")
+		}
+	}
 }
 
 // incomingResponse mirrors wireResponse (response.go) for decoding rather
