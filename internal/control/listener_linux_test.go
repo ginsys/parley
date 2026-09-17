@@ -698,6 +698,66 @@ func TestListenerServiceReceiptEpochMatchesHelloEpoch(t *testing.T) {
 	}
 }
 
+// restartTeardownWait bounds every finite wait used by serveIncarnation
+// and its regression below, so a stuck accept loop cannot hang either the
+// test or its own cleanup indefinitely.
+const restartTeardownWait = 5 * time.Second
+
+// serveIncarnation bundles one restart incarnation's store/listener
+// lifetime and guarantees its stop/close sequence runs exactly once,
+// whether invoked explicitly (the normal restart path, before the next
+// incarnation opens the same on-disk file) or as a t.Cleanup fallback if a
+// fallible operation between resource acquisition and that explicit
+// teardown fails first. Register teardown via t.Cleanup as soon as the
+// struct exists, before acquiring any resource, so a failure at any later
+// point -- not only after the explicit teardown -- still stops admission,
+// cancels, waits for the accept loop to actually exit, and closes the
+// store, instead of leaking them past the test (mandate T1 companion).
+type serveIncarnation struct {
+	once   sync.Once
+	db     *store.DB
+	svc    *Listener
+	cancel context.CancelFunc
+}
+
+// teardown stops admission, cancels the worker context, waits (bounded)
+// for the accept loop to actually finish, then closes the store -- in
+// that order, so DB resources are only released after the service has
+// genuinely stopped. sync.Once makes it safe to call both explicitly and
+// as a t.Cleanup fallback without double-closing the listener or
+// manufacturing a cleanup error on a healthy restart; nil fields (an
+// early failure before a later resource was acquired) are skipped.
+func (s *serveIncarnation) teardown(t *testing.T) {
+	t.Helper()
+	s.once.Do(func() {
+		if s.svc != nil {
+			if err := s.svc.StopAdmission(); err != nil {
+				t.Errorf("StopAdmission: %v", err)
+			}
+		}
+		if s.cancel != nil {
+			s.cancel()
+		}
+		if s.svc != nil {
+			done := make(chan error, 1)
+			go func() { done <- s.svc.Wait() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("listener accept loop reported failure: %v", err)
+				}
+			case <-time.After(restartTeardownWait):
+				t.Errorf("listener did not stop accepting within %s", restartTeardownWait)
+			}
+		}
+		if s.db != nil {
+			if err := s.db.Close(); err != nil {
+				t.Errorf("closing store: %v", err)
+			}
+		}
+	})
+}
+
 // TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory exercises
 // an actual restart: reopening the same on-disk database and starting a
 // fresh Listener/coordinator produces a new epoch (mandate R6: "restarting
@@ -718,11 +778,17 @@ func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T
 	principal := store.CommandPrincipal{ID: adminID, ConnectorUID: uid}
 
 	// First incarnation: init, serve, capture hello's epoch/server_id and a
-	// real committed receipt.
+	// real committed receipt. inc1's teardown is registered before any
+	// resource is acquired, so a failure at any point below -- not only
+	// after the explicit teardown further down -- still tears it down.
+	inc1 := &serveIncarnation{}
+	t.Cleanup(func() { inc1.teardown(t) })
+
 	db1, err := store.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	inc1.db = db1
 	if err := db1.OpenReaders(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -733,6 +799,8 @@ func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T
 	}
 	svc1 := NewListenerService(cfg1, 0600)
 	wctx1, cancel1 := context.WithCancel(ctx)
+	inc1.svc = svc1
+	inc1.cancel = cancel1
 	if err := svc1.Start(ctx, runtime.Resources{WorkerContext: wctx1, Writer: db1, Queries: db1.Queries(), Mode: runtime.Normal}); err != nil {
 		t.Fatal(err)
 	}
@@ -753,22 +821,25 @@ func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T
 		t.Fatalf("receipt epoch %q != hello epoch %q", receipt1.View.Epoch, epoch1)
 	}
 
-	svc1.StopAdmission()
-	cancel1()
-	svc1.Wait()
-	if err := db1.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// Explicit normal teardown of the first incarnation, before the second
+	// one opens the same on-disk file. inc1.teardown is idempotent
+	// (sync.Once), so the t.Cleanup fallback registered above becomes a
+	// no-op rather than double-closing anything.
+	inc1.teardown(t)
 
 	// Second incarnation: a real restart against the same on-disk file.
+	// Same registration discipline as inc1.
+	inc2 := &serveIncarnation{}
+	t.Cleanup(func() { inc2.teardown(t) })
+
 	db2, err := store.OpenExisting(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	inc2.db = db2
 	if err := db2.OpenReaders(ctx); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db2.Close() })
 	socketPath2 := filepath.Join(dir, "admin2.sock")
 	cfg2, err := NewConfig(socketPath2, uid, map[string]uint32{adminID: uid})
 	if err != nil {
@@ -776,15 +847,11 @@ func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T
 	}
 	svc2 := NewListenerService(cfg2, 0600)
 	wctx2, cancel2 := context.WithCancel(ctx)
-	t.Cleanup(cancel2)
+	inc2.svc = svc2
+	inc2.cancel = cancel2
 	if err := svc2.Start(ctx, runtime.Resources{WorkerContext: wctx2, Writer: db2, Queries: db2.Queries(), Mode: runtime.Normal}); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		svc2.StopAdmission()
-		cancel2()
-		svc2.Wait()
-	})
 
 	resp2 := dialAndRoundTrip(t, socketPath2, uid, `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
 	result2 := resp2["result"].(map[string]any)
@@ -813,4 +880,89 @@ func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T
 		t.Fatalf("historical receipt not preserved: replayed=%v auditID=%q (want %q) epoch=%q (want %q)",
 			replay.Replayed, replay.AuditID, receipt1.AuditID, replay.View.Epoch, epoch1)
 	}
+}
+
+// TestListenerRestartFirstIncarnationCleansUpOnEarlyReturnAfterGenuineStart
+// is the restart test's T1-companion regression. After synchronizing on a
+// genuinely started first incarnation (a real authenticated server.hello
+// round trip succeeds, not merely a raw dial), it deliberately returns
+// early -- no explicit StopAdmission/cancel/Wait/Close -- relying solely
+// on serveIncarnation's t.Cleanup fallback.
+//
+// Registration order controls the property under test: privateSocketDir's
+// own directory-removal cleanup is registered first (so it fires *last*),
+// the post-teardown verification below is registered second (so it fires
+// *second*), and inc's fallback teardown is registered last (so it fires
+// *first*) -- meaning fixture removal never races a still-live listener or
+// open store, and the verification below only ever runs after teardown has
+// already completed (mandate T1 companion: "verify its service stopped
+// and DB resources settled before fixture removal").
+func TestListenerRestartFirstIncarnationCleansUpOnEarlyReturnAfterGenuineStart(t *testing.T) {
+	ctx := context.Background()
+	dir := privateSocketDir(t)
+	dbPath := filepath.Join(dir, "parley.db")
+	adminID := "60000000-0000-4000-8000-000000000002"
+	uid := uint32(os.Getuid())
+	socketPath := filepath.Join(dir, "admin.sock")
+
+	var svc *Listener
+	// Registered before inc's fallback teardown (so LIFO runs it *after*
+	// teardown has already completed): proves the listener was actually
+	// closed -- a fresh dial must fail -- and that the accept loop
+	// actually exited, the same evidentiary shape as
+	// TestServeCleanupWaitsForCompletionEvenOnEarlyReturn in cmd/parleyd.
+	t.Cleanup(func() {
+		if svc == nil {
+			return // never got far enough to start; nothing to verify
+		}
+		if _, dialErr := connection.DialTrustedServer(context.Background(), socketPath, uid); dialErr == nil {
+			t.Error("socket still accepts connections after the wait-for-completion cleanup returned")
+		}
+		done := make(chan error, 1)
+		go func() { done <- svc.Wait() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("listener accept loop reported failure: %v", err)
+			}
+		case <-time.After(restartTeardownWait):
+			t.Error("accept loop did not exit promptly after teardown")
+		}
+	})
+
+	inc := &serveIncarnation{}
+	t.Cleanup(func() { inc.teardown(t) })
+
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inc.db = db
+	if err := db.OpenReaders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewConfig(socketPath, uid, map[string]uint32{adminID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc = NewListenerService(cfg, 0600)
+	wctx, cancel := context.WithCancel(ctx)
+	inc.svc = svc
+	inc.cancel = cancel
+	if err := svc.Start(ctx, runtime.Resources{WorkerContext: wctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Synchronize on actual readiness -- a full authenticated hello round
+	// trip, not merely a raw dial -- before deliberately taking the
+	// early-return path below.
+	resp := dialAndRoundTrip(t, socketPath, uid, `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
+	if resp["error"] != nil {
+		t.Fatalf("hello failed on a genuinely started incarnation: %#v", resp)
+	}
+
+	// Deliberately nothing else here: no explicit StopAdmission/cancel/
+	// Wait/Close. Reaching the end of the test function having only
+	// confirmed startup above is the "early exit after a genuinely started
+	// first incarnation" this regression demonstrates recovers cleanly.
 }

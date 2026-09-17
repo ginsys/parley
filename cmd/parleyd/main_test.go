@@ -36,6 +36,55 @@ func privateDir(t *testing.T, prefix string) string {
 	return dir
 }
 
+// privateDirRetainable behaves exactly like privateDir, except its removal
+// cleanup checks *retain immediately before deleting the directory: when
+// *retain is true it logs and keeps the directory instead of racing
+// filesystem removal against a server that never confirmed it finished.
+// t.Cleanup's LIFO order guarantees a serve-shutdown cleanup registered
+// after these directories exist (see registerServeShutdownCleanup) runs,
+// and can set *retain, before any of these removal cleanups run -- so a
+// bounded shutdown-wait timeout can retain the affected fixtures instead of
+// treating elapsed waiting as permission for teardown (mandate T1 item 3).
+func privateDirRetainable(t *testing.T, prefix string, retain *bool) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if *retain {
+			t.Logf("retaining %s: serve did not confirm shutdown within the cleanup wait", dir)
+			return
+		}
+		os.RemoveAll(dir)
+	})
+	return dir
+}
+
+// registerServeShutdownCleanup registers the cancel-and-wait-for-completion
+// cleanup shared by every serve-based test below. Callers must register it
+// before launching serve, so it fires on every exit path including a
+// failure between registration and launch, not only after later assertions
+// (mandate T1 item 1). It is the single implementation exercised by both
+// the acceptance test's normal shutdown path and the early-return
+// regression, so the regression proves the actual helper under test, not
+// an independently maintained duplicate of its shape (mandate T1 item 2).
+// On a bounded timeout it sets *retain so directory-removal cleanups
+// registered earlier (and therefore running later, after this one, under
+// t.Cleanup's LIFO order) retain their fixtures (mandate T1 item 3).
+func registerServeShutdownCleanup(t *testing.T, cancel context.CancelFunc, finished <-chan struct{}, retain *bool) {
+	t.Helper()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(shutdownWait):
+			*retain = true
+			t.Errorf("cleanup: serve did not shut down within %s of cancellation", shutdownWait)
+		}
+	})
+}
+
 func TestRunHelpAndNoArgsShowUsageWithoutTouchingAnything(t *testing.T) {
 	for _, args := range [][]string{nil, {"help"}, {"-h"}, {"--help"}} {
 		var out, errOut bytes.Buffer
@@ -712,14 +761,15 @@ const shutdownWait = 5 * time.Second
 // server.hello round trip through the actual listener/session/store stack,
 // then cancel the context and confirm ordered shutdown returns success.
 func TestServeStartsServesHelloAndShutsDownOnCancellation(t *testing.T) {
-	dbPath := filepath.Join(privateDir(t, "parleyd-serve-db-"), "parley.db")
+	var retainFixtures bool
+	dbPath := filepath.Join(privateDirRetainable(t, "parleyd-serve-db-", &retainFixtures), "parley.db")
 	var initOut, initErr bytes.Buffer
 	if code := runInit([]string{"-database", dbPath}, &initOut, &initErr); code != 0 {
 		t.Fatalf("init failed: code=%d err=%q", code, initErr.String())
 	}
 
-	socketPath := filepath.Join(privateDir(t, "parleyd-serve-sock-"), "admin.sock")
-	markersDir := filepath.Join(privateDir(t, "parleyd-serve-mk-"), "markers")
+	socketPath := filepath.Join(privateDirRetainable(t, "parleyd-serve-sock-", &retainFixtures), "admin.sock")
+	markersDir := filepath.Join(privateDirRetainable(t, "parleyd-serve-mk-", &retainFixtures), "markers")
 	if err := os.Mkdir(markersDir, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -742,6 +792,16 @@ func TestServeStartsServesHelloAndShutsDownOnCancellation(t *testing.T) {
 	var resultMu sync.Mutex
 	var resultCode int
 	var out, errOut bytes.Buffer
+
+	// Registered before serve is launched (mandate T1 item 1): fires on
+	// every exit path, including a failure between here and the launch
+	// itself, not only after later assertions. t.Cleanup's LIFO order runs
+	// this before privateDirRetainable's own removal cleanups (registered
+	// earlier, above), so a bare cancel() is never treated as evidence that
+	// serve actually finished -- this waits for it, bounded, and retains
+	// the fixtures above on a timeout instead of conceding them to removal.
+	registerServeShutdownCleanup(t, cancel, finished, &retainFixtures)
+
 	go func() {
 		code := serve(ctx, serveConfig{
 			databasePath: dbPath, control: controlCfg, socketMode: 0600,
@@ -752,22 +812,6 @@ func TestServeStartsServesHelloAndShutsDownOnCancellation(t *testing.T) {
 		resultMu.Unlock()
 		close(finished)
 	}()
-
-	// Registered right after launch, before any assertion below can fail:
-	// t.Cleanup runs on every exit path, including an early t.Fatal, and
-	// runs LIFO, so this fires before privateDir's own directory-removal
-	// cleanups (registered earlier, above) even though this line runs
-	// later in the function body. A bare cancel() is not evidence that
-	// serve actually finished (mandate T1) -- this waits for it, bounded,
-	// before conceding those directories to removal.
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-finished:
-		case <-time.After(shutdownWait):
-			t.Errorf("cleanup: serve did not shut down within %s of cancellation", shutdownWait)
-		}
-	})
 
 	var conn *net.UnixConn
 	deadline := time.Now().Add(3 * time.Second)
@@ -831,32 +875,46 @@ func TestServeStartsServesHelloAndShutsDownOnCancellation(t *testing.T) {
 }
 
 // TestServeCleanupWaitsForCompletionEvenOnEarlyReturn is T1's direct
-// regression. It deliberately does *not* do the hello round trip or call
-// cancel() itself -- exactly mirroring what would remain if an assertion
-// between launch and the acceptance test's own explicit cancel()/select
-// had failed early -- and relies solely on t.Cleanup to tear serve down.
-// testing.T.Cleanup runs on every exit path, including a plain return, not
-// only after t.FailNow(), so this proves the same thing an early t.Fatal
-// would without leaving an intentionally-failing test in the suite (a
-// failing subtest would mark this package permanently red, defeating its
-// own purpose as a regression).
+// regression. After synchronizing on serve genuinely having started
+// (a real authenticated dial succeeds, proving the listener is bound and
+// therefore that ownership was already acquired -- serve only publishes
+// the socket after runtime.Start acquires it), it deliberately does *not*
+// do the hello round trip or call cancel() itself -- exactly mirroring
+// what would remain if an assertion between a confirmed launch and the
+// acceptance test's own explicit cancel()/select had failed early -- and
+// relies solely on t.Cleanup to tear serve down. Without that readiness
+// wait, cancellation could win a race against startup and a later
+// successful Acquire would demonstrate only that ownership was never taken
+// in the first place, not that a running owner was released (mandate T1
+// item 2). testing.T.Cleanup runs on every exit path, including a plain
+// return, not only after t.FailNow(), so this proves the same thing an
+// early t.Fatal would without leaving an intentionally-failing test in the
+// suite (a failing subtest would mark this package permanently red,
+// defeating its own purpose as a regression).
 //
-// Two cleanups are registered, in the order that makes t.Cleanup's LIFO
-// firing check the property that matters: the ownership re-acquisition
-// check is registered *first* (so it fires *last*), the cancel-and-wait is
-// registered *second* (so it fires *first*) -- meaning the re-acquisition
-// only ever runs after the wait has already blocked until serve() genuinely
-// returned. A cleanup that only called cancel() without waiting could let
-// this re-acquisition race the still-exiting goroutine and intermittently
-// find the lock still held.
+// Registration order matters here, and t.Cleanup fires LIFO: the fixture
+// directories are created *first* (via privateDirRetainable, each
+// registering its own removal), then the ownership re-acquisition check is
+// registered, then the shared cancel-and-wait cleanup last. Firing order is
+// therefore the reverse: the shared shutdown cleanup runs *first* (the same
+// helper the acceptance test uses, not an independently maintained
+// duplicate, per mandate T1 item 2) -- cancelling and waiting for serve to
+// actually return, and setting *retain on a bounded timeout -- then the
+// ownership re-acquisition check runs *second*, while dbPath still exists,
+// proving ownership was actually released rather than merely that
+// cancellation was requested; only then do the directory removals run,
+// last, honoring *retain if the wait above timed out. A cleanup that only
+// called cancel() without waiting could let the re-acquisition race the
+// still-exiting goroutine and intermittently find the lock still held.
 func TestServeCleanupWaitsForCompletionEvenOnEarlyReturn(t *testing.T) {
-	dbPath := filepath.Join(privateDir(t, "parleyd-serve-earlyret-db-"), "parley.db")
+	var retainFixtures bool
+	dbPath := filepath.Join(privateDirRetainable(t, "parleyd-serve-earlyret-db-", &retainFixtures), "parley.db")
 	var initOut, initErr bytes.Buffer
 	if code := runInit([]string{"-database", dbPath}, &initOut, &initErr); code != 0 {
 		t.Fatalf("init failed: code=%d err=%q", code, initErr.String())
 	}
-	socketPath := filepath.Join(privateDir(t, "parleyd-serve-earlyret-sock-"), "admin.sock")
-	markersDir := filepath.Join(privateDir(t, "parleyd-serve-earlyret-mk-"), "markers")
+	socketPath := filepath.Join(privateDirRetainable(t, "parleyd-serve-earlyret-sock-", &retainFixtures), "admin.sock")
+	markersDir := filepath.Join(privateDirRetainable(t, "parleyd-serve-earlyret-mk-", &retainFixtures), "markers")
 	if err := os.Mkdir(markersDir, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -867,10 +925,10 @@ func TestServeCleanupWaitsForCompletionEvenOnEarlyReturn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Registered first, so LIFO runs it *last*: by then, the cancel-and-wait
-	// cleanup below has already completed, so a fresh Acquire here proves
-	// ownership was actually released, not merely that cancellation was
-	// requested.
+	// Registered first, so LIFO runs it *last*: by then, the shared
+	// shutdown cleanup below has already completed, so a fresh Acquire
+	// here proves ownership was actually released, not merely that
+	// cancellation was requested.
 	t.Cleanup(func() {
 		owner, err := runtime.Acquire(dbPath)
 		if err != nil {
@@ -885,6 +943,11 @@ func TestServeCleanupWaitsForCompletionEvenOnEarlyReturn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
 	var out, errOut bytes.Buffer
+
+	// Registered before serve is launched (mandate T1 item 1), and using
+	// the same helper the acceptance test uses (mandate T1 item 2).
+	registerServeShutdownCleanup(t, cancel, finished, &retainFixtures)
+
 	go func() {
 		serve(ctx, serveConfig{
 			databasePath: dbPath, control: controlCfg, socketMode: 0600,
@@ -892,19 +955,30 @@ func TestServeCleanupWaitsForCompletionEvenOnEarlyReturn(t *testing.T) {
 		}, &out, &errOut)
 		close(finished)
 	}()
-	// Registered second, so LIFO runs it *first* -- the same cancel/wait
-	// shape as the acceptance test's own t.Cleanup.
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-finished:
-		case <-time.After(shutdownWait):
-			t.Errorf("cleanup: serve did not shut down within %s of cancellation", shutdownWait)
+
+	// Synchronize on actual readiness before deliberately taking the
+	// early-return path below: a successful authenticated dial proves
+	// serve reached its running state (the listener only publishes its
+	// socket after runtime.Start has already acquired ownership), so the
+	// ownership-release check above is proving a genuine release, not the
+	// absence of any owner to release (mandate T1 item 2).
+	var conn *net.UnixConn
+	deadline := time.Now().Add(3 * time.Second)
+	for conn == nil && time.Now().Before(deadline) {
+		c, dialErr := connection.DialTrustedServer(context.Background(), socketPath, uid)
+		if dialErr == nil {
+			conn = c
+			break
 		}
-	})
+		time.Sleep(20 * time.Millisecond)
+	}
+	if conn == nil {
+		t.Fatal("server never accepted an authenticated connection; nothing to demonstrate an early return from")
+	}
+	conn.Close()
 
 	// Deliberately nothing else here: no hello round trip, no explicit
-	// cancel(). Reaching the end of the test function with only the two
-	// t.Cleanup registrations above is the "early exit after launch" this
-	// regression demonstrates recovers cleanly.
+	// cancel(). Reaching the end of the test function having only
+	// confirmed startup above is the "early exit after a genuinely started
+	// server" this regression demonstrates recovers cleanly.
 }
