@@ -84,12 +84,24 @@ func (c *Client) Close() error { return c.conn.Close() }
 //
 // An already-cancelled context is refused before anything is sent: nothing
 // was dispatched, so this is a plain ctx.Err(), never *TimeoutError or a
-// broken connection. Once the request is written, an interrupted read
-// leaves the outcome of a mutating call genuinely unknown (the request may
-// have been received and executed); Call reports that as *TimeoutError,
-// exactly as it does for a deadline, and marks the connection broken so a
-// later call can never mistake a stale response for its own (see
-// docs/specifications/control.md's outcome-uncertainty guidance).
+// broken connection -- this is the one case positively established as
+// "not dispatched" (mandate T2); every other failure path below is not.
+// Once Write is entered, a failure there does not prove the request was
+// never seen either: a partial write can still leave bytes in the
+// connection's send buffer, so it is classified exactly like a post-write
+// read failure, not as a proven non-dispatch. And once the request is
+// fully written, an interrupted, truncated or oversized-without-terminator
+// read leaves the outcome of a mutating call genuinely unknown, whatever
+// its concrete transport cause -- a deadline, a cancellation, or the
+// connection closing or resetting with no valid matching response. Call
+// reports all of these uniformly as *TimeoutError (kept as the exported
+// type name for compatibility; despite the name it does not assert an
+// elapsed deadline specifically -- see TimeoutError's own doc comment) and
+// marks the connection broken so a later call can never mistake a stale or
+// still-pending response for its own (see
+// docs/specifications/control.md's outcome-uncertainty guidance). A
+// well-formed, ID-matched response -- success or RemoteError -- is by
+// contrast a definite, resolved outcome and is never wrapped this way.
 func (c *Client) Call(ctx context.Context, method string, params map[string]any, out any) error {
 	if c.broken {
 		return errClientBroken
@@ -132,9 +144,12 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 
 	request = append(request, '\n')
 	if _, err := c.conn.Write(request); err != nil {
-		// A partially written request leaves the server's read position
-		// unknown to us; a later call on this connection could read
-		// whatever response the server eventually sends for it.
+		// A failed or partial write leaves both the server's read position
+		// and whether it ever saw this request unknown to us -- this is
+		// not a proven non-dispatch, so it is classified exactly like a
+		// post-write read failure below, not returned bare (mandate T2).
+		// A later call on this connection could otherwise read whatever
+		// response the server eventually sends for it.
 		c.broken = true
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return wrapCancel(ctxErr, err)
@@ -143,9 +158,12 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 	}
 	line, err := readBoundedFrame(c.br)
 	if err != nil {
-		// Timeout, cancellation, or any other read failure: the response,
-		// if any, is unread and still on the wire. A later call must never
-		// read it mistaking it for its own.
+		// A deadline, a cancellation, an EOF/reset from the peer closing,
+		// or an oversized response with no terminator: none of these is a
+		// valid matching response, and none proves the request was not
+		// received and acted on. The response, if any, is unread and
+		// still on the wire; a later call must never read it mistaking it
+		// for its own (mandate T2).
 		c.broken = true
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return wrapCancel(ctxErr, err)
@@ -333,15 +351,27 @@ func (e *RemoteError) Error() string {
 	return fmt.Sprintf("control: rpc %d: %s", e.RPC, e.Message)
 }
 
-// TimeoutError wraps a transport error observed while ctx's deadline (or a
-// prior SetDeadline) elapsed. It carries no information about whether the
-// server received, executed or committed the request -- an unresolved
-// mutation must be retried with the same operation ID, never assumed
-// failed. See docs/specifications/control.md's command atomicity section.
+// TimeoutError represents an incomplete exchange: a write or read failure
+// observed after the request had already been handed to Write, once no
+// valid matching response can establish what actually happened. Despite
+// the name (kept for API compatibility -- every existing caller matches on
+// this concrete type), it is not asserted to mean an elapsed deadline
+// specifically: ctx's deadline elapsing is one cause, but so is ctx's
+// cancellation, the peer closing the connection (EOF), a reset, or an
+// oversized response with no terminator -- wrapTimeout and wrapCancel
+// below wrap all of these identically, deliberately, because the caller's
+// only correct response to any of them is the same: the outcome is
+// unknown, never labelled a proven failure (mandate T2, correcting an
+// earlier version of this type whose Error() text claimed "timed out"
+// unconditionally, which was simply false for an EOF/reset cause). It
+// carries no information about whether the server received, executed or
+// committed the request -- an unresolved mutation must be retried with the
+// same operation ID, never assumed failed. See
+// docs/specifications/control.md's command atomicity section.
 type TimeoutError struct{ err error }
 
 func (e *TimeoutError) Error() string {
-	return fmt.Sprintf("control: timed out waiting for a response: %v", e.err)
+	return fmt.Sprintf("control: incomplete exchange, outcome unknown: %v", e.err)
 }
 func (e *TimeoutError) Unwrap() error { return e.err }
 
@@ -354,10 +384,19 @@ func wrapCancel(ctxErr, ioErr error) error {
 	return &TimeoutError{err: fmt.Errorf("%w (ctx: %w)", ioErr, ctxErr)}
 }
 
+// wrapTimeout classifies a write/read failure observed with ctx not (yet)
+// Done at the point of the check in Call, so a deadline exceeding is only
+// one of the possible causes here. A server-side close (io.EOF), a reset,
+// or any other transport error at this point leaves the request's outcome
+// exactly as unknown as an actual deadline would: the request may already
+// have reached and executed on the server. Every caller of this function
+// is past the point where the request was (at least partially) handed to
+// Write, so unconditional wrapping is correct here; a positively-observed
+// pre-dispatch refusal (Call's own ctx.Err() check before Write) never
+// reaches this function (mandate T2 -- an earlier version here only
+// wrapped errors satisfying net.Error.Timeout(), so a plain EOF/reset
+// escaped as a bare, unwrapped error that a caller matching on
+// *TimeoutError would then treat as "definitely not performed").
 func wrapTimeout(err error) error {
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return &TimeoutError{err: err}
-	}
-	return err
+	return &TimeoutError{err: err}
 }
