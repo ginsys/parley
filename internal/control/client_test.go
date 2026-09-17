@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -63,6 +64,69 @@ func TestClientCallSequentialRequestsBothSucceed(t *testing.T) {
 		if !errors.As(err, &remote) || remote.Domain != OperationNotFound {
 			t.Fatalf("err=%#v", err)
 		}
+	}
+}
+
+// TestClientCallRejectsConcurrentCall is mandate CP-07's regression:
+// Client is documented single-connection, single-in-flight-request --
+// a second Call while one is still outstanding must fail fast with
+// errClientConcurrentCall rather than race nextID/br/the connection
+// deadline against the first call. This is a caller-misuse guard, not a
+// queue: the second call is never retried or serialized on its behalf.
+func TestClientCallRejectsConcurrentCall(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := dir + "/admin.sock"
+	uid := uint32(os.Getuid())
+	raw, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	received := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		conn, err := raw.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		if _, err := br.ReadBytes('\n'); err != nil {
+			return
+		}
+		close(received)
+		<-release
+		conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"))
+	}()
+
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+	defer client.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	}()
+
+	select {
+	case <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never observed the first request")
+	}
+
+	if err := client.Call(context.Background(), "server.hello", nil, nil); !errors.Is(err, errClientConcurrentCall) {
+		t.Fatalf("err=%v, want errClientConcurrentCall", err)
+	}
+
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+	if client.broken {
+		t.Fatal("the rejected concurrent call must not mark the connection broken")
 	}
 }
 
@@ -679,6 +743,86 @@ func TestClientCallRejectsMalformedResponseEnvelopes(t *testing.T) {
 	}
 }
 
+// TestClientCallMalformedResponseIsClassifiedAsUnresolvedOutcome is
+// mandate CP-02's regression: a response that fails to decode after the
+// request has already been written is not a proven non-dispatch -- it must
+// surface as *TimeoutError (an unresolved-outcome, same-operation-ID-retry
+// classification), exactly like the write/read-failure paths above, never
+// as a bare error a caller could mistake for "definitely not performed".
+func TestClientCallMalformedResponseIsClassifiedAsUnresolvedOutcome(t *testing.T) {
+	uid := uint32(os.Getuid())
+	// Syntactically invalid JSON: json.Unmarshal alone would already
+	// reject this, but the classification -- not the rejection itself --
+	// is what this test targets.
+	path := rawResponder(t, `{"jsonrpc":"2.0","id":"1",`+"\n")
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+	defer client.Close()
+	err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	var timeout *TimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatalf("err=%v, want *TimeoutError", err)
+	}
+	if !client.broken {
+		t.Fatal("connection not marked broken after a malformed response")
+	}
+}
+
+// TestClientCallRejectsResponseViolatingStrictJSONGrammar is mandate
+// CP-06's regression: a response with a duplicate top-level key is exactly
+// the kind of malformed frame encoding/json's lenient decoder would accept
+// silently (last value wins, no error) but the server's own parseJSON
+// grammar rejects on the request path. The response path must apply the
+// identical strict grammar, not a looser one just because it is decoding a
+// reply instead of a request.
+func TestClientCallRejectsResponseViolatingStrictJSONGrammar(t *testing.T) {
+	uid := uint32(os.Getuid())
+	path := rawResponder(t, `{"jsonrpc":"2.0","id":"1","id":"1","result":{}}`+"\n")
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+	defer client.Close()
+	err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	if err == nil {
+		t.Fatal("expected rejection of a duplicate-key response")
+	}
+	var timeout *TimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatalf("err=%v, want *TimeoutError (mandate CP-02 classification)", err)
+	}
+	if !client.broken {
+		t.Fatal("connection not marked broken after a strict-grammar violation")
+	}
+}
+
+// TestClientCallRejectsUnrecognizedDomainCode is mandate CP-03's
+// regression: a peer must not be able to introduce an arbitrary
+// error.data.code merely by sending one that happens to be nonblank -- it
+// must be a member of the accepted domain-code vocabulary this client and
+// the server both enforce.
+func TestClientCallRejectsUnrecognizedDomainCode(t *testing.T) {
+	uid := uint32(os.Getuid())
+	path := rawResponder(t, `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":"not_a_real_domain_code"}}}`+"\n")
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+	defer client.Close()
+	err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	if err == nil {
+		t.Fatal("expected rejection of an unrecognized error.data.code")
+	}
+	if !client.broken {
+		t.Fatal("connection not marked broken after an unrecognized domain code")
+	}
+}
+
 // rawSequentialResponder starts a raw Unix listener that accepts exactly
 // one connection and answers each request line, in order, with the
 // matching entry in responses (already including its own trailing
@@ -804,10 +948,28 @@ func TestDialRejectsInvalidHelloResult(t *testing.T) {
 	uid := uint32(os.Getuid())
 	const validID = "60000000-0000-4000-8000-000000000001"
 	const validLimits = `"limits":{"max_frame_bytes":1,"max_nesting_depth":1,"max_sockets_per_administrator":1,"max_sockets_total":1,"max_executing_per_socket":1,"max_queued_per_socket":1}`
+	// realLimits matches this client's own fixed parley-control/1 profile
+	// exactly -- used to isolate the CP-10/CP-11 cases below from the
+	// pre-existing (and intentionally non-matching) validLimits above, so
+	// those cases fail for the one property under test, not incidentally
+	// for a limits mismatch too.
+	realLimits := fmt.Sprintf(`"limits":{"max_frame_bytes":%d,"max_nesting_depth":%d,"max_sockets_per_administrator":%d,"max_sockets_total":%d,"max_executing_per_socket":%d,"max_queued_per_socket":%d}`,
+		MaxFrameBytes, maxDepth, MaxSocketsPerAdministrator, MaxSocketsTotal, MaxExecutingPerSocket, MaxQueuedPerSocket)
 	cases := []struct {
 		name     string
 		response string
 	}{
+		// CP-11: parley-control/1 is a fixed, not negotiated, profile -- a
+		// peer advertising a merely-positive-but-different limit must be
+		// rejected, not silently tolerated as if this client would then
+		// frame/queue against whatever the peer claims.
+		{"limits incompatible with the fixed profile", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running","limits":{"max_frame_bytes":` + fmt.Sprint(MaxFrameBytes+1) + `,"max_nesting_depth":` + fmt.Sprint(maxDepth) + `,"max_sockets_per_administrator":` + fmt.Sprint(MaxSocketsPerAdministrator) + `,"max_sockets_total":` + fmt.Sprint(MaxSocketsTotal) + `,"max_executing_per_socket":` + fmt.Sprint(MaxExecutingPerSocket) + `,"max_queued_per_socket":` + fmt.Sprint(MaxQueuedPerSocket) + `},"methods":["server.hello"]}}` + "\n"},
+		// CP-10: reuses envelope.go's validMethodSyntax -- a method name
+		// with a space is not in [A-Za-z0-9._]{1,64}.
+		{"invalid method syntax", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["bad method"]}}` + "\n"},
+		// CP-10: a duplicated advertisement is a hello contract violation
+		// even though every individual name is syntactically valid.
+		{"duplicate method name", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["server.hello","server.hello"]}}` + "\n"},
 		{"null hello result", `{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"},
 		{"unsupported protocol", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"other","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
 		{"missing server_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},

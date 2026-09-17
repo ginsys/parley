@@ -49,6 +49,15 @@ const (
 )
 
 func (c Code) Error() string { return string(c) }
+
+// Valid reports whether c is a member of the durable domain-code
+// vocabulary (including the empty/absent value). Exported so a caller
+// outside this package -- internal/control's wire error.data.code
+// validation -- can check a code it received from a peer against exactly
+// the same vocabulary this package enforces internally, rather than
+// duplicating or drifting from this switch.
+func (c Code) Valid() bool { return c.valid() }
+
 func (c Code) valid() bool {
 	switch c {
 	case "", InvalidRequest, AuthenticationFailed, NotFound, Forbidden, IdentityConflict, BindingUnavailable, HostUnverified, NotReady, AlreadyConnected, GenerationConflict, VersionConflict, RequestExpired, RequestTerminal, OperationConflict, EventConflict, SecurityHold, RecoveryRequired, CapacityExceeded, TemporarilyUnavailable, OutcomeUnknown:

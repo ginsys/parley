@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -233,6 +234,62 @@ func TestServeRejectsOverflowAndReservedServerUID(t *testing.T) {
 				t.Fatalf("uid=%q: code=%d err=%q", bad, code, errOut.String())
 			}
 		})
+	}
+}
+
+// TestServeRejectsServerUIDNotMatchingEffectiveUID is CP-04's regression: a
+// syntactically valid -server-uid that names a different account than this
+// process's actual effective UID must be rejected before any startup I/O --
+// SO_PEERCRED can never make that value true, so accepting it would leave
+// every future hello/authentication claiming an identity this process
+// cannot prove.
+func TestServeRejectsServerUIDNotMatchingEffectiveUID(t *testing.T) {
+	const admin = "-administrator=70000000-0000-4000-8000-000000000001=1000"
+	mismatched := strconv.FormatUint(uint64(uint32(os.Geteuid()))+1, 10)
+	var out, errOut bytes.Buffer
+	args := []string{
+		"-database=/x/parley.db", "-admin-socket=/y/admin.sock", admin,
+		"-recovery-markers-dir=/z", "-server-uid=" + mismatched,
+	}
+	code := runServe(args, &out, &errOut)
+	if code != 2 || !strings.Contains(errOut.String(), "does not match this process's effective UID") {
+		t.Fatalf("code=%d err=%q", code, errOut.String())
+	}
+}
+
+// TestServeDefaultServerUIDMatchesEffectiveUID is CP-05's regression: the
+// default -server-uid must behave identically to an explicit os.Geteuid()
+// value (proving the flag defaults to the effective UID, the identity
+// convention internal/connection/publication_linux.go already establishes
+// for socket/peer-credential trust) rather than os.Getuid(), which this
+// flag previously defaulted to. Both invocations are run to completion
+// (against a nonexistent database, so each fails fast and synchronously,
+// per TestServeRefusesMissingDatabaseWithoutSubstitutingEmptyOne) and must
+// reach the identical later failure, not diverge at the new CP-04 check.
+func TestServeDefaultServerUIDMatchesEffectiveUID(t *testing.T) {
+	dir := privateDir(t, "parleyd-serve-defaultuid-")
+	markersDir := filepath.Join(dir, "markers")
+	if err := os.Mkdir(markersDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	const admin = "-administrator=70000000-0000-4000-8000-000000000001=1000"
+	base := []string{
+		"-database=" + filepath.Join(dir, "parley.db"),
+		"-admin-socket=" + filepath.Join(dir, "admin.sock"),
+		admin, "-recovery-markers-dir=" + markersDir,
+	}
+	explicit := append(append([]string{}, base...), "-server-uid="+strconv.Itoa(os.Geteuid()))
+
+	var outDefault, errDefault, outExplicit, errExplicit bytes.Buffer
+	codeDefault := runServe(base, &outDefault, &errDefault)
+	codeExplicit := runServe(explicit, &outExplicit, &errExplicit)
+
+	if strings.Contains(errDefault.String(), "does not match this process's effective UID") {
+		t.Fatalf("default -server-uid was rejected as a mismatch: %q", errDefault.String())
+	}
+	if codeDefault != codeExplicit || errDefault.String() != errExplicit.String() {
+		t.Fatalf("default -server-uid diverged from explicit os.Geteuid(): default(code=%d,err=%q) explicit(code=%d,err=%q)",
+			codeDefault, errDefault.String(), codeExplicit, errExplicit.String())
 	}
 }
 
@@ -668,6 +725,16 @@ func TestServeRequiresFlagsBeforeAnyIO(t *testing.T) {
 		{"missing markers dir", []string{"-database=/x/parley.db", "-admin-socket=/y/admin.sock", admin}, "-recovery-markers-dir is required"},
 		{"missing administrator", []string{"-database=/x/parley.db", "-admin-socket=/y/admin.sock", "-recovery-markers-dir=/z"}, "at least one -administrator is required"},
 		{"bad socket mode", []string{"-database=/x/parley.db", "-admin-socket=/y/admin.sock", admin, "-recovery-markers-dir=/z", "-socket-mode=bogus"}, "invalid -socket-mode"},
+		// CP-01: a syntactically valid octal mode the listener does not
+		// actually support (e.g. world-readable 0644) must be rejected here,
+		// before any startup I/O -- not only deep inside control.Listen after
+		// recovery.NewDirectory and database access have already run.
+		{"unsupported socket mode", []string{"-database=/x/parley.db", "-admin-socket=/y/admin.sock", admin, "-recovery-markers-dir=/z", "-socket-mode=0644"}, "-socket-mode must be 0600 or 0660"},
+		// CP-01: recovery.NewDirectory itself rejects capacity <= 0, but only
+		// once serve() is already running, misreporting an invalid local
+		// argument as an operational failure. This must be rejected before
+		// that startup I/O begins.
+		{"non-positive markers capacity", []string{"-database=/x/parley.db", "-admin-socket=/y/admin.sock", admin, "-recovery-markers-dir=/z", "-recovery-markers-capacity=0"}, "-recovery-markers-capacity must be positive"},
 		{"relative database", []string{"-database=relative.db", "-admin-socket=/y/admin.sock", admin, "-recovery-markers-dir=/z"}, "-database must be an absolute"},
 		{"relative markers dir", []string{"-database=/x/parley.db", "-admin-socket=/y/admin.sock", admin, "-recovery-markers-dir=relative"}, "-recovery-markers-dir must be an absolute"},
 	}

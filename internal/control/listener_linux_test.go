@@ -20,6 +20,7 @@ import (
 	"github.com/ginsys/parley/internal/connection"
 	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 // fakeListener implements net.Listener with a scripted queue of Accept
@@ -575,6 +576,63 @@ func TestListenerServiceStopAdmissionDrainsCleanly(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Wait did not return after StopAdmission")
+	}
+}
+
+// TestListenerServiceStopAdmissionUnlinksTheOwnedSocketPath is mandate
+// CP-09's regression: a clean shutdown must remove the on-disk pathname
+// socket entry it owns, not merely stop accepting on it -- previously the
+// socket file was left behind indefinitely after every clean StopAdmission,
+// looking indistinguishable from a stale/crashed entry to anything that
+// only inspects the filesystem.
+func TestListenerServiceStopAdmissionUnlinksTheOwnedSocketPath(t *testing.T) {
+	fx := newListenerFixture(t)
+	resp := dialAndRoundTrip(t, fx.socketPath, fx.serverUID, `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
+	if resp["error"] != nil {
+		t.Fatalf("%#v", resp)
+	}
+	if err := fx.ln.StopAdmission(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(fx.socketPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("socket path still exists after clean StopAdmission: err=%v", err)
+	}
+}
+
+// TestUnlinkOwnedSocketNeverRemovesAReplacementAtTheSamePath is CP-09's
+// companion negative control: unlinkOwnedSocket must compare device/inode
+// against the identity captured at bind time, not merely the pathname
+// string, so it never removes a different socket a separate process has
+// already bound at the same path after this listener's own entry was
+// replaced.
+func TestUnlinkOwnedSocketNeverRemovesAReplacementAtTheSamePath(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := filepath.Join(dir, "admin.sock")
+	original, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer original.Close()
+	var originalStat unix.Stat_t
+	if err := unix.Lstat(path, &originalStat); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate replacement: remove the original entry and bind a fresh
+	// socket at the identical path, exactly like a subsequent process
+	// legitimately taking over the same pathname.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+
+	unlinkOwnedSocket(path, uint64(originalStat.Dev), originalStat.Ino)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("replacement socket was removed by an unrelated owner's unlink: %v", err)
 	}
 }
 

@@ -148,6 +148,8 @@ type Listener struct {
 
 	mu           sync.Mutex
 	listener     net.Listener // nil until Start binds it
+	boundDev     uint64       // device of the on-disk socket entry Start bound, for unlinkOwnedSocket
+	boundIno     uint64       // inode of the on-disk socket entry Start bound, for unlinkOwnedSocket
 	server       *Server
 	stopped      bool
 	totalSockets int
@@ -207,8 +209,21 @@ func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
 		listener.Close()
 		return fmt.Errorf("control: read coordinator epoch: %w", err)
 	}
+	// Captured immediately after a successful bind, from the on-disk
+	// pathname entry itself (not the socket fd -- Linux's fstat on an
+	// AF_UNIX socket fd reports the socket's own pseudo "sockfs" identity,
+	// not the bound directory entry's real filesystem inode, so comparing
+	// against a socket-fd-derived stat would never match the path's actual
+	// inode at all). This is the identity StopAdmission later verifies
+	// against before unlinking (mandate CP-09).
+	var boundStat unix.Stat_t
+	var boundDev, boundIno uint64
+	if err := unix.Lstat(ln.cfg.AdminSocket, &boundStat); err == nil {
+		boundDev, boundIno = uint64(boundStat.Dev), boundStat.Ino
+	}
 	ln.mu.Lock()
 	ln.listener = listener
+	ln.boundDev, ln.boundIno = boundDev, boundIno
 	ln.server = NewServer(ln.cfg, res.Queries, serverID, epoch, state)
 	ln.mu.Unlock()
 	ln.wg.Add(1)
@@ -227,11 +242,41 @@ func (ln *Listener) StopAdmission() error {
 	ln.mu.Lock()
 	ln.stopped = true
 	listener := ln.listener
+	boundDev, boundIno := ln.boundDev, ln.boundIno
 	ln.mu.Unlock()
 	if listener == nil {
 		return nil
 	}
+	// Remove the on-disk pathname entry so a clean shutdown does not leave
+	// a stale-looking socket behind (mandate CP-09). prepareSocketPath's
+	// own startup-side stale-socket probe already handles a leftover entry
+	// safely regardless of clean-vs-crashed shutdown, so this is hygiene,
+	// not a correctness fix -- any error here is silently ignored.
+	unlinkOwnedSocket(ln.cfg.AdminSocket, boundDev, boundIno)
 	return listener.Close()
+}
+
+// unlinkOwnedSocket removes the on-disk socket entry at path, but only when
+// it is still the exact entry Start bound -- verified by comparing
+// device/inode against the identity captured from the pathname itself at
+// bind time, not merely the pathname string -- so a clean shutdown never
+// risks removing an unrelated socket a separate process may have already
+// bound at that same path after this one's entry was replaced. This
+// mirrors prepareSocketPath's own "owned entry, not merely the pathname"
+// care on the startup side. boundDev/boundIno of 0 (Start's Lstat failed,
+// or never bound) never matches a real entry, so this is a no-op then.
+func unlinkOwnedSocket(path string, boundDev, boundIno uint64) {
+	if boundDev == 0 && boundIno == 0 {
+		return
+	}
+	var pathStat unix.Stat_t
+	if err := unix.Lstat(path, &pathStat); err != nil {
+		return
+	}
+	if boundDev != uint64(pathStat.Dev) || boundIno != pathStat.Ino {
+		return
+	}
+	_ = unix.Unlink(path)
 }
 
 // Wait returns the accept failure acceptLoop recorded, if any (mandate

@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ginsys/parley/internal/connection"
@@ -18,6 +19,10 @@ import (
 // one parley-control/1 server. It performs no retry and no reconnect --
 // callers needing those build them on top -- matching the server's own
 // strictly sequential per-socket design (internal/control/listener_linux.go).
+// Call enforces the single-in-flight precondition itself (mandate CP-07):
+// this is a caller-misuse guard against silent ID/reader races, not a
+// concurrency guarantee -- a rejected concurrent call is not queued,
+// retried or serialized on the caller's behalf.
 type Client struct {
 	conn   *net.UnixConn
 	br     *bufio.Reader
@@ -30,11 +35,23 @@ type Client struct {
 	// reading a stale, unread response left on the wire from an earlier
 	// call as if it belonged to a new one.
 	broken bool
+
+	// inFlight guards against two concurrent Call invocations racing
+	// nextID, br and the connection deadline against each other (mandate
+	// CP-07). A single atomic flag is sufficient because Call always
+	// clears it before returning, on every path, via defer.
+	inFlight atomic.Bool
 }
 
 // errClientBroken is returned by Call once a prior call left this
 // connection's request/response correlation in an unknown state.
 var errClientBroken = errors.New("control: connection is no longer usable after a prior unresolved call")
+
+// errClientConcurrentCall is returned by Call when another Call on the
+// same Client is already in flight. Client is documented single-in-flight
+// (mandate CP-07); this turns a caller's concurrency bug into an
+// immediate, clear error instead of a silent nextID/reader race.
+var errClientConcurrentCall = errors.New("control: concurrent Call on a single-in-flight client")
 
 // Dial connects to cfg.Endpoint, authenticating the server's kernel UID via
 // connection.DialTrustedServer, then performs the first-call server.hello
@@ -103,6 +120,10 @@ func (c *Client) Close() error { return c.conn.Close() }
 // well-formed, ID-matched response -- success or RemoteError -- is by
 // contrast a definite, resolved outcome and is never wrapped this way.
 func (c *Client) Call(ctx context.Context, method string, params map[string]any, out any) error {
+	if !c.inFlight.CompareAndSwap(false, true) {
+		return errClientConcurrentCall
+	}
+	defer c.inFlight.Store(false)
 	if c.broken {
 		return errClientBroken
 	}
@@ -170,10 +191,28 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		}
 		return wrapTimeout(err)
 	}
+	// The frame is validated against the same strict grammar the server
+	// itself enforces on incoming requests (envelope.go's parseJSON) before
+	// any decode is attempted -- a peer's malformed response (duplicate
+	// keys, invalid UTF-8, unpaired surrogate escapes, excess nesting,
+	// trailing bytes) gets the identical rejection an equivalently
+	// malformed request would (mandate CP-06). A malformed response after
+	// an attempted write is not a proven non-dispatch -- classified as an
+	// unresolved outcome via wrapTimeout, not returned bare (mandate CP-02),
+	// matching the write/read-failure classification above.
+	if _, err := parseJSON(line); err != nil {
+		c.broken = true
+		return wrapTimeout(fmt.Errorf("control: malformed response: %w", err))
+	}
 	var resp incomingResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
+		// parseJSON already accepted this exact byte sequence, so a
+		// subsequent json.Unmarshal failure here would indicate an internal
+		// inconsistency between the two decoders, not a hostile/malformed
+		// peer -- still classified as an unresolved outcome, never a bare
+		// error, for the same reason.
 		c.broken = true
-		return fmt.Errorf("control: malformed response: %w", err)
+		return wrapTimeout(fmt.Errorf("control: malformed response: %w", err))
 	}
 	// Exclusivity is judged on key presence for both members, not on
 	// either member's decoded value: presence and an allowed nullable
@@ -324,6 +363,13 @@ func (e incomingError) validate() error {
 		// before.
 		if e.Data == nil || strings.TrimSpace(string(e.Data.Code)) == "" {
 			return errors.New("control: domain error is missing its required error.data.code")
+		}
+		// A peer is never trusted to introduce an arbitrary domain code
+		// merely by sending one that happens to be nonblank -- it must be a
+		// member of the accepted error.data.code vocabulary this client and
+		// the server both enforce (mandate CP-03).
+		if !e.Data.Code.valid() {
+			return fmt.Errorf("control: domain error carries an unrecognized error.data.code %q", e.Data.Code)
 		}
 	default:
 		return fmt.Errorf("control: response carries an unrecognized error code %d", e.Code)

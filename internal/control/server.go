@@ -278,17 +278,34 @@ func (h HelloResult) validate() error {
 	if h.State != string(StateRunning) && h.State != string(StateRecoveryOnly) {
 		return fmt.Errorf("control: hello result has an unknown state %q", h.State)
 	}
-	if h.Limits.MaxFrameBytes <= 0 || h.Limits.MaxNestingDepth <= 0 || h.Limits.MaxSocketsPerAdministrator <= 0 ||
-		h.Limits.MaxSocketsTotal <= 0 || h.Limits.MaxExecutingPerSocket <= 0 || h.Limits.MaxQueuedPerSocket <= 0 {
-		return errors.New("control: hello result has invalid (non-positive) profile limits")
+	// parley-control/1 is a fixed profile, not a negotiated one: this
+	// client has no per-field tolerance for a peer that advertises
+	// different limits than its own build uses, since it would then be
+	// framing/queuing against a profile the server does not actually honor
+	// (mandate CP-11).
+	if h.Limits.MaxFrameBytes != MaxFrameBytes || h.Limits.MaxNestingDepth != maxDepth ||
+		h.Limits.MaxSocketsPerAdministrator != MaxSocketsPerAdministrator ||
+		h.Limits.MaxSocketsTotal != MaxSocketsTotal || h.Limits.MaxExecutingPerSocket != MaxExecutingPerSocket ||
+		h.Limits.MaxQueuedPerSocket != MaxQueuedPerSocket {
+		return fmt.Errorf("control: hello result advertises limits incompatible with this client's fixed parley-control/1 profile: %+v", h.Limits)
 	}
 	if len(h.Methods) == 0 {
 		return errors.New("control: hello result advertises no methods")
 	}
+	// Reuse the exact syntax the server itself enforces on incoming request
+	// methods (envelope.go's validMethodSyntax), and reject a duplicate
+	// advertisement outright -- a hello contract violation here means the
+	// method table this client would dispatch against cannot be trusted
+	// (mandate CP-10).
+	seen := make(map[string]bool, len(h.Methods))
 	for _, m := range h.Methods {
-		if strings.TrimSpace(m) == "" {
-			return errors.New("control: hello result advertises a blank method name")
+		if !validMethodSyntax(m) {
+			return fmt.Errorf("control: hello result advertises an invalid method name %q", m)
 		}
+		if seen[m] {
+			return fmt.Errorf("control: hello result advertises method %q more than once", m)
+		}
+		seen[m] = true
 	}
 	return nil
 }
