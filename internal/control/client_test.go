@@ -213,11 +213,61 @@ func TestClientCallRejectsMismatchedResponseIDAndBreaksTheConnection(t *testing.
 	if err == nil {
 		t.Fatal("expected a mismatched response id to be rejected")
 	}
+	// The request was already fully written and a full response line was
+	// actually read -- this connection's framing is desynchronized, not
+	// proof our request failed, so this must classify as an unresolved
+	// outcome, not a bare error (mandate T2; found by the hosted review of
+	// this batch's own CP-02 fix, which had left this and its sibling
+	// post-write rejection paths below still returning bare errors).
+	var timeout *TimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatalf("err=%v, want *TimeoutError", err)
+	}
 	if !client.broken {
 		t.Fatal("connection not marked broken after a mismatched response id")
 	}
 	if err := client.Call(context.Background(), "server.hello", nil, nil); !errors.Is(err, errClientBroken) {
 		t.Fatalf("err=%v, want errClientBroken", err)
+	}
+}
+
+// TestClientCallClassifiesPostWriteEnvelopeRejectionsAsUnresolvedOutcome
+// covers the sibling post-write rejection paths TestClientCallRejects...
+// MismatchedResponseId... above does not: every one of these is reached
+// only after a full response line was actually read, so the request was
+// already fully written and its outcome is unknown -- each must be
+// *TimeoutError, never a bare error (mandate T2).
+func TestClientCallClassifiesPostWriteEnvelopeRejectionsAsUnresolvedOutcome(t *testing.T) {
+	uid := uint32(os.Getuid())
+	cases := []struct {
+		name     string
+		response string
+	}{
+		{"unsupported jsonrpc version", `{"jsonrpc":"1.0","id":"1","result":{}}` + "\n"},
+		{"neither result nor error present", `{"jsonrpc":"2.0","id":"1"}` + "\n"},
+		{"both result and error present", `{"jsonrpc":"2.0","id":"1","result":{},"error":{"code":-32000,"message":"x","data":{"code":"not_found"}}}` + "\n"},
+		{"explicit null error alongside no result", `{"jsonrpc":"2.0","id":"1","error":null}` + "\n"},
+		{"malformed error object", `{"jsonrpc":"2.0","id":"1","error":{"code":"not-a-number","message":"x"}}` + "\n"},
+		{"error object fails validate (unrecognized code)", `{"jsonrpc":"2.0","id":"1","error":{"code":-1,"message":"x"}}` + "\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := rawResponder(t, c.response)
+			conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &Client{conn: conn, br: bufio.NewReader(conn)}
+			defer client.Close()
+			err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+			var timeout *TimeoutError
+			if !errors.As(err, &timeout) {
+				t.Fatalf("err=%v, want *TimeoutError", err)
+			}
+			if !client.broken {
+				t.Fatal("connection not marked broken")
+			}
+		})
 	}
 }
 
