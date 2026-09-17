@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -198,6 +199,17 @@ func assertConnectionActuallyClosed(t *testing.T, err error) {
 	}
 }
 
+// socketCountForTest reads ln.totalSockets under its own lock -- a
+// test-only synchronization point proving the accept loop has actually
+// registered a newly dialed connection (acquireSocketSlot runs
+// synchronously, before that connection's serving goroutine is spawned),
+// not merely that the kernel accepted it into its listen backlog.
+func (ln *Listener) socketCountForTest() int {
+	ln.mu.Lock()
+	defer ln.mu.Unlock()
+	return ln.totalSockets
+}
+
 func privateSocketDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "parley-control-listener-")
@@ -381,25 +393,92 @@ func newListenerFixture(t *testing.T) *listenerFixture {
 	return &listenerFixture{socketPath: socketPath, adminID: adminID, serverUID: uid, db: db, ln: service}
 }
 
-func dialAndRoundTrip(t *testing.T, path string, serverUID uint32, requestLine string) map[string]any {
-	t.Helper()
-	conn, err := connection.DialTrustedServer(context.Background(), path, serverUID)
+// dialAndRoundTripErr is dialAndRoundTrip's actual I/O core, returning an
+// error instead of calling t.Fatal so TestDialAndRoundTripBoundsHandshakeIODeadline
+// can observe a deliberately induced failure directly -- a *testing.T
+// subtest's failure would otherwise unconditionally propagate to and fail
+// its parent, regardless of what the parent asserts afterward, making
+// "assert this call fails quickly, then still pass" unrepresentable via
+// t.Run. dialAndRoundTrip below is the thin, unchanged-behavior wrapper
+// every other test in this file uses.
+func dialAndRoundTripErr(ctx context.Context, path string, serverUID uint32, requestLine string) (map[string]any, error) {
+	conn, err := connection.DialTrustedServer(ctx, path, serverUID)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer conn.Close()
+	// DialTrustedServer only bounds the dial itself; without this, an
+	// accepted peer that never completes its side of the exchange (see
+	// TestDialAndRoundTripBoundsHandshakeIODeadline) would block this
+	// helper -- and every test using it -- indefinitely. restartTeardownWait
+	// is reused rather than inventing a second finite bound; a deadline
+	// expiring here surfaces as a plain error, never as a false "peer
+	// closed" or "hello succeeded" reading (mandate TC-R1).
+	if err := conn.SetDeadline(time.Now().Add(restartTeardownWait)); err != nil {
+		return nil, err
+	}
 	if _, err := conn.Write([]byte(requestLine + "\n")); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	line, err := bufio.NewReader(conn).ReadBytes('\n')
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(line, &decoded); err != nil {
-		t.Fatalf("response %q: %v", line, err)
+		return nil, fmt.Errorf("response %q: %w", line, err)
+	}
+	return decoded, nil
+}
+
+func dialAndRoundTrip(t *testing.T, path string, serverUID uint32, requestLine string) map[string]any {
+	t.Helper()
+	decoded, err := dialAndRoundTripErr(context.Background(), path, serverUID, requestLine)
+	if err != nil {
+		t.Fatal(err)
 	}
 	return decoded
+}
+
+// TestDialAndRoundTripBoundsHandshakeIODeadline proves dialAndRoundTripErr's
+// deadline (above) actually bounds a stalled exchange, not just a
+// configured duration that is never reached: a peer that accepts the
+// connection but never writes a response must make the call fail within
+// restartTeardownWait plus scheduling slack, never hang. The accepted
+// connection is closed afterward so this probe does not strand it
+// (mandate TC-R1 focused verification #4).
+func TestDialAndRoundTripBoundsHandshakeIODeadline(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := filepath.Join(dir, "admin.sock")
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- c // accepted, but deliberately never written to or closed
+	}()
+
+	start := time.Now()
+	_, err = dialAndRoundTripErr(context.Background(), path, uint32(os.Getuid()), `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
+	elapsed := time.Since(start)
+	var netErr net.Error
+	if err == nil || !(errors.As(err, &netErr) && netErr.Timeout()) {
+		t.Fatalf("expected a deadline-timeout error against a peer that never responds, got: %v", err)
+	}
+	if elapsed > restartTeardownWait+2*time.Second {
+		t.Fatalf("dialAndRoundTripErr did not respect its own deadline: took %s", elapsed)
+	}
+	select {
+	case c := <-accepted:
+		c.Close()
+	default:
+	}
 }
 
 func TestListenerServiceHelloRoundTrip(t *testing.T) {
@@ -703,6 +782,20 @@ func TestListenerServiceReceiptEpochMatchesHelloEpoch(t *testing.T) {
 // test or its own cleanup indefinitely.
 const restartTeardownWait = 5 * time.Second
 
+// teardownOutcome distinguishes a teardown that genuinely completed --
+// observed the accept loop actually stop within its bound, whether or not
+// the service itself then reported an error -- from one that did not
+// observe completion at all. Only a completed teardown may safely close
+// the store or let a caller proceed to open the next incarnation of the
+// same on-disk file; a completed-with-error teardown still safely released
+// its resources but is not a successful restart precondition (mandate
+// TC-R1: these are two different things, not one boolean).
+type teardownOutcome struct {
+	completed bool
+	err       error
+	stage     string // "stop_admission" | "wait_timeout" | "wait_error" | "close" | "" (clean)
+}
+
 // serveIncarnation bundles one restart incarnation's store/listener
 // lifetime and guarantees its stop/close sequence runs exactly once,
 // whether invoked explicitly (the normal restart path, before the next
@@ -713,49 +806,133 @@ const restartTeardownWait = 5 * time.Second
 // point -- not only after the explicit teardown -- still stops admission,
 // cancels, waits for the accept loop to actually exit, and closes the
 // store, instead of leaking them past the test (mandate T1 companion).
+//
+// waitTimeout overrides restartTeardownWait when nonzero, letting a test
+// force a deterministic, genuine (not raced) non-completion -- see
+// TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime
+// -- without an injected fake service.
 type serveIncarnation struct {
-	once   sync.Once
-	db     *store.DB
-	svc    *Listener
-	cancel context.CancelFunc
+	once        sync.Once
+	db          *store.DB
+	svc         *Listener
+	cancel      context.CancelFunc
+	waitTimeout time.Duration
+	outcome     teardownOutcome
 }
 
-// teardown stops admission, cancels the worker context, waits (bounded)
-// for the accept loop to actually finish, then closes the store -- in
-// that order, so DB resources are only released after the service has
-// genuinely stopped. sync.Once makes it safe to call both explicitly and
-// as a t.Cleanup fallback without double-closing the listener or
-// manufacturing a cleanup error on a healthy restart; nil fields (an
-// early failure before a later resource was acquired) are skipped.
-func (s *serveIncarnation) teardown(t *testing.T) {
+// teardownCore performs the actual stop/cancel/wait/close sequence and
+// computes the outcome without touching a *testing.T. It is the single
+// place the sequence and its ordering are implemented; teardown (below)
+// wraps it for the two real restart tests, reporting any problem through
+// t.Errorf, while
+// TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime
+// calls it directly so that deliberately forcing the timeout branch does
+// not itself fail that otherwise-passing regression -- a *testing.T
+// subtest's failure unconditionally propagates to and fails its parent
+// regardless of what the parent asserts afterward, making "expect this to
+// report non-completion, then still pass" unrepresentable through t.Run
+// (mandate TC-R1).
+//
+// On a service-wait timeout, it deliberately does NOT close the store --
+// a service that has not observably stopped may still be using it -- and
+// reports completed=false so a caller must neither proceed to the next
+// incarnation nor let a fixture-removal cleanup race a possibly-still-live
+// listener or store.
+func (s *serveIncarnation) teardownCore() teardownOutcome {
+	var outcome teardownOutcome
+	wait := s.waitTimeout
+	if wait <= 0 {
+		wait = restartTeardownWait
+	}
+	outcome.completed = true
+	if s.svc != nil {
+		if err := s.svc.StopAdmission(); err != nil {
+			outcome.err = err
+			outcome.stage = "stop_admission"
+		}
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.svc != nil {
+		done := make(chan error, 1)
+		go func() { done <- s.svc.Wait() }()
+		select {
+		case err := <-done:
+			if err != nil && outcome.err == nil {
+				outcome.err = err
+				outcome.stage = "wait_error"
+			}
+		case <-time.After(wait):
+			outcome.completed = false
+			outcome.stage = "wait_timeout"
+			outcome.err = fmt.Errorf("listener did not stop accepting within %s", wait)
+			return outcome
+		}
+	}
+	if s.db != nil {
+		if err := s.db.Close(); err != nil && outcome.err == nil {
+			outcome.err = err
+			outcome.stage = "close"
+		}
+	}
+	return outcome
+}
+
+// teardown runs teardownCore exactly once (sync.Once), safe to call both
+// explicitly (the normal restart path, before the next incarnation opens
+// the same on-disk file) and as a t.Cleanup fallback without double-
+// closing the listener, re-running the sequence, or manufacturing a
+// cleanup error on a healthy restart; nil fields (an early failure before
+// a later resource was acquired) are skipped inside teardownCore. Any
+// problem -- including a service-wait timeout -- is reported via
+// t.Errorf, tagged with its stage, so a real regression surfaces as a
+// failing test (mandate T1 companion / TC-R1). It returns the same
+// teardownOutcome on every call, computed only once.
+func (s *serveIncarnation) teardown(t *testing.T) teardownOutcome {
 	t.Helper()
 	s.once.Do(func() {
-		if s.svc != nil {
-			if err := s.svc.StopAdmission(); err != nil {
-				t.Errorf("StopAdmission: %v", err)
-			}
-		}
-		if s.cancel != nil {
-			s.cancel()
-		}
-		if s.svc != nil {
-			done := make(chan error, 1)
-			go func() { done <- s.svc.Wait() }()
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Errorf("listener accept loop reported failure: %v", err)
-				}
-			case <-time.After(restartTeardownWait):
-				t.Errorf("listener did not stop accepting within %s", restartTeardownWait)
-			}
-		}
-		if s.db != nil {
-			if err := s.db.Close(); err != nil {
-				t.Errorf("closing store: %v", err)
-			}
+		s.outcome = s.teardownCore()
+		if s.outcome.err != nil {
+			t.Errorf("teardown (%s): %v", s.outcome.stage, s.outcome.err)
 		}
 	})
+	return s.outcome
+}
+
+// retainOnIncompleteTeardown calls inc.teardown and, when it did not
+// observe completion, marks *retain so a paired privateSocketDirRetainable
+// keeps the fixture directory instead of racing its removal against a
+// possibly-still-live listener or open store (mandate TC-R1). Idempotent
+// like teardown itself -- safe to call from both an explicit call site and
+// its t.Cleanup fallback.
+func retainOnIncompleteTeardown(t *testing.T, inc *serveIncarnation, retain *bool) teardownOutcome {
+	t.Helper()
+	outcome := inc.teardown(t)
+	if !outcome.completed {
+		*retain = true
+	}
+	return outcome
+}
+
+// privateSocketDirRetainable behaves exactly like privateSocketDir, except
+// its removal is skipped when *retain is true at cleanup time -- set by
+// retainOnIncompleteTeardown when a serveIncarnation's teardown did not
+// observe the service actually stop within its bound (mandate TC-R1).
+func privateSocketDirRetainable(t *testing.T, retain *bool) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "parley-control-listener-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if *retain {
+			t.Logf("retaining %s: a service teardown did not confirm shutdown within its wait", dir)
+			return
+		}
+		os.RemoveAll(dir)
+	})
+	return dir
 }
 
 // TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory exercises
@@ -767,7 +944,8 @@ func (s *serveIncarnation) teardown(t *testing.T) {
 // rejected merely for that difference.
 func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T) {
 	ctx := context.Background()
-	dir := privateSocketDir(t)
+	var retainFixtures bool
+	dir := privateSocketDirRetainable(t, &retainFixtures)
 	dbPath := filepath.Join(dir, "parley.db")
 	adminID := "60000000-0000-4000-8000-000000000001"
 	uid := uint32(os.Getuid())
@@ -782,7 +960,7 @@ func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T
 	// resource is acquired, so a failure at any point below -- not only
 	// after the explicit teardown further down -- still tears it down.
 	inc1 := &serveIncarnation{}
-	t.Cleanup(func() { inc1.teardown(t) })
+	t.Cleanup(func() { retainOnIncompleteTeardown(t, inc1, &retainFixtures) })
 
 	db1, err := store.Open(ctx, dbPath)
 	if err != nil {
@@ -824,13 +1002,19 @@ func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T
 	// Explicit normal teardown of the first incarnation, before the second
 	// one opens the same on-disk file. inc1.teardown is idempotent
 	// (sync.Once), so the t.Cleanup fallback registered above becomes a
-	// no-op rather than double-closing anything.
-	inc1.teardown(t)
+	// no-op rather than double-closing anything. A restart against the
+	// same on-disk file is only safe once the first incarnation has
+	// genuinely, cleanly stopped -- not merely once the test's own failed
+	// flag was set (mandate TC-R1): a timed-out or service-error teardown
+	// must stop this test here, before store.OpenExisting ever runs.
+	if outcome := retainOnIncompleteTeardown(t, inc1, &retainFixtures); !outcome.completed || outcome.err != nil {
+		t.Fatalf("first incarnation did not shut down cleanly before restart: completed=%v err=%v", outcome.completed, outcome.err)
+	}
 
 	// Second incarnation: a real restart against the same on-disk file.
 	// Same registration discipline as inc1.
 	inc2 := &serveIncarnation{}
-	t.Cleanup(func() { inc2.teardown(t) })
+	t.Cleanup(func() { retainOnIncompleteTeardown(t, inc2, &retainFixtures) })
 
 	db2, err := store.OpenExisting(ctx, dbPath)
 	if err != nil {
@@ -889,17 +1073,21 @@ func TestListenerRestartMintsNewEpochButPreservesServerIDAndHistory(t *testing.T
 // early -- no explicit StopAdmission/cancel/Wait/Close -- relying solely
 // on serveIncarnation's t.Cleanup fallback.
 //
-// Registration order controls the property under test: privateSocketDir's
+// Registration order controls the property under test: privateSocketDirRetainable's
 // own directory-removal cleanup is registered first (so it fires *last*),
 // the post-teardown verification below is registered second (so it fires
 // *second*), and inc's fallback teardown is registered last (so it fires
 // *first*) -- meaning fixture removal never races a still-live listener or
 // open store, and the verification below only ever runs after teardown has
 // already completed (mandate T1 companion: "verify its service stopped
-// and DB resources settled before fixture removal").
+// and DB resources settled before fixture removal"). If that teardown
+// itself does not observe completion in time, retainOnIncompleteTeardown
+// marks the directory for retention instead of letting it be removed out
+// from under a possibly-still-live listener or store (mandate TC-R1).
 func TestListenerRestartFirstIncarnationCleansUpOnEarlyReturnAfterGenuineStart(t *testing.T) {
 	ctx := context.Background()
-	dir := privateSocketDir(t)
+	var retainFixtures bool
+	dir := privateSocketDirRetainable(t, &retainFixtures)
 	dbPath := filepath.Join(dir, "parley.db")
 	adminID := "60000000-0000-4000-8000-000000000002"
 	uid := uint32(os.Getuid())
@@ -931,7 +1119,7 @@ func TestListenerRestartFirstIncarnationCleansUpOnEarlyReturnAfterGenuineStart(t
 	})
 
 	inc := &serveIncarnation{}
-	t.Cleanup(func() { inc.teardown(t) })
+	t.Cleanup(func() { retainOnIncompleteTeardown(t, inc, &retainFixtures) })
 
 	db, err := store.Open(ctx, dbPath)
 	if err != nil {
@@ -965,4 +1153,117 @@ func TestListenerRestartFirstIncarnationCleansUpOnEarlyReturnAfterGenuineStart(t
 	// Wait/Close. Reaching the end of the test function having only
 	// confirmed startup above is the "early exit after a genuinely started
 	// first incarnation" this regression demonstrates recovers cleanly.
+}
+
+// TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime
+// is TC-R1's core regression: it forces serveIncarnation.teardown's bounded
+// wait to observe a genuinely not-yet-stopped service, using a real
+// connected-but-silent peer whose own several-second pre-hello deadline
+// (FrameDeadline) has not yet elapsed -- never an injected fake -- against
+// a deliberately short waitTimeout. It then proves the required gate: the
+// store is not closed and the fixture directory is marked for retention.
+//
+// The worker-context cancel func is deliberately withheld from inc (left
+// nil): serveSession's ctx.Done() watcher closes any connection the
+// instant its context is cancelled, which would make the wait complete
+// almost immediately and defeat this probe. It is called directly, after
+// the assertions below, as this probe's own cleanup -- along with closing
+// the idle connection and actually joining the service and closing the
+// store -- so it does not strand a deliberate leak past its own run
+// (mandate TC-R1 focused verification #3).
+func TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime(t *testing.T) {
+	ctx := context.Background()
+	var retainFixtures bool
+	dir := privateSocketDirRetainable(t, &retainFixtures)
+	dbPath := filepath.Join(dir, "parley.db")
+	adminID := "60000000-0000-4000-8000-000000000004"
+	uid := uint32(os.Getuid())
+	socketPath := filepath.Join(dir, "admin.sock")
+
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.OpenReaders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewConfig(socketPath, uid, map[string]uint32{adminID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := NewListenerService(cfg, 0600)
+	wctx, cancel := context.WithCancel(ctx)
+	if err := svc.Start(ctx, runtime.Resources{WorkerContext: wctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A connected but silent peer: accepted (kernel-authenticated) and
+	// occupying one of the listener's per-connection goroutines, but not
+	// yet past its own pre-hello deadline -- keeping the listener's accept
+	// loop from fully stopping for several seconds, comfortably longer
+	// than waitTimeout below.
+	idle, err := connection.DialTrustedServer(ctx, socketPath, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A successful Dial only proves the kernel accepted the connection
+	// into its backlog, not that the server's own accept loop has called
+	// Accept() and spawned this connection's serving goroutine yet.
+	// Without this synchronization, teardown below can race ahead of that
+	// and observe a wg count of zero (only the accept loop's own count),
+	// making it complete immediately instead of genuinely timing out --
+	// acquireSocketSlot is incremented synchronously, in program order,
+	// strictly before that goroutine is spawned, so waiting for it here
+	// is a solid proxy with no separate exported hook needed.
+	deadline := time.Now().Add(2 * time.Second)
+	for svc.socketCountForTest() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("server never registered the idle connection as accepted")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// teardownCore is called directly, not teardown/retainOnIncompleteTeardown:
+	// this deliberately forces the timeout branch, and teardown's own
+	// t.Errorf on that branch would otherwise unconditionally fail this
+	// test regardless of the assertions below (see teardownCore's doc
+	// comment). The retention gate itself (retainOnIncompleteTeardown) is
+	// exercised faithfully by applying its exact rule to the outcome here.
+	inc := &serveIncarnation{db: db, svc: svc, waitTimeout: 500 * time.Millisecond}
+	outcome := inc.teardownCore()
+	if outcome.completed {
+		t.Fatal("expected teardown to observe non-completion while a connection is still being served")
+	}
+	if outcome.stage != "wait_timeout" {
+		t.Fatalf("expected the wait_timeout stage, got %q (err: %v)", outcome.stage, outcome.err)
+	}
+	if !outcome.completed {
+		retainFixtures = true
+	}
+	if !retainFixtures {
+		t.Fatal("expected the fixture directory to be marked for retention")
+	}
+	// The store must not have been closed while the service may still be
+	// using it: a fresh read through it must still succeed.
+	if _, err := db.Coordinator().Epoch(ctx); err != nil {
+		t.Fatalf("store appears closed after a timed-out teardown: %v", err)
+	}
+
+	// Release and join the probe's own controlled work rather than
+	// stranding it.
+	idle.Close()
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- svc.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("listener accept loop reported failure while joining the probe: %v", err)
+		}
+	case <-time.After(restartTeardownWait):
+		t.Fatal("listener did not actually stop after the probe's connection was closed")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
