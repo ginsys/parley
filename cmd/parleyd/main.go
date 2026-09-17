@@ -321,7 +321,11 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(&output)
 	dbPath := fs.String("database", "", "absolute path to an already-initialized database (required; see parleyd init)")
 	adminSocket := fs.String("admin-socket", "", "absolute path for the administration Unix socket (required)")
-	serverUIDText := fs.String("server-uid", strconv.Itoa(os.Getuid()), "this process's own UID, as administrators/clients verify it")
+	// Default to the effective UID, not the real UID: internal/connection's
+	// established socket/peer-credential identity convention (publication_linux.go)
+	// trusts os.Geteuid(), and this flag's value is what a peer's SO_PEERCRED
+	// check must actually match (mandate CP-05).
+	serverUIDText := fs.String("server-uid", strconv.Itoa(os.Geteuid()), "this process's own effective UID, as administrators/clients verify it via SO_PEERCRED")
 	socketMode := fs.String("socket-mode", "0600", "administration socket file mode: 0600, or 0660 with an explicitly provisioned administrator-only group")
 	markersDir := fs.String("recovery-markers-dir", "", "absolute path to a private (mode 0700), server-owned directory for durable recovery markers (required)")
 	markersCapacity := fs.Int("recovery-markers-capacity", 64, "bounded materialization capacity for recovery marker listing")
@@ -353,12 +357,39 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "parleyd serve: invalid -socket-mode %q: %v\n", *socketMode, err)
 		return 2
 	}
+	// Reject any mode outside the two the listener actually supports, here
+	// -- before recovery.NewDirectory or database access run -- rather than
+	// deep inside control.Listen where the same check exists today but only
+	// after other startup I/O has already occurred (mandate CP-01). An
+	// invalid local argument must be rejected before it has operational
+	// effects, not merely before the process exits.
+	if mode != 0600 && mode != 0660 {
+		fmt.Fprintf(stderr, "parleyd serve: -socket-mode must be 0600 or 0660, got %q\n", *socketMode)
+		return 2
+	}
+	// recovery.NewDirectory rejects capacity <= 0 too, but only once
+	// serve() is already running -- surfacing there misreports an invalid
+	// local argument as an operational failure (mandate CP-01).
+	if *markersCapacity <= 0 {
+		fmt.Fprintf(stderr, "parleyd serve: -recovery-markers-capacity must be positive, got %d\n", *markersCapacity)
+		return 2
+	}
 	// control.ParseUID validates the full value before any narrowing
 	// (mandate R2): fs.Uint's unchecked uint32(*serverUID) conversion let
 	// 2^32 silently become 0 (root) on a 64-bit host.
 	serverUID, err := control.ParseUID(*serverUIDText)
 	if err != nil {
 		fmt.Fprintf(stderr, "parleyd serve: invalid -server-uid %q: %v\n", *serverUIDText, err)
+		return 2
+	}
+	// The configured server UID must match the identity socket/peer
+	// authentication actually uses (os.Geteuid(), the same convention
+	// internal/connection/publication_linux.go establishes) -- an
+	// explicitly supplied value that names a different account would make
+	// every hello/response claim an identity this process cannot prove and
+	// SO_PEERCRED will never actually match (mandate CP-04).
+	if serverUID != uint32(os.Geteuid()) {
+		fmt.Fprintf(stderr, "parleyd serve: -server-uid %d does not match this process's effective UID %d\n", serverUID, os.Geteuid())
 		return 2
 	}
 	// -admin-socket's absoluteness is enforced by control.NewConfig below.

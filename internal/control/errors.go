@@ -36,6 +36,19 @@ const (
 	OperationNotFound DomainCode = "operation_not_found"
 )
 
+// valid reports whether d is a member of the accepted error.data.code
+// vocabulary this type's own doc comment describes: control's two
+// wire/session-only additions, or any durable store.Code value. A peer
+// is never trusted to introduce an arbitrary domain code merely by
+// sending one that happens to be nonblank (mandate CP-03).
+func (d DomainCode) valid() bool {
+	switch d {
+	case ProtocolMismatch, OperationNotFound:
+		return true
+	}
+	return store.Code(d).Valid()
+}
+
 // domainCode converts a store.Code into the wire's error.data.code string.
 // It never leaks a raw Go error string: an unrecognized/unwrapped error
 // becomes TemporarilyUnavailable's fixed spelling instead.
