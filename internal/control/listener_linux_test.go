@@ -463,6 +463,22 @@ func TestDialAndRoundTripBoundsHandshakeIODeadline(t *testing.T) {
 		}
 		accepted <- c // accepted, but deliberately never written to or closed
 	}()
+	// Close the accepted connection whenever the accept goroutine actually
+	// publishes it -- closing the listener above unblocks a still-pending
+	// Accept but does not close a connection Accept has already returned.
+	// Registered now, before the fallible round-trip call below, so an
+	// early Fatal still runs this; bounded rather than a non-blocking
+	// select, so a connection published only after this goroutine schedules
+	// (a race the original non-blocking check could lose) is still closed
+	// instead of leaked (mandate PC-F2).
+	t.Cleanup(func() {
+		select {
+		case c := <-accepted:
+			c.Close()
+		case <-time.After(restartTeardownWait):
+			t.Errorf("accepted connection was never published by the accept goroutine")
+		}
+	})
 
 	start := time.Now()
 	_, err = dialAndRoundTripErr(context.Background(), path, uint32(os.Getuid()), `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
@@ -473,11 +489,6 @@ func TestDialAndRoundTripBoundsHandshakeIODeadline(t *testing.T) {
 	}
 	if elapsed > restartTeardownWait+2*time.Second {
 		t.Fatalf("dialAndRoundTripErr did not respect its own deadline: took %s", elapsed)
-	}
-	select {
-	case c := <-accepted:
-		c.Close()
-	default:
 	}
 }
 
@@ -1166,11 +1177,16 @@ func TestListenerRestartFirstIncarnationCleansUpOnEarlyReturnAfterGenuineStart(t
 // The worker-context cancel func is deliberately withheld from inc (left
 // nil): serveSession's ctx.Done() watcher closes any connection the
 // instant its context is cancelled, which would make the wait complete
-// almost immediately and defeat this probe. It is called directly, after
-// the assertions below, as this probe's own cleanup -- along with closing
-// the idle connection and actually joining the service and closing the
-// store -- so it does not strand a deliberate leak past its own run
-// (mandate TC-R1 focused verification #3).
+// almost immediately and defeat this probe. It is invoked from a t.Cleanup
+// registered as soon as the idle connection exists (before the fallible
+// assertions below), together with closing that connection and actually
+// joining the service and closing the store, so an early Fatal still
+// releases this probe's own controlled work instead of stranding it
+// (mandate TC-R1 focused verification #3; mandate PC-F2). That same
+// cleanup only clears the retention flag once it has observed every owned
+// resource genuinely settle -- a successful run must not permanently
+// retain the fixture just because retention was required while the forced
+// wait was still outstanding.
 func TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime(t *testing.T) {
 	ctx := context.Background()
 	var retainFixtures bool
@@ -1206,6 +1222,45 @@ func TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// This probe's own real cleanup: release the idle connection, invoke
+	// the cancellation deliberately withheld from inc below, join the
+	// service and close the store. Registered now, before any further
+	// fallible assertion, so an early Fatal below still runs it -- mirrors
+	// every other serveIncarnation-owned resource in this file. This is
+	// separate from inc's own teardownCore call below: that call observes
+	// the forced-incomplete outcome under test; this releases the actual
+	// capability withheld from it. Only when every owned resource is
+	// observed genuinely settled does it clear retainFixtures again -- a
+	// deadline elapsing or a stop merely being requested is not that
+	// evidence, and a prior successful run must not permanently retain a
+	// SQLite-containing temp directory just because the forced-timeout
+	// assertions above required retention while the wait was still
+	// outstanding (mandate PC-F2).
+	t.Cleanup(func() {
+		idle.Close()
+		cancel()
+		done := make(chan error, 1)
+		go func() { done <- svc.Wait() }()
+		var waitErr error
+		select {
+		case waitErr = <-done:
+		case <-time.After(restartTeardownWait):
+			waitErr = fmt.Errorf("listener did not actually stop after the probe's connection was closed")
+		}
+		closeErr := db.Close()
+		switch {
+		case waitErr != nil:
+			retainFixtures = true
+			t.Errorf("probe cleanup: listener did not settle, retaining %s: %v", dir, waitErr)
+		case closeErr != nil:
+			retainFixtures = true
+			t.Errorf("probe cleanup: store close failed, retaining %s: %v", dir, closeErr)
+		default:
+			retainFixtures = false
+		}
+	})
+
 	// A successful Dial only proves the kernel accepted the connection
 	// into its backlog, not that the server's own accept loop has called
 	// Accept() and spawned this connection's serving goroutine yet.
@@ -1249,21 +1304,7 @@ func TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime(t 
 		t.Fatalf("store appears closed after a timed-out teardown: %v", err)
 	}
 
-	// Release and join the probe's own controlled work rather than
-	// stranding it.
-	idle.Close()
-	cancel()
-	done := make(chan error, 1)
-	go func() { done <- svc.Wait() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("listener accept loop reported failure while joining the probe: %v", err)
-		}
-	case <-time.After(restartTeardownWait):
-		t.Fatal("listener did not actually stop after the probe's connection was closed")
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// Releasing and joining the probe's own controlled work, and the
+	// resulting retention decision, happen in the registered t.Cleanup
+	// above -- run on every exit path, not only this one.
 }

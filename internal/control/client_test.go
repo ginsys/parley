@@ -548,7 +548,19 @@ func TestClientCallCancellationRaceWithResponseHasCoherentOutcomeAndNoLeak(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer client.Close()
+	// A plain `defer client.Close()` here would bind the *original* client
+	// value at defer-registration time: the loop below reassigns `client`
+	// on every redial, so that defer would close only the first-dialed
+	// connection and leak every replacement if a later Fatal exits before
+	// the explicit `client.Close()` at the end of this function. Look up
+	// the current, owned client at defer-execution time instead, with a
+	// nil guard: a failed redial can leave `client` nil right before the
+	// test terminates.
+	defer func() {
+		if client != nil {
+			_ = client.Close()
+		}
+	}()
 
 	before := goruntime.NumGoroutine()
 	for i := 0; i < 50; i++ {
