@@ -636,6 +636,45 @@ func TestUnlinkOwnedSocketNeverRemovesAReplacementAtTheSamePath(t *testing.T) {
 	}
 }
 
+// TestListenerServiceStartCleansUpTheSocketWhenIdentityReadFails is F2's
+// regression, surfaced by the hosted review of this batch's own CP-09 fix:
+// Start used to capture boundDev/boundIno and install them on ln only after
+// both the installation-identity read (Coordinator().Inspect) and the epoch
+// read (Coordinator().Epoch) succeeded, so a failure in either one returned
+// an error without ever unlinking the socket Start had just bound,
+// orphaning the file. The fix captures the identity immediately after a
+// successful bind and calls unlinkOwnedSocket on both failure returns,
+// before Start ever returns to its caller.
+func TestListenerServiceStartCleansUpTheSocketWhenIdentityReadFails(t *testing.T) {
+	dir := privateSocketDir(t)
+	socketPath := filepath.Join(dir, "admin.sock")
+	adminID := "60000000-0000-4000-8000-000000000001"
+	uid := uint32(os.Getuid())
+	cfg, err := NewConfig(socketPath, uid, map[string]uint32{adminID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := controlTestDB(t)
+	// Closing the store's underlying *sql.DB before Start ever calls
+	// Coordinator().Inspect forces that call's own `c.db.Begin(ctx)` to fail
+	// cleanly (sql.ErrConnDone) -- reaching exactly the installation-
+	// identity-read failure branch Start's error wrapping names, with no
+	// test-only injection seam added to production code.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	service := NewListenerService(cfg, 0600)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal})
+	if err == nil {
+		t.Fatal("Start succeeded against a closed store, want the installation-identity-read failure")
+	}
+	if _, statErr := os.Stat(socketPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("socket path still exists after Start's identity-read failure: err=%v", statErr)
+	}
+}
+
 func TestListenerServiceRecoveryOnlyState(t *testing.T) {
 	dir := privateSocketDir(t)
 	socketPath := filepath.Join(dir, "admin.sock")

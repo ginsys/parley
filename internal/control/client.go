@@ -225,9 +225,19 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 	// present error's own value, and only to reject it.
 	resultPresent := len(resp.Result) > 0
 	errorPresent := len(resp.Error) > 0
+	// Every rejection below is reached only after a full, ID-matched-or-not
+	// response line was actually read off the wire -- the request was
+	// therefore fully written and (per the server's strictly sequential
+	// per-socket serving) almost certainly already acted on. A malformed,
+	// self-contradictory or desynchronized response here proves nothing
+	// about whether that action succeeded: it is exactly as unresolved as
+	// the read/decode failures above, and must be classified the same way,
+	// via wrapTimeout, never as a bare error a caller could mistake for a
+	// proven non-dispatch of a mutating call (mandate T2; this specific gap
+	// was surfaced by the hosted review of this batch's own CP-02 fix).
 	if resp.JSONRPC != "2.0" {
 		c.broken = true
-		return fmt.Errorf("control: response has unsupported jsonrpc version %q", resp.JSONRPC)
+		return wrapTimeout(fmt.Errorf("control: response has unsupported jsonrpc version %q", resp.JSONRPC))
 	}
 	if resultPresent == errorPresent {
 		// Exactly one of result/error must be present -- neither (a bare
@@ -235,7 +245,7 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		// self-contradictory envelope (mandate R5). Neither is safe to
 		// treat as success.
 		c.broken = true
-		return errors.New("control: response must carry exactly one of result or error")
+		return wrapTimeout(errors.New("control: response must carry exactly one of result or error"))
 	}
 	if resp.ID == nil || *resp.ID != id {
 		// The server's own serialization (internal/control/listener_linux.go)
@@ -244,7 +254,7 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		// not merely that a request was skipped -- never proceed as if the
 		// mismatched response belonged to this call.
 		c.broken = true
-		return fmt.Errorf("control: response id %s does not match request id %q", formatResponseID(resp.ID), id)
+		return wrapTimeout(fmt.Errorf("control: response id %s does not match request id %q", formatResponseID(resp.ID), id))
 	}
 	if errorPresent {
 		// A present error must be an actual, valid error object -- a bare
@@ -255,16 +265,16 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 		// (mandate R5).
 		if string(resp.Error) == "null" {
 			c.broken = true
-			return errors.New("control: response carries an explicit null error, not a valid error object")
+			return wrapTimeout(errors.New("control: response carries an explicit null error, not a valid error object"))
 		}
 		var wireErr incomingError
 		if err := json.Unmarshal(resp.Error, &wireErr); err != nil {
 			c.broken = true
-			return fmt.Errorf("control: malformed error object: %w", err)
+			return wrapTimeout(fmt.Errorf("control: malformed error object: %w", err))
 		}
 		if err := wireErr.validate(); err != nil {
 			c.broken = true
-			return err
+			return wrapTimeout(err)
 		}
 		remote := &RemoteError{RPC: wireErr.Code, Message: wireErr.Message}
 		if wireErr.Data != nil {
