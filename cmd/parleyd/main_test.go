@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -699,6 +700,12 @@ func TestServeRefusesMissingDatabaseWithoutSubstitutingEmptyOne(t *testing.T) {
 	}
 }
 
+// shutdownWait bounds both the normal-path and the cleanup-path wait for
+// serve to actually return after cancellation, and the raw handshake I/O in
+// TestServeStartsServesHelloAndShutsDownOnCancellation -- so a stuck server
+// cannot hang either the test or its own cleanup indefinitely (mandate T1).
+const shutdownWait = 5 * time.Second
+
 // TestServeStartsServesHelloAndShutsDownOnCancellation is the end-to-end
 // acceptance path: init a real database, bind a real socket and marker
 // directory, start serve in the background, prove a real authenticated
@@ -724,14 +731,43 @@ func TestServeStartsServesHelloAndShutsDownOnCancellation(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan int, 1)
+	// finished is closed exactly once by the goroutine below, after storing
+	// its result -- unlike a single-value buffered channel, a closed
+	// channel can be observed repeatedly, so both the normal-path
+	// assertion below and the cleanup guard can each read it without
+	// blocking on a value the other side already drained (mandate T1: a
+	// cleanup that must not "consume an already-consumed single result and
+	// then hang").
+	finished := make(chan struct{})
+	var resultMu sync.Mutex
+	var resultCode int
 	var out, errOut bytes.Buffer
 	go func() {
-		done <- serve(ctx, serveConfig{
+		code := serve(ctx, serveConfig{
 			databasePath: dbPath, control: controlCfg, socketMode: 0600,
 			markersDir: markersDir, markersUID: uid, markersCapacity: 8,
 		}, &out, &errOut)
+		resultMu.Lock()
+		resultCode = code
+		resultMu.Unlock()
+		close(finished)
 	}()
+
+	// Registered right after launch, before any assertion below can fail:
+	// t.Cleanup runs on every exit path, including an early t.Fatal, and
+	// runs LIFO, so this fires before privateDir's own directory-removal
+	// cleanups (registered earlier, above) even though this line runs
+	// later in the function body. A bare cancel() is not evidence that
+	// serve actually finished (mandate T1) -- this waits for it, bounded,
+	// before conceding those directories to removal.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(shutdownWait):
+			t.Errorf("cleanup: serve did not shut down within %s of cancellation", shutdownWait)
+		}
+	})
 
 	var conn *net.UnixConn
 	deadline := time.Now().Add(3 * time.Second)
@@ -747,6 +783,12 @@ func TestServeStartsServesHelloAndShutsDownOnCancellation(t *testing.T) {
 		t.Fatal("server never accepted an authenticated connection")
 	}
 	defer conn.Close()
+	// Bounds the raw handshake I/O below so a server that never responds
+	// cannot hang this test (and so delay reaching the cleanup above)
+	// indefinitely (mandate T1).
+	if err := conn.SetDeadline(time.Now().Add(shutdownWait)); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}` + "\n")); err != nil {
 		t.Fatal(err)
@@ -776,11 +818,93 @@ func TestServeStartsServesHelloAndShutsDownOnCancellation(t *testing.T) {
 
 	cancel()
 	select {
-	case code := <-done:
+	case <-finished:
+		resultMu.Lock()
+		code := resultCode
+		resultMu.Unlock()
 		if code != 0 {
 			t.Fatalf("code=%d err=%q", code, errOut.String())
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(shutdownWait):
 		t.Fatal("serve did not shut down after context cancellation")
 	}
+}
+
+// TestServeCleanupWaitsForCompletionEvenOnEarlyReturn is T1's direct
+// regression. It deliberately does *not* do the hello round trip or call
+// cancel() itself -- exactly mirroring what would remain if an assertion
+// between launch and the acceptance test's own explicit cancel()/select
+// had failed early -- and relies solely on t.Cleanup to tear serve down.
+// testing.T.Cleanup runs on every exit path, including a plain return, not
+// only after t.FailNow(), so this proves the same thing an early t.Fatal
+// would without leaving an intentionally-failing test in the suite (a
+// failing subtest would mark this package permanently red, defeating its
+// own purpose as a regression).
+//
+// Two cleanups are registered, in the order that makes t.Cleanup's LIFO
+// firing check the property that matters: the ownership re-acquisition
+// check is registered *first* (so it fires *last*), the cancel-and-wait is
+// registered *second* (so it fires *first*) -- meaning the re-acquisition
+// only ever runs after the wait has already blocked until serve() genuinely
+// returned. A cleanup that only called cancel() without waiting could let
+// this re-acquisition race the still-exiting goroutine and intermittently
+// find the lock still held.
+func TestServeCleanupWaitsForCompletionEvenOnEarlyReturn(t *testing.T) {
+	dbPath := filepath.Join(privateDir(t, "parleyd-serve-earlyret-db-"), "parley.db")
+	var initOut, initErr bytes.Buffer
+	if code := runInit([]string{"-database", dbPath}, &initOut, &initErr); code != 0 {
+		t.Fatalf("init failed: code=%d err=%q", code, initErr.String())
+	}
+	socketPath := filepath.Join(privateDir(t, "parleyd-serve-earlyret-sock-"), "admin.sock")
+	markersDir := filepath.Join(privateDir(t, "parleyd-serve-earlyret-mk-"), "markers")
+	if err := os.Mkdir(markersDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	uid := uint32(os.Getuid())
+	adminID := "70000000-0000-4000-8000-000000000001"
+	controlCfg, err := control.NewConfig(socketPath, uid, map[string]uint32{adminID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Registered first, so LIFO runs it *last*: by then, the cancel-and-wait
+	// cleanup below has already completed, so a fresh Acquire here proves
+	// ownership was actually released, not merely that cancellation was
+	// requested.
+	t.Cleanup(func() {
+		owner, err := runtime.Acquire(dbPath)
+		if err != nil {
+			t.Errorf("ownership was not released by the time the wait-for-completion cleanup returned: %v", err)
+			return
+		}
+		if err := owner.Close(); err != nil {
+			t.Errorf("close after re-acquiring released ownership: %v", err)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	var out, errOut bytes.Buffer
+	go func() {
+		serve(ctx, serveConfig{
+			databasePath: dbPath, control: controlCfg, socketMode: 0600,
+			markersDir: markersDir, markersUID: uid, markersCapacity: 8,
+		}, &out, &errOut)
+		close(finished)
+	}()
+	// Registered second, so LIFO runs it *first* -- the same cancel/wait
+	// shape as the acceptance test's own t.Cleanup.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(shutdownWait):
+			t.Errorf("cleanup: serve did not shut down within %s of cancellation", shutdownWait)
+		}
+	})
+
+	// Deliberately nothing else here: no hello round trip, no explicit
+	// cancel(). Reaching the end of the test function with only the two
+	// t.Cleanup registrations above is the "early exit after launch" this
+	// regression demonstrates recovers cleanly.
 }

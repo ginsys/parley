@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	goruntime "runtime"
@@ -89,10 +90,22 @@ func TestDialFailsWhenAdministratorUIDUnconfigured(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected dial/hello to fail for an unconfigured administrator UID")
 	}
+	// The listener closes an unconfigured administrator's socket immediately
+	// at accept time, before serveSession ever runs -- but that happens
+	// concurrently with, not strictly before, the client's own hello write,
+	// so the client cannot structurally distinguish this from a connection
+	// reset mid-flight (mandate T2: a post-write failure is an unresolved
+	// exchange unless it is positively established as pre-dispatch, and a
+	// race with the peer's accept-time close is not provable from here).
+	// It must never be misreported as a *RemoteError (no such response was
+	// ever sent).
 	var remote *RemoteError
 	var timeout *TimeoutError
-	if errors.As(err, &remote) || errors.As(err, &timeout) {
-		t.Fatalf("expected a plain transport failure (closed connection), got %#v", err)
+	if errors.As(err, &remote) {
+		t.Fatalf("expected a transport failure, not a server response, got %#v", err)
+	}
+	if !errors.As(err, &timeout) {
+		t.Fatalf("err=%v (%T), want *TimeoutError (outcome unknown)", err, err)
 	}
 }
 
@@ -187,6 +200,115 @@ func TestClientCallMarksConnectionBrokenAfterTimeout(t *testing.T) {
 	}
 	if err := client.Call(context.Background(), "server.hello", nil, nil); !errors.Is(err, errClientBroken) {
 		t.Fatalf("err=%v, want errClientBroken", err)
+	}
+}
+
+// TestClientCallReportsServerSideCloseAsIncompleteExchangeNotBareEOF covers
+// a post-write failure that is not a deadline timeout at all: the peer
+// demonstrably receives the full request (synchronized on the server
+// goroutine's own successful ReadString, not on timing) and then closes
+// without ever writing a response. ctx carries no deadline and is never
+// cancelled, so the resulting read failure here is a plain io.EOF -- not a
+// net.Error with Timeout() true, and not something wrapCancel's ctx.Err()
+// branch would touch either. The request may already have reached and
+// been acted on by the server -- the outcome is exactly as unknown as an
+// actual timeout's -- so this must still surface as *TimeoutError, never
+// as a bare io.EOF a caller could mistake for "definitely not performed"
+// (mandate T2). Before the fix, wrapTimeout only wrapped
+// net.Error.Timeout() failures, so this exact scenario returned a bare,
+// unwrapped io.EOF: this test fails against that prior behavior.
+func TestClientCallReportsServerSideCloseAsIncompleteExchangeNotBareEOF(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := dir + "/admin.sock"
+	uid := uint32(os.Getuid())
+	raw, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	received := make(chan struct{})
+	go func() {
+		conn, err := raw.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+			return
+		}
+		close(received) // the request was genuinely received before this closes
+	}()
+
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+	defer client.Close()
+
+	err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	select {
+	case <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server goroutine never observed the request")
+	}
+	var timeout *TimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatalf("err=%v (%T), want *TimeoutError", err, err)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("err=%v, want the underlying io.EOF preserved via Unwrap", err)
+	}
+	if !client.broken {
+		t.Fatal("connection not marked broken after a server-side close")
+	}
+}
+
+// TestClientCallReportsTruncatedResponseAsIncompleteExchange covers the
+// other unresolved-outcome shape mandate T2 names explicitly: the peer
+// writes part of a response and then closes without ever sending the
+// terminating LF readBoundedFrame requires. This is a distinct failure
+// path from a close with zero bytes written (the previous test) -- some
+// response bytes did arrive, just not a complete, parseable one -- and
+// must be classified the same way: outcome unknown, never a proven
+// failure and never confused with the well-formed responses
+// TestClientCallAcceptsWellFormedResultsAndErrorsAndKeepsConnectionUsable
+// covers.
+func TestClientCallReportsTruncatedResponseAsIncompleteExchange(t *testing.T) {
+	dir := privateSocketDir(t)
+	path := dir + "/admin.sock"
+	uid := uint32(os.Getuid())
+	raw, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	go func() {
+		conn, err := raw.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+			return
+		}
+		conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","resu`)) // deliberately no closing LF
+	}()
+
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+	defer client.Close()
+
+	err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	var timeout *TimeoutError
+	if !errors.As(err, &timeout) {
+		t.Fatalf("err=%v (%T), want *TimeoutError", err, err)
+	}
+	if !client.broken {
+		t.Fatal("connection not marked broken after a truncated response")
 	}
 }
 
