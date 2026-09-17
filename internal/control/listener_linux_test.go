@@ -1166,6 +1166,69 @@ func TestListenerRestartFirstIncarnationCleansUpOnEarlyReturnAfterGenuineStart(t
 	// first incarnation" this regression demonstrates recovers cleanly.
 }
 
+// probeOwner owns every resource that
+// TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime
+// acquires, tracking exactly what has actually been created so far so an
+// early failure at any acquisition step still releases only what exists
+// (mandate PC-F2's "early resource registration": a probe owner registered
+// once, over zero-value/nil fields, before the first fallible acquisition,
+// not one built and registered only after several of them already
+// succeeded). It is deliberately independent of inc's own borrowed-resource
+// teardownCore call below: release stops admission and observes completion
+// itself rather than assuming teardownCore already did so, since an early
+// exit before that call would otherwise leave the accept loop permanently
+// blocked in Accept with nothing left to unblock it -- cancelling the
+// worker context alone does not close the listening socket, only
+// StopAdmission does.
+type probeOwner struct {
+	db     *store.DB
+	svc    *Listener
+	cancel context.CancelFunc
+	idle   net.Conn
+}
+
+// release independently stops admission -- tolerating an already-performed
+// stop of this exact listener (a repeated net.Listener.Close() returns a
+// wrapped net.ErrClosed, not a genuine new failure, and StopAdmission
+// itself is documented safe even before a listener ever bound) -- releases
+// the idle connection, invokes the cancellation withheld from the borrowed
+// incarnation under test, and observes Wait within its bound before ever
+// closing the database. A Wait that does not complete within the bound
+// returns before the database is closed or any retention decision is made,
+// applying the same stop-before-close rule used for the borrowed
+// incarnation to this probe's own real resources; a completed Wait that
+// itself reports a service error still safely proceeds through ordered
+// close, with that error preserved and reported.
+func (o *probeOwner) release() error {
+	var stopErr error
+	if o.svc != nil {
+		if err := o.svc.StopAdmission(); err != nil && !errors.Is(err, net.ErrClosed) {
+			stopErr = fmt.Errorf("stop admission: %w", err)
+		}
+	}
+	if o.idle != nil {
+		o.idle.Close()
+	}
+	if o.cancel != nil {
+		o.cancel()
+	}
+	var waitErr error
+	if o.svc != nil {
+		done := make(chan error, 1)
+		go func() { done <- o.svc.Wait() }()
+		select {
+		case waitErr = <-done:
+		case <-time.After(restartTeardownWait):
+			return fmt.Errorf("listener did not actually stop within %s", restartTeardownWait)
+		}
+	}
+	var closeErr error
+	if o.db != nil {
+		closeErr = o.db.Close()
+	}
+	return errors.Join(stopErr, waitErr, closeErr)
+}
+
 // TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime
 // is TC-R1's core regression: it forces serveIncarnation.teardown's bounded
 // wait to observe a genuinely not-yet-stopped service, using a real
@@ -1177,16 +1240,16 @@ func TestListenerRestartFirstIncarnationCleansUpOnEarlyReturnAfterGenuineStart(t
 // The worker-context cancel func is deliberately withheld from inc (left
 // nil): serveSession's ctx.Done() watcher closes any connection the
 // instant its context is cancelled, which would make the wait complete
-// almost immediately and defeat this probe. It is invoked from a t.Cleanup
-// registered as soon as the idle connection exists (before the fallible
-// assertions below), together with closing that connection and actually
-// joining the service and closing the store, so an early Fatal still
-// releases this probe's own controlled work instead of stranding it
-// (mandate TC-R1 focused verification #3; mandate PC-F2). That same
-// cleanup only clears the retention flag once it has observed every owned
-// resource genuinely settle -- a successful run must not permanently
-// retain the fixture just because retention was required while the forced
-// wait was still outstanding.
+// almost immediately and defeat this probe. The real cancellation
+// capability, along with every other resource, is instead owned by a
+// probeOwner (above), released from a t.Cleanup registered before this
+// function acquires anything, so an early Fatal at any point still
+// releases exactly what was actually acquired instead of stranding it
+// (mandate TC-R1 focused verification #3; mandate PC-F2). That release
+// only clears the retention flag once it has observed every owned resource
+// genuinely settle -- a successful run must not permanently retain the
+// fixture just because retention was required while the forced wait was
+// still outstanding.
 func TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime(t *testing.T) {
 	ctx := context.Background()
 	var retainFixtures bool
@@ -1196,10 +1259,21 @@ func TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime(t 
 	uid := uint32(os.Getuid())
 	socketPath := filepath.Join(dir, "admin.sock")
 
+	owner := &probeOwner{}
+	t.Cleanup(func() {
+		if err := owner.release(); err != nil {
+			retainFixtures = true
+			t.Errorf("probe cleanup did not settle cleanly, retaining %s: %v", dir, err)
+			return
+		}
+		retainFixtures = false
+	})
+
 	db, err := store.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner.db = db
 	if err := db.OpenReaders(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -1208,7 +1282,9 @@ func TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime(t 
 		t.Fatal(err)
 	}
 	svc := NewListenerService(cfg, 0600)
+	owner.svc = svc
 	wctx, cancel := context.WithCancel(ctx)
+	owner.cancel = cancel
 	if err := svc.Start(ctx, runtime.Resources{WorkerContext: wctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal}); err != nil {
 		t.Fatal(err)
 	}
@@ -1222,44 +1298,7 @@ func TestServeIncarnationTeardownRetainsResourcesWhenServiceDoesNotStopInTime(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	// This probe's own real cleanup: release the idle connection, invoke
-	// the cancellation deliberately withheld from inc below, join the
-	// service and close the store. Registered now, before any further
-	// fallible assertion, so an early Fatal below still runs it -- mirrors
-	// every other serveIncarnation-owned resource in this file. This is
-	// separate from inc's own teardownCore call below: that call observes
-	// the forced-incomplete outcome under test; this releases the actual
-	// capability withheld from it. Only when every owned resource is
-	// observed genuinely settled does it clear retainFixtures again -- a
-	// deadline elapsing or a stop merely being requested is not that
-	// evidence, and a prior successful run must not permanently retain a
-	// SQLite-containing temp directory just because the forced-timeout
-	// assertions above required retention while the wait was still
-	// outstanding (mandate PC-F2).
-	t.Cleanup(func() {
-		idle.Close()
-		cancel()
-		done := make(chan error, 1)
-		go func() { done <- svc.Wait() }()
-		var waitErr error
-		select {
-		case waitErr = <-done:
-		case <-time.After(restartTeardownWait):
-			waitErr = fmt.Errorf("listener did not actually stop after the probe's connection was closed")
-		}
-		closeErr := db.Close()
-		switch {
-		case waitErr != nil:
-			retainFixtures = true
-			t.Errorf("probe cleanup: listener did not settle, retaining %s: %v", dir, waitErr)
-		case closeErr != nil:
-			retainFixtures = true
-			t.Errorf("probe cleanup: store close failed, retaining %s: %v", dir, closeErr)
-		default:
-			retainFixtures = false
-		}
-	})
+	owner.idle = idle
 
 	// A successful Dial only proves the kernel accepted the connection
 	// into its backlog, not that the server's own accept loop has called
