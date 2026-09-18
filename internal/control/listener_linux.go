@@ -176,6 +176,13 @@ type Listener struct {
 	acceptErr    error       // recorded by fail; returned by Wait
 	onFailure    func(error) // optional, set via OnAcceptFailure before Start
 	wg           sync.WaitGroup
+
+	// lstatSocket, when set, replaces unix.Lstat for Start's post-bind
+	// identity read. Instance-local (a field on this Listener, not a
+	// package-level variable) so a test exercising this failure cannot
+	// race an unrelated test's ordinary Start call in the same package.
+	// Nil in production; Start falls back to unix.Lstat itself.
+	lstatSocket func(path string, stat *unix.Stat_t) error
 }
 
 // NewListenerService builds a Listener for runtime.Start's
@@ -223,11 +230,29 @@ func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
 	// left StopAdmission's `listener == nil` check short-circuiting past
 	// unlinkOwnedSocket entirely, orphaning the just-bound socket file
 	// (found by the hosted review of this batch's own CP-09 fix).
-	var boundStat unix.Stat_t
-	var boundDev, boundIno uint64
-	if err := unix.Lstat(ln.cfg.AdminSocket, &boundStat); err == nil {
-		boundDev, boundIno = uint64(boundStat.Dev), boundStat.Ino
+	//
+	// A failed Lstat here is itself a startup failure, not a degraded but
+	// otherwise successful Start: leaving boundDev/boundIno at zero would
+	// make unlinkOwnedSocket a permanent, silent no-op for this incarnation
+	// (found by a later hosted review of that fix). This does NOT mean
+	// blindly unlinking the pathname on this failure -- an Lstat failure
+	// establishes nothing about what, if anything, currently occupies that
+	// pathname, so removing it here would be exactly the unverified-removal
+	// mistake unlinkOwnedSocket's own identity check exists to avoid. Fail
+	// closed instead: close the listener this attempt just bound and leave
+	// the pathname untouched, its state and cleanup explicitly unverified.
+	lstat := ln.lstatSocket
+	if lstat == nil {
+		lstat = unix.Lstat
 	}
+	var boundStat unix.Stat_t
+	if statErr := lstat(ln.cfg.AdminSocket, &boundStat); statErr != nil {
+		return errors.Join(
+			fmt.Errorf("control: read bound socket identity: %w", statErr),
+			listener.Close(),
+		)
+	}
+	boundDev, boundIno := uint64(boundStat.Dev), boundStat.Ino
 	state := StateRunning
 	if res.Mode == runtime.Held {
 		state = StateRecoveryOnly
