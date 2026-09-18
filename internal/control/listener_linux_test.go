@@ -788,21 +788,62 @@ func TestWriteResponseReplacesOversizedResponseWithInternalError(t *testing.T) {
 	}
 	defer ln.Close()
 
-	accepted := make(chan *net.UnixConn, 1)
+	// gotConn is unconditionally closed on every AcceptUnix outcome, success
+	// or failure, so a select waiting on it never blocks forever the way a
+	// prior version's `serverConn := <-accepted` could when AcceptUnix
+	// failed without publishing anything at all. acceptedConn is guarded by
+	// acceptedMu since the accept goroutine and this test's own goroutine
+	// (via t.Cleanup, which can run concurrently with nothing else by then,
+	// but still reads the same variable) both touch it.
+	var acceptedMu sync.Mutex
+	var acceptedConn *net.UnixConn
+	gotConn := make(chan struct{})
 	go func() {
 		c, err := ln.AcceptUnix()
-		if err != nil {
+		acceptedMu.Lock()
+		if err == nil {
+			acceptedConn = c
+		}
+		acceptedMu.Unlock()
+		close(gotConn)
+	}()
+	// Registered before any fallible assertion below (mandate: named test
+	// evidence): whatever AcceptUnix eventually does, and even if it
+	// finishes only after a t.Fatal elsewhere already gave up waiting, the
+	// accepted connection -- if any -- is still closed here rather than
+	// leaked.
+	t.Cleanup(func() {
+		select {
+		case <-gotConn:
+		case <-time.After(2 * time.Second):
+			t.Error("accept goroutine never finished")
 			return
 		}
-		accepted <- c
-	}()
+		acceptedMu.Lock()
+		c := acceptedConn
+		acceptedMu.Unlock()
+		if c != nil {
+			c.Close()
+		}
+	})
+
 	dialed, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dialed.Close()
-	serverConn := <-accepted
-	defer serverConn.Close()
+
+	select {
+	case <-gotConn:
+	case <-time.After(5 * time.Second):
+		t.Fatal("accept never completed")
+	}
+	acceptedMu.Lock()
+	serverConn := acceptedConn
+	acceptedMu.Unlock()
+	if serverConn == nil {
+		t.Fatal("accept failed")
+	}
 
 	id := "1"
 	oversized := make([]byte, MaxFrameBytes)
@@ -815,8 +856,13 @@ func TestWriteResponseReplacesOversizedResponseWithInternalError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := <-writeErr; err != nil {
-		t.Fatal(err)
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("writeResponse never completed after the client read its response")
 	}
 	if len(line) >= MaxFrameBytes {
 		t.Fatalf("wrote an oversized frame: %d bytes", len(line))

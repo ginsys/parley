@@ -12,6 +12,7 @@ import (
 	"os"
 	goruntime "runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -73,6 +74,18 @@ func TestClientCallSequentialRequestsBothSucceed(t *testing.T) {
 // errClientConcurrentCall rather than race nextID/br/the connection
 // deadline against the first call. This is a caller-misuse guard, not a
 // queue: the second call is never retried or serialized on its behalf.
+//
+// This is a directly affected test from batch 10, not a general cleanup
+// campaign: only its own resource lifecycle is fixed here. release is
+// registered for idempotent, guaranteed closing via t.Cleanup before the
+// fake server goroutine or either Call is launched -- an early t.Fatal in
+// any assertion below (e.g. a regressed guard letting the second Call
+// through) must not strand the fake server on <-release forever, since
+// t.Cleanup still runs after Fatal even though the code after it does
+// not. Every subsequent wait is bounded, and the fake server's own exit is
+// joined, so a broken guard implementation fails this test promptly
+// instead of hanging it, and no probe goroutine survives past the test
+// regardless of which assertion (if any) fails first.
 func TestClientCallRejectsConcurrentCall(t *testing.T) {
 	dir := privateSocketDir(t)
 	path := dir + "/admin.sock"
@@ -82,9 +95,16 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer raw.Close()
+
 	received := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseNow := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseNow)
+
+	serverDone := make(chan struct{})
 	go func() {
+		defer close(serverDone)
 		conn, err := raw.Accept()
 		if err != nil {
 			return
@@ -98,6 +118,13 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 		<-release
 		conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"))
 	}()
+	t.Cleanup(func() {
+		select {
+		case <-serverDone:
+		case <-time.After(2 * time.Second):
+			t.Error("fake server goroutine did not exit after release")
+		}
+	})
 
 	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
 	if err != nil {
@@ -121,9 +148,14 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 		t.Fatalf("err=%v, want errClientConcurrentCall", err)
 	}
 
-	close(release)
-	if err := <-firstDone; err != nil {
-		t.Fatalf("first call failed: %v", err)
+	releaseNow()
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatalf("first call failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first call never completed after release")
 	}
 	if client.broken {
 		t.Fatal("the rejected concurrent call must not mark the connection broken")
@@ -249,6 +281,21 @@ func TestClientCallClassifiesPostWriteEnvelopeRejectionsAsUnresolvedOutcome(t *t
 		{"explicit null error alongside no result", `{"jsonrpc":"2.0","id":"1","error":null}` + "\n"},
 		{"malformed error object", `{"jsonrpc":"2.0","id":"1","error":{"code":"not-a-number","message":"x"}}` + "\n"},
 		{"error object fails validate (unrecognized code)", `{"jsonrpc":"2.0","id":"1","error":{"code":-1,"message":"x"}}` + "\n"},
+		// The remaining cases are mandate CP-06's response-contract
+		// completion: encoding/json's struct decode is case-insensitive on
+		// field names when no exact match exists and silently ignores
+		// unknown object keys, so without validateResponseEnvelope/
+		// validateErrorObjectShape these would otherwise decode as ordinary
+		// responses (or, for CRLF, slip past parseJSON's own trailing-
+		// content check, since a trailing CR is insignificant JSON
+		// whitespace).
+		{"unknown outer member", `{"jsonrpc":"2.0","id":"1","result":{},"extra":true}` + "\n"},
+		{"wrong-case jsonrpc alias", `{"JSONRPC":"2.0","id":"1","result":{}}` + "\n"},
+		{"case-distinct competing keys", `{"jsonrpc":"2.0","JSONRPC":"2.0","id":"1","result":{}}` + "\n"},
+		{"CRLF line ending", `{"jsonrpc":"2.0","id":"1","result":{}}` + "\r\n"},
+		{"unknown error member", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":"not_found"},"extra":true}}` + "\n"},
+		{"unknown error.data member", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":"not_found","extra":true}}}` + "\n"},
+		{"error.data explicitly null", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":null}}` + "\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -426,44 +473,35 @@ func TestClientCallReportsTruncatedResponseAsIncompleteExchange(t *testing.T) {
 	}
 }
 
+// infiniteXReader is a finite-per-Read, unbounded-in-total in-memory
+// io.Reader that never produces the LF readBoundedFrame is waiting for and
+// never returns an error -- unlike a real socket with a read deadline, it
+// cannot itself time out, so the only way readBoundedFrame can return here
+// is by actually tripping its own size bound. This makes the test
+// deterministic instead of racing a 10s socket deadline against the
+// intended size rejection (mandate: named test evidence).
+type infiniteXReader struct{}
+
+func (infiniteXReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
 // TestReadBoundedFrameRefusesOversizedUnterminatedStream proves the
 // client's response reader will not buffer without limit -- mirroring the
 // server's own MaxFrameBytes write bound (writeResponse in
-// listener_linux.go) -- when a peer never sends the terminating LF.
+// listener_linux.go) -- when a peer never sends the terminating LF, and
+// that the returned error is the actual size-rejection outcome, not a
+// coincidental deadline or EOF standing in for it. A prior version of this
+// test read from a real socket under a 10s read deadline and accepted any
+// non-nil error, so a regression that let readBoundedFrame buffer far past
+// MaxFrameBytes (or hang) would have still passed once that deadline fired.
 func TestReadBoundedFrameRefusesOversizedUnterminatedStream(t *testing.T) {
-	dir := privateSocketDir(t)
-	path := dir + "/admin.sock"
-	raw, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer raw.Close()
-	go func() {
-		conn, err := raw.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		chunk := make([]byte, 4096)
-		for i := range chunk {
-			chunk[i] = 'x'
-		}
-		for {
-			if _, err := conn.Write(chunk); err != nil {
-				return
-			}
-		}
-	}()
-
-	conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: path, Net: "unix"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, err = readBoundedFrame(bufio.NewReader(conn))
-	if err == nil {
-		t.Fatal("expected refusal of an unbounded unterminated stream")
+	_, err := readBoundedFrame(bufio.NewReader(infiniteXReader{}))
+	if !errors.Is(err, errFrameTooLarge) {
+		t.Fatalf("err=%v, want errFrameTooLarge -- a deadline or EOF must not be mistaken for the size rejection", err)
 	}
 }
 
@@ -850,26 +888,76 @@ func TestClientCallRejectsResponseViolatingStrictJSONGrammar(t *testing.T) {
 	}
 }
 
-// TestClientCallRejectsUnrecognizedDomainCode is mandate CP-03's
-// regression: a peer must not be able to introduce an arbitrary
+// TestClientCallDomainCodeVocabulary is mandate CP-03's regression, in both
+// directions: a peer must not be able to introduce an arbitrary
 // error.data.code merely by sending one that happens to be nonblank -- it
 // must be a member of the accepted domain-code vocabulary this client and
-// the server both enforce.
-func TestClientCallRejectsUnrecognizedDomainCode(t *testing.T) {
+// the server both enforce -- but that vocabulary must also actually accept
+// every code the wire contract names, including the six wire-only
+// additions (resnapshot_required, subscription_conflict,
+// stale_grant_version, invalid_membership, unsupported_membership,
+// incompatible_identifier) that have no store.Code counterpart. A valid
+// code must decode into a genuine, usable RemoteError; an invalid one must
+// leave the exchange incomplete (*TimeoutError) on a now-unusable
+// connection, never a bare error a caller could mistake for something
+// else.
+func TestClientCallDomainCodeVocabulary(t *testing.T) {
 	uid := uint32(os.Getuid())
-	path := rawResponder(t, `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":"not_a_real_domain_code"}}}`+"\n")
-	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
-	if err != nil {
-		t.Fatal(err)
+	valid := []DomainCode{
+		ProtocolMismatch, OperationNotFound,
+		ResnapshotRequired, SubscriptionConflict, StaleGrantVersion,
+		InvalidMembership, UnsupportedMembership, IncompatibleIdentifier,
+		// A representative pre-existing store.Code, proving the switch
+		// added by CP-03 did not shadow the store.Code fallback beneath it.
+		DomainCode("capacity_exceeded"),
 	}
-	client := &Client{conn: conn, br: bufio.NewReader(conn)}
-	defer client.Close()
-	err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
-	if err == nil {
-		t.Fatal("expected rejection of an unrecognized error.data.code")
+	for _, code := range valid {
+		t.Run("valid/"+string(code), func(t *testing.T) {
+			response := fmt.Sprintf(`{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":%q}}}`+"\n", code)
+			path := rawResponder(t, response)
+			conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &Client{conn: conn, br: bufio.NewReader(conn)}
+			defer client.Close()
+			err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+			var remote *RemoteError
+			if !errors.As(err, &remote) || remote.Domain != code {
+				t.Fatalf("err=%#v, want RemoteError with Domain %q", err, code)
+			}
+			if client.broken {
+				t.Fatal("a valid domain code must not mark the connection broken")
+			}
+		})
 	}
-	if !client.broken {
-		t.Fatal("connection not marked broken after an unrecognized domain code")
+
+	invalid := []struct {
+		name     string
+		response string
+	}{
+		{"unrecognized", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":"not_a_real_domain_code"}}}` + "\n"},
+		{"blank", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":""}}}` + "\n"},
+		{"wrong type", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":123}}}` + "\n"},
+	}
+	for _, c := range invalid {
+		t.Run("invalid/"+c.name, func(t *testing.T) {
+			path := rawResponder(t, c.response)
+			conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := &Client{conn: conn, br: bufio.NewReader(conn)}
+			defer client.Close()
+			err = client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+			var timeout *TimeoutError
+			if !errors.As(err, &timeout) {
+				t.Fatalf("err=%#v, want *TimeoutError -- an invalid domain code is an incomplete exchange, not a bare error", err)
+			}
+			if !client.broken {
+				t.Fatal("connection not marked broken after an invalid domain code")
+			}
+		})
 	}
 }
 
