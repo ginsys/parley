@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -278,6 +279,108 @@ func TestListenRefusesUnsupportedModes(t *testing.T) {
 			t.Fatalf("mode %v: expected refusal, got none", mode)
 		}
 	}
+}
+
+// TestControlSocketAddrAcceptsAndRejectsAtTheExactBoundary exercises the
+// pure address-length arithmetic directly, at the precise byte boundary
+// x/sys/unix's SockaddrUnix enforces (S15-2): a constructed-address helper,
+// not a large number of real file descriptors, is what a descriptor-width
+// boundary needs -- controlSocketAddr performs no syscalls, so an arbitrary
+// small fd number exercises the same string arithmetic a large one would.
+func TestControlSocketAddrAcceptsAndRejectsAtTheExactBoundary(t *testing.T) {
+	const parent = 3 // arbitrary; controlSocketAddr never dereferences it
+	prefix := fmt.Sprintf("/proc/self/fd/%d/", parent)
+	fit := maxUnixSockAddrLen - len(prefix)
+	if fit < 1 {
+		t.Fatalf("test setup: prefix %q already exceeds the boundary", prefix)
+	}
+	name := strings.Repeat("a", fit)
+
+	addr, err := controlSocketAddr(parent, name)
+	if err != nil {
+		t.Fatalf("exact boundary (%d bytes) rejected: %v", len(prefix)+fit, err)
+	}
+	if len(addr) != maxUnixSockAddrLen {
+		t.Fatalf("addr len=%d, want exactly %d", len(addr), maxUnixSockAddrLen)
+	}
+
+	if _, err := controlSocketAddr(parent, name+"a"); !errors.Is(err, errSocketAddressTooLong) {
+		t.Fatalf("one byte over the boundary: err=%v, want errSocketAddressTooLong", err)
+	}
+}
+
+// TestListenRejectsAdminSocketAddressTooLongForSockaddrUn proves the
+// rejection actually reaches real Listen callers, not just the pure helper
+// above, and that startup fails with the documented error rather than
+// falling back to an unprotected bind.
+func TestListenRejectsAdminSocketAddressTooLongForSockaddrUn(t *testing.T) {
+	dir := privateSocketDir(t)
+	// Long enough that /proc/self/fd/<parent>/<name> cannot fit a struct
+	// sockaddr_un regardless of the parent descriptor's numeric width.
+	name := strings.Repeat("a", maxUnixSockAddrLen+1)
+	path := filepath.Join(dir, name)
+	_, err := Listen(Config{AdminSocket: path, ServerUID: uint32(os.Getuid())}, 0600)
+	if !errors.Is(err, errSocketAddressTooLong) {
+		t.Fatalf("err=%v, want errSocketAddressTooLong", err)
+	}
+	if _, statErr := os.Lstat(path); statErr == nil {
+		t.Fatal("Listen created an entry at the rejected pathname")
+	}
+}
+
+// TestListenRejectsTooLongAddressWithoutTouchingExistingEntry proves the
+// address-length check runs before prepareSocketPath can probe or remove
+// anything: an existing entry at a nonrepresentable pathname must survive
+// the rejected Listen call untouched.
+func TestListenRejectsTooLongAddressWithoutTouchingExistingEntry(t *testing.T) {
+	dir := privateSocketDir(t)
+	name := strings.Repeat("a", maxUnixSockAddrLen+1)
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Listen(Config{AdminSocket: path, ServerUID: uint32(os.Getuid())}, 0600)
+	if !errors.Is(err, errSocketAddressTooLong) {
+		t.Fatalf("err=%v, want errSocketAddressTooLong", err)
+	}
+	data, statErr := os.ReadFile(path)
+	if statErr != nil {
+		t.Fatalf("existing entry removed on rejection: %v", statErr)
+	}
+	if string(data) != "existing" {
+		t.Fatalf("existing entry modified: %q", data)
+	}
+}
+
+// TestListenAcceptsAdminSocketAtTheAddressBoundaryAndBinds proves the
+// boundary above isn't merely rejecting everything: a path whose
+// constructed address is short enough still binds and accepts real
+// connections. TestListenBindsWithRequestedModeAndAccepts already covers
+// the ordinary short-path case; this covers the accepted edge next to the
+// rejected one above.
+func TestListenAcceptsAdminSocketAtTheAddressBoundaryAndBinds(t *testing.T) {
+	dir := privateSocketDir(t)
+	// A long name, but kept far enough below maxUnixSockAddrLen that the
+	// plain "dir+name" absolute path (this test's own verification dial
+	// path, which does not go through /proc/self/fd/ addressing) also
+	// stays representable -- that is a separate, real client-side
+	// constraint this test must not confuse with the fix under test. The
+	// margin below the boundary accounts for the dir prefix length
+	// (os.MkdirTemp's random suffix varies) and leaves room for the
+	// descriptor-relative address (typically slightly longer than the
+	// plain path for a small parent fd number) to still fit.
+	name := strings.Repeat("a", maxUnixSockAddrLen-50)
+	path := filepath.Join(dir, name)
+	l, err := Listen(Config{AdminSocket: path, ServerUID: uint32(os.Getuid())}, 0600)
+	if err != nil {
+		t.Fatalf("long-but-representable path rejected: %v", err)
+	}
+	defer l.Close()
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
 }
 
 func TestListenReplacesProvablyStaleSocket(t *testing.T) {
@@ -701,7 +804,20 @@ func TestListenerServiceStartFailsClosedWhenPostBindIdentityCannotBeRead(t *test
 	service.lstatSocket = func(string, *unix.Stat_t) error { return injectedErr }
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Registered before Start, not merely before the assertions below: if
+	// Start ever regresses to succeed despite the injected lstat failure --
+	// exactly the condition this test exists to rule out -- the t.Fatal a
+	// few lines down would Goexit past this test's own manual
+	// StopAdmission/Wait calls near its end, leaking that incarnation's
+	// real accept loop for the rest of the package run. StopAdmission and
+	// Wait are safe to call again here even along the intended-failure
+	// path below: ln.listener stays nil throughout it (Start returns
+	// before ever assigning it), making both a no-op the second time.
+	t.Cleanup(func() {
+		service.StopAdmission()
+		cancel()
+		service.Wait()
+	})
 	err = service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal})
 	if err == nil {
 		t.Fatal("Start succeeded despite a failed post-bind identity read")

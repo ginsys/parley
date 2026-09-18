@@ -162,12 +162,30 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 
 	secondDone := make(chan error, 1)
 	secondGoroutineDone := make(chan struct{})
+	// secondLaunched is only ever written by this goroutine, before any
+	// Fatal below that could unwind through this Cleanup; the testing
+	// package runs Cleanup on this same goroutine after the test function
+	// returns or Goexits, so that write always happens-before this read --
+	// no separate synchronization is needed.
+	secondLaunched := false
 
-	// Registered before any work above can fail, per the doc comment above.
+	// Registered after the first Call goroutine is already launched (its
+	// own failure is reported via firstDone, not by this goroutine
+	// aborting) but before anything below that can call t.Fatal, so a
+	// Fatal in this goroutine always still runs this cleanup. It waits on
+	// secondGoroutineDone only when secondLaunched is true: a Fatal that
+	// fires before the second goroutine is ever started (e.g. "server
+	// never observed the first request" below) must not manufacture a
+	// false "second Call goroutine did not complete" error for work that
+	// never began.
 	t.Cleanup(func() {
 		releaseNow()
 		conn.Close()
-		for name, done := range map[string]chan struct{}{"first": firstGoroutineDone, "second": secondGoroutineDone} {
+		waits := map[string]chan struct{}{"first": firstGoroutineDone}
+		if secondLaunched {
+			waits["second"] = secondGoroutineDone
+		}
+		for name, done := range waits {
 			select {
 			case <-done:
 			case <-time.After(2 * time.Second):
@@ -189,6 +207,7 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 
 	secondCtx, secondCancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer secondCancel()
+	secondLaunched = true
 	go func() {
 		defer close(secondGoroutineDone)
 		secondDone <- client.Call(secondCtx, "server.hello", nil, nil)
