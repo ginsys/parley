@@ -377,13 +377,40 @@ ID-less-object-precedence and exact-envelope rules, the `-32700`..`-32603`/`-320
 `error.data.code` error contract, and a Linux listener authenticating each connection's kernel UID
 via `SO_PEERCRED` with per-administrator/total socket caps and a bounded, proven-abandonment-only
 stale-socket replacement. `cmd/parleyd` (`init`/`serve`) is the first standing server executable;
-`parleyctl` gained `-endpoint`/`-server-uid` and a `hello` diagnostic. **Only `server.hello` and
-`operation.get` are wired and advertised.** Every other method this section and
-[control.md](specifications/control.md) describe -- membership, admission, identity/recovery
-mutation, subscriptions and snapshots -- remains unimplemented; PR1 does not claim them, and
-`parleyctl grant|revoke|renew` still open the database directly (transitional, removed in PR2). See
+`parleyctl` gained `-endpoint`/`-server-uid` and a `hello` diagnostic. At the end of PR1, only
+`server.hello` and `operation.get` were wired and advertised; every mutation method remained
+unimplemented and `parleyctl grant|revoke|renew` still opened the database directly. See
 [Runtime foundation](runtime.md) for the exact startup/shutdown sequence `parleyd serve` uses, and
 [Operations](operations.md) for initialization and stopped-service backup guidance.
+
+### PR2 implementation status (2026-09-18)
+
+`internal/membership` implements the members/policy model's full shape validation (`Validate`,
+the `invalid_membership` class) and the first-runtime two-member subset check (`Supported`,
+`unsupported_membership`), plus the exact translation to and from the existing positional
+`grants` columns (`ToGrantFields`/`FromGrant`) described under
+[Accepted membership model](#accepted-membership-model) below. No members table or migration is
+introduced; translation is pure and stateless.
+
+`internal/control` now wires `membership.enroll|renew|replace|revoke` on top of the existing
+`store.Coordinator.Execute`, reusing `internal/controller`'s enrollment/renewal/replacement bodies
+(refactored into tx-accepting `GrantTx`/`RenewTx`/`ReplaceTx`/`RevokeTx` cores so the legacy
+self-opening `Grant`/`Renew`/`Revoke` methods and the new wire handlers can never diverge in
+validation, version assignment or the active-grant conflict check). Each mutation requires an
+explicit `expected_grant_version` (zero only when the conversation has no prior history) and
+verifies both named peers currently hold an enabled binding (`store.EnabledPeer`) before mutating.
+`StaleGrantVersion`, `InvalidMembership`, `UnsupportedMembership`, `NoActiveGrant` and
+`AlreadyActive` are `store.Code` values (not `control`-only codes), so a domain rejection is
+carried through `store.CommandResult.Code` and audited exactly like every other coordinator
+outcome -- including under a global recovery hold, which already blocks every `membership.*` kind
+with no extra code, since none of them appear in `recovery.humanRecovery`'s allowlist.
+
+`parleyctl` is now a pure client: `grant|revoke|renew` and the direct-database `openController`
+path are gone entirely, replaced by `parleyctl membership enroll|renew|replace|revoke` against the
+authenticated control endpoint via `control.Client`. It opens no database, acquires no lock, and
+mints a fresh operation ID per invocation (`-operation-id` for an explicit retry of a lost
+response). `admission`, identity/recovery mutation, subscriptions and snapshots remain
+unimplemented; PR2 does not claim them.
 
 ## Accepted conversation admission
 
@@ -457,9 +484,11 @@ and fixture details. These are target contracts; identity binding is not yet imp
 ## Accepted membership model
 
 The owner approved [decision #17](https://github.com/ginsys/parley/issues/17) on 2026-09-10.
-These are target contracts; the implemented core still uses the pair representation described below.
-The [draft membership specification](specifications/membership.md) expands them into proposed API,
-storage, lifecycle and verification contracts for owner review.
+The first-runtime subset below (`open`/single-edge `directed`, exactly two members) is implemented
+as of PR2 -- see [PR2 implementation status](#pr2-implementation-status-2026-09-18) above; the
+members/policies/edges tables, `lead_only`, larger groups and the room migration remain target
+contracts, not yet implemented. The [draft membership specification](specifications/membership.md)
+expands them into proposed API, storage, lifecycle and verification contracts for owner review.
 
 Grants have immutable versioned members (one exact peer ID and role per version) and a policy:
 

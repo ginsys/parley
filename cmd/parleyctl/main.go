@@ -9,123 +9,125 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/control"
-	"github.com/ginsys/parley/internal/controller"
-	"github.com/ginsys/parley/internal/runtime"
+	"github.com/ginsys/parley/internal/membership"
 	"github.com/ginsys/parley/internal/store"
+	"github.com/google/uuid"
 )
 
-type controllerAPI interface {
-	Grant(context.Context, controller.GrantParams) (*store.Grant, error)
-	Revoke(context.Context, string) (*controller.RevokeResult, error)
-	Renew(context.Context, controller.RenewParams) (*store.Grant, error)
+// membershipClient is the subset of *control.Client every membership
+// subcommand dispatch needs. It exists so a test can inject a fake client
+// that never opens a real socket -- the replacement for the removed
+// controllerFactory seam from the legacy direct-database grant/revoke/renew
+// path (PR1). Every membership.* method is a mutation dispatched through
+// Call; nothing here opens a database or a lock of any kind.
+type membershipClient interface {
+	Call(ctx context.Context, method string, params map[string]any, out any) error
+	Close() error
 }
-type controllerFactory func(context.Context, string) (controllerAPI, io.Closer, error)
+
+// dialFunc is the injectable seam production wires to dialControlClient and
+// tests substitute with a fake dialer.
+type dialFunc func(ctx context.Context, cfg control.ClientConfig) (membershipClient, error)
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Getenv("PARLEY_DB"), os.Stdout, os.Stderr, openController, os.Getenv))
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, dialControlClient, os.Getenv))
 }
 
-// openController is the legacy direct-database writer path (transitional:
-// PR2 removes it once membership.* wire commands replace grant/revoke/renew).
-// It joins the same canonical ownership exclusion the server uses so a
-// running parleyd cannot have its database opened out from under it by this
-// client.
-func openController(ctx context.Context, path string) (controllerAPI, io.Closer, error) {
-	return openControllerWith(ctx, path, runtime.Acquire, store.Open)
-}
-
-// openControllerWith is openController's actual body, with the underlying
-// database-open operation as the only injectable seam. This lets a test
-// exercise the real ownership-lock-then-open sequence -- refusal before the
-// store is ever opened, and the lock retained for the returned controller's
-// full lifetime, not just at acquisition -- without invoking the production
-// CLI or reimplementing the locking logic in the test. openStore is given
-// owner.Path(), not the caller's raw path: acquire resolves symlinks before
-// taking the lock (runtime.Acquire's canonical path), while store.Open only
-// lexically cleans its input, so a path reaching the database through a
-// symlinked ancestor could otherwise name a different file to each of them.
-// Passing the already-resolved canonical path to both guarantees they can
-// never diverge.
-func openControllerWith(ctx context.Context, path string, acquire func(string) (*runtime.Ownership, error), openStore func(context.Context, string) (*store.DB, error)) (controllerAPI, io.Closer, error) {
-	owner, err := acquire(path)
+// dialControlClient is dialFunc's production body: a real control.Dial,
+// discarding its HelloResult -- membership dispatch only needs Call/Close,
+// runHello below performs its own separate Dial when it needs the full
+// handshake result to print.
+func dialControlClient(ctx context.Context, cfg control.ClientConfig) (membershipClient, error) {
+	client, _, err := control.Dial(ctx, cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	db, err := openStore(ctx, owner.Path())
-	if err != nil {
-		return nil, nil, errors.Join(err, owner.Close())
-	}
-	return controller.New(db), &ownedController{db: db, owner: owner}, nil
+	return client, nil
 }
 
-// ownedController closes the store before releasing ownership: the lock
-// protects the database for the controller's entire lifetime, not merely
-// until the factory returns.
-type ownedController struct {
-	db    *store.DB
-	owner *runtime.Ownership
-}
-
-func (c *ownedController) Close() error {
-	return errors.Join(c.db.Close(), c.owner.Close())
-}
-
+// command is one parsed `membership <op>` invocation. endpoint/serverUID
+// mirror hello's own flags; resolution precedence (flag > env > refused
+// PARLEY_DB) is applied once, later, by control.ResolveClientConfig -- never
+// duplicated here.
 type command struct {
-	name, conversation, peerA, peerB string
-	direction                        store.Direction
-	budget                           int64
-	expiresIn                        time.Duration
-	cancelReplies                    bool
+	op                  string // enroll | renew | replace | revoke
+	conversation        string
+	peerA, peerB        string
+	direction           store.Direction
+	maxExchanges        int64
+	expiresIn           time.Duration
+	cancelReplies       bool
+	expectedVersion     int64
+	operationID         string
+	endpoint, serverUID string
 }
 
 func parseCommand(args []string, output io.Writer) (command, error) {
-	c := command{name: args[0]}
-	if c.name != "grant" && c.name != "revoke" && c.name != "renew" {
-		return c, fmt.Errorf("unknown command %q", c.name)
+	c := command{op: args[0]}
+	switch c.op {
+	case "enroll", "renew", "replace", "revoke":
+	default:
+		return c, fmt.Errorf("unknown membership subcommand %q", c.op)
 	}
-	fs := flag.NewFlagSet(c.name, flag.ContinueOnError)
+	fs := flag.NewFlagSet("membership "+c.op, flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.StringVar(&c.conversation, "conversation", "", "conversation name (required)")
+	fs.StringVar(&c.operationID, "operation-id", "", "explicit operation ID (a UUID) for retrying a lost response; default: a fresh random UUID")
+	fs.StringVar(&c.endpoint, "endpoint", "", "administration socket path (or $PARLEY_ENDPOINT)")
+	fs.StringVar(&c.serverUID, "server-uid", "", "the server process's UID (or $PARLEY_SERVER_UID)")
 	var direction string
-	if c.name == "grant" {
+	switch c.op {
+	case "enroll", "replace":
 		fs.StringVar(&c.peerA, "peer-a", "", "peer A identifier (required)")
 		fs.StringVar(&c.peerB, "peer-b", "", "peer B identifier (required)")
 		fs.StringVar(&direction, "direction", "bidirectional", "bidirectional | a_to_b | b_to_a")
-		fs.Int64Var(&c.budget, "max-exchanges", 0, "positive exchange budget (required)")
+	}
+	switch c.op {
+	case "enroll":
+		fs.Int64Var(&c.maxExchanges, "max-exchanges", 0, "positive exchange budget (required)")
 		fs.DurationVar(&c.expiresIn, "expires-in", 0, "TTL; 0 means no expiry")
-	} else if c.name == "renew" {
-		fs.Int64Var(&c.budget, "max-exchanges", 0, "new budget; 0 keeps the current value")
+		fs.Int64Var(&c.expectedVersion, "expected-grant-version", 0, "expected latest historical grant version; 0 if the conversation has never been enrolled")
+	case "renew", "replace":
+		fs.Int64Var(&c.maxExchanges, "max-exchanges", 0, "new budget; 0 keeps the current value")
 		fs.DurationVar(&c.expiresIn, "expires-in", 0, "new TTL; 0 keeps the current expiry")
 		fs.BoolVar(&c.cancelReplies, "cancel-pending-replies", false, "cancel pending trusted replies instead of carrying them forward")
+		fs.Int64Var(&c.expectedVersion, "expected-grant-version", -1, "expected current active grant version (required)")
+	case "revoke":
+		fs.Int64Var(&c.expectedVersion, "expected-grant-version", -1, "expected current active grant version (required)")
 	}
 	if err := fs.Parse(args[1:]); err != nil {
 		return c, err
 	}
-	c.direction = store.Direction(direction)
 	if fs.NArg() != 0 {
 		return c, fmt.Errorf("unexpected positional arguments")
 	}
-	// Identifiers are opaque exact keys. TrimSpace checks emptiness only;
-	// normalization could retarget existing grants.
-	if strings.TrimSpace(c.conversation) == "" {
-		return c, fmt.Errorf("%s requires -conversation", c.name)
+	if c.op == "enroll" || c.op == "replace" {
+		c.direction = store.Direction(direction)
 	}
-	if c.name != "revoke" {
+	// Identifiers are opaque exact keys. TrimSpace checks emptiness only;
+	// normalization could retarget existing grants. Revoke keeps the exact
+	// key even if it is byte-malformed -- new-enrollment validation does not
+	// apply to that path (AGENTS.md).
+	if strings.TrimSpace(c.conversation) == "" {
+		return c, fmt.Errorf("membership %s requires -conversation", c.op)
+	}
+	if c.op != "revoke" {
 		if err := bridgetext.ValidateMetadata(c.conversation); err != nil {
 			return c, fmt.Errorf("conversation identifier: %w", err)
 		}
 	}
-	if c.budget < 0 || c.expiresIn < 0 {
+	if c.maxExchanges < 0 || c.expiresIn < 0 {
 		return c, fmt.Errorf("budget and expiry must not be negative")
 	}
-	if c.name == "grant" {
-		if strings.TrimSpace(c.peerA) == "" || strings.TrimSpace(c.peerB) == "" || c.peerA == c.peerB || c.budget == 0 {
-			return c, fmt.Errorf("grant requires distinct nonempty peers and -max-exchanges > 0")
+	if c.op == "enroll" || c.op == "replace" {
+		if strings.TrimSpace(c.peerA) == "" || strings.TrimSpace(c.peerB) == "" || c.peerA == c.peerB {
+			return c, fmt.Errorf("%s requires distinct nonempty peers", c.op)
 		}
 		for _, id := range []string{c.peerA, c.peerB} {
 			if err := bridgetext.ValidateMetadata(id); err != nil {
@@ -138,20 +140,59 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 			return c, fmt.Errorf("invalid direction %q", c.direction)
 		}
 	}
+	if c.op == "enroll" {
+		if c.expectedVersion < 0 {
+			return c, fmt.Errorf("-expected-grant-version must not be negative")
+		}
+		if c.maxExchanges == 0 {
+			return c, fmt.Errorf("enroll requires -max-exchanges > 0")
+		}
+	} else if c.expectedVersion < 1 {
+		return c, fmt.Errorf("membership %s requires -expected-grant-version >= 1", c.op)
+	}
+	if c.operationID != "" && !validOperationID(c.operationID) {
+		return c, fmt.Errorf("-operation-id must be a canonical UUID")
+	}
 	return c, nil
 }
 
-// run validates everything before opening storage. Tests inject a fake controller;
-// they never execute the protected CLI or write grants through its production factory.
-func run(args []string, dbPath string, stdout, stderr io.Writer, factory controllerFactory, getenv func(string) string) int {
+// validOperationID mirrors internal/control's own canonicalUUID check (the
+// wire profile's identifier form) so a locally rejected -operation-id fails
+// before dialing, never as a server round trip.
+func validOperationID(s string) bool {
+	id, err := uuid.Parse(s)
+	return err == nil && id != uuid.Nil && id.String() == s
+}
+
+// run validates everything and resolves client configuration before ever
+// dialing. Tests inject a fake dialer; they never reach a real control.Dial.
+func run(args []string, stdout, stderr io.Writer, dial dialFunc, getenv func(string) string) int {
 	if len(args) == 0 || (len(args) == 1 && (args[0] == "help" || args[0] == "-h" || args[0] == "--help")) {
 		usage(stdout)
 		return 0
 	}
-	// hello is a pure client diagnostic: it never opens a database and does
-	// not go through parseCommand/factory at all.
+	// hello is a pure client diagnostic: it dials but performs no mutation.
 	if args[0] == "hello" {
 		return runHello(args[1:], stdout, stderr, getenv)
+	}
+	if args[0] == "membership" {
+		return runMembership(args[1:], stdout, stderr, dial, getenv)
+	}
+	fmt.Fprintf(stderr, "parleyctl: unknown command %q\n", args[0])
+	usage(stderr)
+	return 2
+}
+
+// runMembership dispatches one membership.enroll/renew/replace/revoke call.
+func runMembership(args []string, stdout, stderr io.Writer, dial dialFunc, getenv func(string) string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "parleyctl: membership requires a subcommand")
+		membershipUsage(stderr)
+		return 2
+	}
+	if args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+		membershipUsage(stdout)
+		return 0
 	}
 	// FlagSet sends help to the chosen writer and does not exit the process.
 	var parseOutput strings.Builder
@@ -162,51 +203,136 @@ func run(args []string, dbPath string, stdout, stderr io.Writer, factory control
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "parleyctl: %v\n", err)
-		usage(stderr)
+		membershipUsage(stderr)
 		return 2
 	}
-	if dbPath == "" {
-		dbPath = "parley.db"
-	}
-	ctx := context.Background()
-	ctrl, closer, err := factory(ctx, dbPath)
+	cfg, err := control.ResolveClientConfig(control.ClientOptions{EndpointFlag: c.endpoint, ServerUIDFlag: c.serverUID, Getenv: getenv})
 	if err != nil {
-		fmt.Fprintf(stderr, "parleyctl: open database: %v\n", err)
+		fmt.Fprintf(stderr, "parleyctl membership %s: %v\n", c.op, err)
+		return 2
+	}
+	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := dial(dialCtx, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "parleyctl membership %s: %v\n", c.op, describeDialFailure(err))
 		return 1
 	}
-	// Close before returning to main's os.Exit, on success and operational failure.
-	defer closer.Close()
-	var expiresAt *time.Time
-	if c.expiresIn > 0 {
-		value := time.Now().Add(c.expiresIn)
-		expiresAt = &value
+	defer client.Close()
+
+	operationID := c.operationID
+	if operationID == "" {
+		operationID = uuid.NewString()
 	}
-	switch c.name {
-	case "grant":
-		g, opErr := ctrl.Grant(ctx, controller.GrantParams{Conversation: c.conversation, PeerAID: c.peerA, PeerBID: c.peerB, Direction: c.direction, MaxExchanges: c.budget, ExpiresAt: expiresAt})
-		err = opErr
-		if err == nil {
-			fmt.Fprintf(stdout, "granted %q v%d: %q <-> %q, %s, budget %d, expires %s\n", g.Conversation, g.GrantVersion, g.PeerAID, g.PeerBID, g.Direction, g.MaxExchanges, orNever(g.ExpiresAt))
+	params := membershipParams(c, operationID)
+
+	callCtx, cancelCall := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelCall()
+	var result control.CommandReceiptResult
+	if err := client.Call(callCtx, "membership."+c.op, params, &result); err != nil {
+		var timeout *control.TimeoutError
+		if errors.As(err, &timeout) {
+			fmt.Fprintf(stderr, "parleyctl membership %s: %v -- retry with -operation-id %s\n", c.op, err, operationID)
+		} else {
+			fmt.Fprintf(stderr, "parleyctl membership %s: %v\n", c.op, err)
+		}
+		return 1
+	}
+	printMembershipResult(stdout, c, operationID, result)
+	return 0
+}
+
+// describeDialFailure adds the "outcome unknown" qualifier hello already
+// uses whenever a dial failure is a *control.TimeoutError -- an ambiguous
+// pre-mutation outcome, never a proven refusal.
+func describeDialFailure(err error) string {
+	var timeout *control.TimeoutError
+	if errors.As(err, &timeout) {
+		return fmt.Sprintf("%v (outcome unknown, not a proven failure)", err)
+	}
+	return err.Error()
+}
+
+// membershipParams builds the wire params object for c.op, per
+// docs/specifications/control.md's decimal-string 64-bit codec: every
+// counter/version/budget is sent as a canonical decimal string, never a
+// bare JSON number.
+func membershipParams(c command, operationID string) map[string]any {
+	params := map[string]any{
+		"operation_id":           operationID,
+		"conversation":           c.conversation,
+		"expected_grant_version": strconv.FormatInt(c.expectedVersion, 10),
+	}
+	switch c.op {
+	case "enroll":
+		model := membership.FromGrant(c.peerA, c.peerB, c.direction)
+		params["members"] = membersWire(model.Members)
+		params["policy"] = policyWire(model.Policy)
+		params["max_exchanges"] = strconv.FormatInt(c.maxExchanges, 10)
+		if expiresAt := expiresAtFromDuration(c.expiresIn); expiresAt != "" {
+			params["expires_at"] = expiresAt
 		}
 	case "renew":
-		g, opErr := ctrl.Renew(ctx, controller.RenewParams{Conversation: c.conversation, MaxExchanges: c.budget, ExpiresAt: expiresAt, CancelPendingReplies: c.cancelReplies})
-		err = opErr
-		if err == nil {
-			fmt.Fprintf(stdout, "renewed %q to v%d: budget %d, expires %s\n", g.Conversation, g.GrantVersion, g.MaxExchanges, orNever(g.ExpiresAt))
+		params["cancel_pending_replies"] = c.cancelReplies
+		if c.maxExchanges != 0 {
+			params["max_exchanges"] = strconv.FormatInt(c.maxExchanges, 10)
+		}
+		if expiresAt := expiresAtFromDuration(c.expiresIn); expiresAt != "" {
+			params["expires_at"] = expiresAt
+		}
+	case "replace":
+		model := membership.FromGrant(c.peerA, c.peerB, c.direction)
+		params["members"] = membersWire(model.Members)
+		params["policy"] = policyWire(model.Policy)
+		params["cancel_pending_replies"] = c.cancelReplies
+		if c.maxExchanges != 0 {
+			params["max_exchanges"] = strconv.FormatInt(c.maxExchanges, 10)
+		}
+		if expiresAt := expiresAtFromDuration(c.expiresIn); expiresAt != "" {
+			params["expires_at"] = expiresAt
 		}
 	case "revoke":
-		result, opErr := ctrl.Revoke(ctx, c.conversation)
-		err = opErr
-		if err == nil {
-			fmt.Fprintf(stdout, "revoked %q: %d cancelled, %d already dispatching, %d already handed off\n", c.conversation, result.Cancelled, result.AlreadyDispatching, result.AlreadyHandedOff)
-			fmt.Fprintln(stdout, "This stops Parley's own delivery only; other communication paths remain possible.")
-		}
+		// conversation + expected_grant_version already set above; revoke
+		// carries nothing else.
 	}
-	if err != nil {
-		fmt.Fprintf(stderr, "parleyctl: %s: %v\n", c.name, err)
-		return 1
+	return params
+}
+
+func membersWire(members []membership.Member) []any {
+	out := make([]any, len(members))
+	for i, m := range members {
+		out[i] = map[string]any{"peer_id": m.PeerID, "role": string(m.Role)}
 	}
-	return 0
+	return out
+}
+
+func policyWire(p membership.Policy) map[string]any {
+	edges := make([]any, len(p.Edges))
+	for i, e := range p.Edges {
+		edges[i] = map[string]any{"from": e.From, "to": e.To}
+	}
+	return map[string]any{"kind": string(p.Kind), "edges": edges}
+}
+
+// expiresAtFromDuration renders a TTL as an absolute RFC3339 UTC timestamp,
+// or "" for "no explicit expiry" (enroll) / "keep the current expiry"
+// (renew, replace) -- the wire's own optionality for expires_at.
+func expiresAtFromDuration(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	return time.Now().Add(d).UTC().Format(time.RFC3339)
+}
+
+// printMembershipResult renders a command receipt deterministically -- one
+// field per line, in a fixed order, never a dumped map (matching hello's
+// own printHello convention).
+func printMembershipResult(w io.Writer, c command, operationID string, result control.CommandReceiptResult) {
+	fmt.Fprintf(w, "membership %s %q: operation_id %s\n", c.op, c.conversation, operationID)
+	fmt.Fprintf(w, "  audit_id %s, commit_epoch %s, commit_revision %s\n", result.AuditID, result.CommitView.Epoch, result.CommitView.Revision)
+	for _, r := range result.Result.Resources {
+		fmt.Fprintf(w, "  %s %s: %s -> %s\n", r.Kind, r.ID, r.Before, r.After)
+	}
 }
 
 // runHello is the client-side diagnostic added in mandate PR1 §4.D: it
@@ -292,32 +418,37 @@ func printHello(w io.Writer, h control.HelloResult) error {
 	return nil
 }
 
-func orNever(value *string) string {
-	if value == nil {
-		return "never"
-	}
-	return *value
+func membershipUsage(output io.Writer) {
+	fmt.Fprintln(output, `parleyctl membership: authenticated membership mutations against parleyd.
+
+Usage:
+  parleyctl membership enroll  -conversation NAME -peer-a ID -peer-b ID -max-exchanges N [-direction bidirectional|a_to_b|b_to_a] [-expires-in DURATION] [-expected-grant-version N] [-operation-id UUID] -endpoint PATH -server-uid UID
+  parleyctl membership renew   -conversation NAME -expected-grant-version N [-max-exchanges N] [-expires-in DURATION] [-cancel-pending-replies] [-operation-id UUID] -endpoint PATH -server-uid UID
+  parleyctl membership replace -conversation NAME -expected-grant-version N -peer-a ID -peer-b ID [-direction bidirectional|a_to_b|b_to_a] [-max-exchanges N] [-expires-in DURATION] [-cancel-pending-replies] [-operation-id UUID] -endpoint PATH -server-uid UID
+  parleyctl membership revoke  -conversation NAME -expected-grant-version N [-operation-id UUID] -endpoint PATH -server-uid UID
+
+-expected-grant-version pins optimistic concurrency: 0 for enroll of a
+conversation with no prior history, else the exact current active grant
+version. A stale value is rejected rather than silently overwritten.
+-operation-id defaults to a fresh random UUID; pass the same value again to
+retry a call whose response was lost without risking a second mutation.
+Endpoint/server UID: -endpoint/-server-uid flags, else
+$PARLEY_ENDPOINT/$PARLEY_SERVER_UID; $PARLEY_DB is refused as a client source.`)
 }
 
 func usage(output io.Writer) {
-	fmt.Fprintln(output, `parleyctl: the protected Parley grant administrator.
+	fmt.Fprintln(output, `parleyctl: the Parley grant administration client.
 Run directly in your own shell, never through an agent tool call.
 This command does not start a running bridge; no-argument invocation shows help.
+It is a pure client of parleyd's administration socket -- it never opens the
+database directly and $PARLEY_DB is refused wherever it is set.
 
 Usage:
-  parleyctl grant  -conversation NAME -peer-a ID -peer-b ID -max-exchanges N [-direction bidirectional|a_to_b|b_to_a] [-expires-in DURATION]
-  parleyctl revoke -conversation NAME
-  parleyctl renew  -conversation NAME [-max-exchanges N] [-expires-in DURATION] [-cancel-pending-replies]
+  parleyctl membership enroll|renew|replace|revoke ...  (see 'membership help')
   parleyctl hello  [-endpoint PATH] [-server-uid UID]
   parleyctl [help|-h|--help]
 
-Use a subcommand's -h for flag details. Grant budget must be positive.
-Renewal uses 0 to keep budget/expiry; negative values are invalid.
-Renewal carries eligible trusted replies forward unless -cancel-pending-replies is set.
-grant/revoke/renew open the database directly (transitional; see AGENTS.md) --
-database path: $PARLEY_DB (default ./parley.db).
-hello is a pure client diagnostic against parleyd's administration socket; it
-never opens a database. Endpoint/server UID: -endpoint/-server-uid flags, else
+Endpoint/server UID: -endpoint/-server-uid flags, else
 $PARLEY_ENDPOINT/$PARLEY_SERVER_UID; $PARLEY_DB is refused as a client source.
 Help exits 0, invalid arguments exit 2, operational failures exit 1.`)
 }

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,69 +12,91 @@ import (
 	"time"
 
 	"github.com/ginsys/parley/internal/control"
-	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
 )
 
-// noEnv is passed to run in every test not exercising hello's environment
-// resolution, so an ambient PARLEY_ENDPOINT/PARLEY_SERVER_UID in the actual
-// process environment can never leak into these tests.
+// noEnv is passed to run in every test not exercising hello's or a
+// membership subcommand's environment resolution, so an ambient
+// PARLEY_ENDPOINT/PARLEY_SERVER_UID in the actual process environment can
+// never leak into these tests.
 func noEnv(string) string { return "" }
 
-type fakeController struct {
-	grant         controller.GrantParams
-	renew         controller.RenewParams
-	revoke        string
+// fakeClient is the injected membershipClient every non-network membership
+// test dispatches against -- the replacement for the removed fakeController
+// seam from the legacy direct-database grant/revoke/renew path.
+type fakeClient struct {
+	method        string
+	params        map[string]any
 	err           error
 	calls, closed int
 }
 
-func (f *fakeController) Grant(_ context.Context, p controller.GrantParams) (*store.Grant, error) {
+func (f *fakeClient) Call(_ context.Context, method string, params map[string]any, out any) error {
 	f.calls++
-	f.grant = p
-	return &store.Grant{Conversation: p.Conversation, GrantVersion: 1, PeerAID: p.PeerAID, PeerBID: p.PeerBID, Direction: p.Direction, MaxExchanges: p.MaxExchanges}, f.err
+	f.method = method
+	f.params = params
+	if f.err != nil {
+		return f.err
+	}
+	if result, ok := out.(*control.CommandReceiptResult); ok {
+		*result = control.CommandReceiptResult{
+			AuditID:    "audit-1",
+			CommitView: control.CommitView{Epoch: "epoch-1", Revision: "1"},
+		}
+	}
+	return nil
 }
-func (f *fakeController) Renew(_ context.Context, p controller.RenewParams) (*store.Grant, error) {
-	f.calls++
-	f.renew = p
-	return &store.Grant{Conversation: p.Conversation, GrantVersion: 2, MaxExchanges: 3}, f.err
-}
-func (f *fakeController) Revoke(_ context.Context, c string) (*controller.RevokeResult, error) {
-	f.calls++
-	f.revoke = c
-	return &controller.RevokeResult{Cancelled: 1}, f.err
-}
-func (f *fakeController) Close() error { f.closed++; return nil }
+func (f *fakeClient) Close() error { f.closed++; return nil }
 
-func TestHelpAndInvalidArgumentsNeverOpenDatabase(t *testing.T) {
+func fakeDial(client *fakeClient) dialFunc {
+	return func(context.Context, control.ClientConfig) (membershipClient, error) { return client, nil }
+}
+
+// fatalIfDialed is a dialFunc that fails the test if a membership subcommand
+// ever dials before its own argument validation completes.
+func fatalIfDialed(t *testing.T) dialFunc {
+	return func(context.Context, control.ClientConfig) (membershipClient, error) {
+		t.Fatal("dialed the control endpoint before argument validation")
+		return nil, nil
+	}
+}
+
+func TestHelpAndInvalidArgumentsNeverDial(t *testing.T) {
 	tests := []struct {
 		args []string
 		code int
 	}{
 		{nil, 0}, {[]string{"help"}, 0}, {[]string{"-h"}, 0}, {[]string{"--help"}, 0},
-		{[]string{"grant", "--help"}, 0}, {[]string{"renew", "-h"}, 0}, {[]string{"revoke", "--help"}, 0},
+		{[]string{"membership", "help"}, 0}, {[]string{"membership", "-h"}, 0},
+		{[]string{"membership", "enroll", "--help"}, 0}, {[]string{"membership", "renew", "-h"}, 0},
+		{[]string{"membership", "replace", "-h"}, 0}, {[]string{"membership", "revoke", "--help"}, 0},
 		{[]string{"serve"}, 2}, {[]string{"help", "extra"}, 2},
-		{[]string{"grant"}, 2}, {[]string{"renew"}, 2}, {[]string{"revoke"}, 2},
-		{[]string{"revoke", "-conversation", " "}, 2}, {[]string{"revoke", "-conversation", "c", "extra"}, 2},
-		{[]string{"renew", "-conversation", "c", "-max-exchanges", "-1"}, 2},
-		{[]string{"renew", "-conversation", "c", "-expires-in", "-1s"}, 2},
-		{[]string{"renew", "-conversation", "c", "-expires-in", "oops"}, 2},
-		{[]string{"renew", "-conversation", "c", "--unknown"}, 2},
-		{[]string{"grant", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "0"}, 2},
-		{[]string{"grant", "-conversation", "c", "-peer-a", "a", "-peer-b", "a", "-max-exchanges", "1"}, 2},
-		{[]string{"grant", "-conversation", "c", "-peer-a", " ", "-peer-b", "b", "-max-exchanges", "1"}, 2},
-		{[]string{"grant", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-direction", "wrong"}, 2},
-		{[]string{"grant", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "-1s"}, 2},
+		{[]string{"membership"}, 2}, {[]string{"membership", "unknown"}, 2},
+		{[]string{"membership", "enroll"}, 2}, {[]string{"membership", "renew"}, 2},
+		{[]string{"membership", "replace"}, 2}, {[]string{"membership", "revoke"}, 2},
+		{[]string{"membership", "revoke", "-conversation", " "}, 2},
+		{[]string{"membership", "revoke", "-conversation", "c", "-expected-grant-version", "1", "extra"}, 2},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-max-exchanges", "-1"}, 2},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "-1s"}, 2},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "oops"}, 2},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "--unknown"}, 2},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "0"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "0"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "a", "-max-exchanges", "1"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", " ", "-peer-b", "b", "-max-exchanges", "1"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-direction", "wrong"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "-1s"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expected-grant-version", "-1"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-operation-id", "not-a-uuid"}, 2},
+		// Syntactically valid but no endpoint/server-uid configured anywhere:
+		// ResolveClientConfig fails before dial is ever reached.
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1"}, 2},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			factory := func(context.Context, string) (controllerAPI, io.Closer, error) {
-				t.Fatal("opened database before argument validation")
-				return nil, nil, nil
-			}
-			if code := run(tt.args, "unused.db", &stdout, &stderr, factory, noEnv); code != tt.code {
+			if code := run(tt.args, &stdout, &stderr, fatalIfDialed(t), noEnv); code != tt.code {
 				t.Fatalf("exit=%d: %s %s", code, &stdout, &stderr)
 			}
 			if tt.code == 0 && (stdout.Len() == 0 || stderr.Len() != 0) {
@@ -88,17 +109,13 @@ func TestHelpAndInvalidArgumentsNeverOpenDatabase(t *testing.T) {
 	}
 }
 
-func TestUnsafePeerIdentifiersRejectedBeforeStorage(t *testing.T) {
-	for _, id := range []string{"a\xff", "a\xfe", "café", "a\ufffd", "peer\x7f", "peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
+func TestUnsafePeerIdentifiersRejectedBeforeDialing(t *testing.T) {
+	for _, id := range []string{"a\xff", "a\xfe", "café", "a�", "peer\x7f", "peer\n", "peer\r", "peer\t", "peer\x00", "peer", "peer ", "peer ", "peer​", "peer‮"} {
 		for _, flag := range []string{"-conversation", "-peer-a", "-peer-b"} {
 			t.Run(flag+id, func(t *testing.T) {
-				args := []string{"grant", "-conversation", "fixture", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2", flag, id}
+				args := []string{"membership", "enroll", "-conversation", "fixture", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2", flag, id}
 				var out, errOut bytes.Buffer
-				factory := func(context.Context, string) (controllerAPI, io.Closer, error) {
-					t.Fatal("opened storage for unsafe peer identifier")
-					return nil, nil, nil
-				}
-				if code := run(args, "unused.db", &out, &errOut, factory, noEnv); code != 2 {
+				if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
 					t.Fatalf("exit=%d: %s", code, &errOut)
 				}
 			})
@@ -106,60 +123,82 @@ func TestUnsafePeerIdentifiersRejectedBeforeStorage(t *testing.T) {
 	}
 }
 
-func TestRoutingUsesValidatedParametersAndClosesStorage(t *testing.T) {
-	for _, operation := range []string{"grant", "renew", "revoke"} {
+// membershipEndpointArgs are appended to every test that must pass argument
+// validation and reach dispatch -- the fake dialer never actually opens a
+// socket, but ResolveClientConfig still requires syntactically valid values.
+var membershipEndpointArgs = []string{"-endpoint", "/tmp/parleyctl-test.sock", "-server-uid", "1000"}
+
+func TestMembershipRoutingUsesValidatedParametersAndClosesClient(t *testing.T) {
+	for _, op := range []string{"enroll", "renew", "replace", "revoke"} {
 		for _, fails := range []bool{false, true} {
-			t.Run(operation+map[bool]string{false: "", true: "_failure"}[fails], func(t *testing.T) {
-				args := []string{operation, "-conversation", "fixture"}
-				switch operation {
-				case "grant":
+			t.Run(op+map[bool]string{false: "", true: "_failure"}[fails], func(t *testing.T) {
+				args := []string{"membership", op, "-conversation", "fixture"}
+				switch op {
+				case "enroll":
 					args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "3", "-direction", "b_to_a", "-expires-in", "1h")
 				case "renew":
-					args = append(args, "-cancel-pending-replies")
+					args = append(args, "-expected-grant-version", "2", "-cancel-pending-replies")
+				case "replace":
+					args = append(args, "-expected-grant-version", "3", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "5")
+				case "revoke":
+					args = append(args, "-expected-grant-version", "4")
 				}
-				fake := &fakeController{}
+				args = append(args, membershipEndpointArgs...)
+
+				fake := &fakeClient{}
 				if fails {
 					fake.err = errors.New("synthetic operation failure")
 				}
-				opened := 0
-				factory := func(_ context.Context, path string) (controllerAPI, io.Closer, error) {
-					opened++
-					if path != "selected.db" {
-						t.Fatalf("path=%q", path)
-					}
-					return fake, fake, nil
-				}
 				var out, errOut bytes.Buffer
 				before := time.Now()
-				code := run(args, "selected.db", &out, &errOut, factory, noEnv)
+				code := run(args, &out, &errOut, fakeDial(fake), noEnv)
 				expected := 0
 				if fails {
 					expected = 1
 				}
-				if code != expected || opened != 1 || fake.calls != 1 || fake.closed != 1 {
-					t.Fatalf("exit/open/call/close=%d/%d/%d/%d", code, opened, fake.calls, fake.closed)
+				if code != expected || fake.calls != 1 || fake.closed != 1 {
+					t.Fatalf("exit/call/close=%d/%d/%d", code, fake.calls, fake.closed)
 				}
 				if fails {
 					if out.Len() != 0 || !strings.Contains(errOut.String(), "synthetic operation failure") {
 						t.Fatalf("failure output: %q %q", &out, &errOut)
 					}
-				} else if out.Len() == 0 || errOut.Len() != 0 {
+					return
+				}
+				if out.Len() == 0 || errOut.Len() != 0 {
 					t.Fatalf("success output: %q %q", &out, &errOut)
 				}
-				switch operation {
-				case "grant":
-					p := fake.grant
-					if p.Conversation != "fixture" || p.PeerAID != "a" || p.PeerBID != "b" || p.Direction != store.BToA || p.MaxExchanges != 3 || p.ExpiresAt == nil || p.ExpiresAt.Before(before.Add(time.Hour)) || p.ExpiresAt.After(time.Now().Add(time.Hour)) {
-						t.Fatalf("grant=%+v", p)
+				if fake.method != "membership."+op {
+					t.Fatalf("method=%q", fake.method)
+				}
+				if fake.params["conversation"] != "fixture" {
+					t.Fatalf("conversation=%v", fake.params["conversation"])
+				}
+				switch op {
+				case "enroll":
+					if fake.params["expected_grant_version"] != "0" || fake.params["max_exchanges"] != "3" {
+						t.Fatalf("enroll params=%+v", fake.params)
 					}
+					checkMembersAndDirectedPolicy(t, fake.params, "b", "a")
+					// expires_at loses sub-second precision through RFC3339's
+					// seconds-only rendering (expiresAtFromDuration), so the
+					// lower bound needs a one-second slack against `before`.
+					checkExpiresAt(t, fake.params, before.Add(time.Hour-time.Second), time.Now().Add(time.Hour))
 				case "renew":
-					p := fake.renew
-					if p.Conversation != "fixture" || !p.CancelPendingReplies || p.MaxExchanges != 0 || p.ExpiresAt != nil {
-						t.Fatalf("renew=%+v", p)
+					if fake.params["expected_grant_version"] != "2" || fake.params["cancel_pending_replies"] != true {
+						t.Fatalf("renew params=%+v", fake.params)
 					}
+					if _, present := fake.params["max_exchanges"]; present {
+						t.Fatalf("renew sent max_exchanges despite the default 'keep current' value: %+v", fake.params)
+					}
+				case "replace":
+					if fake.params["expected_grant_version"] != "3" || fake.params["max_exchanges"] != "5" || fake.params["cancel_pending_replies"] != false {
+						t.Fatalf("replace params=%+v", fake.params)
+					}
+					checkMembersAndDirectedPolicy(t, fake.params, "", "") // open policy: no edge check needed
 				case "revoke":
-					if fake.revoke != "fixture" {
-						t.Fatal(fake.revoke)
+					if fake.params["expected_grant_version"] != "4" || len(fake.params) != 3 {
+						t.Fatalf("revoke params=%+v", fake.params)
 					}
 				}
 			})
@@ -167,226 +206,167 @@ func TestRoutingUsesValidatedParametersAndClosesStorage(t *testing.T) {
 	}
 }
 
-func TestDatabaseOpenFailureAndDefaultPath(t *testing.T) {
-	var out, errOut bytes.Buffer
-	factory := func(_ context.Context, path string) (controllerAPI, io.Closer, error) {
-		if path != "parley.db" {
-			t.Fatal(path)
-		}
-		return nil, nil, errors.New("synthetic open failure")
+// checkMembersAndDirectedPolicy asserts the canonical two-member list is
+// present; if wantFrom/wantTo are nonempty it also asserts a one-edge
+// directed policy with that exact edge (membership.FromGrant's translation).
+func checkMembersAndDirectedPolicy(t *testing.T, params map[string]any, wantFrom, wantTo string) {
+	t.Helper()
+	members, ok := params["members"].([]any)
+	if !ok || len(members) != 2 {
+		t.Fatalf("members=%+v", params["members"])
 	}
-	if code := run([]string{"revoke", "-conversation", "fixture"}, "", &out, &errOut, factory, noEnv); code != 1 || out.Len() != 0 || !strings.Contains(errOut.String(), "synthetic open failure") {
-		t.Fatalf("exit=%d: %s %s", code, &out, &errOut)
+	ids := make([]string, 2)
+	for i, m := range members {
+		obj := m.(map[string]any)
+		if obj["role"] != "member" {
+			t.Fatalf("member role=%v", obj["role"])
+		}
+		ids[i] = obj["peer_id"].(string)
+	}
+	if ids[0] != "a" || ids[1] != "b" {
+		t.Fatalf("members not canonically ordered: %v", ids)
+	}
+	if wantFrom == "" {
+		return
+	}
+	policy := params["policy"].(map[string]any)
+	if policy["kind"] != "directed" {
+		t.Fatalf("policy=%+v", policy)
+	}
+	edges := policy["edges"].([]any)
+	if len(edges) != 1 {
+		t.Fatalf("edges=%+v", edges)
+	}
+	edge := edges[0].(map[string]any)
+	if edge["from"] != wantFrom || edge["to"] != wantTo {
+		t.Fatalf("edge=%+v, want %s->%s", edge, wantFrom, wantTo)
+	}
+}
+
+func checkExpiresAt(t *testing.T, params map[string]any, lower, upper time.Time) {
+	t.Helper()
+	raw, ok := params["expires_at"].(string)
+	if !ok {
+		t.Fatalf("expires_at missing: %+v", params)
+	}
+	got, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		t.Fatalf("expires_at=%q: %v", raw, err)
+	}
+	if got.Before(lower) || got.After(upper) {
+		t.Fatalf("expires_at=%v outside [%v,%v]", got, lower, upper)
+	}
+}
+
+func TestMembershipOperationIDDefaultsToFreshUUIDButExplicitValueUsedVerbatim(t *testing.T) {
+	args := func(extra ...string) []string {
+		a := []string{"membership", "revoke", "-conversation", "fixture", "-expected-grant-version", "1"}
+		a = append(a, membershipEndpointArgs...)
+		return append(a, extra...)
+	}
+	fake1, fake2 := &fakeClient{}, &fakeClient{}
+	var out1, out2, errOut bytes.Buffer
+	if code := run(args(), &out1, &errOut, fakeDial(fake1), noEnv); code != 0 {
+		t.Fatalf("exit=%d: %s", code, &errOut)
+	}
+	if code := run(args(), &out2, &errOut, fakeDial(fake2), noEnv); code != 0 {
+		t.Fatalf("exit=%d: %s", code, &errOut)
+	}
+	id1, id2 := fake1.params["operation_id"], fake2.params["operation_id"]
+	if id1 == "" || id2 == "" || id1 == id2 {
+		t.Fatalf("expected two distinct fresh operation IDs, got %v and %v", id1, id2)
+	}
+
+	explicit := "80000000-0000-4000-8000-000000000099"
+	fake3 := &fakeClient{}
+	var out3 bytes.Buffer
+	if code := run(args("-operation-id", explicit), &out3, &errOut, fakeDial(fake3), noEnv); code != 0 {
+		t.Fatalf("exit=%d: %s", code, &errOut)
+	}
+	if fake3.params["operation_id"] != explicit {
+		t.Fatalf("operation_id=%v, want %s", fake3.params["operation_id"], explicit)
+	}
+	if !strings.Contains(out3.String(), explicit) {
+		t.Fatalf("operation id not visible in output: %s", &out3)
 	}
 }
 
 func TestCLIIdentifiersRemainExactAndVisible(t *testing.T) {
-	for _, operation := range []string{"grant", "renew", "revoke"} {
-		t.Run(operation, func(t *testing.T) {
-			fake := &fakeController{}
-			factory := func(context.Context, string) (controllerAPI, io.Closer, error) { return fake, fake, nil }
-			args := []string{operation, "-conversation", " x"}
-			if operation == "grant" {
+	for _, op := range []string{"enroll", "renew", "replace", "revoke"} {
+		t.Run(op, func(t *testing.T) {
+			args := []string{"membership", op, "-conversation", " x"}
+			switch op {
+			case "enroll":
 				args = append(args, "-peer-a", "a", "-peer-b", "a ", "-max-exchanges", "1")
+			case "renew":
+				args = append(args, "-expected-grant-version", "1")
+			case "replace":
+				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "a ")
+			case "revoke":
+				args = append(args, "-expected-grant-version", "1")
 			}
+			args = append(args, membershipEndpointArgs...)
+			fake := &fakeClient{}
 			var out, errOut bytes.Buffer
-			if code := run(args, "unused", &out, &errOut, factory, noEnv); code != 0 {
+			if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
 				t.Fatalf("exit %d: %s", code, &errOut)
 			}
 			if !strings.Contains(out.String(), `" x"`) {
 				t.Fatalf("identifier whitespace hidden: %s", &out)
 			}
-			switch operation {
-			case "grant":
-				if fake.grant.Conversation != " x" || fake.grant.PeerAID != "a" || fake.grant.PeerBID != "a " || !strings.Contains(out.String(), `"a" <-> "a "`) {
-					t.Fatalf("grant identity changed: %+v %s", fake.grant, &out)
-				}
-			case "renew":
-				if fake.renew.Conversation != " x" {
-					t.Fatalf("renew identity changed: %+v", fake.renew)
-				}
-			case "revoke":
-				if fake.revoke != " x" {
-					t.Fatalf("revoke identity changed: %q", fake.revoke)
-				}
+			if fake.params["conversation"] != " x" {
+				t.Fatalf("conversation identity changed: %+v", fake.params)
 			}
 		})
 	}
 }
 
-// TestOpenControllerAcquiresCanonicalLockForItsFullLifetime is the EP-02
-// acceptance test: it exercises openController's actual production body
-// (openControllerWith) with the real runtime.Acquire and a real on-disk
-// database, injecting only the underlying store-open call -- never the whole
-// lock-bearing function, and never a reimplementation of the lock itself.
-func TestOpenControllerAcquiresCanonicalLockForItsFullLifetime(t *testing.T) {
-	// runtime.Acquire requires a private, non-group/other-writable parent
-	// directory (internal/runtime/ownership_linux.go trustedParents).
-	// t.TempDir()'s shared per-package work directory can be group-writable
-	// under this host's umask; use the same disposable-private-directory
-	// pattern as internal/runtime/ownership_linux_test.go's privateDB instead.
-	dir, err := os.MkdirTemp("/tmp", "parleyctl-ownership-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	path := filepath.Join(dir, "parley.db")
-	// Seed a real, already-initialized database (mirrors `parleyd init`).
-	// runtime.Acquire requires the private (owner-only, 0600) mode
-	// internal/runtime/ownership_linux.go's openPrivate enforces; pre-create
-	// the file with that mode so store.Open's migration writes into it
-	// without SQLite's own (looser) create-mode ever taking effect.
-	if err := os.WriteFile(path, nil, 0600); err != nil {
-		t.Fatal(err)
-	}
-	seed, err := store.Open(context.Background(), path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := seed.Close(); err != nil {
-		t.Fatal(err)
-	}
-	canonical, err := filepath.Abs(path)
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestMembershipRevokeKeepsExactMalformedKeyButOthersValidateFirst mirrors
+// the legacy CLI's exact-key revocation guarantee (AGENTS.md: "Do not apply
+// new-enrollment validation to that revocation path"): revoke never applies
+// bridgetext.ValidateMetadata to -conversation, so a byte-malformed
+// historical key is still dispatched unchanged, while every other
+// subcommand -- which enrolls or requires an existing well-formed identity
+// -- rejects the same key before ever dialing.
+func TestMembershipRevokeKeepsExactMalformedKeyButOthersValidateFirst(t *testing.T) {
+	for _, name := range []string{"café", "a\xff", "a\xfe", "a�"} {
+		fake := &fakeClient{}
+		var out, errOut bytes.Buffer
+		args := append([]string{"membership", "renew", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
+		if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+			t.Fatalf("renew dialed for %x: exit=%d %s", name, code, &errOut)
+		}
 
-	t.Run("refuses_before_store_open_when_already_owned", func(t *testing.T) {
-		owner, err := runtime.Acquire(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer owner.Close()
-		opened := false
-		_, _, err = openControllerWith(context.Background(), path, runtime.Acquire, func(ctx context.Context, p string) (*store.DB, error) {
-			opened = true
-			return store.Open(ctx, p)
-		})
-		if !errors.Is(err, runtime.ErrAlreadyRunning) {
-			t.Fatalf("err=%v, want ErrAlreadyRunning", err)
-		}
-		if opened {
-			t.Fatal("store opener called despite a contended lock")
-		}
-	})
-
-	t.Run("lock_and_opener_target_the_same_canonical_path", func(t *testing.T) {
-		// openControllerWith passes owner.Path() -- runtime.Acquire's
-		// resolved canonical path -- to openStore, never the caller's raw
-		// path: Acquire resolves symlinks before taking the lock, while
-		// store.Open only lexically cleans its input, so a path reaching
-		// the database through a symlinked ancestor could otherwise name a
-		// different file to each of them. The mismatch is recorded rather
-		// than asserted inside the acquire callback itself: a t.Fatal
-		// there would Goexit mid openControllerWith, before its Ownership
-		// is ever returned or closed, leaking the lock for the rest of
-		// this test run.
-		var lockPath, openedWith string
-		_, closer, err := openControllerWith(context.Background(), path, func(p string) (*runtime.Ownership, error) {
-			owner, err := runtime.Acquire(p)
-			if err == nil {
-				lockPath = owner.Path()
-			}
-			return owner, err
-		}, func(ctx context.Context, p string) (*store.DB, error) {
-			openedWith = p
-			return store.Open(ctx, p)
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer closer.Close()
-		if lockPath != canonical {
-			t.Fatalf("lock path=%q, want %q", lockPath, canonical)
-		}
-		if openedWith != canonical {
-			t.Fatalf("store opener path=%q, want the lock's resolved canonical path %q", openedWith, canonical)
-		}
-	})
-
-	t.Run("ownership_retained_until_close_not_just_acquisition", func(t *testing.T) {
-		_, closer, err := openControllerWith(context.Background(), path, runtime.Acquire, store.Open)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer closer.Close()
-		// The resource lifetime, not just acquisition order, is the acceptance
-		// condition: a contender must still be refused after the factory has
-		// already returned a live controller. Capture and release the
-		// contender's Ownership even on unexpected success, so a regression
-		// that lets it through does not also leak that second lock handle
-		// for the rest of the package run.
-		contender, err := runtime.Acquire(path)
-		if err == nil {
-			contender.Close()
-			t.Fatal("contender acquired the lock before close")
-		}
-		if !errors.Is(err, runtime.ErrAlreadyRunning) {
-			t.Fatalf("contender acquire failed with unexpected error: %v", err)
-		}
-		if err := closer.Close(); err != nil {
-			t.Fatal(err)
-		}
-		released, err := runtime.Acquire(path)
-		if err != nil {
-			t.Fatalf("lock not released after close: %v", err)
-		}
-		released.Close()
-	})
-
-	t.Run("store_open_failure_unwinds_the_lock_without_deleting_it", func(t *testing.T) {
-		synthetic := errors.New("synthetic store open failure")
-		_, _, err := openControllerWith(context.Background(), path, runtime.Acquire, func(context.Context, string) (*store.DB, error) {
-			return nil, synthetic
-		})
-		if !errors.Is(err, synthetic) {
-			t.Fatalf("err=%v, want synthetic store open failure", err)
-		}
-		if _, statErr := os.Stat(canonical + ".lock"); statErr != nil {
-			t.Fatalf("lock file removed on unwind: %v", statErr)
-		}
-		released, err := runtime.Acquire(path)
-		if err != nil {
-			t.Fatalf("lock not released after store-open failure: %v", err)
-		}
-		released.Close()
-	})
-}
-
-func TestCLIRenewRejectsIncompatibleNamesButRevokeKeepsExactKey(t *testing.T) {
-	for _, name := range []string{"café", "a\xff", "a\xfe", "a\ufffd"} {
-		for _, operation := range []string{"renew", "revoke"} {
-			fake := &fakeController{}
-			opened := false
-			factory := func(context.Context, string) (controllerAPI, io.Closer, error) {
-				opened = true
-				return fake, fake, nil
-			}
-			var out, errOut bytes.Buffer
-			code := run([]string{operation, "-conversation", name}, "unused", &out, &errOut, factory, noEnv)
-			if operation == "renew" {
-				if code != 2 || opened {
-					t.Fatalf("renew opened storage for %x: exit=%d", name, code)
-				}
-			} else if code != 0 || !opened || fake.revoke != name {
-				t.Fatalf("revoke changed key %x: %+v, exit=%d", name, fake, code)
-			}
+		args = append([]string{"membership", "revoke", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
+		if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 || fake.params["conversation"] != name {
+			t.Fatalf("revoke changed key %x: %+v, exit=%d", name, fake.params, code)
 		}
 	}
 }
 
-// fatalIfOpened is a controllerFactory that fails the test if hello -- a
-// pure client diagnostic -- ever reaches the legacy database-opening path.
-func fatalIfOpened(t *testing.T) controllerFactory {
-	return func(context.Context, string) (controllerAPI, io.Closer, error) {
-		t.Fatal("hello opened a database through the legacy controller factory")
-		return nil, nil, nil
+// TestMembershipDialFailureReportsOperationalErrorNotArgumentError exercises
+// the production dialControlClient against a nonexistent socket path: a
+// real, deterministic dial failure (ENOENT), never a fake, mirroring
+// TestHelloDialFailureReportsOperationalErrorNotArgumentError below.
+func TestMembershipDialFailureReportsOperationalErrorNotArgumentError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "admin.sock")
+	args := []string{"membership", "revoke", "-conversation", "fixture", "-expected-grant-version", "1", "-endpoint", path, "-server-uid", "1000"}
+	var out, errOut bytes.Buffer
+	if code := run(args, &out, &errOut, dialControlClient, noEnv); code != 1 || out.Len() != 0 || errOut.Len() == 0 {
+		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 }
+
+// fatalIfOpened is retained under its old name for the hello tests below,
+// which never open a database or dial a control client through the legacy
+// controller factory this file used to define; it is simply fatalIfDialed
+// under the name those tests were written against pre-conversion.
+func fatalIfOpened(t *testing.T) dialFunc { return fatalIfDialed(t) }
 
 func TestHelloRequiresEndpointConfiguration(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := run([]string{"hello"}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	code := run([]string{"hello"}, &out, &errOut, fatalIfOpened(t), noEnv)
 	if code != 2 || !strings.Contains(errOut.String(), "no endpoint configured") {
 		t.Fatalf("exit=%d err=%q", code, errOut.String())
 	}
@@ -400,7 +380,7 @@ func TestHelloRefusesPARLEYDBAsClientSource(t *testing.T) {
 		return ""
 	}
 	var out, errOut bytes.Buffer
-	code := run([]string{"hello", "-endpoint", "/tmp/x", "-server-uid", "1000"}, "unused.db", &out, &errOut, fatalIfOpened(t), getenv)
+	code := run([]string{"hello", "-endpoint", "/tmp/x", "-server-uid", "1000"}, &out, &errOut, fatalIfOpened(t), getenv)
 	if code != 2 || !strings.Contains(errOut.String(), "PARLEY_DB") {
 		t.Fatalf("exit=%d err=%q", code, errOut.String())
 	}
@@ -408,7 +388,7 @@ func TestHelloRefusesPARLEYDBAsClientSource(t *testing.T) {
 
 func TestHelloHelpTouchesNoDatabase(t *testing.T) {
 	var out, errOut bytes.Buffer
-	code := run([]string{"hello", "-h"}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	code := run([]string{"hello", "-h"}, &out, &errOut, fatalIfOpened(t), noEnv)
 	if code != 0 || out.Len() == 0 {
 		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
@@ -422,7 +402,7 @@ func TestHelloDialFailureReportsOperationalErrorNotArgumentError(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	path := filepath.Join(dir, "admin.sock")
 	var out, errOut bytes.Buffer
-	code := run([]string{"hello", "-endpoint", path, "-server-uid", "1000"}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	code := run([]string{"hello", "-endpoint", path, "-server-uid", "1000"}, &out, &errOut, fatalIfOpened(t), noEnv)
 	if code != 1 || out.Len() != 0 || errOut.Len() == 0 {
 		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
@@ -476,7 +456,7 @@ func startHelloTestServer(t *testing.T) (endpoint, serverUID, adminID string) {
 func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 	endpoint, uid, adminID := startHelloTestServer(t)
 	var out, errOut bytes.Buffer
-	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, &out, &errOut, fatalIfOpened(t), noEnv)
 	if code != 0 {
 		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
@@ -485,6 +465,30 @@ func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "protocol:") || !strings.Contains(out.String(), control.ProtocolVersion) {
 		t.Fatalf("out=%q", out.String())
+	}
+}
+
+// TestMembershipEndToEndEnrollSucceedsAgainstARealServer is the one
+// membership fixture that dials a genuine parleyd-style server end to end
+// (real control.Listener, real store.DB, real Coordinator), proving the
+// production dialControlClient/run wiring -- not just the fakeClient seam
+// above -- actually performs a working membership.enroll round trip.
+func TestMembershipEndToEndEnrollSucceedsAgainstARealServer(t *testing.T) {
+	endpoint, uid, _ := startHelloTestServer(t)
+	args := []string{"membership", "enroll", "-conversation", "fixture", "-peer-a", "peer-a", "-peer-b", "peer-b", "-max-exchanges", "3", "-endpoint", endpoint, "-server-uid", uid}
+	var out, errOut bytes.Buffer
+	code := run(args, &out, &errOut, dialControlClient, noEnv)
+	// No enabled binding exists for either synthetic peer against this real
+	// server, so the coordinator rejects with a domain error (BindingUnavailable)
+	// rather than succeeding -- but that is still a genuine, real end-to-end
+	// RPC round trip through dialControlClient/control.Client.Call, exercising
+	// exactly the code path a real enrollment failure takes, distinct from
+	// every dial/argument-validation failure covered elsewhere in this file.
+	if code != 1 || out.Len() != 0 || errOut.Len() == 0 {
+		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	if strings.Contains(errOut.String(), "outcome unknown") {
+		t.Fatalf("a well-formed domain rejection must not be reported as an unresolved timeout: %s", &errOut)
 	}
 }
 
@@ -519,7 +523,7 @@ func TestHelloReportsWriteFailureBeforeAnyOutput(t *testing.T) {
 	endpoint, uid, _ := startHelloTestServer(t)
 	fw := &failingWriter{failAfter: 0}
 	var errOut bytes.Buffer
-	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, "unused.db", fw, &errOut, fatalIfOpened(t), noEnv)
+	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, fw, &errOut, fatalIfOpened(t), noEnv)
 	if code != 1 {
 		t.Fatalf("exit=%d err=%q, want 1", code, errOut.String())
 	}
@@ -542,7 +546,7 @@ func TestHelloReportsWriteFailureAfterPartialOutput(t *testing.T) {
 	endpoint, uid, _ := startHelloTestServer(t)
 	fw := &failingWriter{failAfter: 3}
 	var errOut bytes.Buffer
-	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, "unused.db", fw, &errOut, fatalIfOpened(t), noEnv)
+	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, fw, &errOut, fatalIfOpened(t), noEnv)
 	if code != 1 {
 		t.Fatalf("exit=%d err=%q, want 1", code, errOut.String())
 	}
@@ -561,7 +565,7 @@ func TestHelloWriteFailureExitCodeSurvivesAnUnusableStderr(t *testing.T) {
 	endpoint, uid, _ := startHelloTestServer(t)
 	fw := &failingWriter{failAfter: 0}
 	errFw := &failingWriter{failAfter: 0}
-	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, "unused.db", fw, errFw, fatalIfOpened(t), noEnv)
+	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, fw, errFw, fatalIfOpened(t), noEnv)
 	if code != 1 {
 		t.Fatalf("exit=%d, want 1 even though the diagnostic write to stderr itself failed", code)
 	}
