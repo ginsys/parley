@@ -62,6 +62,8 @@ type command struct {
 	direction           store.Direction
 	maxExchanges        int64
 	expiresIn           time.Duration
+	expiresAtFlag       string // raw -expires-at value, "" if not given
+	expiresAt           string // resolved absolute RFC3339 wire value, "" for no/unchanged expiry
 	cancelReplies       bool
 	expectedVersion     int64
 	operationID         string
@@ -92,10 +94,12 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	case "enroll":
 		fs.Int64Var(&c.maxExchanges, "max-exchanges", 0, "positive exchange budget (required)")
 		fs.DurationVar(&c.expiresIn, "expires-in", 0, "TTL; 0 means no expiry")
+		fs.StringVar(&c.expiresAtFlag, "expires-at", "", "absolute RFC3339 expiry, for retrying a lost response with the exact original value; mutually exclusive with -expires-in")
 		fs.Int64Var(&c.expectedVersion, "expected-grant-version", 0, "expected latest historical grant version; 0 if the conversation has never been enrolled")
 	case "renew", "replace":
 		fs.Int64Var(&c.maxExchanges, "max-exchanges", 0, "new budget; 0 keeps the current value")
 		fs.DurationVar(&c.expiresIn, "expires-in", 0, "new TTL; 0 keeps the current expiry")
+		fs.StringVar(&c.expiresAtFlag, "expires-at", "", "absolute RFC3339 expiry, for retrying a lost response with the exact original value; mutually exclusive with -expires-in")
 		fs.BoolVar(&c.cancelReplies, "cancel-pending-replies", false, "cancel pending trusted replies instead of carrying them forward")
 		fs.Int64Var(&c.expectedVersion, "expected-grant-version", -1, "expected current active grant version (required)")
 	case "revoke":
@@ -124,6 +128,28 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	}
 	if c.maxExchanges < 0 || c.expiresIn < 0 {
 		return c, fmt.Errorf("budget and expiry must not be negative")
+	}
+	if c.op != "revoke" {
+		// -expires-at is the retry-safe form of -expires-in: recomputing a
+		// relative TTL from time.Now() on every invocation changes
+		// expires_at, and therefore store.NewCommandRequest's digest, on
+		// every retry -- turning a lost-response retry with the same
+		// -operation-id into OperationConflict instead of a replayed
+		// receipt. -expires-in resolves to an absolute value once, here;
+		// -expires-at lets a human pin that exact value across a retry.
+		if c.expiresIn > 0 && c.expiresAtFlag != "" {
+			return c, fmt.Errorf("-expires-in and -expires-at are mutually exclusive")
+		}
+		switch {
+		case c.expiresAtFlag != "":
+			parsed, err := time.Parse(time.RFC3339, c.expiresAtFlag)
+			if err != nil {
+				return c, fmt.Errorf("-expires-at must be RFC3339: %w", err)
+			}
+			c.expiresAt = parsed.UTC().Format(time.RFC3339)
+		case c.expiresIn > 0:
+			c.expiresAt = time.Now().Add(c.expiresIn).UTC().Format(time.RFC3339)
+		}
 	}
 	if c.op == "enroll" || c.op == "replace" {
 		if strings.TrimSpace(c.peerA) == "" || strings.TrimSpace(c.peerB) == "" || c.peerA == c.peerB {
@@ -232,7 +258,16 @@ func runMembership(args []string, stdout, stderr io.Writer, dial dialFunc, geten
 	if err := client.Call(callCtx, "membership."+c.op, params, &result); err != nil {
 		var timeout *control.TimeoutError
 		if errors.As(err, &timeout) {
-			fmt.Fprintf(stderr, "parleyctl membership %s: %v -- retry with -operation-id %s\n", c.op, err, operationID)
+			retry := fmt.Sprintf("-operation-id %s", operationID)
+			if c.expiresAt != "" {
+				// c.expiresAt is already the resolved absolute value (from
+				// either -expires-in or -expires-at) -- pinning it via
+				// -expires-at on retry keeps the digest identical even if
+				// the retry is issued well after the original -expires-in
+				// would have resolved to a different instant.
+				retry += fmt.Sprintf(" -expires-at %s", c.expiresAt)
+			}
+			fmt.Fprintf(stderr, "parleyctl membership %s: %v -- retry with %s\n", c.op, err, retry)
 		} else {
 			fmt.Fprintf(stderr, "parleyctl membership %s: %v\n", c.op, err)
 		}
@@ -269,16 +304,16 @@ func membershipParams(c command, operationID string) map[string]any {
 		params["members"] = membersWire(model.Members)
 		params["policy"] = policyWire(model.Policy)
 		params["max_exchanges"] = strconv.FormatInt(c.maxExchanges, 10)
-		if expiresAt := expiresAtFromDuration(c.expiresIn); expiresAt != "" {
-			params["expires_at"] = expiresAt
+		if c.expiresAt != "" {
+			params["expires_at"] = c.expiresAt
 		}
 	case "renew":
 		params["cancel_pending_replies"] = c.cancelReplies
 		if c.maxExchanges != 0 {
 			params["max_exchanges"] = strconv.FormatInt(c.maxExchanges, 10)
 		}
-		if expiresAt := expiresAtFromDuration(c.expiresIn); expiresAt != "" {
-			params["expires_at"] = expiresAt
+		if c.expiresAt != "" {
+			params["expires_at"] = c.expiresAt
 		}
 	case "replace":
 		model := membership.FromGrant(c.peerA, c.peerB, c.direction)
@@ -288,8 +323,8 @@ func membershipParams(c command, operationID string) map[string]any {
 		if c.maxExchanges != 0 {
 			params["max_exchanges"] = strconv.FormatInt(c.maxExchanges, 10)
 		}
-		if expiresAt := expiresAtFromDuration(c.expiresIn); expiresAt != "" {
-			params["expires_at"] = expiresAt
+		if c.expiresAt != "" {
+			params["expires_at"] = c.expiresAt
 		}
 	case "revoke":
 		// conversation + expected_grant_version already set above; revoke
@@ -312,16 +347,6 @@ func policyWire(p membership.Policy) map[string]any {
 		edges[i] = map[string]any{"from": e.From, "to": e.To}
 	}
 	return map[string]any{"kind": string(p.Kind), "edges": edges}
-}
-
-// expiresAtFromDuration renders a TTL as an absolute RFC3339 UTC timestamp,
-// or "" for "no explicit expiry" (enroll) / "keep the current expiry"
-// (renew, replace) -- the wire's own optionality for expires_at.
-func expiresAtFromDuration(d time.Duration) string {
-	if d <= 0 {
-		return ""
-	}
-	return time.Now().Add(d).UTC().Format(time.RFC3339)
 }
 
 // printMembershipResult renders a command receipt deterministically -- one
@@ -422,9 +447,9 @@ func membershipUsage(output io.Writer) {
 	fmt.Fprintln(output, `parleyctl membership: authenticated membership mutations against parleyd.
 
 Usage:
-  parleyctl membership enroll  -conversation NAME -peer-a ID -peer-b ID -max-exchanges N [-direction bidirectional|a_to_b|b_to_a] [-expires-in DURATION] [-expected-grant-version N] [-operation-id UUID] -endpoint PATH -server-uid UID
-  parleyctl membership renew   -conversation NAME -expected-grant-version N [-max-exchanges N] [-expires-in DURATION] [-cancel-pending-replies] [-operation-id UUID] -endpoint PATH -server-uid UID
-  parleyctl membership replace -conversation NAME -expected-grant-version N -peer-a ID -peer-b ID [-direction bidirectional|a_to_b|b_to_a] [-max-exchanges N] [-expires-in DURATION] [-cancel-pending-replies] [-operation-id UUID] -endpoint PATH -server-uid UID
+  parleyctl membership enroll  -conversation NAME -peer-a ID -peer-b ID -max-exchanges N [-direction bidirectional|a_to_b|b_to_a] [-expires-in DURATION | -expires-at RFC3339] [-expected-grant-version N] [-operation-id UUID] -endpoint PATH -server-uid UID
+  parleyctl membership renew   -conversation NAME -expected-grant-version N [-max-exchanges N] [-expires-in DURATION | -expires-at RFC3339] [-cancel-pending-replies] [-operation-id UUID] -endpoint PATH -server-uid UID
+  parleyctl membership replace -conversation NAME -expected-grant-version N -peer-a ID -peer-b ID [-direction bidirectional|a_to_b|b_to_a] [-max-exchanges N] [-expires-in DURATION | -expires-at RFC3339] [-cancel-pending-replies] [-operation-id UUID] -endpoint PATH -server-uid UID
   parleyctl membership revoke  -conversation NAME -expected-grant-version N [-operation-id UUID] -endpoint PATH -server-uid UID
 
 -expected-grant-version pins optimistic concurrency: 0 for enroll of a
@@ -432,6 +457,12 @@ conversation with no prior history, else the exact current active grant
 version. A stale value is rejected rather than silently overwritten.
 -operation-id defaults to a fresh random UUID; pass the same value again to
 retry a call whose response was lost without risking a second mutation.
+-expires-in resolves to an absolute expiry once, at the moment this command
+runs; retrying the same call across a lost response must use -expires-at
+with the exact value reported alongside the retry guidance, never -expires-in
+again, since a relative TTL recomputed on the retry would change the digest
+and never replay the original receipt. -expires-in and -expires-at are
+mutually exclusive.
 Endpoint/server UID: -endpoint/-server-uid flags, else
 $PARLEY_ENDPOINT/$PARLEY_SERVER_UID; $PARLEY_DB is refused as a client source.`)
 }

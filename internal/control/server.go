@@ -139,14 +139,28 @@ func (sess *Session) Handle(ctx context.Context, req Request) (resp Response, cl
 		return sess.handleHello(req)
 	case "operation.get":
 		return sess.handleOperationGet(ctx, req)
-	case "membership.enroll":
-		return sess.handleMembershipEnroll(ctx, req)
-	case "membership.renew":
-		return sess.handleMembershipRenew(ctx, req)
-	case "membership.replace":
-		return sess.handleMembershipReplace(ctx, req)
-	case "membership.revoke":
-		return sess.handleMembershipRevoke(ctx, req)
+	case "membership.enroll", "membership.renew", "membership.replace", "membership.revoke":
+		if sess.server.Store == nil {
+			// Store is an ordinary field, not enforced non-nil by NewServer
+			// -- server_test.go's testServer helper constructs one with a
+			// nil Store for hello/operation.get-only fixtures, and this
+			// method's own doc comment promises Handle never panics on a
+			// well-formed request. A production Listener.Start always
+			// passes its real writer (res.Writer), so this is defense in
+			// depth against a misconfigured/test Server, not a reachable
+			// production path.
+			return domainErrorResponse(&req.ID, DomainCode(store.TemporarilyUnavailable)), false
+		}
+		switch req.Method {
+		case "membership.enroll":
+			return sess.handleMembershipEnroll(ctx, req)
+		case "membership.renew":
+			return sess.handleMembershipRenew(ctx, req)
+		case "membership.replace":
+			return sess.handleMembershipReplace(ctx, req)
+		default:
+			return sess.handleMembershipRevoke(ctx, req)
+		}
 	default:
 		// Reachable only pre-negotiation would already have been caught
 		// above; post-negotiation this is any method PR1 does not wire.

@@ -251,7 +251,13 @@ func scanEnvelopes(rows *sql.Rows) ([]Envelope, error) {
 }
 
 // CanCarryReply validates provenance and every crossed renewal boundary. A
-// cancellation choice or revocation cannot be bypassed by a later renewal.
+// cancellation choice or revocation cannot be bypassed by a later renewal,
+// and neither can a renewal/replacement that denied this exact reply
+// direction for one or more intervening versions before a later version
+// restored it: a reply left dispatching through such a deny-then-restore
+// sequence was genuinely undeliverable for the whole denied window, and
+// must not be silently revived just because the final version happens to
+// permit the direction again.
 func CanCarryReply(ctx context.Context, tx *sql.Tx, e *Envelope, target int64) (bool, error) {
 	if !e.TrustedReply || e.InReplyTo == nil || target <= e.GrantVersion {
 		return false, nil
@@ -268,9 +274,37 @@ func CanCarryReply(ctx context.Context, tx *sql.Tx, e *Envelope, target int64) (
 	if err != nil || valid != 1 {
 		return false, err
 	}
-	var blockers int
-	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM grants WHERE conversation=? AND grant_version>=? AND grant_version<=? AND (status='revoked' OR (grant_version>? AND cancel_pending_replies=1))`, e.Conversation, e.GrantVersion, target, e.GrantVersion).Scan(&blockers)
-	return blockers == 0, err
+	rows, err := tx.QueryContext(ctx, `SELECT grant_version, peer_a_id, peer_b_id, direction, status, cancel_pending_replies FROM grants WHERE conversation=? AND grant_version>=? AND grant_version<=?`, e.Conversation, e.GrantVersion, target)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var version int64
+		var peerA, peerB string
+		var direction Direction
+		var status GrantStatus
+		var cancelPending bool
+		if err := rows.Scan(&version, &peerA, &peerB, &direction, &status, &cancelPending); err != nil {
+			return false, err
+		}
+		if status == GrantRevoked {
+			return false, nil
+		}
+		if version > e.GrantVersion && cancelPending {
+			return false, nil
+		}
+		// A synthetic Grant with Status forced to GrantActive reuses
+		// PermitsDirection's exact peer/direction switch for a historical
+		// row without duplicating that logic here -- this row's own
+		// lifecycle status is already handled by the revoked check above,
+		// so PermitsDirection's own status gate must not also apply to it.
+		historical := Grant{PeerAID: peerA, PeerBID: peerB, Direction: direction, Status: GrantActive}
+		if !historical.PermitsDirection(e.FromPeer, e.ToPeer) {
+			return false, nil
+		}
+	}
+	return true, rows.Err()
 }
 
 // SettleDispatch is conditional on the exact attempt, preventing an old
