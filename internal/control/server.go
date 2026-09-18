@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ginsys/parley/internal/store"
 )
@@ -39,7 +40,10 @@ const (
 // table (docs/specifications/control.md) defines many more; every one of
 // them, until wired in a later change, is method-not-found here -- this
 // package does not claim to implement them.
-var ImplementedMethods = []string{"server.hello", "operation.get"}
+var ImplementedMethods = []string{
+	"server.hello", "operation.get",
+	"membership.enroll", "membership.renew", "membership.replace", "membership.revoke",
+}
 
 // Identity is one session's negotiated administrator identity, resolved
 // from the kernel-verified connecting UID via the server's configured
@@ -51,10 +55,13 @@ type Identity struct {
 
 // Server holds what dispatch needs across every session: the immutable
 // administrator configuration (for the UID->principal reverse lookup),
-// the reader pool for read methods, and this process's identity.
+// the reader pool for read methods, the owning writer's coordinator (for
+// membership.* mutations) and this process's identity.
 type Server struct {
 	Config   Config
 	Queries  store.Queries
+	Store    *store.DB // the owning writer; membership.* mutations use its Coordinator()
+	Now      func() time.Time
 	ServerID string // installation.server_id: stable across restarts
 	Epoch    string // minted once per process start; changes on restart
 	State    ServerState
@@ -62,16 +69,28 @@ type Server struct {
 	byUID map[uint32]string // reverse of Config.administrators, built once
 }
 
+// now returns Server.Now, defaulting to time.Now -- Now is injectable for
+// tests, never required of a production caller.
+func (s *Server) now() func() time.Time {
+	if s.Now != nil {
+		return s.Now
+	}
+	return time.Now
+}
+
 // NewServer builds a Server. serverID and epoch are resolved by the
 // caller (cmd/parleyd) before construction; this package does not open or
-// query the store beyond the injected Queries.
-func NewServer(cfg Config, queries store.Queries, serverID, epoch string, state ServerState) *Server {
+// query the store beyond the injected Queries. writer is the same
+// *store.DB runtime.Start already opened (Resources.Writer); membership.*
+// handlers call writer.Coordinator().Execute directly, never a second
+// coordinator or writer.
+func NewServer(cfg Config, queries store.Queries, writer *store.DB, serverID, epoch string, state ServerState) *Server {
 	admins := cfg.Administrators()
 	byUID := make(map[uint32]string, len(admins))
 	for id, uid := range admins {
 		byUID[uid] = id
 	}
-	return &Server{Config: cfg, Queries: queries, ServerID: serverID, Epoch: epoch, State: state, byUID: byUID}
+	return &Server{Config: cfg, Queries: queries, Store: writer, ServerID: serverID, Epoch: epoch, State: state, byUID: byUID}
 }
 
 // IdentifyPeer resolves a kernel-verified UID to its configured
@@ -120,6 +139,14 @@ func (sess *Session) Handle(ctx context.Context, req Request) (resp Response, cl
 		return sess.handleHello(req)
 	case "operation.get":
 		return sess.handleOperationGet(ctx, req)
+	case "membership.enroll":
+		return sess.handleMembershipEnroll(ctx, req)
+	case "membership.renew":
+		return sess.handleMembershipRenew(ctx, req)
+	case "membership.replace":
+		return sess.handleMembershipReplace(ctx, req)
+	case "membership.revoke":
+		return sess.handleMembershipRevoke(ctx, req)
 	default:
 		// Reachable only pre-negotiation would already have been caught
 		// above; post-negotiation this is any method PR1 does not wire.

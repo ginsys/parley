@@ -1,0 +1,612 @@
+package control
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"strconv"
+	"time"
+
+	"github.com/ginsys/parley/internal/controller"
+	"github.com/ginsys/parley/internal/membership"
+	"github.com/ginsys/parley/internal/store"
+)
+
+// membership.enroll/renew/replace/revoke: docs/specifications/control.md's
+// wire mutation methods, translating an authenticated administrator's
+// request into a store.Coordinator.Execute call. Each reuses
+// internal/membership for the members/policy <-> grant translation and
+// internal/controller's *Tx functions for the actual grant mutation --
+// this file owns wire decode/digest/response shape only, never grant
+// business logic of its own.
+//
+// authorize is a trivial no-op for every method here: administrators carry
+// no retirement lifecycle in the current schema (only bindings/connections
+// do, via retired_namespaces -- see internal/store/restore_disposition.go),
+// and the automatic recovery-hold gate (store.Coordinator.Execute's
+// h.Before call) already blocks every membership.* kind during a global
+// hold, since none of them appear in recovery.humanRecovery's allowlist.
+func noopAuthorize(context.Context, *sql.Tx) error { return nil }
+
+func (sess *Session) principal() store.CommandPrincipal {
+	return store.CommandPrincipal{ID: sess.identity.PrincipalID, ConnectorUID: sess.identity.UID}
+}
+
+// mutationResponse converts one Coordinator.Execute outcome into a wire
+// Response. err is an infrastructure/pre-principal failure (the mutation
+// never durably ran); a domain rejection is instead carried in
+// receipt.Result.Code with err == nil -- Coordinator.execute records a
+// terminal rejection's audit and returns it as a normal, non-error receipt
+// (internal/store/coordinator.go), so a wire caller must check
+// Result.Code even on the success path, not branch on err alone.
+func mutationResponse(id string, receipt store.CommandReceipt, err error) Response {
+	if err != nil {
+		return domainErrorResponse(&id, domainCode(err))
+	}
+	if receipt.Result.Code != "" {
+		return domainErrorResponse(&id, DomainCode(receipt.Result.Code))
+	}
+	return successResponse(id, CommandReceiptResult{
+		Result:     toWireCommandResult(receipt.Result),
+		AuditID:    receipt.AuditID,
+		CommitView: CommitView{Epoch: receipt.View.Epoch, Revision: strconv.FormatInt(receipt.View.Revision, 10)},
+	})
+}
+
+// CommandReceiptResult is the successful wire result shape shared by every
+// membership mutation: a command receipt per control.md's "Command
+// atomicity, idempotency and audit" section. There is no separate
+// operation_id field -- the response's own JSON-RPC id already echoes the
+// request's operation_id (see paramOperationID/dispatch below), so
+// republishing it inside the result would be a second, independently
+// driftable copy of the same value.
+type CommandReceiptResult struct {
+	Result     wireCommandResult `json:"result"`
+	AuditID    string            `json:"audit_id"`
+	CommitView CommitView        `json:"commit_view"`
+}
+
+// toWireCommandResult re-encodes a live store.CommandResult with
+// decimal-string Before/After fields, mirroring recodeCommandResult's
+// stored-JSON re-encoding (server.go) for the live-mutation path.
+func toWireCommandResult(result store.CommandResult) wireCommandResult {
+	resources := make([]wireResourceChange, len(result.Resources))
+	for i, r := range result.Resources {
+		resources[i] = wireResourceChange{
+			Kind:   r.Kind,
+			ID:     r.ID,
+			Before: strconv.FormatInt(r.Before, 10),
+			After:  strconv.FormatInt(r.After, 10),
+		}
+	}
+	return wireCommandResult{Code: result.Code, Resources: resources}
+}
+
+// rejection and domainRejection mirror internal/connection/provisioning.go's
+// identically named helpers exactly. Packages do not share these -- each
+// coordinator-calling package defines its own copy, the codebase's
+// established convention rather than an oversight.
+func rejection(code store.Code) (store.CommandResult, error) {
+	return store.CommandResult{Code: code}, nil
+}
+func domainRejection(err error) (store.CommandResult, error) {
+	var code store.Code
+	if errors.As(err, &code) && code != "" {
+		return rejection(code)
+	}
+	return store.CommandResult{}, err
+}
+
+// handleMembershipEnroll implements membership.enroll.
+func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (Response, bool) {
+	p, ok := decodeEnrollParams(req.Params)
+	if !ok {
+		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	model := membership.Model{Members: p.members, Policy: p.policy}
+	resp, ok := checkMembershipShape(req.ID, model)
+	if !ok {
+		return resp, false
+	}
+	peerA, peerB, direction := membership.ToGrantFields(model)
+	fields := []store.Field{
+		{Name: "conversation", Value: p.conversation},
+		{Name: "expected_grant_version", Value: p.expectedVersion},
+		membersField(model), policyField(model.Policy),
+		{Name: "max_exchanges", Value: p.maxExchanges},
+	}
+	if p.expiresAt != nil {
+		fields = append(fields, store.Field{Name: "expires_at", Value: p.expiresAtText})
+	}
+	request, err := store.NewCommandRequest("membership.enroll", p.operationID, fields...)
+	if err != nil {
+		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	expectedVersion := p.expectedVersion
+	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
+		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
+			now := store.AuthorityTime(ctx, sess.server.now())
+			if _, err := store.EnabledPeer(ctx, tx, peerA, now); err != nil {
+				return domainRejection(err)
+			}
+			if _, err := store.EnabledPeer(ctx, tx, peerB, now); err != nil {
+				return domainRejection(err)
+			}
+			g, err := controller.GrantTx(ctx, tx, controller.GrantParams{
+				Conversation: p.conversation, PeerAID: peerA, PeerBID: peerB, Direction: direction,
+				MaxExchanges: p.maxExchanges, ExpiresAt: p.expiresAt, ExpectedVersion: &expectedVersion,
+			})
+			if err != nil {
+				return domainRejection(err)
+			}
+			return store.CommandResult{Resources: []store.ResourceChange{{Kind: "grant", ID: p.conversation, After: g.GrantVersion}}}, nil
+		}, nil)
+	return mutationResponse(req.ID, receipt, err), false
+}
+
+// handleMembershipRenew implements membership.renew.
+func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Response, bool) {
+	p, ok := decodeRenewParams(req.Params)
+	if !ok {
+		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	fields := renewalFields(p.conversation, p.expectedVersion, p.maxExchanges, p.expiresAtText, p.cancelPendingReplies)
+	request, err := store.NewCommandRequest("membership.renew", p.operationID, fields...)
+	if err != nil {
+		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	expectedVersion := p.expectedVersion
+	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
+		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
+			g, err := controller.RenewTx(ctx, tx, controller.RenewParams{
+				CancelPendingReplies: p.cancelPendingReplies, Conversation: p.conversation,
+				MaxExchanges: p.maxExchanges, ExpiresAt: p.expiresAt, ExpectedVersion: &expectedVersion,
+			})
+			if err != nil {
+				return domainRejection(err)
+			}
+			return store.CommandResult{Resources: []store.ResourceChange{{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: g.GrantVersion}}}, nil
+		}, nil)
+	return mutationResponse(req.ID, receipt, err), false
+}
+
+// handleMembershipReplace implements membership.replace.
+func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (Response, bool) {
+	p, ok := decodeReplaceParams(req.Params)
+	if !ok {
+		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	model := membership.Model{Members: p.members, Policy: p.policy}
+	resp, ok := checkMembershipShape(req.ID, model)
+	if !ok {
+		return resp, false
+	}
+	peerA, peerB, direction := membership.ToGrantFields(model)
+	fields := renewalFields(p.conversation, p.expectedVersion, p.maxExchanges, p.expiresAtText, p.cancelPendingReplies)
+	fields = append(fields, membersField(model), policyField(model.Policy))
+	request, err := store.NewCommandRequest("membership.replace", p.operationID, fields...)
+	if err != nil {
+		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	expectedVersion := p.expectedVersion
+	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
+		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
+			now := store.AuthorityTime(ctx, sess.server.now())
+			if _, err := store.EnabledPeer(ctx, tx, peerA, now); err != nil {
+				return domainRejection(err)
+			}
+			if _, err := store.EnabledPeer(ctx, tx, peerB, now); err != nil {
+				return domainRejection(err)
+			}
+			g, err := controller.ReplaceTx(ctx, tx, controller.ReplaceParams{
+				CancelPendingReplies: p.cancelPendingReplies, Conversation: p.conversation,
+				PeerAID: peerA, PeerBID: peerB, Direction: direction,
+				MaxExchanges: p.maxExchanges, ExpiresAt: p.expiresAt, ExpectedVersion: &expectedVersion,
+			})
+			if err != nil {
+				return domainRejection(err)
+			}
+			return store.CommandResult{Resources: []store.ResourceChange{{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: g.GrantVersion}}}, nil
+		}, nil)
+	return mutationResponse(req.ID, receipt, err), false
+}
+
+// handleMembershipRevoke implements membership.revoke.
+func (sess *Session) handleMembershipRevoke(ctx context.Context, req Request) (Response, bool) {
+	p, ok := decodeRevokeParams(req.Params)
+	if !ok {
+		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	request, err := store.NewCommandRequest("membership.revoke", p.operationID,
+		store.Field{Name: "conversation", Value: p.conversation},
+		store.Field{Name: "expected_grant_version", Value: p.expectedVersion})
+	if err != nil {
+		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
+		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
+			result, err := controller.RevokeTx(ctx, tx, p.conversation, &p.expectedVersion)
+			if err != nil {
+				return domainRejection(err)
+			}
+			return store.CommandResult{Resources: []store.ResourceChange{
+				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: p.expectedVersion},
+				{Kind: "queued_cancelled", ID: p.conversation, After: int64(result.Cancelled)},
+			}}, nil
+		}, nil)
+	return mutationResponse(req.ID, receipt, err), false
+}
+
+// checkMembershipShape runs the two-stage membership.md check shared by
+// enroll/replace: full Validate (invalid_membership) then Supported
+// (unsupported_membership). Returns ok == false with the response already
+// built when either check fails.
+func checkMembershipShape(id string, model membership.Model) (Response, bool) {
+	if err := membership.Validate(model); err != nil {
+		return domainErrorResponse(&id, DomainCode(store.InvalidMembership)), false
+	}
+	if !membership.Supported(model) {
+		return domainErrorResponse(&id, DomainCode(store.UnsupportedMembership)), false
+	}
+	return Response{}, true
+}
+
+// renewalFields builds the digest fields common to renew and replace.
+// expiresAtText is the raw wire RFC3339 string, or "" if expires_at was
+// omitted -- omitted, never digested, matching the field's optionality.
+func renewalFields(conversation string, expectedVersion, maxExchanges int64, expiresAtText string, cancelPendingReplies bool) []store.Field {
+	fields := []store.Field{
+		{Name: "conversation", Value: conversation},
+		{Name: "expected_grant_version", Value: expectedVersion},
+		{Name: "cancel_pending_replies", Value: cancelPendingReplies},
+	}
+	if maxExchanges != 0 {
+		fields = append(fields, store.Field{Name: "max_exchanges", Value: maxExchanges})
+	}
+	if expiresAtText != "" {
+		fields = append(fields, store.Field{Name: "expires_at", Value: expiresAtText})
+	}
+	return fields
+}
+
+func membersField(model membership.Model) store.Field {
+	members := make(store.Set, len(model.Members))
+	for i, m := range model.Members {
+		members[i] = store.Fields{{Name: "peer_id", Value: m.PeerID}, {Name: "role", Value: string(m.Role)}}
+	}
+	return store.Field{Name: "members", Value: members}
+}
+
+func policyField(p membership.Policy) store.Field {
+	edges := make(store.Set, len(p.Edges))
+	for i, e := range p.Edges {
+		edges[i] = store.Fields{{Name: "from", Value: e.From}, {Name: "to", Value: e.To}}
+	}
+	return store.Field{Name: "policy", Value: store.Fields{{Name: "kind", Value: string(p.Kind)}, {Name: "edges", Value: edges}}}
+}
+
+// --- param decoding ---
+//
+// Every wire identifier byte-shape rule (conversation/peer ASCII exact-key
+// validation) is enforced by membership.Validate against the members list,
+// and by validateGrant/validateRenewalInput inside internal/controller for
+// the top-level conversation field -- this file only checks JSON shape
+// (right key set, right JSON type per field) and produces InvalidParams
+// for a violation. A wire request whose conversation identifier bytes are
+// malformed still reaches controller.GrantTx/RenewTx/ReplaceTx, which
+// reject it with a plain Go error rather than a store.Code; domainRejection
+// then propagates that as an infrastructure-style failure (whole
+// transaction rolled back, TemporarilyUnavailable on the wire) rather than
+// a clean audited rejection. Pre-validating it here would let a malformed
+// conversation identifier degrade to a wrong domain code instead of a
+// wrong transport code; recorded as a known limitation rather than guessed
+// at, since neither control.md nor membership.md assign conversation-byte-
+// shape violations a specific domain code.
+
+type enrollParams struct {
+	operationID     string
+	conversation    string
+	expectedVersion int64
+	members         []membership.Member
+	policy          membership.Policy
+	maxExchanges    int64
+	expiresAt       *time.Time
+	expiresAtText   string
+}
+
+func decodeEnrollParams(params map[string]any) (enrollParams, bool) {
+	if !paramKeysAllowed(params, "operation_id", "conversation", "expected_grant_version", "members", "policy", "max_exchanges", "expires_at") {
+		return enrollParams{}, false
+	}
+	var p enrollParams
+	var ok bool
+	if p.operationID, ok = paramOperationID(params); !ok {
+		return enrollParams{}, false
+	}
+	if p.conversation, ok = paramString(params, "conversation"); !ok {
+		return enrollParams{}, false
+	}
+	if p.expectedVersion, ok = paramDecimal(params, "expected_grant_version"); !ok {
+		return enrollParams{}, false
+	}
+	if p.maxExchanges, ok = paramDecimal(params, "max_exchanges"); !ok || p.maxExchanges <= 0 {
+		return enrollParams{}, false
+	}
+	membersRaw, ok := params["members"]
+	if !ok {
+		return enrollParams{}, false
+	}
+	if p.members, ok = decodeMembers(membersRaw); !ok {
+		return enrollParams{}, false
+	}
+	policyRaw, ok := params["policy"]
+	if !ok {
+		return enrollParams{}, false
+	}
+	if p.policy, ok = decodePolicy(policyRaw); !ok {
+		return enrollParams{}, false
+	}
+	if p.expiresAt, p.expiresAtText, ok = paramOptionalExpiresAt(params); !ok {
+		return enrollParams{}, false
+	}
+	return p, true
+}
+
+type renewParams struct {
+	operationID          string
+	conversation         string
+	expectedVersion      int64
+	maxExchanges         int64
+	expiresAt            *time.Time
+	expiresAtText        string
+	cancelPendingReplies bool
+}
+
+func decodeRenewParams(params map[string]any) (renewParams, bool) {
+	if !paramKeysAllowed(params, "operation_id", "conversation", "expected_grant_version", "max_exchanges", "expires_at", "cancel_pending_replies") {
+		return renewParams{}, false
+	}
+	p, ok := decodeRenewalCore(params)
+	return p, ok
+}
+
+type replaceParams struct {
+	renewParams
+	members []membership.Member
+	policy  membership.Policy
+}
+
+func decodeReplaceParams(params map[string]any) (replaceParams, bool) {
+	if !paramKeysAllowed(params, "operation_id", "conversation", "expected_grant_version", "max_exchanges", "expires_at", "cancel_pending_replies", "members", "policy") {
+		return replaceParams{}, false
+	}
+	core, ok := decodeRenewalCore(params)
+	if !ok {
+		return replaceParams{}, false
+	}
+	membersRaw, ok := params["members"]
+	if !ok {
+		return replaceParams{}, false
+	}
+	members, ok := decodeMembers(membersRaw)
+	if !ok {
+		return replaceParams{}, false
+	}
+	policyRaw, ok := params["policy"]
+	if !ok {
+		return replaceParams{}, false
+	}
+	policy, ok := decodePolicy(policyRaw)
+	if !ok {
+		return replaceParams{}, false
+	}
+	return replaceParams{renewParams: core, members: members, policy: policy}, true
+}
+
+// decodeRenewalCore decodes the fields renew and replace share: required
+// operation_id/conversation/expected_grant_version(positive), optional
+// max_exchanges(positive if present)/expires_at, and
+// cancel_pending_replies defaulting false when omitted.
+func decodeRenewalCore(params map[string]any) (renewParams, bool) {
+	var p renewParams
+	var ok bool
+	if p.operationID, ok = paramOperationID(params); !ok {
+		return renewParams{}, false
+	}
+	if p.conversation, ok = paramString(params, "conversation"); !ok {
+		return renewParams{}, false
+	}
+	if p.expectedVersion, ok = paramDecimal(params, "expected_grant_version"); !ok || p.expectedVersion < 1 {
+		return renewParams{}, false
+	}
+	if _, present := params["max_exchanges"]; present {
+		if p.maxExchanges, ok = paramDecimal(params, "max_exchanges"); !ok || p.maxExchanges <= 0 {
+			return renewParams{}, false
+		}
+	}
+	if p.expiresAt, p.expiresAtText, ok = paramOptionalExpiresAt(params); !ok {
+		return renewParams{}, false
+	}
+	if _, present := params["cancel_pending_replies"]; present {
+		if p.cancelPendingReplies, ok = paramBool(params, "cancel_pending_replies"); !ok {
+			return renewParams{}, false
+		}
+	}
+	return p, true
+}
+
+type revokeParams struct {
+	operationID     string
+	conversation    string
+	expectedVersion int64
+}
+
+func decodeRevokeParams(params map[string]any) (revokeParams, bool) {
+	if !paramKeysAllowed(params, "operation_id", "conversation", "expected_grant_version") {
+		return revokeParams{}, false
+	}
+	var p revokeParams
+	var ok bool
+	if p.operationID, ok = paramOperationID(params); !ok {
+		return revokeParams{}, false
+	}
+	if p.conversation, ok = paramString(params, "conversation"); !ok {
+		return revokeParams{}, false
+	}
+	if p.expectedVersion, ok = paramDecimal(params, "expected_grant_version"); !ok || p.expectedVersion < 1 {
+		return revokeParams{}, false
+	}
+	return p, true
+}
+
+func decodeMembers(raw any) ([]membership.Member, bool) {
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	members := make([]membership.Member, len(arr))
+	for i, item := range arr {
+		obj, ok := item.(map[string]any)
+		if !ok || !paramKeysAllowed(obj, "peer_id", "role") {
+			return nil, false
+		}
+		peerID, ok := paramString(obj, "peer_id")
+		if !ok {
+			return nil, false
+		}
+		role, ok := paramString(obj, "role")
+		if !ok {
+			return nil, false
+		}
+		members[i] = membership.Member{PeerID: peerID, Role: membership.Role(role)}
+	}
+	return members, true
+}
+
+func decodePolicy(raw any) (membership.Policy, bool) {
+	obj, ok := raw.(map[string]any)
+	if !ok || !paramKeysAllowed(obj, "kind", "edges") {
+		return membership.Policy{}, false
+	}
+	kindStr, ok := paramString(obj, "kind")
+	if !ok {
+		return membership.Policy{}, false
+	}
+	var edges []membership.Edge
+	if edgesRaw, present := obj["edges"]; present {
+		arr, ok := edgesRaw.([]any)
+		if !ok {
+			return membership.Policy{}, false
+		}
+		edges = make([]membership.Edge, len(arr))
+		for i, item := range arr {
+			eobj, ok := item.(map[string]any)
+			if !ok || !paramKeysAllowed(eobj, "from", "to") {
+				return membership.Policy{}, false
+			}
+			from, ok := paramString(eobj, "from")
+			if !ok {
+				return membership.Policy{}, false
+			}
+			to, ok := paramString(eobj, "to")
+			if !ok {
+				return membership.Policy{}, false
+			}
+			edges[i] = membership.Edge{From: from, To: to}
+		}
+	}
+	return membership.Policy{Kind: membership.PolicyKind(kindStr), Edges: edges}, true
+}
+
+func paramOptionalExpiresAt(params map[string]any) (*time.Time, string, bool) {
+	raw, present := params["expires_at"]
+	if !present {
+		return nil, "", true
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return nil, "", false
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return nil, "", false
+	}
+	return &t, s, true
+}
+
+func paramKeysAllowed(params map[string]any, allowed ...string) bool {
+	set := make(map[string]bool, len(allowed))
+	for _, k := range allowed {
+		set[k] = true
+	}
+	for k := range params {
+		if !set[k] {
+			return false
+		}
+	}
+	return true
+}
+
+func paramString(params map[string]any, key string) (string, bool) {
+	v, ok := params[key]
+	if !ok {
+		return "", false
+	}
+	s, ok := v.(string)
+	return s, ok
+}
+
+func paramBool(params map[string]any, key string) (bool, bool) {
+	v, ok := params[key]
+	if !ok {
+		return false, false
+	}
+	b, ok := v.(bool)
+	return b, ok
+}
+
+// paramOperationID decodes the fixed operation_id field: a canonical UUID
+// string, the CommandRequest idempotency key every mutation method shares.
+func paramOperationID(params map[string]any) (string, bool) {
+	s, ok := paramString(params, "operation_id")
+	if !ok || !canonicalUUID(s) {
+		return "", false
+	}
+	return s, true
+}
+
+// paramDecimal parses key as a canonical nonnegative decimal string -- the
+// wire profile's 64-bit counter/version/budget codec (control.md): ASCII
+// digits only, no sign, no leading zero unless the value is exactly "0".
+// Any other spelling of the same number is rejected rather than
+// normalized, so two different wire spellings of one value can never
+// collide in the durable command digest.
+func paramDecimal(params map[string]any, key string) (int64, bool) {
+	s, ok := paramString(params, key)
+	if !ok {
+		return 0, false
+	}
+	return parseCanonicalNonNegative(s)
+}
+
+func parseCanonicalNonNegative(s string) (int64, bool) {
+	if s == "" || len(s) > 20 {
+		return 0, false
+	}
+	if s == "0" {
+		return 0, true
+	}
+	if s[0] < '1' || s[0] > '9' {
+		return 0, false
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
