@@ -200,7 +200,25 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 	// an attempted write is not a proven non-dispatch -- classified as an
 	// unresolved outcome via wrapTimeout, not returned bare (mandate CP-02),
 	// matching the write/read-failure classification above.
-	if _, err := parseJSON(line); err != nil {
+	value, err := parseJSON(line)
+	if err != nil {
+		c.broken = true
+		return wrapTimeout(fmt.Errorf("control: malformed response: %w", err))
+	}
+	// parseJSON only proves the bytes are valid, strictly-parsed JSON --
+	// it does not by itself enforce the response envelope's shape (see
+	// parseJSON's own doc comment in json.go). encoding/json's struct
+	// decode below is case-insensitive on field names when no exact
+	// match exists and silently ignores unknown object keys, so an
+	// invented member, a wrong-case alias like "JSONRPC", or a
+	// case-distinct competing key would otherwise decode as an ordinary
+	// response instead of being rejected (mandate CP-06). This check
+	// mirrors classifyEnvelope's own allowed-keys-map pattern on the
+	// generic parsed value, before any struct decode is attempted; it is
+	// deliberately not classifyEnvelope itself, since a response
+	// envelope's shape (result/error) differs from a request's
+	// (method/params).
+	if err := validateResponseEnvelope(value); err != nil {
 		c.broken = true
 		return wrapTimeout(fmt.Errorf("control: malformed response: %w", err))
 	}
@@ -306,6 +324,14 @@ func formatResponseID(id *string) string {
 // writes (see writeResponse in listener_linux.go). Without this, a
 // malformed or hostile peer sending an unterminated stream would make
 // bufio.Reader.ReadBytes buffer without limit.
+//
+// A CR immediately before the terminating LF is rejected using the server's
+// own errFrameBadBytes sentinel (frame.go), the same framing rule ReadFrame
+// enforces server-side. Without this check, a CRLF-framed response would
+// pass unnoticed: the JSON parser treats a trailing CR as insignificant
+// whitespace, so it is not caught by parseJSON's own trailing-content check
+// either (mandate CP-06) -- framing must be checked independently of valid
+// JSON whitespace, not folded into the JSON-level validation below.
 func readBoundedFrame(br *bufio.Reader) ([]byte, error) {
 	var buf []byte
 	for {
@@ -315,12 +341,89 @@ func readBoundedFrame(br *bufio.Reader) ([]byte, error) {
 		}
 		buf = append(buf, b)
 		if b == '\n' {
+			if len(buf) >= 2 && buf[len(buf)-2] == '\r' {
+				return nil, errFrameBadBytes
+			}
 			return buf, nil
 		}
 		if len(buf) >= MaxFrameBytes {
-			return nil, fmt.Errorf("control: response exceeds the frame bound")
+			// The same sentinel the server's own ReadFrame (frame.go) uses
+			// for its identical bound, so a caller/test can assert the
+			// actual size-rejection outcome via errors.Is rather than a
+			// bare non-nil error, which would also match a coincidental
+			// deadline or EOF (mandate: named test evidence).
+			return nil, errFrameTooLarge
 		}
 	}
+}
+
+// validateResponseEnvelope enforces the exact, case-sensitive response
+// envelope shape the wire contract requires, using the same parseJSON
+// output the request-side classifyEnvelope (envelope.go) is built from --
+// but this is a separate function, not a reuse of classifyEnvelope itself,
+// since a response envelope (jsonrpc/id/result/error) is structurally
+// different from a request envelope (jsonrpc/id/method/params). A response
+// must never be passed through the request-only classifier (mandate
+// CP-06). Only the outer envelope and, when present, the error object's
+// own shape are checked here; result's shape is left to the caller's own
+// out value, matching incomingResponse's existing json.RawMessage
+// deferral.
+func validateResponseEnvelope(value any) error {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("control: response is not a JSON object")
+	}
+	allowed := map[string]bool{"jsonrpc": true, "id": true, "result": true, "error": true}
+	for k := range obj {
+		if !allowed[k] {
+			return fmt.Errorf("control: response carries an unrecognized field %q", k)
+		}
+	}
+	if _, ok := obj["jsonrpc"]; !ok {
+		return errors.New("control: response is missing the required jsonrpc field")
+	}
+	if _, ok := obj["id"]; !ok {
+		return errors.New("control: response is missing the required id field")
+	}
+	if errVal, present := obj["error"]; present && errVal != nil {
+		if err := validateErrorObjectShape(errVal); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateErrorObjectShape enforces the exact, case-sensitive shape of a
+// present, non-null error object: only code/message/data are permitted,
+// and when data is present and non-null, only its code member is
+// permitted -- mirroring wireError/errorData's own encoding shape
+// (response.go). This runs before incomingError's own json.Unmarshal
+// decode for the same reason validateResponseEnvelope runs before
+// incomingResponse's: an invented or wrong-case member would otherwise be
+// silently dropped or aliased rather than rejected.
+func validateErrorObjectShape(value any) error {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("control: response error must be an object, got %#v", value)
+	}
+	allowed := map[string]bool{"code": true, "message": true, "data": true}
+	for k := range obj {
+		if !allowed[k] {
+			return fmt.Errorf("control: response error carries an unrecognized field %q", k)
+		}
+	}
+	if data, present := obj["data"]; present && data != nil {
+		dataObj, ok := data.(map[string]any)
+		if !ok {
+			return fmt.Errorf("control: response error.data must be an object, got %#v", data)
+		}
+		for k := range dataObj {
+			if k != "code" {
+				return fmt.Errorf("control: response error.data carries an unrecognized field %q", k)
+			}
+		}
+	}
+	return nil
 }
 
 // incomingResponse mirrors wireResponse (response.go) for decoding rather

@@ -119,6 +119,25 @@ func prepareSocketPath(parent int, name string, serverUID uint32) error {
 // existing socket returns a definite ECONNREFUSED -- proof no listener is
 // bound to it. A successful connect, a timeout, a permission failure or
 // any other outcome is not proof of abandonment.
+//
+// ECONNREFUSED is not exclusive to an abandoned socket, though: a socket
+// that has been Bind'd but not yet had Listen called on it can also
+// return ECONNREFUSED for that same brief interval, indistinguishable
+// from this probe's intended "abandoned" case. This matters only if a
+// second, concurrent Listen (this function or another process's) could
+// observe an in-progress first Listen's Bind-but-not-yet-Listen socket at
+// this exact pathname. In the accepted production assembly this cannot
+// happen for two *cooperating* contenders on the *same* database:
+// runtime.Start acquires the canonical database ownership lock
+// (internal/runtime/runtime.go's Acquire call, before any
+// runtime.Service.Start including this listener's) before this
+// listener's own Start ever calls Listen, so only the single lock holder
+// ever reaches Bind/Listen for that database at a time. This is a
+// configuration/ownership-scoped mitigation, not a general proof: it says
+// nothing about an arbitrary standalone Listen caller outside that
+// assembly, or about two different databases whose configuration happens
+// to share one socket pathname -- neither of those is protected by the
+// database ownership lock, and this function does not claim otherwise.
 func probeConnectionRefused(parent int, name string) (bool, error) {
 	addr := fmt.Sprintf("/proc/self/fd/%d/%s", parent, name)
 	conn, err := net.DialTimeout("unix", addr, staleSocketProbeTimeout)
@@ -263,27 +282,39 @@ func (ln *Listener) StopAdmission() error {
 }
 
 // unlinkOwnedSocket removes the on-disk socket entry at path, but only when
-// it is still the exact entry Start bound -- verified by comparing
-// device/inode against the identity captured from the pathname itself at
-// bind time, not merely the pathname string -- so a clean shutdown greatly
-// narrows the risk of removing an unrelated socket a separate process may
-// have already bound at that same path after this one's entry was
-// replaced. This mirrors prepareSocketPath's own "owned entry, not merely
-// the pathname" care on the startup side. boundDev/boundIno of 0 (Start's
-// Lstat failed, or never bound) never matches a real entry, so this is a
-// no-op then.
+// a fresh Lstat of that path still reports the identity (device/inode)
+// captured from the pathname itself at bind time, not merely the pathname
+// string. This is best-effort, identity-checked cleanup: it protects
+// against a replacement that is already visible (a different device/inode)
+// at the moment this check runs, and it still relies on this service
+// having exclusive/trusted control of the socket pathname for its own
+// lifecycle -- the same precondition prepareSocketPath's own startup-side
+// stale-socket probe depends on. The identity captured after Listen
+// returns is a sampled post-bind pathname identity, not proof of atomic
+// binding; boundDev/boundIno of 0 (Start's Lstat failed, or never bound)
+// never matches a real entry, so this is a no-op then.
 //
-// The Lstat and Unlink below are two separate syscalls on the pathname,
-// not one atomic dirfd-relative operation (unlike prepareSocketPath, which
-// retains a parent directory fd across its own check-then-unlink) -- there
-// is an unavoidable, vanishingly narrow window between them. Closing it
-// would mean keeping this listener's parent directory fd open for its
-// entire lifetime solely for this shutdown-time check, which this fix does
-// not do. In practice a replacement bound in that window would need to
-// receive the exact freed device/inode pair to be wrongly unlinked here,
-// which no common filesystem's inode allocator does for a just-freed
-// inode under immediate reuse pressure -- but this is a probabilistic
-// argument, not a proof, and is recorded here rather than overclaimed.
+// This does NOT close every replacement race, and no inode-reuse argument
+// is required for one to matter. Lstat and Unlink below are two separate,
+// non-atomic syscalls on the same pathname. A different actor can replace
+// the entry -- move or remove the original and install a different-inode
+// socket at the same name -- strictly after Lstat has already matched the
+// originally-bound identity but before Unlink runs; Unlink then removes
+// whatever now occupies that name, regardless of its inode. No reuse of
+// the original device/inode pair is needed for this to happen: the
+// replacement is simply the thing present at unlink time, identity check
+// or not. Retaining a parent-directory descriptor across the two calls
+// (as prepareSocketPath does on the startup side) would not close this
+// window either -- descriptor-relative Fstatat/Unlinkat resolve by name
+// within that directory fd, which stabilizes the parent-directory *lookup*
+// against a symlink or rename higher in the path, but performs two
+// separate syscalls, not one atomic compare-and-unlink of a directory
+// entry; a concurrent replace of the same name races an Unlinkat exactly
+// as it races a plain Unlink. Closing this window structurally would
+// require exclusive/serialized control of the socket pathname for this
+// service's entire lifecycle, which this fix does not add -- that remains
+// a known, accepted limitation of a single-owner deployment, not evidence
+// of a guarantee this code provides.
 func unlinkOwnedSocket(path string, boundDev, boundIno uint64) {
 	if boundDev == 0 && boundIno == 0 {
 		return
