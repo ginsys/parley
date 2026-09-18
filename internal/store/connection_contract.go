@@ -46,6 +46,25 @@ const (
 	CapacityExceeded       Code = "capacity_exceeded"
 	TemporarilyUnavailable Code = "temporarily_unavailable"
 	OutcomeUnknown         Code = "outcome_unknown"
+
+	// The five codes below back PR2's membership.* mutations. They were
+	// named in internal/control/errors.go as "wire-only" additions before
+	// any method that could return them was wired; unlike that package's
+	// remaining wire-only codes (protocol_mismatch, operation_not_found,
+	// resnapshot_required, subscription_conflict), these four describe an
+	// actual store-mutation precondition failure, not a wire/session
+	// concern, so they must be valid, terminalResult codes here to satisfy
+	// the accepted control specification's audited/replayable terminal-
+	// rejection contract (docs/specifications/control.md "Command
+	// atomicity, idempotency and audit": a terminal rejection records its
+	// receipt/audit, and a same-ID retry returns that receipt rather than
+	// reevaluating now-stale preconditions). IncompatibleIdentifier is
+	// deliberately left as control-only: no PR2 method returns it.
+	StaleGrantVersion     Code = "stale_grant_version"
+	InvalidMembership     Code = "invalid_membership"
+	UnsupportedMembership Code = "unsupported_membership"
+	NoActiveGrant         Code = "no_active_grant"
+	AlreadyActive         Code = "already_active"
 )
 
 func (c Code) Error() string { return string(c) }
@@ -60,7 +79,8 @@ func (c Code) Valid() bool { return c.valid() }
 
 func (c Code) valid() bool {
 	switch c {
-	case "", InvalidRequest, AuthenticationFailed, NotFound, Forbidden, IdentityConflict, BindingUnavailable, HostUnverified, NotReady, AlreadyConnected, GenerationConflict, VersionConflict, RequestExpired, RequestTerminal, OperationConflict, EventConflict, SecurityHold, RecoveryRequired, CapacityExceeded, TemporarilyUnavailable, OutcomeUnknown:
+	case "", InvalidRequest, AuthenticationFailed, NotFound, Forbidden, IdentityConflict, BindingUnavailable, HostUnverified, NotReady, AlreadyConnected, GenerationConflict, VersionConflict, RequestExpired, RequestTerminal, OperationConflict, EventConflict, SecurityHold, RecoveryRequired, CapacityExceeded, TemporarilyUnavailable, OutcomeUnknown,
+		StaleGrantVersion, InvalidMembership, UnsupportedMembership, NoActiveGrant, AlreadyActive:
 		return true
 	}
 	return false
@@ -70,7 +90,8 @@ func (c Code) valid() bool {
 // infrastructure and pre-principal failures must roll back the entire command.
 func (c Code) terminalResult() bool {
 	switch c {
-	case "", InvalidRequest, NotFound, Forbidden, IdentityConflict, BindingUnavailable, HostUnverified, NotReady, AlreadyConnected, GenerationConflict, VersionConflict, RequestExpired, RequestTerminal, OperationConflict, EventConflict, SecurityHold:
+	case "", InvalidRequest, NotFound, Forbidden, IdentityConflict, BindingUnavailable, HostUnverified, NotReady, AlreadyConnected, GenerationConflict, VersionConflict, RequestExpired, RequestTerminal, OperationConflict, EventConflict, SecurityHold,
+		StaleGrantVersion, InvalidMembership, UnsupportedMembership, NoActiveGrant, AlreadyActive:
 		return true
 	}
 	return false
