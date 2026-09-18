@@ -251,23 +251,45 @@ func runHello(args []string, stdout, stderr io.Writer, getenv func(string) strin
 		return 1
 	}
 	defer client.Close()
-	printHello(stdout, hello)
+	// The hello RPC itself already succeeded by this point -- a failure
+	// writing its output is a distinct, later failure and must not be
+	// reported as a dial/handshake/RPC outcome (mandate S15-1): the hello
+	// may have succeeded; only publishing its diagnostic failed.
+	if err := printHello(stdout, hello); err != nil {
+		fmt.Fprintf(stderr, "parleyctl hello: writing diagnostic output: %v\n", err)
+		return 1
+	}
 	return 0
 }
 
-func printHello(w io.Writer, h control.HelloResult) {
-	fmt.Fprintf(w, "protocol:                      %s\n", h.Protocol)
-	fmt.Fprintf(w, "server_id:                     %s\n", h.ServerID)
-	fmt.Fprintf(w, "server_epoch:                  %s\n", h.ServerEpoch)
-	fmt.Fprintf(w, "administrator_id:              %s\n", h.AdministratorID)
-	fmt.Fprintf(w, "state:                         %s\n", h.State)
-	fmt.Fprintf(w, "max_frame_bytes:               %d\n", h.Limits.MaxFrameBytes)
-	fmt.Fprintf(w, "max_nesting_depth:             %d\n", h.Limits.MaxNestingDepth)
-	fmt.Fprintf(w, "max_sockets_per_administrator: %d\n", h.Limits.MaxSocketsPerAdministrator)
-	fmt.Fprintf(w, "max_sockets_total:             %d\n", h.Limits.MaxSocketsTotal)
-	fmt.Fprintf(w, "max_executing_per_socket:      %d\n", h.Limits.MaxExecutingPerSocket)
-	fmt.Fprintf(w, "max_queued_per_socket:         %d\n", h.Limits.MaxQueuedPerSocket)
-	fmt.Fprintf(w, "methods:                       %s\n", strings.Join(h.Methods, ", "))
+// printHello writes the hello diagnostic and returns the first write error
+// encountered, if any (mandate S15-1): a caller piped into a closed or
+// otherwise failing writer must be told delivery failed rather than exiting
+// 0 having silently dropped the diagnostic. Lines are rendered up front so
+// only the actual io.WriteString calls below can fail, and writing stops at
+// the first failure rather than attempting every remaining line (whose
+// errors would only obscure the original one).
+func printHello(w io.Writer, h control.HelloResult) error {
+	lines := []string{
+		fmt.Sprintf("protocol:                      %s\n", h.Protocol),
+		fmt.Sprintf("server_id:                     %s\n", h.ServerID),
+		fmt.Sprintf("server_epoch:                  %s\n", h.ServerEpoch),
+		fmt.Sprintf("administrator_id:              %s\n", h.AdministratorID),
+		fmt.Sprintf("state:                         %s\n", h.State),
+		fmt.Sprintf("max_frame_bytes:               %d\n", h.Limits.MaxFrameBytes),
+		fmt.Sprintf("max_nesting_depth:             %d\n", h.Limits.MaxNestingDepth),
+		fmt.Sprintf("max_sockets_per_administrator: %d\n", h.Limits.MaxSocketsPerAdministrator),
+		fmt.Sprintf("max_sockets_total:             %d\n", h.Limits.MaxSocketsTotal),
+		fmt.Sprintf("max_executing_per_socket:      %d\n", h.Limits.MaxExecutingPerSocket),
+		fmt.Sprintf("max_queued_per_socket:         %d\n", h.Limits.MaxQueuedPerSocket),
+		fmt.Sprintf("methods:                       %s\n", strings.Join(h.Methods, ", ")),
+	}
+	for _, line := range lines {
+		if _, err := io.WriteString(w, line); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func orNever(value *string) string {

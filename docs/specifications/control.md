@@ -16,6 +16,10 @@ administrator IDs are never reused; OS account reuse requires a new administrato
 of its privilege routes. Server and socket parents must be trusted, not agent-writable. Require
 socket mode `0600`, or `0660` with an explicitly provisioned administrator-only group; kernel UID
 allowlisting is required in either case. Reject abstract sockets. No TCP listener or URI fallback.
+The implementation binds through a descriptor-relative address, not the configured pathname
+directly, which can add or remove a few bytes relative to the configured path; an `admin_socket`
+that leaves no headroom under the platform's `sockaddr_un` length limit is rejected at startup with
+a concise diagnostic rather than silently falling back to an unprotected bind.
 
 The client uses `--endpoint`, then `PARLEY_ENDPOINT`, then a trusted client configuration entry,
 with the same precedence for `--server-uid`, `PARLEY_SERVER_UID` and configured server UID. No

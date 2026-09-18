@@ -328,10 +328,14 @@ type CommitView struct {
 	Revision string `json:"revision"`
 }
 
-// OperationGetResult is operation.get's result for a found record. The
-// stored ResultJSON is the coordinator's original per-command result;
-// this method republishes it verbatim under Result, never reinterprets
-// it.
+// OperationGetResult is operation.get's result for a found record. Result
+// is NOT the stored ResultJSON bytes republished verbatim: handleOperationGet
+// always passes them through recodeCommandResult first, which reconstructs
+// the durable store.CommandResult and re-encodes its resource counters as
+// canonical decimal strings (see wireResourceChange) per the profile's
+// 64-bit codec. The durable stored representation and this wire
+// representation are related but distinct; only the latter is what
+// operation.get actually returns.
 type OperationGetResult struct {
 	OperationID   string          `json:"operation_id"`
 	OperationKind string          `json:"operation_kind"`

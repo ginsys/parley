@@ -276,12 +276,16 @@ func TestOpenControllerAcquiresCanonicalLockForItsFullLifetime(t *testing.T) {
 		// path: Acquire resolves symlinks before taking the lock, while
 		// store.Open only lexically cleans its input, so a path reaching
 		// the database through a symlinked ancestor could otherwise name a
-		// different file to each of them.
-		var openedWith string
+		// different file to each of them. The mismatch is recorded rather
+		// than asserted inside the acquire callback itself: a t.Fatal
+		// there would Goexit mid openControllerWith, before its Ownership
+		// is ever returned or closed, leaking the lock for the rest of
+		// this test run.
+		var lockPath, openedWith string
 		_, closer, err := openControllerWith(context.Background(), path, func(p string) (*runtime.Ownership, error) {
 			owner, err := runtime.Acquire(p)
-			if err == nil && owner.Path() != canonical {
-				t.Fatalf("lock path=%q, want %q", owner.Path(), canonical)
+			if err == nil {
+				lockPath = owner.Path()
 			}
 			return owner, err
 		}, func(ctx context.Context, p string) (*store.DB, error) {
@@ -292,6 +296,9 @@ func TestOpenControllerAcquiresCanonicalLockForItsFullLifetime(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer closer.Close()
+		if lockPath != canonical {
+			t.Fatalf("lock path=%q, want %q", lockPath, canonical)
+		}
 		if openedWith != canonical {
 			t.Fatalf("store opener path=%q, want the lock's resolved canonical path %q", openedWith, canonical)
 		}
@@ -302,11 +309,20 @@ func TestOpenControllerAcquiresCanonicalLockForItsFullLifetime(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer closer.Close()
 		// The resource lifetime, not just acquisition order, is the acceptance
 		// condition: a contender must still be refused after the factory has
-		// already returned a live controller.
-		if _, err := runtime.Acquire(path); !errors.Is(err, runtime.ErrAlreadyRunning) {
-			t.Fatalf("contender acquired the lock before close: %v", err)
+		// already returned a live controller. Capture and release the
+		// contender's Ownership even on unexpected success, so a regression
+		// that lets it through does not also leak that second lock handle
+		// for the rest of the package run.
+		contender, err := runtime.Acquire(path)
+		if err == nil {
+			contender.Close()
+			t.Fatal("contender acquired the lock before close")
+		}
+		if !errors.Is(err, runtime.ErrAlreadyRunning) {
+			t.Fatalf("contender acquire failed with unexpected error: %v", err)
 		}
 		if err := closer.Close(); err != nil {
 			t.Fatal(err)
@@ -412,12 +428,13 @@ func TestHelloDialFailureReportsOperationalErrorNotArgumentError(t *testing.T) {
 	}
 }
 
-// TestHelloEndToEndRoundTripNeverOpensDatabase wires a real control.Listen
-// socket, control.Listener service and store.DB (control's own exported
-// surface, mirroring what cmd/parleyd assembles) and runs the actual
-// parleyctl hello command against it end to end, proving both the rendered
-// output and that the legacy controllerFactory is never invoked.
-func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
+// startHelloTestServer wires a real control.Listen socket, control.Listener
+// service and store.DB (control's own exported surface, mirroring what
+// cmd/parleyd assembles) and returns the -endpoint/-server-uid arguments a
+// real parleyctl hello invocation can dial against, plus the admin ID hello
+// should report back.
+func startHelloTestServer(t *testing.T) (endpoint, serverUID, adminID string) {
+	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "parleyctl-hello-")
 	if err != nil {
 		t.Fatal(err)
@@ -429,7 +446,7 @@ func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	uid := uint32(os.Getuid())
-	adminID := "80000000-0000-4000-8000-000000000001"
+	adminID = "80000000-0000-4000-8000-000000000001"
 	controlCfg, err := control.NewConfig(socketPath, uid, map[string]uint32{adminID: uid})
 	if err != nil {
 		t.Fatal(err)
@@ -449,9 +466,17 @@ func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { service.StopAdmission(); cancel(); service.Wait() })
+	return socketPath, strconv.FormatUint(uint64(uid), 10), adminID
+}
 
+// TestHelloEndToEndRoundTripNeverOpensDatabase runs the actual parleyctl
+// hello command against a real server end to end, proving both the rendered
+// output and that the legacy controllerFactory is never invoked. This is the
+// healthy-output control for the write-failure tests below.
+func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
+	endpoint, uid, adminID := startHelloTestServer(t)
 	var out, errOut bytes.Buffer
-	code := run([]string{"hello", "-endpoint", socketPath, "-server-uid", strconv.FormatUint(uint64(uid), 10)}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
+	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, "unused.db", &out, &errOut, fatalIfOpened(t), noEnv)
 	if code != 0 {
 		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
@@ -460,5 +485,84 @@ func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "protocol:") || !strings.Contains(out.String(), control.ProtocolVersion) {
 		t.Fatalf("out=%q", out.String())
+	}
+}
+
+// errSyntheticWrite is returned by failingWriter once its allowance of
+// successful writes is exhausted.
+var errSyntheticWrite = errors.New("synthetic write failure")
+
+// failingWriter succeeds its first failAfter Write calls (buffering them),
+// then fails every call after that -- letting tests exercise both a writer
+// that fails before any output and one that fails after partial output.
+type failingWriter struct {
+	failAfter int
+	calls     int
+	buf       bytes.Buffer
+}
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls > w.failAfter {
+		return 0, errSyntheticWrite
+	}
+	return w.buf.Write(p)
+}
+
+// TestHelloReportsWriteFailureBeforeAnyOutput covers a diagnostic delivery
+// failure on the very first output line, through the actual runHello path
+// (a live successful hello RPC, only its output write fails). The hello RPC
+// itself succeeded here -- this must be reported as a distinct operational
+// failure, never conflated with a dial/RPC error message, and must not exit
+// 0 having silently dropped the diagnostic.
+func TestHelloReportsWriteFailureBeforeAnyOutput(t *testing.T) {
+	endpoint, uid, _ := startHelloTestServer(t)
+	fw := &failingWriter{failAfter: 0}
+	var errOut bytes.Buffer
+	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, "unused.db", fw, &errOut, fatalIfOpened(t), noEnv)
+	if code != 1 {
+		t.Fatalf("exit=%d err=%q, want 1", code, errOut.String())
+	}
+	if fw.buf.Len() != 0 {
+		t.Fatalf("wrote output despite a failing first write: %q", fw.buf.String())
+	}
+	if errOut.Len() == 0 {
+		t.Fatal("no diagnostic message on stderr")
+	}
+	if strings.Contains(errOut.String(), "dial") || strings.Contains(errOut.String(), "protocol_mismatch") {
+		t.Fatalf("write failure message conflated with a dial/RPC failure: %q", errOut.String())
+	}
+}
+
+// TestHelloReportsWriteFailureAfterPartialOutput covers a diagnostic
+// delivery failure after some lines already wrote successfully: writing
+// must stop at the first failure (not attempt every remaining line, which
+// would only obscure the original error) and still report a nonzero exit.
+func TestHelloReportsWriteFailureAfterPartialOutput(t *testing.T) {
+	endpoint, uid, _ := startHelloTestServer(t)
+	fw := &failingWriter{failAfter: 3}
+	var errOut bytes.Buffer
+	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, "unused.db", fw, &errOut, fatalIfOpened(t), noEnv)
+	if code != 1 {
+		t.Fatalf("exit=%d err=%q, want 1", code, errOut.String())
+	}
+	if got := strings.Count(fw.buf.String(), "\n"); got != 3 {
+		t.Fatalf("wrote %d lines before stopping, want exactly 3: %q", got, fw.buf.String())
+	}
+	if errOut.Len() == 0 {
+		t.Fatal("no diagnostic message on stderr")
+	}
+}
+
+// TestHelloWriteFailureExitCodeSurvivesAnUnusableStderr proves the nonzero
+// exit does not depend on the error-reporting stderr write itself
+// succeeding: an unusable stderr must not restore a zero exit status.
+func TestHelloWriteFailureExitCodeSurvivesAnUnusableStderr(t *testing.T) {
+	endpoint, uid, _ := startHelloTestServer(t)
+	fw := &failingWriter{failAfter: 0}
+	errFw := &failingWriter{failAfter: 0}
+	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, "unused.db", fw, errFw, fatalIfOpened(t), noEnv)
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1 even though the diagnostic write to stderr itself failed", code)
 	}
 }

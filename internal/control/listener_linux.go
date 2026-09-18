@@ -34,7 +34,39 @@ const staleSocketProbeTimeout = 2 * time.Second
 var (
 	errUnexpectedSocketEntry  = errors.New("control: an unexpected file exists at admin_socket")
 	errSocketNotProvablyStale = errors.New("control: existing admin_socket is not provably abandoned; refusing to replace it")
+	errSocketAddressTooLong   = errors.New("control: admin_socket's descriptor-relative bind address does not fit a struct sockaddr_un")
 )
+
+// maxUnixSockAddrLen is the largest address x/sys/unix's SockaddrUnix will
+// accept on Linux: its sockaddr() rejects any name with len(name) >=
+// len(raw.Path) (an 108-byte array), returning EINVAL otherwise -- so 107 is
+// the largest representable length, not 108. Verified against
+// golang.org/x/sys/unix's syscall_linux.go SockaddrUnix.sockaddr, and
+// independently empirically: a 107-byte address binds successfully; a
+// 108-byte one is rejected.
+const maxUnixSockAddrLen = len(unix.RawSockaddrUnix{}.Path) - 1
+
+// controlSocketAddr builds the descriptor-relative "/proc/self/fd/<parent>/
+// <name>" address used for both Bind (TOCTOU-safe: it resolves the name
+// lookup through the already-verified trusted directory descriptor, never a
+// re-walked absolute path) and prepareSocketPath's stale-entry probe, so the
+// two can never diverge on what they consider a valid address.
+//
+// This spelling can be LONGER than the original configured admin_socket
+// path -- and, depending on parent's numeric width, can also be shorter --
+// so validating the length of the original configured path is not
+// sufficient: only the actual constructed address's length determines
+// whether the platform's struct sockaddr_un can represent it. Validating
+// here, before prepareSocketPath ever probes or removes an existing entry,
+// means a nonrepresentable address is rejected without touching whatever
+// currently occupies that pathname.
+func controlSocketAddr(parent int, name string) (string, error) {
+	addr := fmt.Sprintf("/proc/self/fd/%d/%s", parent, name)
+	if len(addr) > maxUnixSockAddrLen {
+		return "", fmt.Errorf("%w: constructed address is %d bytes, exceeds the %d-byte limit (admin_socket=%q)", errSocketAddressTooLong, len(addr), maxUnixSockAddrLen, name)
+	}
+	return addr, nil
+}
 
 // Listen binds cfg.AdminSocket, after validating every ancestor directory
 // is trusted (see connection.TrustedDirectory) and, if an entry already
@@ -57,7 +89,15 @@ func Listen(cfg Config, mode os.FileMode) (net.Listener, error) {
 	}
 	defer unix.Close(parent)
 
-	if err := prepareSocketPath(parent, name, cfg.ServerUID); err != nil {
+	// Validated before prepareSocketPath can probe or remove any existing
+	// entry: a nonrepresentable address must be rejected without touching
+	// whatever currently occupies that pathname.
+	addr, err := controlSocketAddr(parent, name)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := prepareSocketPath(parent, name, addr, cfg.ServerUID); err != nil {
 		return nil, err
 	}
 
@@ -65,7 +105,6 @@ func Listen(cfg Config, mode os.FileMode) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	addr := fmt.Sprintf("/proc/self/fd/%d/%s", parent, name)
 	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: addr}); err != nil {
 		unix.Close(fd)
 		return nil, err
@@ -92,8 +131,10 @@ func Listen(cfg Config, mode os.FileMode) (net.Listener, error) {
 
 // prepareSocketPath ensures name does not already exist under parent,
 // unlinking it first only when it is provably an abandoned socket from a
-// crashed prior server instance.
-func prepareSocketPath(parent int, name string, serverUID uint32) error {
+// crashed prior server instance. addr is the already-validated
+// controlSocketAddr for this same parent/name, reused for the probe so it
+// can never diverge from the address Listen will actually Bind.
+func prepareSocketPath(parent int, name, addr string, serverUID uint32) error {
 	var st unix.Stat_t
 	err := unix.Fstatat(parent, name, &st, unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
@@ -105,7 +146,7 @@ func prepareSocketPath(parent int, name string, serverUID uint32) error {
 	if st.Mode&unix.S_IFMT != unix.S_IFSOCK || st.Uid != serverUID {
 		return errUnexpectedSocketEntry
 	}
-	refused, err := probeConnectionRefused(parent, name)
+	refused, err := probeConnectionRefused(addr)
 	if err != nil {
 		return err
 	}
@@ -138,8 +179,7 @@ func prepareSocketPath(parent int, name string, serverUID uint32) error {
 // assembly, or about two different databases whose configuration happens
 // to share one socket pathname -- neither of those is protected by the
 // database ownership lock, and this function does not claim otherwise.
-func probeConnectionRefused(parent int, name string) (bool, error) {
-	addr := fmt.Sprintf("/proc/self/fd/%d/%s", parent, name)
+func probeConnectionRefused(addr string) (bool, error) {
 	conn, err := net.DialTimeout("unix", addr, staleSocketProbeTimeout)
 	if err == nil {
 		conn.Close()

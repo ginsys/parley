@@ -76,7 +76,12 @@ parleyd serve \
   directory is validated the same way `-database`'s is. An existing entry at this path is replaced
   only after a bounded connect attempt proves it definitely abandoned (`ECONNREFUSED`); a live
   socket, a non-socket entry, a wrong owner, a timeout or a permission failure all refuse startup
-  rather than risk hijacking a running instance's socket.
+  rather than risk hijacking a running instance's socket. Binding uses a TOCTOU-safe
+  `/proc/self/fd/<fd>/<name>` address rather than the pathname itself, which can be a few bytes
+  longer than `-admin-socket`'s own length; a resulting address that cannot fit a
+  `struct sockaddr_un` (108 bytes including the terminator) fails startup with a concise diagnostic
+  rather than falling back to an unprotected bind. In practice this means an `-admin-socket` path
+  must leave a little headroom under the platform's 108-byte limit, not use it to the last byte.
 - `-administrator ID=UID` maps one administrator's canonical UUID to the one OS account UID
   permitted to connect as that administrator (`SO_PEERCRED`-verified, never client-asserted).
   Repeat for multiple administrators. At least one is required. Two administrators cannot share a
