@@ -314,7 +314,7 @@ func (ln *Listener) Start(ctx context.Context, res runtime.Resources) error {
 	ln.mu.Lock()
 	ln.listener = listener
 	ln.boundDev, ln.boundIno = boundDev, boundIno
-	ln.server = NewServer(ln.cfg, res.Queries, serverID, epoch, state)
+	ln.server = NewServer(ln.cfg, res.Queries, res.Writer, serverID, epoch, state)
 	ln.mu.Unlock()
 	ln.wg.Add(1)
 	go ln.acceptLoop(res.WorkerContext)

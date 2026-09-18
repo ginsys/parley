@@ -44,7 +44,7 @@ func testServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewServer(cfg, store.Queries{}, "server-id-fixture", "epoch-fixture", StateRunning)
+	return NewServer(cfg, store.Queries{}, nil, "server-id-fixture", "epoch-fixture", StateRunning)
 }
 
 func decodeResult[T any](t *testing.T, resp Response) T {
@@ -177,7 +177,7 @@ func TestHandleOperationGetEndToEndAndScoping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewServer(cfg, db.Queries(), "server-id-fixture", "epoch-fixture", StateRunning)
+	srv := NewServer(cfg, db.Queries(), db, "server-id-fixture", "epoch-fixture", StateRunning)
 
 	owner := srv.NewSession(Identity{PrincipalID: testHelloAdmin, UID: 1001})
 	owner.negotiated = true
@@ -233,7 +233,7 @@ func TestHandleOperationGetRepublishesResourceChangesAsDecimalStrings(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewServer(cfg, db.Queries(), "server-id-fixture", "epoch-fixture", StateRunning)
+	srv := NewServer(cfg, db.Queries(), db, "server-id-fixture", "epoch-fixture", StateRunning)
 	sess := srv.NewSession(Identity{PrincipalID: testHelloAdmin, UID: 1001})
 	sess.negotiated = true
 	resp, _ := sess.Handle(ctx, Request{ID: "1", Method: "operation.get", Params: map[string]any{"operation_id": testHandleOperation}})

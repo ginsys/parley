@@ -34,6 +34,17 @@ const (
 // Naming a spelling here is not the same as implementing the method that
 // returns it -- several of the wire-only additions below are not returned
 // by any method wired in this PR.
+//
+// StaleGrantVersion/InvalidMembership/UnsupportedMembership moved to
+// store.Code in PR2 (internal/store/connection_contract.go): they describe
+// an actual store-mutation precondition failure, not a wire/session
+// concern, and membership.* mutations need them to be valid, terminalResult
+// codes so a rejection is durably audited and replayable like any other
+// domain rejection. They remain accessible as DomainCode constants below
+// (constant conversions of the store.Code values) purely so control-package
+// callers keep one vocabulary to write against; store.Code(d).Valid() in
+// DomainCode.valid() below already accepts them without a separate case.
+// IncompatibleIdentifier stays control-only: no PR2 method returns it.
 type DomainCode string
 
 const (
@@ -44,10 +55,13 @@ const (
 	// error-contract table; no store.Code counterpart exists or is added.
 	ResnapshotRequired     DomainCode = "resnapshot_required"
 	SubscriptionConflict   DomainCode = "subscription_conflict"
-	StaleGrantVersion      DomainCode = "stale_grant_version"
-	InvalidMembership      DomainCode = "invalid_membership"
-	UnsupportedMembership  DomainCode = "unsupported_membership"
 	IncompatibleIdentifier DomainCode = "incompatible_identifier"
+
+	// Constant conversions of the store.Code values of the same name (see
+	// the type doc comment above) -- not new wire-only spellings.
+	StaleGrantVersion     = DomainCode(store.StaleGrantVersion)
+	InvalidMembership     = DomainCode(store.InvalidMembership)
+	UnsupportedMembership = DomainCode(store.UnsupportedMembership)
 )
 
 // valid reports whether d is a member of the accepted error.data.code
@@ -64,10 +78,12 @@ func (d DomainCode) valid() bool {
 	}
 	switch d {
 	case ProtocolMismatch, OperationNotFound,
-		ResnapshotRequired, SubscriptionConflict, StaleGrantVersion,
-		InvalidMembership, UnsupportedMembership, IncompatibleIdentifier:
+		ResnapshotRequired, SubscriptionConflict, IncompatibleIdentifier:
 		return true
 	}
+	// Covers StaleGrantVersion/InvalidMembership/UnsupportedMembership
+	// (now store.Code values, see the type doc comment) and every other
+	// durable domain code.
 	return store.Code(d).Valid()
 }
 
