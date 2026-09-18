@@ -410,7 +410,11 @@ func TestCLIIdentifiersRemainExactAndVisible(t *testing.T) {
 // subcommand -- which enrolls or requires an existing well-formed identity
 // -- rejects the same key before ever dialing.
 func TestMembershipRevokeKeepsExactMalformedKeyButOthersValidateFirst(t *testing.T) {
-	for _, name := range []string{"café", "a\xff", "a\xfe", "a�"} {
+	// \ufffd is an explicit escape, not the literal replacement character --
+	// see the identical rationale on TestUnsafePeerIdentifiersRejectedBeforeDialing
+	// (a hosted AI Code Review finding on an earlier PR2 candidate applied
+	// there; this second fixture list was missed by that same fix).
+	for _, name := range []string{"café", "a\xff", "a\xfe", "a\ufffd"} {
 		fake := &fakeClient{}
 		var out, errOut bytes.Buffer
 		args := append([]string{"membership", "renew", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
