@@ -2,11 +2,14 @@ package control
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"strconv"
 	"time"
 
+	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/controller"
 	"github.com/ginsys/parley/internal/membership"
 	"github.com/ginsys/parley/internal/store"
@@ -27,6 +30,26 @@ import (
 // h.Before call) already blocks every membership.* kind during a global
 // hold, since none of them appear in recovery.humanRecovery's allowlist.
 func noopAuthorize(context.Context, *sql.Tx) error { return nil }
+
+// auditResourceID returns id verbatim when it satisfies
+// store.Coordinator.Execute's own resource-audit rule (bridgetext byte
+// shape plus store.MaxIdentityBytes), or a fixed-width hex SHA-256 digest
+// of id otherwise. AGENTS.md's exact-key human revocation must remain
+// available for legacy conversation identifiers containing bytes outside
+// 0x20-0x7E, or oversized ones -- without this, Execute's own resource
+// validation (internal/store/coordinator.go) would abort the whole revoke
+// command before it ever reaches RevokeTx, silently defeating the one
+// escape path parseCommand's revoke branch deliberately skips
+// bridgetext.ValidateMetadata for. Only the durable audit record's
+// resource ID is affected; RevokeTx itself still receives the conversation
+// identifier verbatim, so the actual mutation target is exact either way.
+func auditResourceID(id string) string {
+	if len(id) <= store.MaxIdentityBytes && bridgetext.ValidateMetadata(id) == nil {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return "legacy-sha256:" + hex.EncodeToString(sum[:])
+}
 
 func (sess *Session) principal() store.CommandPrincipal {
 	return store.CommandPrincipal{ID: sess.identity.PrincipalID, ConnectorUID: sess.identity.UID}
@@ -104,11 +127,20 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (R
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
 	model := membership.Model{Members: p.members, Policy: p.policy}
-	resp, ok := checkMembershipShape(req.ID, model)
-	if !ok {
-		return resp, false
+	// membership.Validate must run before membersField/NewCommandRequest:
+	// a malformed shape (e.g. a duplicate member) produces a members Set
+	// with two identical encoded entries, which store.NewCommandRequest's
+	// own digest canonicalization already refuses on structural grounds
+	// (duplicate Set content -> InvalidRequest) before ever reaching
+	// Execute -- there is no operation_id-scoped audit possible for input
+	// this malformed, since the very shape needed to build the
+	// CommandRequest is broken. membership.Supported, by contrast, only
+	// inspects member count/policy kind and never produces a duplicate
+	// Set entry, so it can safely run inside the mutate callback below
+	// and be durably audited like any other domain rejection.
+	if err := membership.Validate(model); err != nil {
+		return domainErrorResponse(&req.ID, DomainCode(store.InvalidMembership)), false
 	}
-	peerA, peerB, direction := membership.ToGrantFields(model)
 	fields := []store.Field{
 		{Name: "conversation", Value: p.conversation},
 		{Name: "expected_grant_version", Value: p.expectedVersion},
@@ -125,6 +157,16 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (R
 	expectedVersion := p.expectedVersion
 	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
 		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
+			// Run inside the mutate callback, not before Execute: an
+			// unsupported-shape rejection must be recorded through
+			// operation_results/command_audit like any other terminal
+			// domain rejection, so a retry reusing the same operation_id
+			// with a corrected payload hits OperationConflict instead of
+			// silently succeeding.
+			if !membership.Supported(model) {
+				return rejection(store.UnsupportedMembership)
+			}
+			peerA, peerB, direction := membership.ToGrantFields(model)
 			now := store.AuthorityTime(ctx, sess.server.now())
 			if _, err := store.EnabledPeer(ctx, tx, peerA, now); err != nil {
 				return domainRejection(err)
@@ -177,11 +219,13 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
 	model := membership.Model{Members: p.members, Policy: p.policy}
-	resp, ok := checkMembershipShape(req.ID, model)
-	if !ok {
-		return resp, false
+	// See handleMembershipEnroll's identical comment: Validate must run
+	// before membersField/NewCommandRequest (a duplicate member would
+	// otherwise trip store.NewCommandRequest's own Set-uniqueness rule
+	// first); Supported is safe to defer into the mutate callback below.
+	if err := membership.Validate(model); err != nil {
+		return domainErrorResponse(&req.ID, DomainCode(store.InvalidMembership)), false
 	}
-	peerA, peerB, direction := membership.ToGrantFields(model)
 	fields := renewalFields(p.conversation, p.expectedVersion, p.maxExchanges, p.expiresAtText, p.cancelPendingReplies)
 	fields = append(fields, membersField(model), policyField(model.Policy))
 	request, err := store.NewCommandRequest("membership.replace", p.operationID, fields...)
@@ -191,6 +235,12 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 	expectedVersion := p.expectedVersion
 	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
 		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
+			// See handleMembershipEnroll's identical comment: only the
+			// Supported check runs inside Execute's callback.
+			if !membership.Supported(model) {
+				return rejection(store.UnsupportedMembership)
+			}
+			peerA, peerB, direction := membership.ToGrantFields(model)
 			now := store.AuthorityTime(ctx, sess.server.now())
 			if _, err := store.EnabledPeer(ctx, tx, peerA, now); err != nil {
 				return domainRejection(err)
@@ -223,6 +273,7 @@ func (sess *Session) handleMembershipRevoke(ctx context.Context, req Request) (R
 	if err != nil {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
+	id := auditResourceID(p.conversation)
 	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
 		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
 			result, err := controller.RevokeTx(ctx, tx, p.conversation, &p.expectedVersion)
@@ -230,25 +281,13 @@ func (sess *Session) handleMembershipRevoke(ctx context.Context, req Request) (R
 				return domainRejection(err)
 			}
 			return store.CommandResult{Resources: []store.ResourceChange{
-				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: p.expectedVersion},
-				{Kind: "queued_cancelled", ID: p.conversation, After: int64(result.Cancelled)},
+				{Kind: "grant", ID: id, Before: p.expectedVersion, After: p.expectedVersion},
+				{Kind: "queued_cancelled", ID: id, After: int64(result.Cancelled)},
+				{Kind: "queued_already_dispatching", ID: id, After: int64(result.AlreadyDispatching)},
+				{Kind: "queued_already_handed_off", ID: id, After: int64(result.AlreadyHandedOff)},
 			}}, nil
 		}, nil)
 	return mutationResponse(req.ID, receipt, err), false
-}
-
-// checkMembershipShape runs the two-stage membership.md check shared by
-// enroll/replace: full Validate (invalid_membership) then Supported
-// (unsupported_membership). Returns ok == false with the response already
-// built when either check fails.
-func checkMembershipShape(id string, model membership.Model) (Response, bool) {
-	if err := membership.Validate(model); err != nil {
-		return domainErrorResponse(&id, DomainCode(store.InvalidMembership)), false
-	}
-	if !membership.Supported(model) {
-		return domainErrorResponse(&id, DomainCode(store.UnsupportedMembership)), false
-	}
-	return Response{}, true
 }
 
 // renewalFields builds the digest fields common to renew and replace.

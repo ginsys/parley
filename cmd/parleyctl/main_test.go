@@ -89,6 +89,10 @@ func TestHelpAndInvalidArgumentsNeverDial(t *testing.T) {
 		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "-1s"}, 2},
 		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expected-grant-version", "-1"}, 2},
 		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-operation-id", "not-a-uuid"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "1h", "-expires-at", "2030-01-01T00:00:00Z"}, 2},
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "not-rfc3339"}, 2},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "1h", "-expires-at", "2030-01-01T00:00:00Z"}, 2},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-at", "not-rfc3339"}, 2},
 		// Syntactically valid but no endpoint/server-uid configured anywhere:
 		// ResolveClientConfig fails before dial is ever reached.
 		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1"}, 2},
@@ -181,8 +185,9 @@ func TestMembershipRoutingUsesValidatedParametersAndClosesClient(t *testing.T) {
 					}
 					checkMembersAndDirectedPolicy(t, fake.params, "b", "a")
 					// expires_at loses sub-second precision through RFC3339's
-					// seconds-only rendering (expiresAtFromDuration), so the
-					// lower bound needs a one-second slack against `before`.
+					// seconds-only rendering (parseCommand's -expires-in
+					// resolution), so the lower bound needs a one-second
+					// slack against `before`.
 					checkExpiresAt(t, fake.params, before.Add(time.Hour-time.Second), time.Now().Add(time.Hour))
 				case "renew":
 					if fake.params["expected_grant_version"] != "2" || fake.params["cancel_pending_replies"] != true {
@@ -255,6 +260,38 @@ func checkExpiresAt(t *testing.T, params map[string]any, lower, upper time.Time)
 	}
 	if got.Before(lower) || got.After(upper) {
 		t.Fatalf("expires_at=%v outside [%v,%v]", got, lower, upper)
+	}
+}
+
+// TestMembershipExpiresAtUsedVerbatim exercises the retry-safe -expires-at
+// path (as opposed to -expires-in's relative-to-now resolution, covered by
+// TestMembershipRoutingUsesValidatedParametersAndClosesClient): the wire
+// expires_at must equal the given absolute value exactly, not merely fall
+// within a tolerance window, since a retry must reproduce the identical
+// digest store.NewCommandRequest computed for the original attempt.
+func TestMembershipExpiresAtUsedVerbatim(t *testing.T) {
+	const want = "2030-06-15T12:00:00Z"
+	for _, op := range []string{"enroll", "renew", "replace"} {
+		t.Run(op, func(t *testing.T) {
+			args := []string{"membership", op, "-conversation", "fixture", "-expires-at", want}
+			switch op {
+			case "enroll":
+				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1")
+			case "renew":
+				args = append(args, "-expected-grant-version", "1")
+			case "replace":
+				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1")
+			}
+			args = append(args, membershipEndpointArgs...)
+			fake := &fakeClient{}
+			var out, errOut bytes.Buffer
+			if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
+				t.Fatalf("exit=%d: %s", code, &errOut)
+			}
+			if fake.params["expires_at"] != want {
+				t.Fatalf("expires_at=%v, want %q", fake.params["expires_at"], want)
+			}
+		})
 	}
 }
 
