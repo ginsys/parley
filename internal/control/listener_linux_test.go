@@ -675,6 +675,95 @@ func TestListenerServiceStartCleansUpTheSocketWhenIdentityReadFails(t *testing.T
 	}
 }
 
+// TestListenerServiceStartFailsClosedWhenPostBindIdentityCannotBeRead is
+// RC-01's regression: a failed post-bind Lstat used to leave
+// boundDev/boundIno at zero while Start still returned success, silently
+// and permanently disabling unlinkOwnedSocket's cleanup for that
+// incarnation. Start must instead fail closed: report the error, close the
+// listener it just bound, and leave the on-disk pathname untouched -- an
+// Lstat failure establishes nothing about what currently occupies that
+// pathname, so removing it would repeat exactly the unverified-removal
+// mistake unlinkOwnedSocket's own identity check exists to avoid.
+func TestListenerServiceStartFailsClosedWhenPostBindIdentityCannotBeRead(t *testing.T) {
+	dir := privateSocketDir(t)
+	socketPath := filepath.Join(dir, "admin.sock")
+	adminID := "60000000-0000-4000-8000-000000000001"
+	uid := uint32(os.Getuid())
+	cfg, err := NewConfig(socketPath, uid, map[string]uint32{adminID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := controlTestDB(t)
+	t.Cleanup(func() { _ = db.Close() })
+
+	service := NewListenerService(cfg, 0600)
+	injectedErr := errors.New("injected lstat failure")
+	service.lstatSocket = func(string, *unix.Stat_t) error { return injectedErr }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = service.Start(context.Background(), runtime.Resources{WorkerContext: ctx, Writer: db, Queries: db.Queries(), Mode: runtime.Normal})
+	if err == nil {
+		t.Fatal("Start succeeded despite a failed post-bind identity read")
+	}
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("err=%v, want it to wrap the injected identity-read failure", err)
+	}
+
+	// The pathname must be left untouched, not speculatively unlinked: an
+	// Lstat failure does not establish that this incarnation's own entry
+	// -- rather than some other, already-replaced entry -- is what is
+	// present now.
+	if _, statErr := os.Stat(socketPath); statErr != nil {
+		t.Fatalf("socket path was removed after an unverified identity read: %v", statErr)
+	}
+
+	// No usable server was installed and no accept loop was launched: a
+	// fresh dial against the same path must not succeed through this
+	// failed incarnation.
+	if conn, dialErr := net.DialTimeout("unix", socketPath, 200*time.Millisecond); dialErr == nil {
+		conn.Close()
+		t.Fatal("dial succeeded against a listener that failed to Start")
+	}
+
+	// A subsequent StopAdmission/Wait must not hang, start work, or invent
+	// a successful pathname removal.
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- service.StopAdmission() }()
+	select {
+	case stopErr := <-stopDone:
+		if stopErr != nil {
+			t.Fatalf("StopAdmission on a failed Start returned an error: %v", stopErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopAdmission on a failed Start did not return")
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- service.Wait() }()
+	select {
+	case waitErr := <-waitDone:
+		if waitErr != nil {
+			t.Fatalf("Wait on a failed Start returned an error: %v", waitErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait on a failed Start did not return")
+	}
+	if _, statErr := os.Stat(socketPath); statErr != nil {
+		t.Fatalf("socket path was removed by StopAdmission after a failed Start: %v", statErr)
+	}
+}
+
+// TestListenerServiceStartSucceedsWhenPostBindIdentityIsReadable is the
+// healthy control for the regression above: an uninjected, real Lstat
+// still lets Start succeed exactly as before.
+func TestListenerServiceStartSucceedsWhenPostBindIdentityIsReadable(t *testing.T) {
+	fx := newListenerFixture(t)
+	resp := dialAndRoundTrip(t, fx.socketPath, fx.serverUID, `{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`)
+	if resp["error"] != nil {
+		t.Fatalf("%#v", resp)
+	}
+}
+
 func TestListenerServiceRecoveryOnlyState(t *testing.T) {
 	dir := privateSocketDir(t)
 	socketPath := filepath.Join(dir, "admin.sock")

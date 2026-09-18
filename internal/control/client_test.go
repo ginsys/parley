@@ -75,17 +75,46 @@ func TestClientCallSequentialRequestsBothSucceed(t *testing.T) {
 // deadline against the first call. This is a caller-misuse guard, not a
 // queue: the second call is never retried or serialized on its behalf.
 //
-// This is a directly affected test from batch 10, not a general cleanup
-// campaign: only its own resource lifecycle is fixed here. release is
-// registered for idempotent, guaranteed closing via t.Cleanup before the
-// fake server goroutine or either Call is launched -- an early t.Fatal in
-// any assertion below (e.g. a regressed guard letting the second Call
-// through) must not strand the fake server on <-release forever, since
-// t.Cleanup still runs after Fatal even though the code after it does
-// not. Every subsequent wait is bounded, and the fake server's own exit is
-// joined, so a broken guard implementation fails this test promptly
-// instead of hanging it, and no probe goroutine survives past the test
-// regardless of which assertion (if any) fails first.
+// release is registered for idempotent, guaranteed closing via t.Cleanup
+// before the fake server goroutine or either Call is launched -- an early
+// t.Fatal in any assertion below must not strand the fake server on
+// <-release forever, since t.Cleanup still runs after Fatal even though
+// the code after it does not.
+//
+// The second Call is itself given a bounded, test-owned deadline rather
+// than context.Background() (mandate RC-05), and is run in its own
+// goroutine observed through an outer bounded select exactly like the
+// first Call above, rather than invoked inline and blocked on directly.
+// With the guard intact, Call rejects it before dispatching anything and
+// both bounds are irrelevant to a passing run's timing. But if the guard
+// regresses, this Call would actually dispatch onto the shared connection
+// and race the first Call's own still-pending read for the connection's
+// one shared deadline (net.Conn.SetDeadline is per-connection, not
+// per-call): each Call's own deferred cleanup unconditionally resets that
+// shared deadline when it returns, so the *inner* ctx timeout on the
+// second call is not itself a reliable bound once two Calls are actually
+// concurrent on one connection -- that race is precisely what the CP-07
+// guard exists to prevent, so disabling it to demonstrate the regression
+// makes the inner bound racy too, observed directly: an inline
+// `client.Call(secondCtx, ...)` here hung past its own 2s context deadline
+// in roughly half of repeated fault-injection runs. The outer select
+// below is therefore the actual bound the test relies on: it always
+// proceeds within its own fixed wait regardless of whether the inner Call
+// returns on its own, and the single combined cleanup (registered before
+// either Call goroutine is launched) unconditionally closes the shared
+// connection, which -- unlike SetDeadline -- cannot be raced back open,
+// so it deterministically unblocks any still-pending read on either Call
+// goroutine. The cleanup then observes both Call goroutines and the fake
+// server's own goroutine actually finishing, each under its own bound, so
+// a broken guard implementation fails this test promptly instead of
+// hanging it and leaves no probe goroutine surviving past the test
+// regardless of which assertion (if any) fails first. The *GoroutineDone
+// channels (closed once, safe to observe repeatedly) are used for that
+// observation instead of firstDone/secondDone themselves, each of which
+// the test body below consumes at most once on the success path --
+// reading a one-shot buffered channel a second time in cleanup would
+// otherwise block for the full timeout and report a false failure on
+// every ordinary passing run.
 func TestClientCallRejectsConcurrentCall(t *testing.T) {
 	dir := privateSocketDir(t)
 	path := dir + "/admin.sock"
@@ -100,7 +129,6 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	releaseNow := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(releaseNow)
 
 	serverDone := make(chan struct{})
 	go func() {
@@ -118,15 +146,34 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 		<-release
 		conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"))
 	}()
+
+	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{conn: conn, br: bufio.NewReader(conn)}
+
+	firstDone := make(chan error, 1)
+	firstGoroutineDone := make(chan struct{})
+	go func() {
+		defer close(firstGoroutineDone)
+		firstDone <- client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
+	}()
+
+	secondDone := make(chan error, 1)
+	secondGoroutineDone := make(chan struct{})
+
+	// Registered before any work above can fail, per the doc comment above.
 	t.Cleanup(func() {
-		// t.Cleanup runs LIFO: this cleanup, registered after releaseNow's,
-		// would otherwise run BEFORE it on an early-exit path, joining a
-		// server still blocked on <-release and spuriously burning the
-		// full wait below on every such path (found by this batch's own
-		// hosted review of the fix above). Calling releaseNow() here too,
-		// before waiting, makes this cleanup correct regardless of
-		// registration order.
 		releaseNow()
+		conn.Close()
+		for name, done := range map[string]chan struct{}{"first": firstGoroutineDone, "second": secondGoroutineDone} {
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Errorf("%s Call goroutine did not complete after release and close", name)
+			}
+		}
 		select {
 		case <-serverDone:
 		case <-time.After(2 * time.Second):
@@ -134,26 +181,25 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 		}
 	})
 
-	conn, err := connection.DialTrustedServer(context.Background(), path, uid)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := &Client{conn: conn, br: bufio.NewReader(conn)}
-	defer client.Close()
-
-	firstDone := make(chan error, 1)
-	go func() {
-		firstDone <- client.Call(context.Background(), "server.hello", map[string]any{"protocol": ProtocolVersion}, nil)
-	}()
-
 	select {
 	case <-received:
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never observed the first request")
 	}
 
-	if err := client.Call(context.Background(), "server.hello", nil, nil); !errors.Is(err, errClientConcurrentCall) {
-		t.Fatalf("err=%v, want errClientConcurrentCall", err)
+	secondCtx, secondCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer secondCancel()
+	go func() {
+		defer close(secondGoroutineDone)
+		secondDone <- client.Call(secondCtx, "server.hello", nil, nil)
+	}()
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, errClientConcurrentCall) {
+			t.Fatalf("err=%v, want errClientConcurrentCall", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second call did not return within its own bounded deadline -- the concurrent-call guard may be broken")
 	}
 
 	releaseNow()
@@ -304,6 +350,18 @@ func TestClientCallClassifiesPostWriteEnvelopeRejectionsAsUnresolvedOutcome(t *t
 		{"unknown error member", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":"not_found"},"extra":true}}` + "\n"},
 		{"unknown error.data member", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":{"code":"not_found","extra":true}}}` + "\n"},
 		{"error.data explicitly null", `{"jsonrpc":"2.0","id":"1","error":{"code":-32000,"message":"x","data":null}}` + "\n"},
+		// RC-03's exact reproduction: an *envelope*-level RPCCode (not
+		// ServerError) with an explicit `"data":null`. incomingError.Data
+		// is an ordinary *errorData pointer field, so encoding/json decodes
+		// both an absent "data" key and an explicit null one to the same
+		// nil value -- indistinguishable to incomingError.validate's own
+		// `e.Data != nil` check for these codes. Before RC-03,
+		// validateErrorObjectShape's own `data != nil` guard let this
+		// explicit null through unexamined (it is legitimately absent for
+		// these codes), so this exact envelope became a valid RemoteError
+		// with an unbroken connection -- silently accepting a field with no
+		// null-is-permitted allowance in the accepted wire contract.
+		{"envelope error carries an explicit null data (RC-03)", `{"jsonrpc":"2.0","id":"1","error":{"code":-32601,"message":"unknown method","data":null}}` + "\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -481,13 +539,15 @@ func TestClientCallReportsTruncatedResponseAsIncompleteExchange(t *testing.T) {
 	}
 }
 
-// infiniteXReader is a finite-per-Read, unbounded-in-total in-memory
-// io.Reader that never produces the LF readBoundedFrame is waiting for and
-// never returns an error -- unlike a real socket with a read deadline, it
-// cannot itself time out, so the only way readBoundedFrame can return here
-// is by actually tripping its own size bound. This makes the test
-// deterministic instead of racing a 10s socket deadline against the
-// intended size rejection (mandate: named test evidence).
+// infiniteXReader is a per-Read-unbounded in-memory io.Reader that never
+// produces the LF readBoundedFrame is waiting for and never itself returns
+// an error. It is always wrapped in io.LimitReader by its callers (mandate
+// RC-04): supplying it unwrapped would make a regressed size guard grow
+// memory without bound instead of failing, since this reader alone never
+// terminates and never errors. Wrapped with a finite limit, the only ways
+// readBoundedFrame can return are (a) tripping its own size bound, the
+// intended outcome, or (b) a regressed guard exhausting the finite input
+// and failing on EOF instead -- both finite, no hang, no unbounded growth.
 type infiniteXReader struct{}
 
 func (infiniteXReader) Read(p []byte) (int, error) {
@@ -506,8 +566,16 @@ func (infiniteXReader) Read(p []byte) (int, error) {
 // test read from a real socket under a 10s read deadline and accepted any
 // non-nil error, so a regression that let readBoundedFrame buffer far past
 // MaxFrameBytes (or hang) would have still passed once that deadline fired.
+// The source is also now finite (mandate RC-04): an unlimited never-failing
+// reader meant a regressed guard would instead grow memory indefinitely
+// rather than fail this test at all -- io.LimitReader here supplies more
+// bytes than the allowed frame length but a bounded amount, so a missing
+// bound exhausts the input and fails with a distinct, diagnosable error
+// (io.ErrUnexpectedEOF from bufio.Reader.ReadString) instead of hanging or
+// leaking.
 func TestReadBoundedFrameRefusesOversizedUnterminatedStream(t *testing.T) {
-	_, err := readBoundedFrame(bufio.NewReader(infiniteXReader{}))
+	src := io.LimitReader(infiniteXReader{}, 2*MaxFrameBytes)
+	_, err := readBoundedFrame(bufio.NewReader(src))
 	if !errors.Is(err, errFrameTooLarge) {
 		t.Fatalf("err=%v, want errFrameTooLarge -- a deadline or EOF must not be mistaken for the size rejection", err)
 	}
@@ -1081,50 +1149,91 @@ func TestClientCallAcceptsWellFormedResultsAndErrorsAndKeepsConnectionUsable(t *
 	})
 }
 
+// fixedProfileLimitsJSON renders this client's own fixed parley-control/1
+// profile limits as a `"limits":{...}` JSON fragment -- the one genuinely
+// valid baseline every hello-result test case is derived from, so a case
+// targeting an unrelated field never incidentally fails (or is
+// incidentally saved) by a limits mismatch (mandate RC-02).
+func fixedProfileLimitsJSON() string {
+	return fmt.Sprintf(`"limits":{"max_frame_bytes":%d,"max_nesting_depth":%d,"max_sockets_per_administrator":%d,"max_sockets_total":%d,"max_executing_per_socket":%d,"max_queued_per_socket":%d}`,
+		MaxFrameBytes, maxDepth, MaxSocketsPerAdministrator, MaxSocketsTotal, MaxExecutingPerSocket, MaxQueuedPerSocket)
+}
+
+const validHelloID = "60000000-0000-4000-8000-000000000001"
+
+// TestDialAcceptsAGenuinelyValidHelloResult is RC-02's positive control: a
+// hello result matching the fixed parley-control/1 profile exactly, with
+// canonical identities, a valid epoch, state and methods, must negotiate
+// successfully through the real Dial path and yield a usable client. This
+// proves the baseline every negative case in
+// TestDialRejectsInvalidHelloResult mutates a single field from is itself
+// valid, not merely "not obviously wrong."
+func TestDialAcceptsAGenuinelyValidHelloResult(t *testing.T) {
+	uid := uint32(os.Getuid())
+	response := `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validHelloID + `","server_epoch":"e","administrator_id":"` + validHelloID + `","state":"running",` + fixedProfileLimitsJSON() + `,"methods":["server.hello"]}}` + "\n"
+	path := rawResponder(t, response)
+	client, hello, err := Dial(context.Background(), ClientConfig{Endpoint: path, ServerUID: uid})
+	if err != nil {
+		t.Fatalf("a genuinely valid, profile-matching hello result was rejected: %v", err)
+	}
+	defer client.Close()
+	if hello.ServerID != validHelloID || hello.AdministratorID != validHelloID || hello.State != "running" {
+		t.Fatalf("Dial returned an unexpected HelloResult: %+v", hello)
+	}
+}
+
 // TestDialRejectsInvalidHelloResult covers mandate R5's requirement that
 // Dial validate the decoded HelloResult itself, not just the envelope
-// Call's own checks already accept: a bare `{"result":{}}`, an
-// unsupported protocol, a missing/malformed required identity field, an
-// unknown state, an invalid (non-positive) limits shape, and a missing or
-// blank advertised method must all fail negotiation. server_id and
-// administrator_id use valid canonical UUIDs except in the cases that
-// specifically target those fields, so each case fails for the reason it
-// claims to test, not incidentally for a different one.
+// Call's own checks already accept: a bare `{"result":{}}`, an actual
+// `"result":null`, an unsupported protocol, a missing/malformed required
+// identity field, an unknown state, an invalid (non-positive) limits
+// shape, and a missing or blank advertised method must all fail
+// negotiation. Every case below holds every field but one at the same
+// genuinely valid baseline TestDialAcceptsAGenuinelyValidHelloResult
+// proves negotiates successfully (fixedProfileLimitsJSON, canonical UUIDs,
+// "running", one valid method), so each case fails for the single
+// property it names -- not incidentally masked or incidentally caused by
+// an unrelated field, such as the limits mismatch that previously made
+// "missing methods" and "blank method name" fail at the limits check
+// instead of ever reaching the methods check they claim to exercise
+// (mandate RC-02). want is checked as a substring of the rejection's own
+// error text, and the rejection is confirmed to be a plain hello.validate()
+// error, not a *TimeoutError from an unrelated connection-level failure --
+// together these rule out a transport timeout, a malformed fixture, or an
+// unrelated field silently making the case pass for the wrong reason.
 func TestDialRejectsInvalidHelloResult(t *testing.T) {
 	uid := uint32(os.Getuid())
-	const validID = "60000000-0000-4000-8000-000000000001"
-	const validLimits = `"limits":{"max_frame_bytes":1,"max_nesting_depth":1,"max_sockets_per_administrator":1,"max_sockets_total":1,"max_executing_per_socket":1,"max_queued_per_socket":1}`
-	// realLimits matches this client's own fixed parley-control/1 profile
-	// exactly -- used to isolate the CP-10/CP-11 cases below from the
-	// pre-existing (and intentionally non-matching) validLimits above, so
-	// those cases fail for the one property under test, not incidentally
-	// for a limits mismatch too.
-	realLimits := fmt.Sprintf(`"limits":{"max_frame_bytes":%d,"max_nesting_depth":%d,"max_sockets_per_administrator":%d,"max_sockets_total":%d,"max_executing_per_socket":%d,"max_queued_per_socket":%d}`,
-		MaxFrameBytes, maxDepth, MaxSocketsPerAdministrator, MaxSocketsTotal, MaxExecutingPerSocket, MaxQueuedPerSocket)
+	validID := validHelloID
+	realLimits := fixedProfileLimitsJSON()
 	cases := []struct {
 		name     string
 		response string
+		want     string
 	}{
 		// CP-11: parley-control/1 is a fixed, not negotiated, profile -- a
 		// peer advertising a merely-positive-but-different limit must be
 		// rejected, not silently tolerated as if this client would then
 		// frame/queue against whatever the peer claims.
-		{"limits incompatible with the fixed profile", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running","limits":{"max_frame_bytes":` + fmt.Sprint(MaxFrameBytes+1) + `,"max_nesting_depth":` + fmt.Sprint(maxDepth) + `,"max_sockets_per_administrator":` + fmt.Sprint(MaxSocketsPerAdministrator) + `,"max_sockets_total":` + fmt.Sprint(MaxSocketsTotal) + `,"max_executing_per_socket":` + fmt.Sprint(MaxExecutingPerSocket) + `,"max_queued_per_socket":` + fmt.Sprint(MaxQueuedPerSocket) + `},"methods":["server.hello"]}}` + "\n"},
+		{"limits incompatible with the fixed profile", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running","limits":{"max_frame_bytes":` + fmt.Sprint(MaxFrameBytes+1) + `,"max_nesting_depth":` + fmt.Sprint(maxDepth) + `,"max_sockets_per_administrator":` + fmt.Sprint(MaxSocketsPerAdministrator) + `,"max_sockets_total":` + fmt.Sprint(MaxSocketsTotal) + `,"max_executing_per_socket":` + fmt.Sprint(MaxExecutingPerSocket) + `,"max_queued_per_socket":` + fmt.Sprint(MaxQueuedPerSocket) + `},"methods":["server.hello"]}}` + "\n", "limits incompatible"},
 		// CP-10: reuses envelope.go's validMethodSyntax -- a method name
 		// with a space is not in [A-Za-z0-9._]{1,64}.
-		{"invalid method syntax", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["bad method"]}}` + "\n"},
+		{"invalid method syntax", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["bad method"]}}` + "\n", "invalid method name"},
 		// CP-10: a duplicated advertisement is a hello contract violation
 		// even though every individual name is syntactically valid.
-		{"duplicate method name", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["server.hello","server.hello"]}}` + "\n"},
-		{"null hello result", `{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"},
-		{"unsupported protocol", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"other","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
-		{"missing server_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
-		{"non-uuid server_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"  ","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
-		{"non-uuid administrator_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"not-a-uuid","state":"running",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
-		{"unknown state", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"unknown",` + validLimits + `,"methods":["server.hello"]}}` + "\n"},
-		{"invalid limits shape", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running","limits":{},"methods":["server.hello"]}}` + "\n"},
-		{"missing methods", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `}}` + "\n"},
-		{"blank method name", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + validLimits + `,"methods":["  "]}}` + "\n"},
+		{"duplicate method name", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["server.hello","server.hello"]}}` + "\n", "more than once"},
+		// An empty object and an explicit null are distinct wire shapes
+		// (RC-02); both must still be rejected, both decode to a zero-value
+		// HelloResult and so are both caught by the very first check.
+		{"empty hello result object", `{"jsonrpc":"2.0","id":"1","result":{}}` + "\n", "unsupported protocol"},
+		{"null hello result", `{"jsonrpc":"2.0","id":"1","result":null}` + "\n", "unsupported protocol"},
+		{"unsupported protocol", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"other","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["server.hello"]}}` + "\n", "unsupported protocol"},
+		{"missing server_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["server.hello"]}}` + "\n", "invalid server_id"},
+		{"non-uuid server_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"  ","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["server.hello"]}}` + "\n", "invalid server_id"},
+		{"non-uuid administrator_id", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"not-a-uuid","state":"running",` + realLimits + `,"methods":["server.hello"]}}` + "\n", "invalid administrator_id"},
+		{"unknown state", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"unknown",` + realLimits + `,"methods":["server.hello"]}}` + "\n", "unknown state"},
+		{"invalid limits shape", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running","limits":{},"methods":["server.hello"]}}` + "\n", "limits incompatible"},
+		{"missing methods", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `}}` + "\n", "advertises no methods"},
+		{"blank method name", `{"jsonrpc":"2.0","id":"1","result":{"protocol":"` + ProtocolVersion + `","server_id":"` + validID + `","server_epoch":"e","administrator_id":"` + validID + `","state":"running",` + realLimits + `,"methods":["  "]}}` + "\n", "invalid method name"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1132,6 +1241,13 @@ func TestDialRejectsInvalidHelloResult(t *testing.T) {
 			_, _, err := Dial(context.Background(), ClientConfig{Endpoint: path, ServerUID: uid})
 			if err == nil {
 				t.Fatal("expected rejection")
+			}
+			var timeout *TimeoutError
+			if errors.As(err, &timeout) {
+				t.Fatalf("rejected via a connection-level error (%v), not hello.validate() as this case intends", err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err=%q, want it to contain %q", err.Error(), c.want)
 			}
 		})
 	}

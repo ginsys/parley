@@ -395,12 +395,22 @@ func validateResponseEnvelope(value any) error {
 
 // validateErrorObjectShape enforces the exact, case-sensitive shape of a
 // present, non-null error object: only code/message/data are permitted,
-// and when data is present and non-null, only its code member is
-// permitted -- mirroring wireError/errorData's own encoding shape
+// and a present data member must be an object carrying only its code
+// member -- mirroring wireError/errorData's own encoding shape
 // (response.go). This runs before incomingError's own json.Unmarshal
 // decode for the same reason validateResponseEnvelope runs before
 // incomingResponse's: an invented or wrong-case member would otherwise be
 // silently dropped or aliased rather than rejected.
+//
+// An explicit `"data":null` is rejected here, not merely tolerated as
+// absent (mandate RC-03): the accepted wire contract gives error.data no
+// null-is-permitted allowance the way a present envelope result value has.
+// Checking this before incomingError's own decode matters because
+// *errorData -- an ordinary Go pointer field -- cannot tell the two shapes
+// apart afterwards: encoding/json sets a pointer field to nil for both an
+// absent key and an explicit `null` value, so incomingError.validate's own
+// `e.Data == nil` checks would otherwise let an explicit null silently
+// pass as if data had never been sent at all.
 func validateErrorObjectShape(value any) error {
 	obj, ok := value.(map[string]any)
 	if !ok {
@@ -412,7 +422,10 @@ func validateErrorObjectShape(value any) error {
 			return fmt.Errorf("control: response error carries an unrecognized field %q", k)
 		}
 	}
-	if data, present := obj["data"]; present && data != nil {
+	if data, present := obj["data"]; present {
+		if data == nil {
+			return errors.New("control: response error.data must not be null")
+		}
 		dataObj, ok := data.(map[string]any)
 		if !ok {
 			return fmt.Errorf("control: response error.data must be an object, got %#v", data)
