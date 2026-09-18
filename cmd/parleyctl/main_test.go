@@ -89,10 +89,6 @@ func TestHelpAndInvalidArgumentsNeverDial(t *testing.T) {
 		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "-1s"}, 2},
 		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expected-grant-version", "-1"}, 2},
 		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-operation-id", "not-a-uuid"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "1h", "-expires-at", "2030-01-01T00:00:00Z"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "not-rfc3339"}, 2},
-		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "1h", "-expires-at", "2030-01-01T00:00:00Z"}, 2},
-		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-at", "not-rfc3339"}, 2},
 		// Syntactically valid but no endpoint/server-uid configured anywhere:
 		// ResolveClientConfig fails before dial is ever reached.
 		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1"}, 2},
@@ -263,6 +259,38 @@ func checkExpiresAt(t *testing.T, params map[string]any, lower, upper time.Time)
 	}
 }
 
+// TestMembershipExpiresAtValidation asserts the specific rejection reason
+// for -expires-in/-expires-at misuse, not merely "some exit-2 error
+// occurred": every case supplies membershipEndpointArgs so a config-
+// resolution failure (also exit 2, via ResolveClientConfig) cannot mask a
+// broken or missing parseCommand check -- without an endpoint configured,
+// a test asserting only the exit code would still pass even if the
+// mutual-exclusion/RFC3339 checks below were deleted entirely.
+func TestMembershipExpiresAtValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"mutually_exclusive", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "1h", "-expires-at", "2030-01-01T00:00:00Z"}, "-expires-in and -expires-at are mutually exclusive"},
+		{"bad_rfc3339", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "not-rfc3339"}, "-expires-at must be RFC3339"},
+		{"renew_mutually_exclusive", []string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "1h", "-expires-at", "2030-01-01T00:00:00Z"}, "-expires-in and -expires-at are mutually exclusive"},
+		{"renew_bad_rfc3339", []string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-at", "not-rfc3339"}, "-expires-at must be RFC3339"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append(append([]string{}, tt.args...), membershipEndpointArgs...)
+			var out, errOut bytes.Buffer
+			if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+				t.Fatalf("exit=%d: %s", code, &errOut)
+			}
+			if !strings.Contains(errOut.String(), tt.want) {
+				t.Fatalf("stderr=%q, want substring %q", &errOut, tt.want)
+			}
+		})
+	}
+}
+
 // TestMembershipExpiresAtUsedVerbatim exercises the retry-safe -expires-at
 // path (as opposed to -expires-in's relative-to-now resolution, covered by
 // TestMembershipRoutingUsesValidatedParametersAndClosesClient): the wire
@@ -270,28 +298,34 @@ func checkExpiresAt(t *testing.T, params map[string]any, lower, upper time.Time)
 // within a tolerance window, since a retry must reproduce the identical
 // digest store.NewCommandRequest computed for the original attempt.
 func TestMembershipExpiresAtUsedVerbatim(t *testing.T) {
-	const want = "2030-06-15T12:00:00Z"
-	for _, op := range []string{"enroll", "renew", "replace"} {
-		t.Run(op, func(t *testing.T) {
-			args := []string{"membership", op, "-conversation", "fixture", "-expires-at", want}
-			switch op {
-			case "enroll":
-				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1")
-			case "renew":
-				args = append(args, "-expected-grant-version", "1")
-			case "replace":
-				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1")
-			}
-			args = append(args, membershipEndpointArgs...)
-			fake := &fakeClient{}
-			var out, errOut bytes.Buffer
-			if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
-				t.Fatalf("exit=%d: %s", code, &errOut)
-			}
-			if fake.params["expires_at"] != want {
-				t.Fatalf("expires_at=%v, want %q", fake.params["expires_at"], want)
-			}
-		})
+	// The fractional-second case guards a real defect a Codex review found
+	// in the first repair batch: reformatting the parsed value with
+	// time.RFC3339 (no fractional spec) silently truncated sub-second
+	// precision instead of reproducing the given instant exactly. The
+	// fix reformats with time.RFC3339Nano.
+	for _, want := range []string{"2030-06-15T12:00:00Z", "2030-06-15T12:00:00.123456789Z"} {
+		for _, op := range []string{"enroll", "renew", "replace"} {
+			t.Run(want+"/"+op, func(t *testing.T) {
+				args := []string{"membership", op, "-conversation", "fixture", "-expires-at", want}
+				switch op {
+				case "enroll":
+					args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1")
+				case "renew":
+					args = append(args, "-expected-grant-version", "1")
+				case "replace":
+					args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1")
+				}
+				args = append(args, membershipEndpointArgs...)
+				fake := &fakeClient{}
+				var out, errOut bytes.Buffer
+				if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
+					t.Fatalf("exit=%d: %s", code, &errOut)
+				}
+				if fake.params["expires_at"] != want {
+					t.Fatalf("expires_at=%v, want %q", fake.params["expires_at"], want)
+				}
+			})
+		}
 	}
 }
 

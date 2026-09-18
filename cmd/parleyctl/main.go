@@ -146,7 +146,13 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 			if err != nil {
 				return c, fmt.Errorf("-expires-at must be RFC3339: %w", err)
 			}
-			c.expiresAt = parsed.UTC().Format(time.RFC3339)
+			// RFC3339Nano, not RFC3339: -expires-at's whole purpose is
+			// reproducing the exact original wire value across a retry, so
+			// truncating a fractional-second input (RFC3339 has no
+			// fractional spec) would silently change the resolved
+			// expires_at -- and therefore store.NewCommandRequest's digest
+			// -- from what -expires-at was given specifically to preserve.
+			c.expiresAt = parsed.UTC().Format(time.RFC3339Nano)
 		case c.expiresIn > 0:
 			c.expiresAt = time.Now().Add(c.expiresIn).UTC().Format(time.RFC3339)
 		}

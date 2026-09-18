@@ -138,6 +138,17 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (R
 	// inspects member count/policy kind and never produces a duplicate
 	// Set entry, so it can safely run inside the mutate callback below
 	// and be durably audited like any other domain rejection.
+	//
+	// Known asymmetry (from repair-batch-1 review): invalid_membership
+	// rejections here are therefore NOT recorded through
+	// operation_results/command_audit (they never reach Execute at all),
+	// while unsupported_membership rejections below are. A retry with the
+	// same operation_id and a still-malformed payload re-runs this exact
+	// check and gets the same InvalidMembership response every time --
+	// there is no OperationConflict risk from the missing audit row,
+	// only the absence of a durable record of the earlier attempt. See
+	// docs/specifications/control.md's invalid_membership row for the
+	// documented exception this asymmetry corresponds to.
 	if err := membership.Validate(model); err != nil {
 		return domainErrorResponse(&req.ID, DomainCode(store.InvalidMembership)), false
 	}
