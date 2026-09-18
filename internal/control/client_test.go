@@ -119,6 +119,14 @@ func TestClientCallRejectsConcurrentCall(t *testing.T) {
 		conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}` + "\n"))
 	}()
 	t.Cleanup(func() {
+		// t.Cleanup runs LIFO: this cleanup, registered after releaseNow's,
+		// would otherwise run BEFORE it on an early-exit path, joining a
+		// server still blocked on <-release and spuriously burning the
+		// full wait below on every such path (found by this batch's own
+		// hosted review of the fix above). Calling releaseNow() here too,
+		// before waiting, makes this cleanup correct regardless of
+		// registration order.
+		releaseNow()
 		select {
 		case <-serverDone:
 		case <-time.After(2 * time.Second):
