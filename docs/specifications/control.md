@@ -334,6 +334,7 @@ An unreadable/oversize/partial frame may be closed without a response or echoed 
 | `operation_conflict`, `operation_not_found`, `outcome_unknown` | Follow durable result rules; never retry under a new ID automatically |
 | `stale_grant_version`, `version_conflict`, `request_expired`, `request_terminal` | No retargeted command effect; inspect current state before new human action |
 | `invalid_membership`, `unsupported_membership`, `incompatible_identifier` | Explicit contract/compatibility rejection; no lossy translation |
+| `security_hold`, `recovery_required`, `binding_unavailable`, `host_unverified` | Preserve holds and account/host boundaries; ordinary retry cannot authorize recovery |
 
 `invalid_membership` is a narrow, known exception to the durable-audit rule above: a malformed
 shape (for example a duplicate member entry) cannot reach the coordinator's command-digest
@@ -343,7 +344,6 @@ any operation receipt or audit row exists for it. It is not ambiguous or unsafe 
 operation ID with the same still-malformed payload simply re-evaluates the same check and returns
 the same rejection every time — but it leaves no durable trace of the attempt. `unsupported_membership`
 carries no such conflict and is audited normally.
-| `security_hold`, `recovery_required`, `binding_unavailable`, `host_unverified` | Preserve holds and account/host boundaries; ordinary retry cannot authorize recovery |
 
 Other domain codes are the explicit membership/connection error enumerations, not arbitrary strings.
 Permission checks precede private lookup diagnostics. Expose expected/current versions only to a

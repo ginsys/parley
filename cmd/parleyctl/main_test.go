@@ -110,7 +110,17 @@ func TestHelpAndInvalidArgumentsNeverDial(t *testing.T) {
 }
 
 func TestUnsafePeerIdentifiersRejectedBeforeDialing(t *testing.T) {
-	for _, id := range []string{"a\xff", "a\xfe", "café", "a�", "peer\x7f", "peer\n", "peer\r", "peer\t", "peer\x00", "peer", "peer ", "peer ", "peer​", "peer‮"} {
+	// The non-ASCII/invisible/directional-override fixtures use explicit
+	// \uXXXX escapes rather than the raw characters themselves (a hosted
+	// AI Code Review finding on an earlier PR2 candidate): a literal
+	// U+202E RIGHT-TO-LEFT OVERRIDE or U+200B ZERO WIDTH SPACE in tracked
+	// source is Trojan-Source-class -- it can reorder how the rest of the
+	// line renders in an editor or review tool, and is silently
+	// corruptible by any tool that normalizes or strips invisible
+	// codepoints. "café" is the one intentionally-visible non-ASCII case
+	// (a readable non-ASCII-byte rejection, not an invisible-character
+	// one) and stays literal.
+	for _, id := range []string{"a\xff", "a\xfe", "café", "a\ufffd", "peer\x7f", "peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
 		for _, flag := range []string{"-conversation", "-peer-a", "-peer-b"} {
 			t.Run(flag+id, func(t *testing.T) {
 				args := []string{"membership", "enroll", "-conversation", "fixture", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2", flag, id}
