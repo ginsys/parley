@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -57,12 +58,37 @@ func (f *fakeClient) Call(_ context.Context, method string, params map[string]an
 		// the caller's own requested operation ID, so a fixture hardcoding
 		// an unrelated constant here would make every fakeClient-backed
 		// success path spuriously "unusable" (MC-01, correcting an earlier
-		// audit-1/operation-1 placeholder receipt this fixture used).
+		// audit-1/operation-1 placeholder receipt this fixture used). Usable
+		// also now validates AuditID/CommitView.Epoch as canonical UUIDs,
+		// CommitView.Revision as a canonical decimal string, and requires a
+		// nonempty Result.Resources with valid Kind/ID/Before/After -- a
+		// second lead-reviewed residual on the same fixture (a "fixed" wire
+		// operation_id alone was not itself contract-valid).
+		//
+		// CommandReceiptResult's Result field has an unexported concrete
+		// type (server.go's wireCommandResult), so this fixture cannot build
+		// one via a Go composite literal from outside the package -- it
+		// round-trips through encoding/json instead, exactly the path a
+		// real wire response takes through Client.Call's own
+		// json.Unmarshal(resp.Result, out). This receipt is shaped exactly
+		// like a real successful membership.enroll result.
 		opID, _ := params["operation_id"].(string)
-		*result = control.CommandReceiptResult{
-			AuditID:     "audit-1",
-			OperationID: opID,
-			CommitView:  control.CommitView{Epoch: "epoch-1", Revision: "1"},
+		wire, err := json.Marshal(map[string]any{
+			"audit_id":     "60000000-0000-4000-8000-000000000001",
+			"operation_id": opID,
+			"commit_view":  map[string]any{"epoch": "70000000-0000-4000-8000-000000000001", "revision": "1"},
+			"result": map[string]any{
+				"code": "",
+				"resources": []map[string]any{
+					{"kind": "grant", "id": params["conversation"], "before": "0", "after": "1"},
+				},
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(wire, result); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -82,36 +108,55 @@ func fatalIfDialed(t *testing.T) dialFunc {
 	}
 }
 
+// TestHelpAndInvalidArgumentsNeverDial's exit-2 cases each name the exact
+// diagnostic parseCommand/runMembership is expected to produce, and the
+// cases that test a parseCommand-level validation (not the deliberate
+// missing-endpoint case at the end, and not the flag-set-level cases that
+// fail inside fs.Parse itself before any custom validation runs) append
+// membershipEndpointArgs so control.ResolveClientConfig would succeed if
+// dial were ever reached. Without this, deleting the validation under test
+// (e.g. the negative--max-exchanges guard) would still exit 2 -- from the
+// unrelated missing-endpoint error -- and this test would not notice (a
+// lead-reviewed regression against an earlier version of this test that
+// checked only the exit code and stream shape, never the actual diagnostic
+// or reason for reaching it).
 func TestHelpAndInvalidArgumentsNeverDial(t *testing.T) {
 	tests := []struct {
-		args []string
-		code int
+		args    []string
+		code    int
+		wantErr string // substring required in stderr when code == 2; ignored when code == 0
 	}{
-		{nil, 0}, {[]string{"help"}, 0}, {[]string{"-h"}, 0}, {[]string{"--help"}, 0},
-		{[]string{"membership", "help"}, 0}, {[]string{"membership", "-h"}, 0},
-		{[]string{"membership", "enroll", "--help"}, 0}, {[]string{"membership", "renew", "-h"}, 0},
-		{[]string{"membership", "replace", "-h"}, 0}, {[]string{"membership", "revoke", "--help"}, 0},
-		{[]string{"serve"}, 2}, {[]string{"help", "extra"}, 2},
-		{[]string{"membership"}, 2}, {[]string{"membership", "unknown"}, 2},
-		{[]string{"membership", "enroll"}, 2}, {[]string{"membership", "renew"}, 2},
-		{[]string{"membership", "replace"}, 2}, {[]string{"membership", "revoke"}, 2},
-		{[]string{"membership", "revoke", "-conversation", " "}, 2},
-		{[]string{"membership", "revoke", "-conversation", "c", "-expected-grant-version", "1", "extra"}, 2},
-		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-max-exchanges", "-1"}, 2},
-		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "-1s"}, 2},
-		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "oops"}, 2},
-		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "--unknown"}, 2},
-		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "0"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "0"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "a", "-max-exchanges", "1"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", " ", "-peer-b", "b", "-max-exchanges", "1"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-direction", "wrong"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "-1s"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expected-grant-version", "-1"}, 2},
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-operation-id", "not-a-uuid"}, 2},
+		{nil, 0, ""}, {[]string{"help"}, 0, ""}, {[]string{"-h"}, 0, ""}, {[]string{"--help"}, 0, ""},
+		{[]string{"membership", "help"}, 0, ""}, {[]string{"membership", "-h"}, 0, ""},
+		{[]string{"membership", "enroll", "--help"}, 0, ""}, {[]string{"membership", "renew", "-h"}, 0, ""},
+		{[]string{"membership", "replace", "-h"}, 0, ""}, {[]string{"membership", "revoke", "--help"}, 0, ""},
+		{[]string{"serve"}, 2, `unknown command "serve"`},
+		{[]string{"help", "extra"}, 2, `unknown command "help"`},
+		{[]string{"membership"}, 2, "membership requires a subcommand"},
+		{[]string{"membership", "unknown"}, 2, `unknown membership subcommand "unknown"`},
+		{[]string{"membership", "enroll"}, 2, "requires -conversation"},
+		{[]string{"membership", "renew"}, 2, "requires -conversation"},
+		{[]string{"membership", "replace"}, 2, "requires -conversation"},
+		{[]string{"membership", "revoke"}, 2, "requires -conversation"},
+		{[]string{"membership", "revoke", "-conversation", " "}, 2, "requires -conversation"},
+		{[]string{"membership", "revoke", "-conversation", "c", "-expected-grant-version", "1", "extra"}, 2, "unexpected positional arguments"},
+		{append([]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-max-exchanges", "-1"}, membershipEndpointArgs...), 2, "must not be negative"},
+		{append([]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "-1s"}, membershipEndpointArgs...), 2, "must not be negative"},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "oops"}, 2, "invalid value"},
+		{[]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "--unknown"}, 2, "flag provided but not defined"},
+		{append([]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "0"}, membershipEndpointArgs...), 2, "requires -expected-grant-version >= 1"},
+		{append([]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "0"}, membershipEndpointArgs...), 2, "requires -max-exchanges > 0"},
+		{append([]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "a", "-max-exchanges", "1"}, membershipEndpointArgs...), 2, "requires distinct nonempty peers"},
+		{append([]string{"membership", "enroll", "-conversation", "c", "-peer-a", " ", "-peer-b", "b", "-max-exchanges", "1"}, membershipEndpointArgs...), 2, "requires distinct nonempty peers"},
+		{append([]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-direction", "wrong"}, membershipEndpointArgs...), 2, `invalid direction "wrong"`},
+		{append([]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "-1s"}, membershipEndpointArgs...), 2, "must not be negative"},
+		{append([]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expected-grant-version", "-1"}, membershipEndpointArgs...), 2, "-expected-grant-version must not be negative"},
+		{append([]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-operation-id", "not-a-uuid"}, membershipEndpointArgs...), 2, "-operation-id must be a canonical UUID"},
 		// Syntactically valid but no endpoint/server-uid configured anywhere:
-		// ResolveClientConfig fails before dial is ever reached.
-		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1"}, 2},
+		// ResolveClientConfig fails before dial is ever reached. Deliberately
+		// omits membershipEndpointArgs -- this case exists to prove that
+		// specific failure, not to isolate a parseCommand validation.
+		{[]string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1"}, 2, "no endpoint configured"},
 	}
 	for _, tt := range tests {
 		t.Run(strings.Join(tt.args, " "), func(t *testing.T) {
@@ -122,14 +167,25 @@ func TestHelpAndInvalidArgumentsNeverDial(t *testing.T) {
 			if tt.code == 0 && (stdout.Len() == 0 || stderr.Len() != 0) {
 				t.Fatalf("help streams: %q %q", &stdout, &stderr)
 			}
-			if tt.code == 2 && (stderr.Len() == 0 || stdout.Len() != 0) {
-				t.Fatalf("error streams: %q %q", &stdout, &stderr)
+			if tt.code == 2 {
+				if stderr.Len() == 0 || stdout.Len() != 0 {
+					t.Fatalf("error streams: %q %q", &stdout, &stderr)
+				}
+				if !strings.Contains(stderr.String(), tt.wantErr) {
+					t.Fatalf("stderr %q does not contain expected diagnostic %q", &stderr, tt.wantErr)
+				}
 			}
 		})
 	}
 }
 
 func TestUnsafePeerIdentifiersRejectedBeforeDialing(t *testing.T) {
+	// wantErr and membershipEndpointArgs (appended to args below) close the
+	// same isolation gap as TestHelpAndInvalidArgumentsNeverDial: without a
+	// resolvable endpoint, deleting the identifier check under test would
+	// still exit 2 from the unrelated missing-endpoint error, and this test
+	// would not notice.
+	wantErr := map[string]string{"-conversation": "conversation identifier:", "-peer-a": "peer identifier:", "-peer-b": "peer identifier:"}
 	// The non-ASCII/invisible/directional-override fixtures use explicit
 	// \uXXXX escapes rather than the raw characters themselves (a hosted
 	// AI Code Review finding on an earlier PR2 candidate): a literal
@@ -143,10 +199,13 @@ func TestUnsafePeerIdentifiersRejectedBeforeDialing(t *testing.T) {
 	for _, id := range []string{"a\xff", "a\xfe", "café", "a\ufffd", "peer\x7f", "peer\n", "peer\r", "peer\t", "peer\x00", "peer\u0085", "peer\u2028", "peer\u2029", "peer\u200b", "peer\u202e"} {
 		for _, flag := range []string{"-conversation", "-peer-a", "-peer-b"} {
 			t.Run(flag+id, func(t *testing.T) {
-				args := []string{"membership", "enroll", "-conversation", "fixture", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2", flag, id}
+				args := append([]string{"membership", "enroll", "-conversation", "fixture", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2", flag, id}, membershipEndpointArgs...)
 				var out, errOut bytes.Buffer
 				if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
 					t.Fatalf("exit=%d: %s", code, &errOut)
+				}
+				if !strings.Contains(errOut.String(), wantErr[flag]) {
+					t.Fatalf("stderr %q does not contain expected diagnostic %q", &errOut, wantErr[flag])
 				}
 			})
 		}
@@ -303,9 +362,20 @@ func TestMembershipExpiresAtValidation(t *testing.T) {
 		want string
 	}{
 		{"mutually_exclusive", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "1h", "-expires-at", "2030-01-01T00:00:00Z"}, "-expires-in and -expires-at are mutually exclusive"},
-		{"bad_rfc3339", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "not-rfc3339"}, "-expires-at must be RFC3339"},
+		{"bad_rfc3339", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "not-rfc3339"}, "-expires-at must match RFC3339 UTC"},
 		{"renew_mutually_exclusive", []string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "1h", "-expires-at", "2030-01-01T00:00:00Z"}, "-expires-in and -expires-at are mutually exclusive"},
-		{"renew_bad_rfc3339", []string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-at", "not-rfc3339"}, "-expires-at must be RFC3339"},
+		{"renew_bad_rfc3339", []string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-at", "not-rfc3339"}, "-expires-at must match RFC3339 UTC"},
+		// MC-03 regression: time.Parse(time.RFC3339, ...) alone silently
+		// normalized each of these three instead of rejecting them --
+		// excess fractional precision (truncated to 9 digits), a comma
+		// fraction separator (a legal ISO 8601 alternative RFC3339 itself
+		// doesn't document rejecting), and a single-digit hour. Each must
+		// now fail the CLI's own grammar check before any parse/reformat
+		// happens, matching the server's expiresAtGrammar exactly.
+		{"excess_fraction_precision", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "2030-06-15T12:00:00.1234567891Z"}, "-expires-at must match RFC3339 UTC"},
+		{"comma_fraction_separator", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "2030-06-15T12:00:00,5Z"}, "-expires-at must match RFC3339 UTC"},
+		{"single_digit_hour", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "2030-06-15T1:00:00Z"}, "-expires-at must match RFC3339 UTC"},
+		{"numeric_offset_not_normalized", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "2030-06-15T12:00:00+02:00"}, "-expires-at must match RFC3339 UTC"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -333,7 +403,12 @@ func TestMembershipExpiresAtUsedVerbatim(t *testing.T) {
 	// time.RFC3339 (no fractional spec) silently truncated sub-second
 	// precision instead of reproducing the given instant exactly. The
 	// fix reformats with time.RFC3339Nano.
-	for _, want := range []string{"2030-06-15T12:00:00Z", "2030-06-15T12:00:00.123456789Z"} {
+	// MC-03: ".750Z" is a trailing-zero fraction time.Format(RFC3339Nano)
+	// would itself compact to ".75Z" on a round trip. The original string
+	// must survive verbatim -- reformatting instead of sending the
+	// validated input as-is would silently change this digest, defeating
+	// -expires-at's own reason for existing.
+	for _, want := range []string{"2030-06-15T12:00:00Z", "2030-06-15T12:00:00.123456789Z", "2030-06-15T12:00:00.750Z"} {
 		for _, op := range []string{"enroll", "renew", "replace"} {
 			t.Run(want+"/"+op, func(t *testing.T) {
 				args := []string{"membership", op, "-conversation", "fixture", "-expires-at", want}

@@ -360,12 +360,25 @@ type SupersedeResult struct {
 func supersede(ctx context.Context, tx *sql.Tx, current *store.Grant, conversation, peerA, peerB string, direction store.Direction,
 	maxExchanges int64, expiresAt *time.Time, cancelPendingReplies bool) (*SupersedeResult, error) {
 	// Counted before any mutation below, mirroring RevokeTx's identical
-	// ordering and identical countByState call: only the currently active
-	// grant version can ever accept a dispatch claim, so any envelope
-	// presently in dispatching/handed_off state was necessarily claimed
-	// under current.GrantVersion, the one about to be superseded --
-	// scoping the count by conversation alone (not also grant_version) is
-	// therefore exact here, the same reasoning RevokeTx already relies on.
+	// ordering and identical countByState call: this count is intentionally
+	// conversation-wide, not scoped to current.GrantVersion. A hosted review
+	// finding (PR #63, issuecomment-5740801367) correctly flagged an earlier
+	// version of this comment for claiming the opposite -- that any envelope
+	// presently dispatching/handed_off "was necessarily claimed under
+	// current.GrantVersion" -- which is false after two successive
+	// renewals: an envelope claimed under version N stays dispatching/
+	// handed_off across N's own supersession (dispatch claims are never
+	// retargeted to a successor version, and Revoke/RenewTx/ReplaceTx never
+	// touch an envelope already past Queued), so a later supersede of N+1
+	// still finds and reports it, attributed only to "this conversation has
+	// outstanding in-flight work," not to the version being superseded right
+	// now. Scoping this count by conversation alone is therefore the
+	// deliberate design (matching RevokeTx's own identical choice), not an
+	// approximation that happens to be exact only for a single renewal --
+	// see TestMembershipRenewResultReportsDispatchingAndHandedOffCounts
+	// (internal/control/membership_test.go) for the two-renewal regression
+	// coverage proving work retained from an earlier grant version is still
+	// counted.
 	dispatching, err := countByState(ctx, tx, conversation, store.Dispatching)
 	if err != nil {
 		return nil, err

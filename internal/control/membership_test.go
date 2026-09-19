@@ -231,6 +231,14 @@ func TestMembershipEnrollReplayReturnsSameReceiptWithoutASecondGrant(t *testing.
 	if r1.AuditID != r2.AuditID {
 		t.Fatalf("replay produced a different audit record: %s vs %s", r1.AuditID, r2.AuditID)
 	}
+	opID, _ := params["operation_id"].(string)
+	// A replayed receipt must remain Usable exactly as it was when first
+	// produced: Usable validates shape/domain only, never live server state
+	// (the grant this replay describes has not changed version since, but
+	// Usable must not depend on that -- see its own doc comment).
+	if !r2.Usable(opID) {
+		t.Fatalf("a replayed receipt must remain Usable: %#v", r2)
+	}
 	var count int
 	if err := db.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
 		return tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM grants WHERE conversation='conv-1'").Scan(&count)
@@ -397,6 +405,117 @@ func TestMembershipEnrollResultEchoesExactOperationID(t *testing.T) {
 	}
 }
 
+// TestCommandReceiptResultUsableValidatesActualReceiptContents is MC-01's
+// second residual: checking only that AuditID/OperationID/CommitView's
+// fields were nonempty strings and Result.Code was "" (the version
+// TestMembershipEnrollResultEchoesExactOperationID's fix left behind) let a
+// missing or `null` "result" member -- which decodes into a zero-valued
+// wireCommandResult, not an error, since an absent/null field is a no-op
+// for encoding/json's struct decode -- and placeholder metadata like
+// "audit-1"/"epoch-1"/"not-a-number" pass despite describing no actual
+// mutation. Each case here starts from a genuinely valid receipt (the same
+// shape a real successful membership.enroll produces) and corrupts exactly
+// one documented field/domain rule, proving Usable rejects that specific
+// defect and nothing else -- with the unmodified receipt itself as the
+// positive control.
+func TestCommandReceiptResultUsableValidatesActualReceiptContents(t *testing.T) {
+	const opID = "80000000-0000-4000-8000-000000000099"
+	valid := func() CommandReceiptResult {
+		return CommandReceiptResult{
+			AuditID:     "60000000-0000-4000-8000-000000000001",
+			OperationID: opID,
+			CommitView:  CommitView{Epoch: "70000000-0000-4000-8000-000000000001", Revision: "1"},
+			Result: wireCommandResult{
+				Resources: []wireResourceChange{{Kind: "grant", ID: "conv-1", Before: "0", After: "1"}},
+			},
+		}
+	}
+	tests := []struct {
+		name string
+		want bool
+		make func() CommandReceiptResult
+	}{
+		{"valid receipt is the positive control", true, valid},
+		{"missing result (zero-valued wireCommandResult)", false, func() CommandReceiptResult {
+			r := valid()
+			r.Result = wireCommandResult{}
+			return r
+		}},
+		{"result present but resources empty", false, func() CommandReceiptResult {
+			r := valid()
+			r.Result.Resources = nil
+			return r
+		}},
+		{"non-UUID audit_id placeholder", false, func() CommandReceiptResult {
+			r := valid()
+			r.AuditID = "audit-1"
+			return r
+		}},
+		{"non-UUID epoch placeholder", false, func() CommandReceiptResult {
+			r := valid()
+			r.CommitView.Epoch = "epoch-1"
+			return r
+		}},
+		{"non-decimal revision", false, func() CommandReceiptResult {
+			r := valid()
+			r.CommitView.Revision = "not-a-number"
+			return r
+		}},
+		{"empty revision", false, func() CommandReceiptResult {
+			r := valid()
+			r.CommitView.Revision = ""
+			return r
+		}},
+		{"resource kind empty", false, func() CommandReceiptResult {
+			r := valid()
+			r.Result.Resources[0].Kind = ""
+			return r
+		}},
+		{"resource id empty", false, func() CommandReceiptResult {
+			r := valid()
+			r.Result.Resources[0].ID = ""
+			return r
+		}},
+		{"resource before not decimal", false, func() CommandReceiptResult {
+			r := valid()
+			r.Result.Resources[0].Before = "one"
+			return r
+		}},
+		{"resource after not decimal", false, func() CommandReceiptResult {
+			r := valid()
+			r.Result.Resources[0].After = "01"
+			return r
+		}},
+		{"nonempty result.code", false, func() CommandReceiptResult {
+			r := valid()
+			r.Result.Code = store.NoActiveGrant
+			return r
+		}},
+		{"mismatched operation_id", false, func() CommandReceiptResult {
+			r := valid()
+			r.OperationID = "80000000-0000-4000-8000-000000000001"
+			return r
+		}},
+		{"non-UUID operation_id even if it matches the request string", false, func() CommandReceiptResult {
+			r := valid()
+			r.OperationID = "not-a-uuid"
+			return r
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := tt.make()
+			requested := opID
+			if tt.name == "non-UUID operation_id even if it matches the request string" {
+				requested = "not-a-uuid"
+			}
+			if got := r.Usable(requested); got != tt.want {
+				t.Fatalf("Usable()=%v, want %v: %#v", got, tt.want, r)
+			}
+		})
+	}
+}
+
 // TestMembershipRenewResultReportsCarriedAndCancelledCounts is MC-01.B's
 // regression: RenewTx's SupersedeResult.Carried/Cancelled counts --
 // previously discarded entirely -- must reach the wire result as
@@ -465,6 +584,91 @@ func TestMembershipRenewResultReportsCarriedAndCancelledCounts(t *testing.T) {
 	}
 	if cancelled != "1" {
 		t.Fatalf("queued_cancelled=%q, want 1: %#v", cancelled, result.Result.Resources)
+	}
+}
+
+// TestMembershipRenewResultReportsDispatchingAndHandedOffCounts is MC-04's
+// residual on top of the carried/cancelled coverage above: the wire
+// response's queued_already_dispatching/queued_already_handed_off resource
+// kinds had no dedicated nonzero-count test -- a regression that stopped
+// reporting them, or reported the wrong value, would not have been caught by
+// carried/cancelled-only coverage. It also exercises the property documented
+// on controller.supersede: an in-flight envelope's dispatching/handed-off
+// state is counted conversation-wide, not scoped to the grant version it was
+// claimed under -- work retained from grant version 1 must still be counted
+// after a SECOND renewal (to version 3), even though that envelope's own
+// grant_version (1) is by then two versions behind current.
+func TestMembershipRenewResultReportsDispatchingAndHandedOffCounts(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("enroll failed: %#v", enroll.Err)
+	}
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatching := "80000000-0000-4000-8000-000000000011"
+	if err := store.InsertQueued(ctx, tx, store.Envelope{
+		ID: dispatching, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
+		Text: "dispatching", GrantVersion: 1, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetState(ctx, tx, dispatching, store.Queued, store.Dispatching, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	handedOff := "80000000-0000-4000-8000-000000000012"
+	if err := store.InsertQueued(ctx, tx, store.Envelope{
+		ID: handedOff, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
+		Text: "handed-off", GrantVersion: 1, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetState(ctx, tx, handedOff, store.Queued, store.Dispatching, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetState(ctx, tx, handedOff, store.Dispatching, store.HandedOff, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	counts := func(resp Response) (dispatchingCount, handedOffCount string) {
+		result := decodeResult[CommandReceiptResult](t, resp)
+		for _, r := range result.Result.Resources {
+			switch r.Kind {
+			case "queued_already_dispatching":
+				dispatchingCount = r.After
+			case "queued_already_handed_off":
+				handedOffCount = r.After
+			}
+		}
+		return
+	}
+
+	renew1, _ := sess.Handle(ctx, Request{ID: "2", Method: "membership.renew", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+	}})
+	if renew1.Err != nil {
+		t.Fatalf("first renew failed: %#v", renew1.Err)
+	}
+	if d, h := counts(renew1); d != "1" || h != "1" {
+		t.Fatalf("after first renew: queued_already_dispatching=%q queued_already_handed_off=%q, want 1/1", d, h)
+	}
+
+	renew2, _ := sess.Handle(ctx, Request{ID: "3", Method: "membership.renew", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "2",
+	}})
+	if renew2.Err != nil {
+		t.Fatalf("second renew failed: %#v", renew2.Err)
+	}
+	if d, h := counts(renew2); d != "1" || h != "1" {
+		t.Fatalf("after second renew: work claimed under grant version 1 must still be counted (conversation-wide, not per-version): queued_already_dispatching=%q queued_already_handed_off=%q, want 1/1", d, h)
 	}
 }
 
