@@ -5,10 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/ginsys/parley/internal/store"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/ginsys/parley/internal/store"
 )
 
 func TestUnsafePeerIdentifiersNeverCreateGrants(t *testing.T) {
@@ -88,6 +90,182 @@ func TestRenewRejectsLegacyUnsafePeersWithoutChangingHistory(t *testing.T) {
 	tx.Rollback()
 	if _, err := ctrl.Revoke(ctx, "c"); err != nil {
 		t.Fatalf("legacy grant cannot be revoked: %v", err)
+	}
+}
+
+// TestGrantTxRefusesVersionOverflowWithoutMutating and
+// TestGrantTxAcceptsVersionAtTheMaxInt64Boundary are the version-overflow
+// correction named in thread PRRT_kwDOUT1JT86j2RK8 (root 4049498709):
+// GrantTx's successor version used to be a bare `latest + 1`, which would
+// silently wrap to a negative grant_version once a conversation's history
+// reached math.MaxInt64 instead of refusing. GrantTx now uses
+// store.NextVersion (see internal/controller/controller.go), the same
+// checked-arithmetic helper store.Coordinator.Execute already uses for its
+// own sequence/revision counters. The seed row here is inserted directly by
+// SQL (not via store.InsertGrant, which always writes 'active') so a fresh
+// GrantTx call has no active-grant conflict to navigate -- MAX(grant_version)
+// alone is what GrantTx reads to compute its successor.
+func TestGrantTxRefusesVersionOverflowWithoutMutating(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "grant-overflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "c", "c", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO grants (conversation, grant_version, peer_a_id, peer_b_id, direction,
+		                     max_exchanges, exchanges_used, granted_at, expires_at, status, revoked_at, cancel_pending_replies)
+		VALUES ('c', ?, 'a', 'b', 'bidirectional', 2, 0, '2026-01-01T00:00:00Z', NULL, 'revoked', '2026-01-01T00:00:00Z', 0)`,
+		int64(math.MaxInt64)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrl := New(db)
+	if _, err := ctrl.Grant(ctx, GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2}); err == nil {
+		t.Fatal("expected GrantTx to refuse a successor version past math.MaxInt64")
+	}
+
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE conversation='c'").Scan(&count); err != nil || count != 1 {
+		t.Errorf("history rows=%d: %v", count, err)
+	}
+	if _, err := store.CurrentGrant(ctx, tx, "c"); !errors.Is(err, store.ErrNoActiveGrant) {
+		t.Errorf("a refused overflow must not create a new active grant: %v", err)
+	}
+}
+
+func TestGrantTxAcceptsVersionAtTheMaxInt64Boundary(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "grant-boundary.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "c", "c", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO grants (conversation, grant_version, peer_a_id, peer_b_id, direction,
+		                     max_exchanges, exchanges_used, granted_at, expires_at, status, revoked_at, cancel_pending_replies)
+		VALUES ('c', ?, 'a', 'b', 'bidirectional', 2, 0, '2026-01-01T00:00:00Z', NULL, 'revoked', '2026-01-01T00:00:00Z', 0)`,
+		int64(math.MaxInt64-1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrl := New(db)
+	g, err := ctrl.Grant(ctx, GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2})
+	if err != nil {
+		t.Fatalf("expected the exact math.MaxInt64 boundary to be accepted, got %v", err)
+	}
+	if g.GrantVersion != math.MaxInt64 {
+		t.Errorf("expected successor version math.MaxInt64, got %d", g.GrantVersion)
+	}
+}
+
+// TestSupersedeRefusesVersionOverflowWithoutMutating and
+// TestSupersedeAcceptsVersionAtTheMaxInt64Boundary cover the same
+// NextVersion correction applied to supersede's successor computation
+// (shared by RenewTx and ReplaceTx), exercised here through the legacy
+// Controller.Renew wrapper. Unlike GrantTx's seed above, this needs a real
+// *active* current grant (supersede's first read is store.CurrentGrant), so
+// the seed uses store.InsertGrant directly.
+func TestSupersedeRefusesVersionOverflowWithoutMutating(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "supersede-overflow.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "c", "c", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertGrant(ctx, tx, store.Grant{
+		Conversation: "c", GrantVersion: math.MaxInt64, PeerAID: "a", PeerBID: "b",
+		Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrl := New(db)
+	if _, err := ctrl.Renew(ctx, RenewParams{Conversation: "c", MaxExchanges: 3}); err == nil {
+		t.Fatal("expected supersede to refuse a successor version past math.MaxInt64")
+	}
+
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	g, err := store.CurrentGrant(ctx, tx, "c")
+	if err != nil || g.GrantVersion != math.MaxInt64 || g.MaxExchanges != 2 {
+		t.Errorf("current grant changed by a refused renew: %+v: %v", g, err)
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE conversation='c'").Scan(&count); err != nil || count != 1 {
+		t.Errorf("history rows=%d: %v", count, err)
+	}
+}
+
+func TestSupersedeAcceptsVersionAtTheMaxInt64Boundary(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "supersede-boundary.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "c", "c", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertGrant(ctx, tx, store.Grant{
+		Conversation: "c", GrantVersion: math.MaxInt64 - 1, PeerAID: "a", PeerBID: "b",
+		Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrl := New(db)
+	g, err := ctrl.Renew(ctx, RenewParams{Conversation: "c", MaxExchanges: 3})
+	if err != nil {
+		t.Fatalf("expected the exact math.MaxInt64 boundary to be accepted, got %v", err)
+	}
+	if g.GrantVersion != math.MaxInt64 {
+		t.Errorf("expected successor version math.MaxInt64, got %d", g.GrantVersion)
 	}
 }
 
@@ -259,6 +437,25 @@ func TestGrantAndRenewRejectExpiryAtOrBeforeAuthorityInstant(t *testing.T) {
 		}
 		return r
 	}
+	// domainRejection mirrors internal/control/membership.go's own helper of
+	// the same name exactly (every real mutate callback wraps GrantTx/RenewTx
+	// errors through it): a store.Code error becomes a terminal
+	// CommandResult{Code: ...} with a nil Go error, which is what actually
+	// reaches Coordinator.Execute's terminalResult()/audit path below. Before
+	// this fix, grantMutate/renewMutate returned the raw Go error directly,
+	// so the boundary-rejection cases (boundaryID/renewBoundaryID) never
+	// exercised that durable-audit path at all -- unlike every real wire
+	// handler -- leaving their replay/conflict semantics completely
+	// untested. A local copy, not an import, per this codebase's established
+	// per-package convention (see internal/connection/provisioning.go and
+	// internal/control/membership.go's own identical duplication).
+	domainRejection := func(err error) (store.CommandResult, error) {
+		var code store.Code
+		if errors.As(err, &code) && code != "" {
+			return store.CommandResult{Code: code}, nil
+		}
+		return store.CommandResult{}, err
+	}
 	grantMutate := func(expiresAt time.Time, maxExchanges int64, capture **store.Grant) func(context.Context, *sql.Tx) (store.CommandResult, error) {
 		return func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
 			g, err := GrantTx(ctx, tx, GrantParams{
@@ -266,7 +463,7 @@ func TestGrantAndRenewRejectExpiryAtOrBeforeAuthorityInstant(t *testing.T) {
 				MaxExchanges: maxExchanges, ExpiresAt: &expiresAt,
 			})
 			if err != nil {
-				return store.CommandResult{}, err
+				return domainRejection(err)
 			}
 			if capture != nil {
 				*capture = g
@@ -280,10 +477,31 @@ func TestGrantAndRenewRejectExpiryAtOrBeforeAuthorityInstant(t *testing.T) {
 	}
 
 	// Equality-boundary rejection: expires_at == authority instant exactly,
-	// not merely before it.
+	// not merely before it. This is a terminal domain rejection (via
+	// domainRejection above), not a plain error -- Coordinator.Execute
+	// returns it as Result.Code with a nil Go error and durably audits it,
+	// exactly like a real membership.enroll wire call's rejection.
 	boundaryID := "20000000-0000-4000-8000-000000000001"
-	if _, err := db.Coordinator().Execute(ctx, principal, grantRequest(boundaryID, authority, 2), allowNoAuth, grantMutate(authority, 2, nil), nil); !errors.Is(err, store.RequestExpired) {
-		t.Fatalf("grant with expires_at == authority instant: got %v, want store.RequestExpired", err)
+	boundaryReceipt, err := db.Coordinator().Execute(ctx, principal, grantRequest(boundaryID, authority, 2), allowNoAuth, grantMutate(authority, 2, nil), nil)
+	if err != nil || boundaryReceipt.Result.Code != store.RequestExpired {
+		t.Fatalf("grant with expires_at == authority instant: got %+v %v, want store.RequestExpired", boundaryReceipt, err)
+	}
+	if len(boundaryReceipt.Result.Resources) != 0 {
+		t.Fatalf("a rejected grant must record no business effect, got %+v", boundaryReceipt.Result.Resources)
+	}
+
+	// Replay of the durably-recorded rejection: the identical operation_id
+	// and identical fields must return the same audit record without
+	// re-running GrantTx at all.
+	boundaryReplay, err := db.Coordinator().Execute(ctx, principal, grantRequest(boundaryID, authority, 2), allowNoAuth, neverInvoked, nil)
+	if err != nil || !boundaryReplay.Replayed || boundaryReplay.AuditID != boundaryReceipt.AuditID || boundaryReplay.Result.Code != store.RequestExpired {
+		t.Fatalf("boundary replay=%+v %v, want Replayed with AuditID=%q and Code=RequestExpired", boundaryReplay, err, boundaryReceipt.AuditID)
+	}
+
+	// Conflict against the same recorded rejection: same operation_id, a
+	// changed field (a different budget).
+	if _, err := db.Coordinator().Execute(ctx, principal, grantRequest(boundaryID, authority, 3), allowNoAuth, neverInvoked, nil); !errors.Is(err, store.OperationConflict) {
+		t.Fatalf("conflicting retry against a rejected boundary operation: got %v, want store.OperationConflict", err)
 	}
 
 	// Future acceptance, plus stored-timestamp consistency: the accepted
@@ -330,7 +548,7 @@ func TestGrantAndRenewRejectExpiryAtOrBeforeAuthorityInstant(t *testing.T) {
 		return func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
 			result, err := RenewTx(ctx, tx, RenewParams{Conversation: "c", MaxExchanges: maxExchanges, ExpiresAt: &expiresAt})
 			if err != nil {
-				return store.CommandResult{}, err
+				return domainRejection(err)
 			}
 			if capture != nil {
 				*capture = result
@@ -341,10 +559,24 @@ func TestGrantAndRenewRejectExpiryAtOrBeforeAuthorityInstant(t *testing.T) {
 
 	// Renew's own equality-boundary rejection, against the same fixed
 	// authority instant (still unmoved -- the recovery fixture's clock
-	// never advances on its own).
+	// never advances on its own). Same durable-audit shape as the grant
+	// boundary case above.
 	renewBoundaryID := "20000000-0000-4000-8000-000000000003"
-	if _, err := db.Coordinator().Execute(ctx, principal, renewRequest(renewBoundaryID, authority, 3), allowNoAuth, renewMutate(authority, 3, nil), nil); !errors.Is(err, store.RequestExpired) {
-		t.Fatalf("renew with expires_at == authority instant: got %v, want store.RequestExpired", err)
+	renewBoundaryReceipt, err := db.Coordinator().Execute(ctx, principal, renewRequest(renewBoundaryID, authority, 3), allowNoAuth, renewMutate(authority, 3, nil), nil)
+	if err != nil || renewBoundaryReceipt.Result.Code != store.RequestExpired {
+		t.Fatalf("renew with expires_at == authority instant: got %+v %v, want store.RequestExpired", renewBoundaryReceipt, err)
+	}
+	if len(renewBoundaryReceipt.Result.Resources) != 0 {
+		t.Fatalf("a rejected renew must record no business effect, got %+v", renewBoundaryReceipt.Result.Resources)
+	}
+
+	renewBoundaryReplay, err := db.Coordinator().Execute(ctx, principal, renewRequest(renewBoundaryID, authority, 3), allowNoAuth, neverInvoked, nil)
+	if err != nil || !renewBoundaryReplay.Replayed || renewBoundaryReplay.AuditID != renewBoundaryReceipt.AuditID || renewBoundaryReplay.Result.Code != store.RequestExpired {
+		t.Fatalf("renew boundary replay=%+v %v, want Replayed with AuditID=%q and Code=RequestExpired", renewBoundaryReplay, err, renewBoundaryReceipt.AuditID)
+	}
+
+	if _, err := db.Coordinator().Execute(ctx, principal, renewRequest(renewBoundaryID, authority, 4), allowNoAuth, neverInvoked, nil); !errors.Is(err, store.OperationConflict) {
+		t.Fatalf("conflicting retry against a rejected renew boundary operation: got %v, want store.OperationConflict", err)
 	}
 
 	// Renew's future acceptance and stored-timestamp consistency.

@@ -552,6 +552,50 @@ func TestMembershipRevokeRejectsInvalidUTF8BeforeDialing(t *testing.T) {
 	}
 }
 
+// TestMembershipEnrollRenewReplaceRejectOversizedConversationBeforeDialing
+// and TestMembershipEnrollAcceptsConversationAtTheMaxIdentityBytesBoundary
+// are the client-side half of MC-02/review-5255666571's length finding
+// (internal/control/membership.go's incompatibleConversation): an ASCII
+// conversation identifier longer than store.MaxIdentityBytes must be
+// refused locally, before ever dialing, exactly like the invalid-UTF-8 case
+// above -- not merely eventually rejected server-side after a round trip.
+// Revoke keeps its exact-key escape and is deliberately excluded (see the
+// bound's own comment in parseCommand).
+func TestMembershipEnrollRenewReplaceRejectOversizedConversationBeforeDialing(t *testing.T) {
+	oversized := strings.Repeat("x", store.MaxIdentityBytes+1)
+	for _, op := range []string{"enroll", "renew", "replace"} {
+		t.Run(op, func(t *testing.T) {
+			args := []string{"membership", op, "-conversation", oversized}
+			switch op {
+			case "enroll":
+				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2")
+			case "renew":
+				args = append(args, "-expected-grant-version", "1")
+			case "replace":
+				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b")
+			}
+			args = append(args, membershipEndpointArgs...)
+			var out, errOut bytes.Buffer
+			if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+				t.Fatalf("%s dialed for a %d-byte conversation: exit=%d %s", op, len(oversized), code, &errOut)
+			}
+		})
+	}
+}
+
+func TestMembershipEnrollAcceptsConversationAtTheMaxIdentityBytesBoundary(t *testing.T) {
+	boundary := strings.Repeat("x", store.MaxIdentityBytes)
+	fake := &fakeClient{}
+	var out, errOut bytes.Buffer
+	args := append([]string{"membership", "enroll", "-conversation", boundary, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2"}, membershipEndpointArgs...)
+	if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
+		t.Fatalf("expected a %d-byte conversation to be accepted: exit=%d %s", len(boundary), code, &errOut)
+	}
+	if fake.params["conversation"] != boundary {
+		t.Fatalf("conversation identity changed: %+v", fake.params)
+	}
+}
+
 // TestMembershipDialFailureReportsOperationalErrorNotArgumentError exercises
 // the production dialControlClient against a nonexistent socket path: a
 // real, deterministic dial failure (ENOENT), never a fake, mirroring

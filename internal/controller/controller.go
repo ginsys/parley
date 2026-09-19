@@ -104,18 +104,22 @@ func GrantTx(ctx context.Context, tx *sql.Tx, p GrantParams) (*store.Grant, erro
 	if p.ExpectedVersion != nil && *p.ExpectedVersion != latest {
 		return nil, store.StaleGrantVersion
 	}
-	if _, err := store.CurrentGrant(ctx, tx, p.Conversation); err == nil {
-		if p.ExpectedVersion != nil {
-			return nil, store.AlreadyActive
-		}
-		return nil, fmt.Errorf("conversation %q already has an active grant; use Renew", p.Conversation)
-	} else if !errors.Is(err, store.ErrNoActiveGrant) {
+	// Checked before any business-state mutation below (thread
+	// PRRT_kwDOUT1JT86j2RK8, root 4049498709): a bare latest+1 could wrap
+	// to a negative version if a conversation's history ever reached
+	// math.MaxInt64, silently minting an invalid grant_version instead of
+	// refusing. NextVersion is the same checked-arithmetic helper
+	// store.Coordinator.Execute already uses for its own sequence/revision
+	// counters (internal/store/coordinator.go); reusing it here keeps one
+	// overflow rule rather than a second, independently written one.
+	nextVersion, err := store.NextVersion(latest)
+	if err != nil {
 		return nil, err
 	}
 
 	g := store.Grant{
 		Conversation: p.Conversation,
-		GrantVersion: latest + 1,
+		GrantVersion: nextVersion,
 		PeerAID:      p.PeerAID,
 		PeerBID:      p.PeerBID,
 		Direction:    p.Direction,
@@ -311,6 +315,18 @@ func ReplaceTx(ctx context.Context, tx *sql.Tx, p ReplaceParams) (*SupersedeResu
 	if err != nil {
 		return nil, err
 	}
+	// Review 5255666571 (root 4053127303, thread PRRT_kwDOUT1JT86j_Wm8):
+	// RenewTx validates the conversation's current, already-stored peer IDs
+	// before superseding (see RenewTx above); this call was missing here,
+	// letting a byte-malformed legacy pair -- recorded before today's
+	// ASCII-compatibility rule existed -- be silently superseded by an
+	// otherwise-valid replacement instead of durably rejected the way a
+	// renewal of the same legacy grant already is. p.PeerAID/p.PeerBID
+	// (the caller's NEW replacement peers) are validated separately above,
+	// via validateGrant; this checks the OLD, stored peers being replaced.
+	if err := validatePeerIDs(current.PeerAID, current.PeerBID); err != nil {
+		return nil, err
+	}
 	return supersede(ctx, tx, current, p.Conversation, p.PeerAID, p.PeerBID, p.Direction,
 		p.MaxExchanges, p.ExpiresAt, p.CancelPendingReplies)
 }
@@ -387,6 +403,21 @@ func supersede(ctx context.Context, tx *sql.Tx, current *store.Grant, conversati
 	if err != nil {
 		return nil, err
 	}
+	// Checked before any business-state mutation below (thread
+	// PRRT_kwDOUT1JT86j2RK8, root 4049498709): the same NextVersion
+	// checked-arithmetic helper GrantTx now uses above, applied to
+	// supersede's own successor-version calculation, so a conversation
+	// history that has already reached math.MaxInt64 is refused rather
+	// than silently wrapping to a negative grant_version. Computed before
+	// SetGrantStatus marks the current grant superseded, so a refusal here
+	// leaves the current grant's status untouched inside this transaction
+	// (which the coordinator also rolls back wholesale on any mutate
+	// error, but the ordering itself documents that this check gates
+	// supersession, not merely storage).
+	newVersion, err := store.NextVersion(current.GrantVersion)
+	if err != nil {
+		return nil, err
+	}
 	now := authorityNow(ctx)
 	if err := store.SetGrantStatus(ctx, tx, conversation, current.GrantVersion, store.GrantSuperseded, now); err != nil {
 		return nil, err
@@ -398,7 +429,6 @@ func supersede(ctx context.Context, tx *sql.Tx, current *store.Grant, conversati
 	if expiresAt == nil {
 		nextExpiresAt = current.ExpiresAt
 	}
-	newVersion := current.GrantVersion + 1
 	next := store.Grant{
 		CancelPendingReplies: cancelPendingReplies,
 		Conversation:         conversation,

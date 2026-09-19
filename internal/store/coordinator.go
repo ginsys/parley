@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/google/uuid"
@@ -197,7 +198,39 @@ func (c *Coordinator) execute(ctx context.Context, p CommandPrincipal, r Command
 		return CommandReceipt{}, InvalidRequest
 	}
 	for _, resource := range result.Resources {
-		if len(resource.Kind) > 64 || bridgetext.ValidateMetadata(resource.Kind) != nil || len(resource.ID) > MaxIdentityBytes || bridgetext.ValidateMetadata(resource.ID) != nil || resource.Before < 0 || resource.After < 0 {
+		if len(resource.Kind) > 64 || bridgetext.ValidateMetadata(resource.Kind) != nil || resource.Before < 0 || resource.After < 0 {
+			return CommandReceipt{}, InvalidRequest
+		}
+		// The narrow, explicitly bounded legacy-revoke resource-ID
+		// exception (2026-09-19 lead approval): membership.revoke's own
+		// resource IDs are always the (possibly byte-malformed)
+		// conversation identifier revoke was asked to act on -- see
+		// internal/control/membership.go's handleMembershipRevoke, the
+		// only caller for this command kind, whose resource shape is fixed
+		// and never caller-influenced -- so relaxing the ID rule for
+		// exactly this one command kind cannot smuggle an oversized/
+		// non-ASCII identifier past the ordinary rule below for any other
+		// mutation. AGENTS.md's exact-key human revocation escape must
+		// remain able to durably report a legacy conversation identifier
+		// whose bytes never satisfied bridgetext.ValidateMetadata's ASCII
+		// rule or MaxIdentityBytes's ordinary bound, rather than silently
+		// substituting an opaque alias for it (see
+		// internal/control/membership.go's auditRepresentable, applied
+		// before Execute is even called -- the bound enforced here is the
+		// second, independent check on the actually-committed result).
+		// MaxLocatorBytes (not a new constant) is reused deliberately: the
+		// codebase's existing valid-UTF-8-but-not-identity-shaped bound
+		// (internal/store/registry.go's credential locators,
+		// internal/connection/provisioning.go's target locators) is
+		// exactly the "long, arbitrary but bounded and well-formed text"
+		// contract a legacy conversation identifier needs here too.
+		if r.kind == "membership.revoke" {
+			if len(resource.ID) > MaxLocatorBytes || !utf8.ValidString(resource.ID) {
+				return CommandReceipt{}, InvalidRequest
+			}
+			continue
+		}
+		if len(resource.ID) > MaxIdentityBytes || bridgetext.ValidateMetadata(resource.ID) != nil {
 			return CommandReceipt{}, InvalidRequest
 		}
 	}
