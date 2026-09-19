@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ginsys/parley/internal/control"
+	"github.com/ginsys/parley/internal/membership"
 	"github.com/ginsys/parley/internal/runtime"
 	"github.com/ginsys/parley/internal/store"
 )
@@ -30,6 +31,11 @@ type fakeClient struct {
 	params        map[string]any
 	err           error
 	calls, closed int
+	// emptyResult makes Call succeed (nil error, a real RPC round trip) but
+	// leave *out at its zero value -- MC-01.D's regression fixture: a
+	// structurally decoded but zero-valued/malformed receipt, distinct from
+	// a transport-level err.
+	emptyResult bool
 }
 
 func (f *fakeClient) Call(_ context.Context, method string, params map[string]any, out any) error {
@@ -39,10 +45,14 @@ func (f *fakeClient) Call(_ context.Context, method string, params map[string]an
 	if f.err != nil {
 		return f.err
 	}
+	if f.emptyResult {
+		return nil
+	}
 	if result, ok := out.(*control.CommandReceiptResult); ok {
 		*result = control.CommandReceiptResult{
-			AuditID:    "audit-1",
-			CommitView: control.CommitView{Epoch: "epoch-1", Revision: "1"},
+			AuditID:     "audit-1",
+			OperationID: "operation-1",
+			CommitView:  control.CommitView{Epoch: "epoch-1", Revision: "1"},
 		}
 	}
 	return nil
@@ -653,5 +663,79 @@ func TestHelloWriteFailureExitCodeSurvivesAnUnusableStderr(t *testing.T) {
 	code := run([]string{"hello", "-endpoint", endpoint, "-server-uid", uid}, fw, errFw, fatalIfOpened(t), noEnv)
 	if code != 1 {
 		t.Fatalf("exit=%d, want 1 even though the diagnostic write to stderr itself failed", code)
+	}
+}
+
+// TestPolicyWireOmitsEdgesForOpenAndLeadOnlyButIncludesForDirected is
+// MC-02's encode-side regression: membership.md's tagged union requires the
+// edges key to be present only for a directed policy -- an earlier version
+// of policyWire always emitted it, even as [] for open/lead_only, which the
+// server's own decodePolicy did not previously reject either (the two sides
+// silently agreed on a wire shape violation). Confirms the fix from the
+// wire-building side; internal/control/membership_test.go's decodePolicy
+// tests confirm the corresponding decode-side enforcement.
+func TestPolicyWireOmitsEdgesForOpenAndLeadOnlyButIncludesForDirected(t *testing.T) {
+	for _, p := range []membership.Policy{
+		{Kind: membership.PolicyOpen},
+		{Kind: membership.PolicyLeadOnly},
+	} {
+		wire := policyWire(p)
+		if _, present := wire["edges"]; present {
+			t.Fatalf("%s policy must omit edges entirely, got %#v", p.Kind, wire)
+		}
+	}
+	directed := policyWire(membership.Policy{Kind: membership.PolicyDirected, Edges: []membership.Edge{{From: "a", To: "b"}}})
+	edges, present := directed["edges"]
+	if !present {
+		t.Fatalf("directed policy must include edges, got %#v", directed)
+	}
+	if arr, ok := edges.([]any); !ok || len(arr) != 1 {
+		t.Fatalf("directed policy edges mismatch: %#v", edges)
+	}
+}
+
+// TestMembershipOutcomeUnknownRemoteErrorGetsSameRetryGuidanceAsTimeout is
+// MC-01.C's regression: store.Coordinator.Execute's own OutcomeUnknown
+// commit path surfaces to the client as a *control.RemoteError whose Domain
+// is outcome_unknown -- a genuinely unresolved outcome distinct from every
+// other *RemoteError (a proven domain rejection), and must get the same
+// retry-safe guidance as a client-side *control.TimeoutError, not fall into
+// the generic no-retry-guidance error branch.
+func TestMembershipOutcomeUnknownRemoteErrorGetsSameRetryGuidanceAsTimeout(t *testing.T) {
+	fake := &fakeClient{err: &control.RemoteError{Domain: control.DomainCode(store.OutcomeUnknown), Message: "commit outcome unresolved"}}
+	args := append([]string{"membership", "revoke", "-conversation", "fixture", "-expected-grant-version", "1"}, membershipEndpointArgs...)
+	var out, errOut bytes.Buffer
+	code := run(args, &out, &errOut, fakeDial(fake), noEnv)
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1", code)
+	}
+	msg := errOut.String()
+	if !strings.Contains(msg, "outcome unknown, not a proven failure") {
+		t.Fatalf("missing outcome-unknown qualifier: %s", msg)
+	}
+	if !strings.Contains(msg, "-operation-id") {
+		t.Fatalf("missing retry guidance: %s", msg)
+	}
+}
+
+// TestMembershipUnusableReceiptIsNotReportedAsSuccess is MC-01.D's
+// regression: a structurally decoded but zero-valued receipt (missing
+// audit_id/operation_id -- e.g. a caller's out pointer that a broken/
+// malicious peer never actually populated) must never be printed and
+// exited 0 as a proven completion.
+func TestMembershipUnusableReceiptIsNotReportedAsSuccess(t *testing.T) {
+	fake := &fakeClient{emptyResult: true}
+	args := append([]string{"membership", "revoke", "-conversation", "fixture", "-expected-grant-version", "1"}, membershipEndpointArgs...)
+	var out, errOut bytes.Buffer
+	code := run(args, &out, &errOut, fakeDial(fake), noEnv)
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1", code)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("an unusable receipt must not be printed as a result: %s", &out)
+	}
+	msg := errOut.String()
+	if !strings.Contains(msg, "unusable receipt") || !strings.Contains(msg, "-operation-id") {
+		t.Fatalf("missing unusable-receipt retry guidance: %s", msg)
 	}
 }

@@ -154,7 +154,13 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 			// -- from what -expires-at was given specifically to preserve.
 			c.expiresAt = parsed.UTC().Format(time.RFC3339Nano)
 		case c.expiresIn > 0:
-			c.expiresAt = time.Now().Add(c.expiresIn).UTC().Format(time.RFC3339)
+			// RFC3339Nano, matching -expires-at's own reformatting below: a
+			// sub-second -expires-in (e.g. "1500ms") would otherwise be
+			// truncated to whole seconds here, then reproduced without that
+			// truncation by a later retry that pins the reported value via
+			// -expires-at -- two different wire digests for what a human
+			// intends as the same retried command.
+			c.expiresAt = time.Now().Add(c.expiresIn).UTC().Format(time.RFC3339Nano)
 		}
 	}
 	if c.op == "enroll" || c.op == "replace" {
@@ -262,24 +268,53 @@ func runMembership(args []string, stdout, stderr io.Writer, dial dialFunc, geten
 	defer cancelCall()
 	var result control.CommandReceiptResult
 	if err := client.Call(callCtx, "membership."+c.op, params, &result); err != nil {
+		// c.expiresAt is already the resolved absolute value (from either
+		// -expires-in or -expires-at) -- pinning it via -expires-at on
+		// retry keeps the digest identical even if the retry is issued well
+		// after the original -expires-in would have resolved to a
+		// different instant.
+		retry := fmt.Sprintf("-operation-id %s", operationID)
+		if c.expiresAt != "" {
+			retry += fmt.Sprintf(" -expires-at %s", c.expiresAt)
+		}
 		var timeout *control.TimeoutError
-		if errors.As(err, &timeout) {
-			retry := fmt.Sprintf("-operation-id %s", operationID)
-			if c.expiresAt != "" {
-				// c.expiresAt is already the resolved absolute value (from
-				// either -expires-in or -expires-at) -- pinning it via
-				// -expires-at on retry keeps the digest identical even if
-				// the retry is issued well after the original -expires-in
-				// would have resolved to a different instant.
-				retry += fmt.Sprintf(" -expires-at %s", c.expiresAt)
-			}
+		var remote *control.RemoteError
+		switch {
+		case errors.As(err, &timeout):
 			fmt.Fprintf(stderr, "parleyctl membership %s: %v -- retry with %s\n", c.op, err, retry)
-		} else {
+		case errors.As(err, &remote) && remote.Domain == control.DomainCode(store.OutcomeUnknown):
+			// The server itself could not determine whether its commit
+			// took effect (store.Coordinator.Execute's own OutcomeUnknown
+			// path) -- exactly as unresolved as a client-side *TimeoutError,
+			// and retried the identical way, not reported as a proven
+			// rejection the way every other *RemoteError below it is.
+			fmt.Fprintf(stderr, "parleyctl membership %s: %v (outcome unknown, not a proven failure) -- retry with %s\n", c.op, err, retry)
+		default:
 			fmt.Fprintf(stderr, "parleyctl membership %s: %v\n", c.op, err)
 		}
 		return 1
 	}
-	printMembershipResult(stdout, c, operationID, result)
+	if !result.Usable() {
+		// A structurally well-formed but zero-valued/malformed receipt --
+		// missing audit_id or operation_id -- must never be printed and
+		// exited 0 as if the mutation had definitely completed; the safe
+		// treatment is identical to an unresolved outcome, not a proven
+		// success.
+		retry := fmt.Sprintf("-operation-id %s", operationID)
+		if c.expiresAt != "" {
+			retry += fmt.Sprintf(" -expires-at %s", c.expiresAt)
+		}
+		fmt.Fprintf(stderr, "parleyctl membership %s: server returned an unusable receipt (outcome unknown, not a proven failure) -- retry with %s\n", c.op, retry)
+		return 1
+	}
+	if err := printMembershipResult(stdout, c, operationID, result); err != nil {
+		// The mutation itself already succeeded by this point -- a failure
+		// writing its receipt is a distinct, later failure and must not be
+		// reported as if the mutation itself were unresolved or rejected
+		// (mirrors runHello's identical printHello contract).
+		fmt.Fprintf(stderr, "parleyctl membership %s: writing result: %v\n", c.op, err)
+		return 1
+	}
 	return 0
 }
 
@@ -347,23 +382,51 @@ func membersWire(members []membership.Member) []any {
 	return out
 }
 
+// policyWire encodes the tagged-union policy object per membership.md: the
+// edges field is present only for a directed policy, never sent as a
+// present-but-empty array for open/lead_only. An earlier version of this
+// function always emitted "edges", even [] for an open policy -- a wire
+// shape violation the server's own decodePolicy did not previously reject
+// either, so the two sides silently agreed on an incorrect wire shape.
 func policyWire(p membership.Policy) map[string]any {
-	edges := make([]any, len(p.Edges))
-	for i, e := range p.Edges {
-		edges[i] = map[string]any{"from": e.From, "to": e.To}
+	wire := map[string]any{"kind": string(p.Kind)}
+	if p.Kind == membership.PolicyDirected {
+		edges := make([]any, len(p.Edges))
+		for i, e := range p.Edges {
+			edges[i] = map[string]any{"from": e.From, "to": e.To}
+		}
+		wire["edges"] = edges
 	}
-	return map[string]any{"kind": string(p.Kind), "edges": edges}
+	return wire
 }
 
 // printMembershipResult renders a command receipt deterministically -- one
 // field per line, in a fixed order, never a dumped map (matching hello's
 // own printHello convention).
-func printMembershipResult(w io.Writer, c command, operationID string, result control.CommandReceiptResult) {
-	fmt.Fprintf(w, "membership %s %q: operation_id %s\n", c.op, c.conversation, operationID)
-	fmt.Fprintf(w, "  audit_id %s, commit_epoch %s, commit_revision %s\n", result.AuditID, result.CommitView.Epoch, result.CommitView.Revision)
-	for _, r := range result.Result.Resources {
-		fmt.Fprintf(w, "  %s %s: %s -> %s\n", r.Kind, r.ID, r.Before, r.After)
+// printMembershipResult renders a command receipt deterministically -- one
+// field per line, in a fixed order, never a dumped map (matching hello's
+// own printHello convention) -- and returns the first write error
+// encountered, if any (mandate S15-1/MC-01): the mutation itself already
+// succeeded by the time this is called, so a failure here is a distinct,
+// later delivery failure and must never be silently dropped behind a zero
+// exit status. r.ID is rendered with %q, not %s: a resource identifier
+// (the conversation, or auditResourceID's legacy-sha256 alias) is an exact
+// key that may carry leading/trailing whitespace, which %q makes visible
+// the same way parseCommand's own identifier quoting does.
+func printMembershipResult(w io.Writer, c command, operationID string, result control.CommandReceiptResult) error {
+	lines := []string{
+		fmt.Sprintf("membership %s %q: operation_id %s\n", c.op, c.conversation, operationID),
+		fmt.Sprintf("  audit_id %s, commit_epoch %s, commit_revision %s\n", result.AuditID, result.CommitView.Epoch, result.CommitView.Revision),
 	}
+	for _, r := range result.Result.Resources {
+		lines = append(lines, fmt.Sprintf("  %s %q: %s -> %s\n", r.Kind, r.ID, r.Before, r.After))
+	}
+	for _, line := range lines {
+		if _, err := io.WriteString(w, line); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // runHello is the client-side diagnostic added in mandate PR1 §4.D: it

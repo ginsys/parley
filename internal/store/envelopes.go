@@ -279,6 +279,7 @@ func CanCarryReply(ctx context.Context, tx *sql.Tx, e *Envelope, target int64) (
 		return false, err
 	}
 	defer rows.Close()
+	var seen int64
 	for rows.Next() {
 		var version int64
 		var peerA, peerB string
@@ -288,6 +289,7 @@ func CanCarryReply(ctx context.Context, tx *sql.Tx, e *Envelope, target int64) (
 		if err := rows.Scan(&version, &peerA, &peerB, &direction, &status, &cancelPending); err != nil {
 			return false, err
 		}
+		seen++
 		if status == GrantRevoked {
 			return false, nil
 		}
@@ -304,7 +306,23 @@ func CanCarryReply(ctx context.Context, tx *sql.Tx, e *Envelope, target int64) (
 			return false, nil
 		}
 	}
-	return true, rows.Err()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	// Every version in [e.GrantVersion, target] must actually exist as a
+	// row, not merely every RETURNED row pass its own per-version checks:
+	// a gap in that range (grant_version rows are never deleted, but this
+	// must not silently assume that) would otherwise let the loop above
+	// see only the surviving versions on either side of the gap and permit
+	// a carry through an unaccounted-for intervening version whose own
+	// direction/revocation/cancel-pending state was never actually
+	// checked. seen counts exactly the rows the query returned; comparing
+	// it against the expected contiguous count is a correctness proof
+	// this row set is actually complete, not an assumption that it is.
+	if want := target - e.GrantVersion + 1; seen != want {
+		return false, nil
+	}
+	return true, nil
 }
 
 // SettleDispatch is conditional on the exact attempt, preventing an old

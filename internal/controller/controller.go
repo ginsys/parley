@@ -93,7 +93,7 @@ func GrantTx(ctx context.Context, tx *sql.Tx, p GrantParams) (*store.Grant, erro
 	if err := validateGrant(p); err != nil {
 		return nil, err
 	}
-	now := nowRFC3339()
+	now := authorityNow(ctx)
 	if err := store.EnsureConversation(ctx, tx, p.Conversation, p.Conversation, now); err != nil {
 		return nil, err
 	}
@@ -202,7 +202,7 @@ func RevokeTx(ctx context.Context, tx *sql.Tx, conversation string, expectedVers
 		return nil, err
 	}
 
-	now := nowRFC3339()
+	now := authorityNow(ctx)
 	if err := store.SetGrantStatus(ctx, tx, conversation, g.GrantVersion, store.GrantRevoked, now); err != nil {
 		return nil, err
 	}
@@ -251,7 +251,7 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 	if err := rejectRecoveryOwner(ctx, tx); err != nil {
 		return nil, err
 	}
-	g, err := RenewTx(ctx, tx, p)
+	result, err := RenewTx(ctx, tx, p)
 	if err != nil {
 		return nil, err
 	}
@@ -259,11 +259,11 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 		return nil, err
 	}
 	committed = true
-	return g, nil
+	return result.Grant, nil
 }
 
 // RenewTx is Renew's actual body, taking an already-open transaction.
-func RenewTx(ctx context.Context, tx *sql.Tx, p RenewParams) (*store.Grant, error) {
+func RenewTx(ctx context.Context, tx *sql.Tx, p RenewParams) (*SupersedeResult, error) {
 	if err := validateRenewalInput(p.Conversation, p.MaxExchanges, p.ExpiresAt); err != nil {
 		return nil, err
 	}
@@ -300,7 +300,7 @@ type ReplaceParams struct {
 // Replace: this operation has no CLI predecessor, only internal/control's
 // membership.replace handler calls it, always inside a coordinator
 // transaction, always with a concrete ExpectedVersion.
-func ReplaceTx(ctx context.Context, tx *sql.Tx, p ReplaceParams) (*store.Grant, error) {
+func ReplaceTx(ctx context.Context, tx *sql.Tx, p ReplaceParams) (*SupersedeResult, error) {
 	if err := validateRenewalInput(p.Conversation, p.MaxExchanges, p.ExpiresAt); err != nil {
 		return nil, err
 	}
@@ -335,14 +335,26 @@ func currentGrantExpecting(ctx context.Context, tx *sql.Tx, conversation string,
 	return current, nil
 }
 
+// SupersedeResult is Renew/Replace's shared result: the successor grant plus
+// the exact counts of what happened to the predecessor's queued envelopes,
+// mirroring RevokeResult's own three-way split so a renew/replace receipt
+// can report its lifecycle effect just as precisely as revoke's does,
+// instead of silently discarding CarryForwardQueuedReplies/
+// CancelQueuedUnderVersion's own return counts.
+type SupersedeResult struct {
+	Grant     *store.Grant
+	Carried   int64
+	Cancelled int64
+}
+
 // supersede is Renew/Replace's shared version-bump body: mark the current
 // active grant superseded, insert its successor with the given peers/
 // direction/budget/expiry, then carry forward eligible queued trusted
 // replies before cancelling whatever else is left queued under the old
 // version. Called only after the caller's own validation and version check.
 func supersede(ctx context.Context, tx *sql.Tx, current *store.Grant, conversation, peerA, peerB string, direction store.Direction,
-	maxExchanges int64, expiresAt *time.Time, cancelPendingReplies bool) (*store.Grant, error) {
-	now := nowRFC3339()
+	maxExchanges int64, expiresAt *time.Time, cancelPendingReplies bool) (*SupersedeResult, error) {
+	now := authorityNow(ctx)
 	if err := store.SetGrantStatus(ctx, tx, conversation, current.GrantVersion, store.GrantSuperseded, now); err != nil {
 		return nil, err
 	}
@@ -377,14 +389,16 @@ func supersede(ctx context.Context, tx *sql.Tx, current *store.Grant, conversati
 	// own membership/edge re-check (against the just-inserted successor's
 	// stored peers/direction) is what correctly cancels a reply instead of
 	// carrying it when Replace denies or removes its edge.
-	if _, err := store.CarryForwardQueuedReplies(ctx, tx, conversation, current.GrantVersion, newVersion, now); err != nil {
+	carried, err := store.CarryForwardQueuedReplies(ctx, tx, conversation, current.GrantVersion, newVersion, now)
+	if err != nil {
 		return nil, err
 	}
-	if _, err := store.CancelQueuedUnderVersion(ctx, tx, conversation, current.GrantVersion, now); err != nil {
+	cancelled, err := store.CancelQueuedUnderVersion(ctx, tx, conversation, current.GrantVersion, now)
+	if err != nil {
 		return nil, err
 	}
 	next.Status = store.GrantActive
-	return &next, nil
+	return &SupersedeResult{Grant: &next, Carried: carried, Cancelled: cancelled}, nil
 }
 
 // validateRenewalInput is Renew/Replace's shared conversation/budget/expiry
@@ -412,8 +426,21 @@ func countByState(ctx context.Context, tx *sql.Tx, conversation string, state st
 	return n, nil
 }
 
-func nowRFC3339() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
+// authorityNow returns store.Coordinator.Execute's single writer-validated
+// instant when one is installed on ctx (every coordinator-driven mutation
+// callback: internal/control's membership.enroll/renew/replace/revoke
+// handlers), falling back to the process wall clock only for a caller with
+// no coordinator context (the legacy self-opening Grant/Revoke/Renew
+// wrappers above). Before this, GrantTx/RevokeTx/supersede each minted
+// their own independent time.Now() sample even when called from inside a
+// coordinator transaction that had already resolved and validated a single
+// authoritative instant for the whole command -- letting a single
+// membership.enroll's EnabledPeer check and its own grant's granted_at
+// timestamp disagree about "now". store.AuthorityTime is the same time
+// authority internal/control/membership.go's handlers already use for
+// their own EnabledPeer checks.
+func authorityNow(ctx context.Context) string {
+	return store.AuthorityTime(ctx, func() time.Time { return time.Now() }).UTC().Format(time.RFC3339Nano)
 }
 
 func formatOptionalTime(t *time.Time) *string {

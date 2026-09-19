@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ginsys/parley/internal/bridgetext"
@@ -23,12 +24,24 @@ import (
 // this file owns wire decode/digest/response shape only, never grant
 // business logic of its own.
 //
-// authorize is a trivial no-op for every method here: administrators carry
-// no retirement lifecycle in the current schema (only bindings/connections
-// do, via retired_namespaces -- see internal/store/restore_disposition.go),
-// and the automatic recovery-hold gate (store.Coordinator.Execute's
-// h.Before call) already blocks every membership.* kind during a global
-// hold, since none of them appear in recovery.humanRecovery's allowlist.
+// authorize is a trivial no-op for every method here, not because
+// administrators are exempt from retirement enforcement, but because that
+// enforcement already happens one layer up and does not need repeating:
+// store.Coordinator.Execute installs the calling principal into ctx before
+// authorize ever runs, and its own transactionContext/Before hook path
+// (internal/recovery/service.go) unconditionally checks that principal
+// against retired_namespaces for every kind absent from
+// recovery.humanRecovery's allowlist -- which every membership.* kind is.
+// A retired administrator is therefore already refused before authorize is
+// reached, the same automatic check internal/connection/lifecycle.go's
+// legacy.disposition/hold.disposition and internal/recovery/restore.go's
+// recovery.complete rely on for the mutation-eligibility half of their own
+// explicit store.CheckRetiredMutation calls -- those calls exist only
+// because their kinds are humanRecovery-exempt and so skip the automatic
+// hook check; membership.* kinds are not exempt, so no explicit call is
+// needed here. This authorize therefore only needs to exist to satisfy
+// Execute's non-nil precondition -- it is deliberately not a second,
+// redundant retirement check.
 func noopAuthorize(context.Context, *sql.Tx) error { return nil }
 
 // auditResourceID returns id verbatim when it satisfies
@@ -70,23 +83,43 @@ func mutationResponse(id string, receipt store.CommandReceipt, err error) Respon
 		return domainErrorResponse(&id, DomainCode(receipt.Result.Code))
 	}
 	return successResponse(id, CommandReceiptResult{
-		Result:     toWireCommandResult(receipt.Result),
-		AuditID:    receipt.AuditID,
-		CommitView: CommitView{Epoch: receipt.View.Epoch, Revision: strconv.FormatInt(receipt.View.Revision, 10)},
+		Result:      toWireCommandResult(receipt.Result),
+		AuditID:     receipt.AuditID,
+		OperationID: receipt.OperationID,
+		CommitView:  CommitView{Epoch: receipt.View.Epoch, Revision: strconv.FormatInt(receipt.View.Revision, 10)},
 	})
 }
 
 // CommandReceiptResult is the successful wire result shape shared by every
 // membership mutation: a command receipt per control.md's "Command
-// atomicity, idempotency and audit" section. There is no separate
-// operation_id field -- the response's own JSON-RPC id already echoes the
-// request's operation_id (see paramOperationID/dispatch below), so
-// republishing it inside the result would be a second, independently
-// driftable copy of the same value.
+// atomicity, idempotency and audit" section.
+//
+// OperationID echoes the exact operation_id this receipt was durably
+// recorded under (store.CommandReceipt.OperationID). It is not redundant
+// with the response's own JSON-RPC id: that id is a separate, per-connection
+// incrementing correlation number (see internal/control/client.go's
+// Client.nextID), never the operation UUID a caller supplied in
+// params.operation_id -- an earlier version of this doc comment incorrectly
+// claimed otherwise. Without this field a caller has no way to confirm,
+// from the receipt alone, which operation_id the server actually recorded
+// this result under.
 type CommandReceiptResult struct {
-	Result     wireCommandResult `json:"result"`
-	AuditID    string            `json:"audit_id"`
-	CommitView CommitView        `json:"commit_view"`
+	Result      wireCommandResult `json:"result"`
+	AuditID     string            `json:"audit_id"`
+	OperationID string            `json:"operation_id"`
+	CommitView  CommitView        `json:"commit_view"`
+}
+
+// Usable reports whether r looks like a genuine command receipt rather than
+// a zero-valued or otherwise malformed one that happened to decode without
+// a transport error -- AuditID/OperationID are always nonempty on every
+// receipt this server actually produces (mutationResponse only reaches
+// successResponse after a real store.Coordinator.Execute call), so an
+// empty value here means the response bytes did not carry a real receipt
+// at all. A caller must never treat r as a proven successful completion
+// without checking this first.
+func (r CommandReceiptResult) Usable() bool {
+	return r.AuditID != "" && r.OperationID != ""
 }
 
 // toWireCommandResult re-encodes a live store.CommandResult with
@@ -125,6 +158,9 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (R
 	p, ok := decodeEnrollParams(req.Params)
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	if err := bridgetext.ValidateMetadata(p.conversation); err != nil {
+		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
 	model := membership.Model{Members: p.members, Policy: p.policy}
 	// membership.Validate must run before membersField/NewCommandRequest:
@@ -203,6 +239,9 @@ func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Re
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
+	if err := bridgetext.ValidateMetadata(p.conversation); err != nil {
+		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
+	}
 	fields := renewalFields(p.conversation, p.expectedVersion, p.maxExchanges, p.expiresAtText, p.cancelPendingReplies)
 	request, err := store.NewCommandRequest("membership.renew", p.operationID, fields...)
 	if err != nil {
@@ -211,14 +250,18 @@ func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Re
 	expectedVersion := p.expectedVersion
 	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
 		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
-			g, err := controller.RenewTx(ctx, tx, controller.RenewParams{
+			result, err := controller.RenewTx(ctx, tx, controller.RenewParams{
 				CancelPendingReplies: p.cancelPendingReplies, Conversation: p.conversation,
 				MaxExchanges: p.maxExchanges, ExpiresAt: p.expiresAt, ExpectedVersion: &expectedVersion,
 			})
 			if err != nil {
 				return domainRejection(err)
 			}
-			return store.CommandResult{Resources: []store.ResourceChange{{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: g.GrantVersion}}}, nil
+			return store.CommandResult{Resources: []store.ResourceChange{
+				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: result.Grant.GrantVersion},
+				{Kind: "queued_carried", ID: p.conversation, After: result.Carried},
+				{Kind: "queued_cancelled", ID: p.conversation, After: result.Cancelled},
+			}}, nil
 		}, nil)
 	return mutationResponse(req.ID, receipt, err), false
 }
@@ -228,6 +271,9 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 	p, ok := decodeReplaceParams(req.Params)
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
+	}
+	if err := bridgetext.ValidateMetadata(p.conversation); err != nil {
+		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
 	model := membership.Model{Members: p.members, Policy: p.policy}
 	// See handleMembershipEnroll's identical comment: Validate must run
@@ -259,7 +305,7 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 			if _, err := store.EnabledPeer(ctx, tx, peerB, now); err != nil {
 				return domainRejection(err)
 			}
-			g, err := controller.ReplaceTx(ctx, tx, controller.ReplaceParams{
+			result, err := controller.ReplaceTx(ctx, tx, controller.ReplaceParams{
 				CancelPendingReplies: p.cancelPendingReplies, Conversation: p.conversation,
 				PeerAID: peerA, PeerBID: peerB, Direction: direction,
 				MaxExchanges: p.maxExchanges, ExpiresAt: p.expiresAt, ExpectedVersion: &expectedVersion,
@@ -267,7 +313,11 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 			if err != nil {
 				return domainRejection(err)
 			}
-			return store.CommandResult{Resources: []store.ResourceChange{{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: g.GrantVersion}}}, nil
+			return store.CommandResult{Resources: []store.ResourceChange{
+				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: result.Grant.GrantVersion},
+				{Kind: "queued_carried", ID: p.conversation, After: result.Carried},
+				{Kind: "queued_cancelled", ID: p.conversation, After: result.Cancelled},
+			}}, nil
 		}, nil)
 	return mutationResponse(req.ID, receipt, err), false
 }
@@ -342,16 +392,27 @@ func policyField(p membership.Policy) store.Field {
 // and by validateGrant/validateRenewalInput inside internal/controller for
 // the top-level conversation field -- this file only checks JSON shape
 // (right key set, right JSON type per field) and produces InvalidParams
-// for a violation. A wire request whose conversation identifier bytes are
-// malformed still reaches controller.GrantTx/RenewTx/ReplaceTx, which
-// reject it with a plain Go error rather than a store.Code; domainRejection
-// then propagates that as an infrastructure-style failure (whole
-// transaction rolled back, TemporarilyUnavailable on the wire) rather than
-// a clean audited rejection. Pre-validating it here would let a malformed
-// conversation identifier degrade to a wrong domain code instead of a
-// wrong transport code; recorded as a known limitation rather than guessed
-// at, since neither control.md nor membership.md assign conversation-byte-
-// shape violations a specific domain code.
+// for a violation.
+//
+// The top-level conversation field is the one exception: enroll/renew/
+// replace each apply bridgetext.ValidateMetadata to p.conversation
+// themselves, immediately after decode and before building the digest
+// fields or calling Execute, and return a deterministic IncompatibleIdentifier
+// rejection rather than letting a malformed identifier reach
+// controller.GrantTx/RenewTx/ReplaceTx -- which reject it with a plain Go
+// error, not a store.Code, and would otherwise degrade to an
+// infrastructure-style TemporarilyUnavailable via domainRejection's
+// fallback. Like membership.Validate's invalid_membership check above, this
+// runs before store.NewCommandRequest/Execute, so it is not durably audited
+// through operation_results/command_audit -- the same known asymmetry
+// (see handleMembershipEnroll's comment): a retry with the same
+// operation_id and a still-malformed conversation re-runs this exact check
+// and gets the same IncompatibleIdentifier response every time, with no
+// OperationConflict risk. handleMembershipRevoke deliberately does not
+// apply this check: AGENTS.md's exact-key human revocation escape must
+// remain reachable for a byte-malformed historical conversation identifier
+// (see auditResourceID's own doc comment for the matching audit-side
+// accommodation).
 
 type enrollParams struct {
 	operationID     string
@@ -533,6 +594,20 @@ func decodeMembers(raw any) ([]membership.Member, bool) {
 	return members, true
 }
 
+// decodePolicy enforces the tagged union's field-presence rule, not merely
+// its decoded content: membership.md's policy object carries an edges field
+// only when kind is "directed" -- open/lead_only must omit the key
+// entirely, never send it present-but-empty. Checking only decoded length
+// (as an earlier version of this function did) cannot tell "edges omitted"
+// and "edges sent as an empty array" apart, since both produce a
+// zero-length Go slice -- letting a client wire an open/lead_only policy
+// with a stray "edges":[] pass decode unnoticed, silently accepted by
+// membership.Validate's own len(Edges)==0 check even though the wire shape
+// itself violated the tagged union. A directed policy conversely requires
+// the key present (even an empty array is a syntactically valid directed
+// policy at this layer; membership.Supported separately treats a
+// zero/multi-edge directed policy as unsupported_membership, a domain
+// rejection, not a decode failure).
 func decodePolicy(raw any) (membership.Policy, bool) {
 	obj, ok := raw.(map[string]any)
 	if !ok || !paramKeysAllowed(obj, "kind", "edges") {
@@ -542,43 +617,77 @@ func decodePolicy(raw any) (membership.Policy, bool) {
 	if !ok {
 		return membership.Policy{}, false
 	}
-	var edges []membership.Edge
-	if edgesRaw, present := obj["edges"]; present {
-		arr, ok := edgesRaw.([]any)
+	kind := membership.PolicyKind(kindStr)
+	edgesRaw, present := obj["edges"]
+	switch kind {
+	case membership.PolicyOpen, membership.PolicyLeadOnly:
+		if present {
+			return membership.Policy{}, false
+		}
+		return membership.Policy{Kind: kind}, true
+	case membership.PolicyDirected:
+		if !present {
+			return membership.Policy{}, false
+		}
+	default:
+		// An unrecognized kind is membership.Validate's rejection to make
+		// (invalid_membership, a domain code), not this decoder's -- letting
+		// edges be either present or absent here avoids a wire-level
+		// InvalidParams masking that intended domain rejection.
+		return membership.Policy{Kind: kind}, true
+	}
+	arr, ok := edgesRaw.([]any)
+	if !ok {
+		return membership.Policy{}, false
+	}
+	edges := make([]membership.Edge, len(arr))
+	for i, item := range arr {
+		eobj, ok := item.(map[string]any)
+		if !ok || !paramKeysAllowed(eobj, "from", "to") {
+			return membership.Policy{}, false
+		}
+		from, ok := paramString(eobj, "from")
 		if !ok {
 			return membership.Policy{}, false
 		}
-		edges = make([]membership.Edge, len(arr))
-		for i, item := range arr {
-			eobj, ok := item.(map[string]any)
-			if !ok || !paramKeysAllowed(eobj, "from", "to") {
-				return membership.Policy{}, false
-			}
-			from, ok := paramString(eobj, "from")
-			if !ok {
-				return membership.Policy{}, false
-			}
-			to, ok := paramString(eobj, "to")
-			if !ok {
-				return membership.Policy{}, false
-			}
-			edges[i] = membership.Edge{From: from, To: to}
+		to, ok := paramString(eobj, "to")
+		if !ok {
+			return membership.Policy{}, false
 		}
+		edges[i] = membership.Edge{From: from, To: to}
 	}
-	return membership.Policy{Kind: membership.PolicyKind(kindStr), Edges: edges}, true
+	return membership.Policy{Kind: kind, Edges: edges}, true
 }
 
+// paramOptionalExpiresAt decodes and validates the wire profile's permitted
+// expires_at form and range (control.md's RFC3339-UTC timestamp codec).
+// Form: RFC3339Nano syntax (fractional seconds permitted, per parleyctl's
+// own -expires-at retry-safe path in cmd/parleyctl/main.go) and a literal
+// "Z" UTC suffix -- a numeric zone offset is rejected outright rather than
+// normalized. Accepting an offset and silently converting it (as an earlier
+// version of parleyctl's own -expires-at flag parsing did on the client
+// side) would make the wire byte string that store.NewCommandRequest digests
+// depend on which equivalent-instant spelling happened to be sent, rather
+// than on the instant itself -- exactly the property a same-operation-id
+// retry's digest must not depend on. Range: store.InstantNanos, the same
+// bound store.Coordinator.Execute itself applies to its own authority
+// instant, so an expiry outside the range a stored nanosecond timestamp can
+// represent is rejected here rather than surfacing later as a storage
+// failure.
 func paramOptionalExpiresAt(params map[string]any) (*time.Time, string, bool) {
 	raw, present := params["expires_at"]
 	if !present {
 		return nil, "", true
 	}
 	s, ok := raw.(string)
-	if !ok {
+	if !ok || !strings.HasSuffix(s, "Z") {
 		return nil, "", false
 	}
-	t, err := time.Parse(time.RFC3339, s)
+	t, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
+		return nil, "", false
+	}
+	if _, err := store.InstantNanos(t); err != nil {
 		return nil, "", false
 	}
 	return &t, s, true

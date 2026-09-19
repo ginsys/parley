@@ -44,7 +44,15 @@ const (
 // (constant conversions of the store.Code values) purely so control-package
 // callers keep one vocabulary to write against; store.Code(d).Valid() in
 // DomainCode.valid() below already accepts them without a separate case.
-// IncompatibleIdentifier stays control-only: no PR2 method returns it.
+// IncompatibleIdentifier stays control-only, not a store.Code: it is
+// returned directly by handleMembershipEnroll/Renew/Replace's own
+// bridgetext.ValidateMetadata pre-check on the conversation field (a wire
+// decode-adjacent rejection, never durably recorded through
+// operation_results/command_audit, mirroring invalid_membership's own
+// pre-Execute asymmetry), never by a store.Coordinator.Execute mutation
+// itself -- so it does not belong in store.Code's durable terminal-result
+// vocabulary alongside StaleGrantVersion/InvalidMembership/
+// UnsupportedMembership above.
 type DomainCode string
 
 const (
