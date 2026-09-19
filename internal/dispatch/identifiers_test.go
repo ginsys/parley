@@ -106,8 +106,28 @@ func TestIncompatibleHistoryRejectsNewWorkWithoutMutation(t *testing.T) {
 				beforeG, beforeE, beforeN := identifierState(t, db, c)
 				tr := newFakeTransport()
 				bridge := bridgefixture.New(t, db, tr)
-				if _, err := controller.New(db).Renew(ctx, controller.RenewParams{Conversation: c, MaxExchanges: 5}); !errors.Is(err, bridgetext.ErrInvalidMetadata) {
-					t.Errorf("renew: %v", err)
+				_, renewErr := controller.New(db).Renew(ctx, controller.RenewParams{Conversation: c, MaxExchanges: 5})
+				if field == 0 {
+					// The malformed value is the conversation identifier
+					// itself: validateRenewalInput's own
+					// bridgetext.ValidateMetadata(conversation) check runs
+					// first and still wraps bridgetext.ErrInvalidMetadata,
+					// unchanged by MC-02/C1 (that fix only touches the
+					// stored peer-ID path below).
+					if !errors.Is(renewErr, bridgetext.ErrInvalidMetadata) {
+						t.Errorf("renew: %v", renewErr)
+					}
+				} else {
+					// The malformed value is one of the conversation's
+					// already-stored historical peer IDs: validatePeerIDs
+					// now rejects with the durable, audited
+					// store.IncompatibleIdentifier terminal code (MC-02/C1)
+					// rather than a plain wrapped bridgetext.ErrInvalidMetadata
+					// -- see validatePeerIDs's own doc comment
+					// (internal/controller/controller.go).
+					if !errors.Is(renewErr, store.IncompatibleIdentifier) {
+						t.Errorf("renew: %v", renewErr)
+					}
 				}
 				// Keep the private author valid; place each incompatible key in
 				// the real request so fixture enrollment cannot mask rejection.

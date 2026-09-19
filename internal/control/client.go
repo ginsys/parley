@@ -303,7 +303,21 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]any,
 	if out == nil || len(resp.Result) == 0 {
 		return nil
 	}
-	return json.Unmarshal(resp.Result, out)
+	if err := json.Unmarshal(resp.Result, out); err != nil {
+		// The envelope itself was well-formed and ID-matched -- the request
+		// was received, acted on, and the server reported success -- but
+		// decoding its result into the caller's out value failed (e.g. a
+		// shape the caller's type does not expect). This is not a proven
+		// non-mutation any more than the read/decode failures above are: the
+		// mutation may well have committed, only its confirmation could not
+		// be understood here. Classified as an unresolved outcome via
+		// wrapTimeout, not returned bare, for the same reason as every
+		// other decode failure in this function (mandate T2/CP-02). The
+		// connection's own framing is intact (a complete, matching response
+		// was read), so it is not marked broken here.
+		return wrapTimeout(fmt.Errorf("control: malformed result: %w", err))
+	}
+	return nil
 }
 
 // formatResponseID renders resp.ID for a diagnostic message without

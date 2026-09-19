@@ -348,13 +348,21 @@ operation ID with the same still-malformed payload simply re-evaluates the same 
 the same rejection every time — but it leaves no durable trace of the attempt. `unsupported_membership`
 carries no such conflict and is audited normally.
 
-`incompatible_identifier` shares the identical exception for `membership.enroll|renew|replace`'s
-own conversation-identifier shape check: a byte-malformed conversation is rejected before the
-digest is constructed at all, so a corrected retry under the same operation ID executes normally
-rather than conflicting, and the original malformed attempt leaves no audit row.
-`membership.revoke` deliberately does not apply this check at all, so it never returns
-`incompatible_identifier` regardless of the conversation identifier's byte shape -- AGENTS.md's
-exact-key human revocation must remain reachable for a byte-malformed historical identifier.
+`incompatible_identifier` has two distinct producers sharing one wire spelling, with different
+audit dispositions. `membership.enroll|renew|replace`'s own conversation-identifier shape check
+shares the identical pre-digest exception above: a byte-malformed conversation is rejected before
+the digest is constructed at all, so a corrected retry under the same operation ID executes
+normally rather than conflicting, and the original malformed attempt leaves no audit row.
+Separately, `membership.renew|replace` also reject a byte-malformed *peer* identifier already
+present in the conversation's stored history -- reached inside the coordinator's mutate callback
+against the current grant's peer IDs, not against client-supplied input -- and this rejection is a
+durable `store.Code` recorded through the normal operation-result/audit path like any other
+terminal rejection, not exempt from the audit-boundary rule. A retry under the same operation ID
+therefore durably conflicts for this producer, unlike the conversation-identifier one.
+`membership.revoke` deliberately does not apply either check, so it never returns
+`incompatible_identifier` regardless of the conversation or peer identifiers' byte shape --
+AGENTS.md's exact-key human revocation must remain reachable for byte-malformed historical
+identifiers.
 
 Other domain codes are the explicit membership/connection error enumerations, not arbitrary strings.
 Permission checks precede private lookup diagnostics. Expose expected/current versions only to a

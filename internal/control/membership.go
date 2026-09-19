@@ -6,8 +6,8 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/ginsys/parley/internal/bridgetext"
@@ -110,16 +110,27 @@ type CommandReceiptResult struct {
 	CommitView  CommitView        `json:"commit_view"`
 }
 
-// Usable reports whether r looks like a genuine command receipt rather than
-// a zero-valued or otherwise malformed one that happened to decode without
-// a transport error -- AuditID/OperationID are always nonempty on every
-// receipt this server actually produces (mutationResponse only reaches
-// successResponse after a real store.Coordinator.Execute call), so an
-// empty value here means the response bytes did not carry a real receipt
-// at all. A caller must never treat r as a proven successful completion
-// without checking this first.
-func (r CommandReceiptResult) Usable() bool {
-	return r.AuditID != "" && r.OperationID != ""
+// Usable reports whether r is a genuine command receipt for the exact
+// operation the caller requested, not merely a structurally nonempty one.
+// AuditID/OperationID/CommitView.Epoch/CommitView.Revision are always
+// nonempty and Result.Code is always "" on every successful receipt this
+// server actually produces (mutationResponse only reaches successResponse,
+// with an empty Result.Code, after a real store.Coordinator.Execute call
+// that did not terminally reject -- see mutationResponse's own doc comment);
+// a response failing any of these checks did not carry a real, matching
+// receipt. Critically, r.OperationID must equal requestedOperationID: two
+// nonempty strings that merely differ (a stale or cross-operation receipt)
+// previously passed this check, letting a caller print its own locally
+// generated operation ID as if the server had confirmed that exact
+// operation. A caller must never treat r as a proven successful completion
+// of requestedOperationID without checking this first.
+func (r CommandReceiptResult) Usable(requestedOperationID string) bool {
+	return r.AuditID != "" &&
+		r.OperationID != "" &&
+		r.OperationID == requestedOperationID &&
+		r.CommitView.Epoch != "" &&
+		r.CommitView.Revision != "" &&
+		r.Result.Code == ""
 }
 
 // toWireCommandResult re-encodes a live store.CommandResult with
@@ -228,7 +239,7 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (R
 			if err != nil {
 				return domainRejection(err)
 			}
-			return store.CommandResult{Resources: []store.ResourceChange{{Kind: "grant", ID: p.conversation, After: g.GrantVersion}}}, nil
+			return store.CommandResult{Resources: []store.ResourceChange{{Kind: "grant", ID: p.conversation, Before: expectedVersion, After: g.GrantVersion}}}, nil
 		}, nil)
 	return mutationResponse(req.ID, receipt, err), false
 }
@@ -261,6 +272,8 @@ func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Re
 				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: result.Grant.GrantVersion},
 				{Kind: "queued_carried", ID: p.conversation, After: result.Carried},
 				{Kind: "queued_cancelled", ID: p.conversation, After: result.Cancelled},
+				{Kind: "queued_already_dispatching", ID: p.conversation, After: result.AlreadyDispatching},
+				{Kind: "queued_already_handed_off", ID: p.conversation, After: result.AlreadyHandedOff},
 			}}, nil
 		}, nil)
 	return mutationResponse(req.ID, receipt, err), false
@@ -317,6 +330,8 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: result.Grant.GrantVersion},
 				{Kind: "queued_carried", ID: p.conversation, After: result.Carried},
 				{Kind: "queued_cancelled", ID: p.conversation, After: result.Cancelled},
+				{Kind: "queued_already_dispatching", ID: p.conversation, After: result.AlreadyDispatching},
+				{Kind: "queued_already_handed_off", ID: p.conversation, After: result.AlreadyHandedOff},
 			}}, nil
 		}, nil)
 	return mutationResponse(req.ID, receipt, err), false
@@ -674,13 +689,31 @@ func decodePolicy(raw any) (membership.Policy, bool) {
 // instant, so an expiry outside the range a stored nanosecond timestamp can
 // represent is rejected here rather than surfacing later as a storage
 // failure.
+// expiresAtGrammar is the exact lexical shape this wire field accepts:
+// 4-digit year, 2-digit month/day/hour/minute/second, an optional
+// dot-separated fraction of 1-9 digits, and a literal "Z". time.Parse with
+// time.RFC3339Nano alone is not sufficient to enforce this (MC-03):
+// verified directly against this Go toolchain, it silently truncates a
+// 10-digit fraction to 9 (e.g. "12:00:00.1234567891Z" parses without error,
+// losing the last digit), accepts a comma in place of the fraction's dot
+// (a legal ISO 8601 alternative RFC3339Nano itself does not document
+// rejecting), and accepts a single-digit hour ("T1:00:00Z"). This grammar
+// check runs before time.Parse and rejects all three. It deliberately does
+// NOT reject a valid trailing-zero fraction spelling such as ".750Z" --
+// three digits, all significant per the grammar above -- merely because
+// time.Time's own String()/Format output would later render the same
+// instant more compactly (".75Z"): validity is a property of the original
+// input's lexical form, not of whether a reformatted round-trip happens to
+// look shorter.
+var expiresAtGrammar = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$`)
+
 func paramOptionalExpiresAt(params map[string]any) (*time.Time, string, bool) {
 	raw, present := params["expires_at"]
 	if !present {
 		return nil, "", true
 	}
 	s, ok := raw.(string)
-	if !ok || !strings.HasSuffix(s, "Z") {
+	if !ok || !expiresAtGrammar.MatchString(s) {
 		return nil, "", false
 	}
 	t, err := time.Parse(time.RFC3339Nano, s)

@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -49,9 +51,17 @@ func (f *fakeClient) Call(_ context.Context, method string, params map[string]an
 		return nil
 	}
 	if result, ok := out.(*control.CommandReceiptResult); ok {
+		// OperationID echoes params["operation_id"] -- exactly what a real
+		// server's mutationResponse does (internal/control/membership.go) --
+		// rather than a fixed placeholder: Usable now requires this to equal
+		// the caller's own requested operation ID, so a fixture hardcoding
+		// an unrelated constant here would make every fakeClient-backed
+		// success path spuriously "unusable" (MC-01, correcting an earlier
+		// audit-1/operation-1 placeholder receipt this fixture used).
+		opID, _ := params["operation_id"].(string)
 		*result = control.CommandReceiptResult{
 			AuditID:     "audit-1",
-			OperationID: "operation-1",
+			OperationID: opID,
 			CommitView:  control.CommitView{Epoch: "epoch-1", Revision: "1"},
 		}
 	}
@@ -415,16 +425,23 @@ func TestCLIIdentifiersRemainExactAndVisible(t *testing.T) {
 // TestMembershipRevokeKeepsExactMalformedKeyButOthersValidateFirst mirrors
 // the legacy CLI's exact-key revocation guarantee (AGENTS.md: "Do not apply
 // new-enrollment validation to that revocation path"): revoke never applies
-// bridgetext.ValidateMetadata to -conversation, so a byte-malformed
-// historical key is still dispatched unchanged, while every other
-// subcommand -- which enrolls or requires an existing well-formed identity
-// -- rejects the same key before ever dialing.
+// bridgetext.ValidateMetadata to -conversation, so a byte-malformed-but-
+// valid-UTF-8 historical key is still dispatched unchanged, while every
+// other subcommand -- which enrolls or requires an existing well-formed
+// identity -- rejects the same key before ever dialing. See
+// TestMembershipRevokeRejectsInvalidUTF8BeforeDialing below for the
+// genuinely-invalid-UTF-8 case, which MC-02 changed: those bytes can no
+// longer reach the wire unchanged, since JSON cannot transmit them
+// byte-exact at all.
 func TestMembershipRevokeKeepsExactMalformedKeyButOthersValidateFirst(t *testing.T) {
 	// \ufffd is an explicit escape, not the literal replacement character --
 	// see the identical rationale on TestUnsafePeerIdentifiersRejectedBeforeDialing
 	// (a hosted AI Code Review finding on an earlier PR2 candidate applied
-	// there; this second fixture list was missed by that same fix).
-	for _, name := range []string{"café", "a\xff", "a\xfe", "a\ufffd"} {
+	// there; this second fixture list was missed by that same fix). Every
+	// value below is valid UTF-8 (the accented letter and \ufffd's rune both
+	// encode validly), unlike the invalid-UTF-8 byte sequences moved out to
+	// TestMembershipRevokeRejectsInvalidUTF8BeforeDialing.
+	for _, name := range []string{"café", "a\ufffd"} {
 		fake := &fakeClient{}
 		var out, errOut bytes.Buffer
 		args := append([]string{"membership", "renew", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
@@ -435,6 +452,27 @@ func TestMembershipRevokeKeepsExactMalformedKeyButOthersValidateFirst(t *testing
 		args = append([]string{"membership", "revoke", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
 		if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 || fake.params["conversation"] != name {
 			t.Fatalf("revoke changed key %x: %+v, exit=%d", name, fake.params, code)
+		}
+	}
+}
+
+// TestMembershipRevokeRejectsInvalidUTF8BeforeDialing is MC-02's regression:
+// an invalid UTF-8 byte sequence cannot be transmitted byte-exact over this
+// JSON-RPC wire protocol at all -- encoding/json.Marshal silently replaces
+// each invalid byte with U+FFFD rather than preserving or rejecting it, so
+// sending one for revoke would silently target a different key than the one
+// on disk, defeating the exact-key revocation guarantee this path exists
+// for. Revoke must refuse these locally, before ever dialing -- narrower
+// than every other subcommand's full bridgetext.ValidateMetadata check
+// (only genuine UTF-8 invalidity, not every ASCII-incompatible byte), and
+// needed only for revoke, since every other subcommand already rejects
+// these bytes via ValidateMetadata regardless.
+func TestMembershipRevokeRejectsInvalidUTF8BeforeDialing(t *testing.T) {
+	for _, name := range []string{"a\xff", "a\xfe", "\xc0\xaf"} {
+		var out, errOut bytes.Buffer
+		args := append([]string{"membership", "revoke", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
+		if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+			t.Fatalf("revoke dialed for invalid UTF-8 %x: exit=%d %s", name, code, &errOut)
 		}
 	}
 }
@@ -508,7 +546,12 @@ func TestHelloDialFailureReportsOperationalErrorNotArgumentError(t *testing.T) {
 // cmd/parleyd assembles) and returns the -endpoint/-server-uid arguments a
 // real parleyctl hello invocation can dial against, plus the admin ID hello
 // should report back.
-func startHelloTestServer(t *testing.T) (endpoint, serverUID, adminID string) {
+// startHelloTestServer starts a real parleyd-style server (real
+// control.Listener, real store.DB, real Coordinator) against a fresh
+// on-disk database, seeding it with seed (if given) before the listener
+// admits any connection. Every existing caller passes no seed and continues
+// to get an empty database exactly as before.
+func startHelloTestServer(t *testing.T, seed ...func(t *testing.T, db *store.DB)) (endpoint, serverUID, adminID string) {
 	t.Helper()
 	dir, err := os.MkdirTemp("/tmp", "parleyctl-hello-")
 	if err != nil {
@@ -531,6 +574,9 @@ func startHelloTestServer(t *testing.T) (endpoint, serverUID, adminID string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
+	for _, s := range seed {
+		s(t, db)
+	}
 	if err := db.OpenReaders(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -542,6 +588,37 @@ func startHelloTestServer(t *testing.T) (endpoint, serverUID, adminID string) {
 	}
 	t.Cleanup(func() { service.StopAdmission(); cancel(); service.Wait() })
 	return socketPath, strconv.FormatUint(uint64(uid), 10), adminID
+}
+
+// seedEnabledBindingForTest mirrors internal/control's own
+// seedEnabledBinding fixture (there is no shared exported helper between the
+// two packages; both hand-construct the same minimal enabled binding +
+// current credential a real membership.enroll needs to pass BindingUnavailable).
+func seedEnabledBindingForTest(t *testing.T, db *store.DB, index int, peer string) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	b := store.BindingRecord{
+		ID: fmt.Sprintf("60000000-0000-4000-8000-%012d", index), PeerID: peer,
+		HostKind: "codex_cli", NamespaceID: "synthetic", SessionID: peer,
+		ConnectorUID: 1001, Status: "enabled", Version: 1,
+	}
+	var secret [32]byte
+	secret[0] = byte(index)
+	c := store.CredentialRecord{
+		ID: fmt.Sprintf("70000000-0000-4000-8000-%012d", index), BindingID: b.ID, Version: 1,
+		Status: "current", ExpiresAtNS: time.Now().Add(24 * time.Hour).UnixNano(), Verifier: sha256.Sum256(secret[:]),
+	}
+	if err := store.InsertBindingCredential(ctx, tx, b, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestHelloEndToEndRoundTripNeverOpensDatabase runs the actual parleyctl
@@ -563,27 +640,67 @@ func TestHelloEndToEndRoundTripNeverOpensDatabase(t *testing.T) {
 	}
 }
 
-// TestMembershipEndToEndEnrollSucceedsAgainstARealServer is the one
-// membership fixture that dials a genuine parleyd-style server end to end
-// (real control.Listener, real store.DB, real Coordinator), proving the
-// production dialControlClient/run wiring -- not just the fakeClient seam
-// above -- actually performs a working membership.enroll round trip.
-func TestMembershipEndToEndEnrollSucceedsAgainstARealServer(t *testing.T) {
+// TestMembershipEndToEndEnrollRejectsWithoutEnabledBindingAgainstARealServer
+// is the one membership fixture that dials a genuine parleyd-style server
+// end to end (real control.Listener, real store.DB, real Coordinator),
+// proving the production dialControlClient/run wiring -- not just the
+// fakeClient seam above -- actually performs a real membership.enroll round
+// trip. Despite the name of an earlier version of this test, this is a
+// rejection fixture, not a success one: no enabled binding exists for
+// either synthetic peer against this real server, so the coordinator
+// rejects with a domain error (BindingUnavailable) rather than succeeding.
+// It is still a genuine, real end-to-end RPC round trip through
+// dialControlClient/control.Client.Call, exercising exactly the code path a
+// real enrollment failure takes, distinct from every dial/argument-
+// validation failure covered elsewhere in this file. See
+// TestMembershipEndToEndEnrollSucceedsAgainstARealServer below for the
+// actual success case this name previously (and wrongly) claimed to cover.
+func TestMembershipEndToEndEnrollRejectsWithoutEnabledBindingAgainstARealServer(t *testing.T) {
 	endpoint, uid, _ := startHelloTestServer(t)
 	args := []string{"membership", "enroll", "-conversation", "fixture", "-peer-a", "peer-a", "-peer-b", "peer-b", "-max-exchanges", "3", "-endpoint", endpoint, "-server-uid", uid}
 	var out, errOut bytes.Buffer
 	code := run(args, &out, &errOut, dialControlClient, noEnv)
-	// No enabled binding exists for either synthetic peer against this real
-	// server, so the coordinator rejects with a domain error (BindingUnavailable)
-	// rather than succeeding -- but that is still a genuine, real end-to-end
-	// RPC round trip through dialControlClient/control.Client.Call, exercising
-	// exactly the code path a real enrollment failure takes, distinct from
-	// every dial/argument-validation failure covered elsewhere in this file.
 	if code != 1 || out.Len() != 0 || errOut.Len() == 0 {
 		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
 	}
 	if strings.Contains(errOut.String(), "outcome unknown") {
 		t.Fatalf("a well-formed domain rejection must not be reported as an unresolved timeout: %s", &errOut)
+	}
+}
+
+// TestMembershipEndToEndEnrollSucceedsAgainstARealServer is the actual
+// success counterpart the name above previously claimed but did not cover:
+// both synthetic peers get a real enabled binding + current credential
+// seeded into the server's database before the listener admits any
+// connection, so this membership.enroll genuinely succeeds end to end --
+// real socket, real frame/profile encoding, real Coordinator.Execute, real
+// commit -- and parleyctl's production output rendering is exercised
+// against a real, non-empty CommandReceiptResult (real audit_id/operation_id/
+// epoch/revision), not the fakeClient seam's synthetic values.
+func TestMembershipEndToEndEnrollSucceedsAgainstARealServer(t *testing.T) {
+	seed := func(t *testing.T, db *store.DB) {
+		seedEnabledBindingForTest(t, db, 1, "peer-a")
+		seedEnabledBindingForTest(t, db, 2, "peer-b")
+	}
+	endpoint, uid, _ := startHelloTestServer(t, seed)
+	opID := "80000000-0000-4000-8000-000000000099"
+	args := []string{
+		"membership", "enroll", "-conversation", "fixture", "-peer-a", "peer-a", "-peer-b", "peer-b",
+		"-max-exchanges", "3", "-operation-id", opID, "-endpoint", endpoint, "-server-uid", uid,
+	}
+	var out, errOut bytes.Buffer
+	code := run(args, &out, &errOut, dialControlClient, noEnv)
+	if code != 0 {
+		t.Fatalf("exit=%d out=%q err=%q", code, out.String(), errOut.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("unexpected stderr on success: %q", errOut.String())
+	}
+	if !strings.Contains(out.String(), "operation_id "+opID) {
+		t.Fatalf("out=%q missing echoed operation_id %q", out.String(), opID)
+	}
+	if !strings.Contains(out.String(), `grant "fixture"`) {
+		t.Fatalf("out=%q missing the enrolled conversation's resource change", out.String())
 	}
 }
 
