@@ -45,24 +45,30 @@ const (
 // to a 6-byte "\uXXXX" sequence, the worst case for any single UTF-8 byte.
 // A receipt carrying 4 copies of a MaxLegacyLocatorBytes-sized, maximally
 // adversarial identifier therefore encodes to at most
-// 4 * MaxLegacyLocatorBytes * 6 = 98,304 bytes for the identifier text
-// alone at the value below, leaving over 900 KiB of headroom inside
+// 4 * MaxLegacyLocatorBytes * 6 = 983,040 bytes for the identifier text
+// alone at the value below, leaving 65,536 bytes inside
 // internal/control.MaxFrameBytes (1 MiB, the wire profile's single-frame
 // bound every mutation response and operation.get reply must fit within)
 // for the rest of the envelope (audit_id, commit_view, other resource
-// fields, JSON-RPC framing). internal/control's
+// fields, JSON-RPC framing), which is a few hundred bytes. The request side
+// is strictly looser: it carries the identifier once (at most 6x expanded)
+// in its own 1 MiB frame, and NewCommandRequest's 1 MiB digest budget counts
+// it once, unescaped. internal/control's
 // TestLegacyConversationBoundStaysWithinFrameLimit constructs exactly this
 // adversarial receipt against a real Response.Encode() and asserts it
 // fits, so a future change to the resource count, the escaping assumption
 // or MaxFrameBytes itself fails that test rather than silently
 // invalidating this comment.
 //
-// This value intentionally stays well under the theoretical frame-derived
-// ceiling above (roughly 40x larger) rather than being raised to meet it: a
-// legacy identifier is bounded historical data carried through the system
-// for exact-key revocation, not a field new data should be encouraged to
-// fill out to a frame-sized maximum.
-const MaxLegacyLocatorBytes = 4096
+// Owner decision 2026-09-19 (review 5257641949): this value is the
+// frame-derived ceiling itself, not a smaller policy cutoff. An earlier
+// 4096 was a deliberately conservative choice ~10x under it, which stranded
+// any adopted legacy grant whose key fell between the two with no exact-key
+// revocation path at all, for no encoding reason -- the historical schema
+// imposes no length limit. An identifier past this bound still cannot be
+// revoked through this path, but only because its worst-case receipt
+// genuinely cannot be carried in one frame.
+const MaxLegacyLocatorBytes = 40960
 
 // Code is safe for diagnostics. Never replace it with a transport/SQLite error string.
 type Code string

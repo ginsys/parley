@@ -1920,21 +1920,68 @@ func TestLegacyConversationBoundStaysWithinFrameLimit(t *testing.T) {
 	if len(data) >= MaxFrameBytes {
 		t.Fatalf("worst-case revoke receipt (%d bytes) does not fit MaxFrameBytes (%d)", len(data), MaxFrameBytes)
 	}
-	if margin := MaxFrameBytes - len(data); margin < 900*1024 {
-		t.Fatalf("expected at least 900 KiB of headroom per the derivation, got %d bytes (encoded=%d)", margin, len(data))
+	// The bound is the frame-derived ceiling itself (owner decision
+	// 2026-09-19, review 5257641949), so the remaining envelope budget is
+	// small by design -- but it must stay comfortably above the few hundred
+	// bytes the rest of a real receipt needs.
+	if margin := MaxFrameBytes - len(data); margin < 32*1024 {
+		t.Fatalf("expected at least 32 KiB left for the rest of the envelope, got %d bytes (encoded=%d)", margin, len(data))
 	}
 }
 
-// TestLegacyConversationBoundIsConservativeNotFrameMaximum demonstrates
-// store.MaxLegacyLocatorBytes's own doc comment claim that the chosen
-// cutoff is a deliberate, far-under-ceiling policy choice, not the literal
-// largest identifier a frame could carry: a plain-ASCII (no escaping
-// expansion) legacy identifier several times past the bound would still
-// fit comfortably inside a single frame if it were ever let through. The
-// refusal above MaxLegacyLocatorBytes is therefore "legacy identifiers do
-// not get a frame-sized budget", not "this literally would not fit".
-func TestLegacyConversationBoundIsConservativeNotFrameMaximum(t *testing.T) {
-	oversized := strings.Repeat("x", store.MaxLegacyLocatorBytes*4)
+// TestMembershipRevokeWorstCaseLegacyIdentifierAtBoundFitsEveryReply drives
+// the same maximally-escaping identifier through the real handlers rather
+// than a hand-built receipt: the revoke response, its operation.get
+// republication and a same-operation-id replay must each encode within
+// MaxFrameBytes and carry the exact identifier, proving the raised bound is
+// genuinely revocable end to end, not merely arithmetically admissible.
+func TestMembershipRevokeWorstCaseLegacyIdentifierAtBoundFitsEveryReply(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	conversation := strings.Repeat("\x01", store.MaxLegacyLocatorBytes)
+	seedLegacyGrant(t, db, conversation)
+	opID := newOpID()
+	revokeParams := map[string]any{"operation_id": opID, "conversation": conversation, "expected_grant_version": "1"}
+
+	steps := []struct {
+		name string
+		req  Request
+	}{
+		{"revoke", Request{ID: "1", Method: "membership.revoke", Params: revokeParams}},
+		{"operation.get", Request{ID: "2", Method: "operation.get", Params: map[string]any{"operation_id": opID}}},
+		{"replay", Request{ID: "3", Method: "membership.revoke", Params: revokeParams}},
+	}
+	for _, step := range steps {
+		resp, _ := sess.Handle(context.Background(), step.req)
+		if resp.Err != nil {
+			t.Fatalf("%s at the worst-case boundary must succeed: %#v", step.name, resp.Err)
+		}
+		data, err := resp.Encode()
+		if err != nil {
+			t.Fatalf("%s encode: %v", step.name, err)
+		}
+		if len(data) >= MaxFrameBytes {
+			t.Fatalf("%s reply (%d bytes) does not fit MaxFrameBytes (%d)", step.name, len(data), MaxFrameBytes)
+		}
+	}
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := store.CurrentGrant(context.Background(), tx, conversation); err == nil {
+		t.Fatal("the worst-case legacy grant must actually be revoked")
+	}
+}
+
+// TestLegacyConversationBoundIsTheFrameCeilingNotAPolicyCutoff is the other
+// half of store.MaxLegacyLocatorBytes's derivation (owner decision
+// 2026-09-19, review 5257641949): the bound must not sit arbitrarily below
+// what a frame can carry. A maximally-escaping identifier only 10% past it
+// already produces a revoke receipt that cannot be carried in one frame, so
+// the refusal above the bound is "this genuinely would not fit", never a
+// smaller policy choice that strands a representable legacy grant.
+func TestLegacyConversationBoundIsTheFrameCeilingNotAPolicyCutoff(t *testing.T) {
+	oversized := strings.Repeat("\x01", store.MaxLegacyLocatorBytes+store.MaxLegacyLocatorBytes/10)
 	resources := make([]wireResourceChange, 4)
 	for i := range resources {
 		resources[i] = wireResourceChange{Kind: "grant", ID: oversized, Before: "1", After: "2"}
@@ -1950,8 +1997,8 @@ func TestLegacyConversationBoundIsConservativeNotFrameMaximum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
-	if len(data) >= MaxFrameBytes {
-		t.Fatalf("a merely-4x-oversized plain-ASCII identifier already exceeds MaxFrameBytes (%d bytes); the conservative-cutoff claim would be false", len(data))
+	if len(data) < MaxFrameBytes {
+		t.Fatalf("a worst-case identifier 10%% past the bound still fits one frame (%d bytes); the bound is below the real ceiling", len(data))
 	}
 }
 
