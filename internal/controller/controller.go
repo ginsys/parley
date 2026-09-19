@@ -298,6 +298,15 @@ func RenewTx(ctx context.Context, tx *sql.Tx, p RenewParams) (*SupersedeResult, 
 	if err := validatePeerIDs(current.PeerAID, current.PeerBID); err != nil {
 		return nil, err
 	}
+	// Peer binding/credential eligibility (store.EnabledPeer) is
+	// deliberately NOT checked here: RenewTx is also Controller.Renew's
+	// legacy self-opening body (internal/controller/controller_test.go,
+	// internal/dispatch's fixtures), which predates the connection
+	// registry and operates on bare peer-ID strings with no bindings row
+	// at all -- requiring one here would reject every legacy caller.
+	// internal/control's handleMembershipRenew (the only PR2 wire caller)
+	// performs this recheck itself, against current.PeerAID/PeerBID, after
+	// this call returns -- see that handler's comment.
 	return supersede(ctx, tx, current, p.Conversation, current.PeerAID, current.PeerBID, current.Direction,
 		p.MaxExchanges, p.ExpiresAt, p.CancelPendingReplies)
 }

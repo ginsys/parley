@@ -100,6 +100,111 @@ func seedEnabledBinding(t *testing.T, db *store.DB, index int, peer string) {
 	}
 }
 
+// seedExpiredBinding mirrors seedEnabledBinding but records a credential
+// that already expired in the past (not merely unenabled or missing),
+// exercising store.EnabledPeer's expired-but-still-"current" branch that
+// calls recordExpiry -- distinct from seedEnabledBinding's always-valid
+// fixture and from an absent/revoked binding.
+func seedExpiredBinding(t *testing.T, db *store.DB, index int, peer string) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	b := store.BindingRecord{
+		ID: fmt.Sprintf("60000000-0000-4000-8000-%012d", index), PeerID: peer,
+		HostKind: "codex_cli", NamespaceID: "synthetic", SessionID: peer,
+		ConnectorUID: 1001, Status: "enabled", Version: 1,
+	}
+	var secret [32]byte
+	secret[0] = byte(index)
+	c := store.CredentialRecord{
+		ID: fmt.Sprintf("70000000-0000-4000-8000-%012d", index), BindingID: b.ID, Version: 1,
+		Status: "current", ExpiresAtNS: time.Now().Add(-time.Hour).UnixNano(), Verifier: sha256.Sum256(secret[:]),
+	}
+	if err := store.InsertBindingCredential(ctx, tx, b, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// revokeBindingDirectly transitions a previously-seeded binding straight to
+// 'revoked', bypassing the normal connection.Lifecycle API -- membership
+// tests only need the resulting store state, not the lifecycle machinery
+// that would ordinarily produce it.
+func revokeBindingDirectly(t *testing.T, db *store.DB, index int) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	id := fmt.Sprintf("60000000-0000-4000-8000-%012d", index)
+	if _, err := tx.ExecContext(ctx, "UPDATE bindings SET status='revoked' WHERE binding_id=?", id); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedBindingExpiringSoon mirrors seedEnabledBinding but with a credential
+// expiring shortly after insertion -- expires_at_ns is immutable once
+// stored (registry_schema.sql's credential_identity_immutable trigger), so
+// a test that needs a binding valid at enroll time and expired by renew
+// time must seed this way and let real time elapse, rather than backdating
+// an existing row.
+func seedBindingExpiringSoon(t *testing.T, db *store.DB, index int, peer string, ttl time.Duration) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	b := store.BindingRecord{
+		ID: fmt.Sprintf("60000000-0000-4000-8000-%012d", index), PeerID: peer,
+		HostKind: "codex_cli", NamespaceID: "synthetic", SessionID: peer,
+		ConnectorUID: 1001, Status: "enabled", Version: 1,
+	}
+	var secret [32]byte
+	secret[0] = byte(index)
+	c := store.CredentialRecord{
+		ID: fmt.Sprintf("70000000-0000-4000-8000-%012d", index), BindingID: b.ID, Version: 1,
+		Status: "current", ExpiresAtNS: time.Now().Add(ttl).UnixNano(), Verifier: sha256.Sum256(secret[:]),
+	}
+	if err := store.InsertBindingCredential(ctx, tx, b, c); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// credentialStatus reads back a credential's durable status, used to prove
+// store.ExpiryEvidence.Persist actually ran rather than merely that the
+// mutation reported binding_unavailable.
+func credentialStatus(t *testing.T, db *store.DB, index int) string {
+	t.Helper()
+	var status string
+	if err := db.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+		c, err := store.ReadCredential(ctx, tx, fmt.Sprintf("70000000-0000-4000-8000-%012d", index))
+		if err != nil {
+			return err
+		}
+		status = c.Status
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
 func openMembers(a, b string) map[string]any {
 	return map[string]any{
 		"operation_id":           newOpID(),
@@ -148,6 +253,26 @@ func TestMembershipEnrollRejectsWithoutEnabledBinding(t *testing.T) {
 	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
 	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.BindingUnavailable) {
 		t.Fatalf("expected binding_unavailable, got %#v", resp.Err)
+	}
+}
+
+// Review 5256536448 (comment 4053873889): store.EnabledPeer's expired-
+// credential branch calls recordExpiry, which is a no-op unless the
+// handler wraps ctx with store.ObserveExpiries and calls Persist afterward.
+// Before that wiring, this scenario correctly reported binding_unavailable
+// but the credential's DB row stayed "current" forever -- no denial
+// evidence was ever durably recorded (AGENTS.md: "Observed expiry is
+// denial evidence... persist it independently").
+func TestMembershipEnrollPersistsObservedCredentialExpiry(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedExpiredBinding(t, db, 2, "peer-b")
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.BindingUnavailable) {
+		t.Fatalf("expected binding_unavailable, got %#v", resp.Err)
+	}
+	if status := credentialStatus(t, db, 2); status != "expired" {
+		t.Fatalf("expired credential observation was not persisted: status=%s", status)
 	}
 }
 
@@ -525,6 +650,52 @@ func TestMembershipRenewRejectsStaleVersion(t *testing.T) {
 	}
 }
 
+// Review 5256536448 (comment 4053873898): RenewTx previously superseded a
+// grant without rechecking either current peer's binding, so a peer
+// revoked after enrollment could still have its grant renewed -- the
+// rejection only surfaced later, at dispatch time, after renewal had
+// already been durably reported successful.
+func TestMembershipRenewRejectsWhenCurrentPeerBindingRevokedSinceEnrollment(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("enroll failed: %#v", enroll.Err)
+	}
+	revokeBindingDirectly(t, db, 2)
+	renew, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.renew", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+	}})
+	if renew.Err == nil || renew.Err.Data == nil || renew.Err.Data.Code != DomainCode(store.BindingUnavailable) {
+		t.Fatalf("expected binding_unavailable, got %#v", renew.Err)
+	}
+}
+
+// Companion to TestMembershipEnrollPersistsObservedCredentialExpiry: proves
+// the same observe-and-persist wiring on the renew path, where the expired
+// peer is resolved from the current grant's stored peers, not from the
+// caller's request.
+func TestMembershipRenewPersistsObservedCredentialExpiry(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedBindingExpiringSoon(t, db, 2, "peer-b", 50*time.Millisecond)
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("enroll failed: %#v", enroll.Err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	renew, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.renew", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+	}})
+	if renew.Err == nil || renew.Err.Data == nil || renew.Err.Data.Code != DomainCode(store.BindingUnavailable) {
+		t.Fatalf("expected binding_unavailable, got %#v", renew.Err)
+	}
+	if status := credentialStatus(t, db, 2); status != "expired" {
+		t.Fatalf("expired credential observation was not persisted: status=%s", status)
+	}
+}
+
 func TestMembershipReplaceChangesMembership(t *testing.T) {
 	sess, db := membershipTestServer(t)
 	seedEnabledBinding(t, db, 1, "peer-a")
@@ -544,6 +715,33 @@ func TestMembershipReplaceChangesMembership(t *testing.T) {
 	}})
 	if replace.Err != nil {
 		t.Fatalf("replace failed: %#v", replace.Err)
+	}
+}
+
+// Companion to TestMembershipEnrollPersistsObservedCredentialExpiry on the
+// replace path.
+func TestMembershipReplacePersistsObservedCredentialExpiry(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	seedExpiredBinding(t, db, 3, "peer-c")
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("enroll failed: %#v", enroll.Err)
+	}
+	replace, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.replace", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+		"members": []any{
+			map[string]any{"peer_id": "peer-a", "role": "member"},
+			map[string]any{"peer_id": "peer-c", "role": "member"},
+		},
+		"policy": map[string]any{"kind": "open"},
+	}})
+	if replace.Err == nil || replace.Err.Data == nil || replace.Err.Data.Code != DomainCode(store.BindingUnavailable) {
+		t.Fatalf("expected binding_unavailable, got %#v", replace.Err)
+	}
+	if status := credentialStatus(t, db, 3); status != "expired" {
+		t.Fatalf("expired credential observation was not persisted: status=%s", status)
 	}
 }
 
