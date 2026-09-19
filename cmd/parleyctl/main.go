@@ -127,6 +127,17 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 		if err := bridgetext.ValidateMetadata(c.conversation); err != nil {
 			return c, fmt.Errorf("conversation identifier: %w", err)
 		}
+		// Mirrors internal/control's own incompatibleConversation length
+		// check (MC-02/review-5255666571 length finding): an ASCII
+		// conversation identifier longer than store.MaxIdentityBytes
+		// would otherwise pass this client-side check, dial, and only
+		// then be rejected server-side -- correct, but a needless round
+		// trip for a boundary this client can already evaluate locally.
+		// Revoke deliberately keeps its exact-key escape and does not
+		// apply this bound (AGENTS.md).
+		if len(c.conversation) > store.MaxIdentityBytes {
+			return c, fmt.Errorf("conversation identifier: exceeds maximum length of %d bytes", store.MaxIdentityBytes)
+		}
 	} else if !utf8.ValidString(c.conversation) {
 		// Unlike an ASCII-incompatible-but-valid-UTF-8 legacy key (e.g.
 		// "café"), an invalid UTF-8 byte sequence cannot be transmitted

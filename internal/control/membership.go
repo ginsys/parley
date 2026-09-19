@@ -2,13 +2,12 @@ package control
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"regexp"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/controller"
@@ -44,24 +43,60 @@ import (
 // redundant retirement check.
 func noopAuthorize(context.Context, *sql.Tx) error { return nil }
 
-// auditResourceID returns id verbatim when it satisfies
-// store.Coordinator.Execute's own resource-audit rule (bridgetext byte
-// shape plus store.MaxIdentityBytes), or a fixed-width hex SHA-256 digest
-// of id otherwise. AGENTS.md's exact-key human revocation must remain
-// available for legacy conversation identifiers containing bytes outside
-// 0x20-0x7E, or oversized ones -- without this, Execute's own resource
-// validation (internal/store/coordinator.go) would abort the whole revoke
-// command before it ever reaches RevokeTx, silently defeating the one
-// escape path parseCommand's revoke branch deliberately skips
-// bridgetext.ValidateMetadata for. Only the durable audit record's
-// resource ID is affected; RevokeTx itself still receives the conversation
-// identifier verbatim, so the actual mutation target is exact either way.
-func auditResourceID(id string) string {
-	if len(id) <= store.MaxIdentityBytes && bridgetext.ValidateMetadata(id) == nil {
-		return id
-	}
-	sum := sha256.Sum256([]byte(id))
-	return "legacy-sha256:" + hex.EncodeToString(sum[:])
+// auditRepresentable reports whether id can be recorded verbatim as a
+// membership.revoke resource identifier, through the coordinator's own
+// narrow, command-kind-scoped validation exception for this one command
+// (internal/store/coordinator.go's matching "membership.revoke" case).
+// AGENTS.md's exact-key human revocation must remain able to target a
+// legacy conversation identifier whose bytes never satisfied
+// bridgetext.ValidateMetadata's ASCII rule or store.MaxIdentityBytes's
+// ordinary bound -- 2026-09-19 lead approval replaced this file's earlier
+// SHA-256 alias substitution (which reported an opaque digest instead of
+// the exact target, defeating self-contained audit identification) with
+// this bound instead: store.MaxLocatorBytes and UTF-8 validity, the same
+// contract the codebase already applies to other long-but-bounded
+// non-identity text fields (credential locators, target locators). Invalid
+// UTF-8 is a different boundary handled earlier, at JSON decode
+// (internal/control/json.go rejects it before any handler runs), so it
+// cannot actually reach this function via any live wire call; the check
+// here is retained anyway as an explicit, testable boundary rather than an
+// assumption about an earlier layer. An id this function refuses is
+// rejected before Execute ever runs (deterministic, not durably audited,
+// mirroring invalid_membership's own pre-Execute asymmetry) instead of
+// reaching the coordinator's own post-mutate resource check after RevokeTx
+// has already run inside the transaction -- which the coordinator would
+// still roll back, but only after wastefully running the mutation, and
+// with a generic InvalidRequest rather than an identifier-specific,
+// retryable diagnostic. RevokeTx itself always receives the conversation
+// identifier verbatim regardless of this check's outcome, so the actual
+// mutation target is exact either way; this function only gates whether
+// the command can be durably reported and replayed at all.
+func auditRepresentable(id string) bool {
+	return utf8.ValidString(id) && len(id) <= store.MaxLocatorBytes
+}
+
+// incompatibleConversation reports whether id fails enroll/renew/replace's
+// top-level conversation pre-check: either byte shape (bridgetext's ASCII
+// rule) or length (store.MaxIdentityBytes, the ordinary bound every other
+// exact identifier in this codebase is held to -- internal/store/registry.go's
+// binding peer IDs, internal/store/work_authorization.go's queue keys,
+// internal/dispatch's transport keys). An earlier version of this pre-check
+// tested only byte shape: a conversation identifier that was valid ASCII
+// but longer than MaxIdentityBytes passed decode-time, reached
+// controller.GrantTx/RenewTx/ReplaceTx and store.EnabledPeer, and was only
+// then caught by store.Coordinator.Execute's own generic per-resource
+// length check on the "grant" resource -- after the mutation had already
+// run inside the transaction (rolled back, since Execute never commits a
+// terminal-result-then-InvalidRequest sequence, but only after wastefully
+// executing it), and reported as a bare InvalidRequest rather than this
+// package's own identifier-specific, explicitly retryable
+// IncompatibleIdentifier. Checking length here, deterministically and
+// before Execute, closes that gap the same way the existing byte-shape
+// check already does for a malformed identifier -- see review 5255666571's
+// issuecomment-5741742001 (length finding). Revoke deliberately does not
+// use this helper; see handleMembershipRevoke's own comment.
+func incompatibleConversation(id string) bool {
+	return len(id) > store.MaxIdentityBytes || bridgetext.ValidateMetadata(id) != nil
 }
 
 func (sess *Session) principal() store.CommandPrincipal {
@@ -214,7 +249,7 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (R
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
-	if err := bridgetext.ValidateMetadata(p.conversation); err != nil {
+	if incompatibleConversation(p.conversation) {
 		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
 	model := membership.Model{Members: p.members, Policy: p.policy}
@@ -294,7 +329,7 @@ func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Re
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
-	if err := bridgetext.ValidateMetadata(p.conversation); err != nil {
+	if incompatibleConversation(p.conversation) {
 		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
 	fields := renewalFields(p.conversation, p.expectedVersion, p.maxExchanges, p.expiresAtText, p.cancelPendingReplies)
@@ -329,7 +364,7 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
-	if err := bridgetext.ValidateMetadata(p.conversation); err != nil {
+	if incompatibleConversation(p.conversation) {
 		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
 	model := membership.Model{Members: p.members, Policy: p.policy}
@@ -387,24 +422,40 @@ func (sess *Session) handleMembershipRevoke(ctx context.Context, req Request) (R
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
+	// Deliberately does NOT apply bridgetext.ValidateMetadata/length like
+	// enroll/renew/replace's own top-level conversation check --
+	// AGENTS.md's exact-key human revocation escape must still reach
+	// RevokeTx for a byte-malformed or oversized-but-representable legacy
+	// conversation identifier. auditRepresentable is the narrower question
+	// "can this be durably reported at all" (valid UTF-8, within
+	// store.MaxLocatorBytes), not "is this an ordinary new identifier" --
+	// truly unrepresentable input (which cannot currently occur on any
+	// live wire call; see auditRepresentable's own doc comment) is refused
+	// here, before Execute, rather than committing a mutation whose result
+	// the coordinator's own post-mutate check would then reject anyway.
+	if !auditRepresentable(p.conversation) {
+		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
+	}
 	request, err := store.NewCommandRequest("membership.revoke", p.operationID,
 		store.Field{Name: "conversation", Value: p.conversation},
 		store.Field{Name: "expected_grant_version", Value: p.expectedVersion})
 	if err != nil {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
-	id := auditResourceID(p.conversation)
 	receipt, err := sess.server.Store.Coordinator().Execute(ctx, sess.principal(), request, noopAuthorize,
 		func(ctx context.Context, tx *sql.Tx) (store.CommandResult, error) {
 			result, err := controller.RevokeTx(ctx, tx, p.conversation, &p.expectedVersion)
 			if err != nil {
 				return domainRejection(err)
 			}
+			// The exact conversation identifier, never an alias: see
+			// auditRepresentable and internal/store/coordinator.go's
+			// matching membership.revoke-scoped validation exception.
 			return store.CommandResult{Resources: []store.ResourceChange{
-				{Kind: "grant", ID: id, Before: p.expectedVersion, After: p.expectedVersion},
-				{Kind: "queued_cancelled", ID: id, After: int64(result.Cancelled)},
-				{Kind: "queued_already_dispatching", ID: id, After: int64(result.AlreadyDispatching)},
-				{Kind: "queued_already_handed_off", ID: id, After: int64(result.AlreadyHandedOff)},
+				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: p.expectedVersion},
+				{Kind: "queued_cancelled", ID: p.conversation, After: int64(result.Cancelled)},
+				{Kind: "queued_already_dispatching", ID: p.conversation, After: int64(result.AlreadyDispatching)},
+				{Kind: "queued_already_handed_off", ID: p.conversation, After: int64(result.AlreadyHandedOff)},
 			}}, nil
 		}, nil)
 	return mutationResponse(req.ID, receipt, err), false

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1036,5 +1037,323 @@ func TestIncompatibleIdentifierRejectionDoesNotReserveOperationID(t *testing.T) 
 	second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: corrected})
 	if second.Err != nil {
 		t.Fatalf("a corrected retry reusing the same operation_id must execute, got %#v", second.Err)
+	}
+}
+
+// TestMembershipEnrollRejectsOversizedConversationDeterministically and
+// TestMembershipEnrollAcceptsConversationAtTheMaximumLength are review
+// 5255666571's issuecomment-5741742001 length finding: a conversation
+// identifier's byte SHAPE was checked before Execute, but its LENGTH was
+// not, letting a valid-ASCII, oversized identifier reach
+// controller.GrantTx/store.EnabledPeer and only then be rejected by
+// store.Coordinator.Execute's own generic per-resource length check
+// (store.MaxIdentityBytes) -- correct in outcome, but as a wasted mutation
+// attempt reported as a bare invalid_request rather than this package's
+// own explicit, retryable incompatible_identifier. incompatibleConversation
+// now checks length too, at the exact store.MaxIdentityBytes boundary.
+func TestMembershipEnrollRejectsOversizedConversationDeterministically(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	params := openMembers("peer-a", "peer-b")
+	params["conversation"] = strings.Repeat("x", store.MaxIdentityBytes+1)
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: params})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier for a 257-byte conversation, got %#v", resp.Err)
+	}
+	// No business mutation: no conversation or grant row exists.
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, table := range []string{"conversations", "grants"} {
+		var count int
+		if err := tx.QueryRowContext(context.Background(), "SELECT count(*) FROM "+table).Scan(&count); err != nil || count != 0 {
+			t.Errorf("%s rows=%d: %v", table, count, err)
+		}
+	}
+}
+
+func TestMembershipEnrollAcceptsConversationAtTheMaximumLength(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	params := openMembers("peer-a", "peer-b")
+	params["conversation"] = strings.Repeat("x", store.MaxIdentityBytes)
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: params})
+	if resp.Err != nil {
+		t.Fatalf("expected a 256-byte conversation to be accepted, got %#v", resp.Err)
+	}
+}
+
+// TestMembershipRenewAndReplaceRejectOversizedConversationDeterministically
+// is the same length boundary for renew/replace's own top-level
+// conversation pre-check, distinct from the enroll coverage above.
+func TestMembershipRenewAndReplaceRejectOversizedConversationDeterministically(t *testing.T) {
+	oversized := strings.Repeat("x", store.MaxIdentityBytes+1)
+	t.Run("renew", func(t *testing.T) {
+		sess, _ := membershipTestServer(t)
+		resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.renew", Params: map[string]any{
+			"operation_id": newOpID(), "conversation": oversized, "expected_grant_version": "1",
+		}})
+		if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
+			t.Fatalf("expected incompatible_identifier, got %#v", resp.Err)
+		}
+	})
+	t.Run("replace", func(t *testing.T) {
+		sess, _ := membershipTestServer(t)
+		resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.replace", Params: map[string]any{
+			"operation_id": newOpID(), "conversation": oversized, "expected_grant_version": "1",
+			"members": []any{
+				map[string]any{"peer_id": "peer-a", "role": "member"},
+				map[string]any{"peer_id": "peer-b", "role": "member"},
+			},
+			"policy": map[string]any{"kind": "open"},
+		}})
+		if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
+			t.Fatalf("expected incompatible_identifier, got %#v", resp.Err)
+		}
+	})
+}
+
+// TestMembershipReplaceRejectsIncompatibleCurrentPeersWithoutMutating is
+// review 5255666571's finding (root 4053127303, thread
+// PRRT_kwDOUT1JT86j_Wm8): RenewTx already validates a conversation's
+// current, already-stored peer IDs before superseding it
+// (internal/controller/controller.go's RenewTx); ReplaceTx validated only
+// the caller's NEW replacement peers, never the grant it was about to
+// supersede's own stored peers -- letting a byte-malformed legacy pair
+// (recorded before today's ASCII-compatibility rule existed) be silently
+// superseded by an unrelated, otherwise-valid replacement rather than
+// durably rejected the way a renewal of the same legacy grant already is.
+// Historical bytes must never silently become new authorization
+// (docs/specifications/membership.md, AGENTS.md's exact-key boundary).
+// Seeding mirrors TestRenewRejectsLegacyUnsafePeersWithoutChangingHistory
+// (internal/controller/controller_test.go), at the wire layer so the
+// durable-audit consequence (unlike the top-level pre-Execute conversation
+// check covered above) is directly observable.
+func TestMembershipReplaceRejectsIncompatibleCurrentPeersWithoutMutating(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-c")
+	seedEnabledBinding(t, db, 3, "peer-b")
+	ctx := context.Background()
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "conv-legacy", "conv-legacy", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	// A pre-existing grant recorded with a legacy, byte-malformed peer --
+	// never reachable through GrantTx today, but a real historical
+	// condition RenewTx/ReplaceTx must both still cope with.
+	if err := store.InsertGrant(ctx, tx, store.Grant{
+		Conversation: "conv-legacy", GrantVersion: 1, PeerAID: "legacy\x7fpeer", PeerBID: "peer-a",
+		Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	replaceLegacy := func(operationID, otherPeer string) Response {
+		resp, _ := sess.Handle(ctx, Request{ID: "1", Method: "membership.replace", Params: map[string]any{
+			"operation_id": operationID, "conversation": "conv-legacy", "expected_grant_version": "1",
+			"members": []any{
+				map[string]any{"peer_id": "peer-a", "role": "member"},
+				map[string]any{"peer_id": otherPeer, "role": "member"},
+			},
+			"policy": map[string]any{"kind": "open"},
+		}})
+		return resp
+	}
+
+	opID := newOpID()
+	first := replaceLegacy(opID, "peer-c")
+	if first.Err == nil || first.Err.Data == nil || first.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier for a legacy current peer, got %#v", first.Err)
+	}
+
+	// No business mutation: the legacy grant is completely unchanged.
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, "conv-legacy")
+	if err != nil || g.GrantVersion != 1 || g.PeerAID != "legacy\x7fpeer" || g.PeerBID != "peer-a" {
+		t.Errorf("legacy grant changed by a rejected replace: %+v: %v", g, err)
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE conversation='conv-legacy'").Scan(&count); err != nil || count != 1 {
+		t.Errorf("history rows=%d: %v", count, err)
+	}
+	tx.Rollback()
+
+	// Durable incompatibility result + same-operation-id replay: unlike
+	// the top-level pre-Execute conversation check, this rejection is
+	// reached inside ReplaceTx's own mutate callback and durably recorded
+	// (validatePeerIDs returns store.IncompatibleIdentifier, a
+	// terminalResult code, through domainRejection -- exactly RenewTx's
+	// existing behavior for the same check against stored peers). A retry
+	// with the identical operation_id and payload must replay the same
+	// recorded rejection, not re-run ReplaceTx.
+	replay := replaceLegacy(opID, "peer-c")
+	if replay.Err == nil || replay.Err.Data == nil || replay.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected a replayed incompatible_identifier, got %#v", replay.Err)
+	}
+
+	// Changed-input conflict: the same operation_id with a different
+	// payload must conflict against the durably-recorded rejection, like
+	// any other terminal result -- not silently re-evaluate.
+	conflict := replaceLegacy(opID, "peer-different")
+	if conflict.Err == nil || conflict.Err.Data == nil || conflict.Err.Data.Code != DomainCode(store.OperationConflict) {
+		t.Fatalf("expected operation_conflict for a changed retry, got %#v", conflict.Err)
+	}
+
+	// Healthy replacement control: an unaffected conversation's replace
+	// still succeeds with the new current-peer check active.
+	enroll, _ := sess.Handle(ctx, Request{ID: "2", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("control enroll failed: %#v", enroll.Err)
+	}
+	control, _ := sess.Handle(ctx, Request{ID: "3", Method: "membership.replace", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+		"members": []any{
+			map[string]any{"peer_id": "peer-a", "role": "member"},
+			map[string]any{"peer_id": "peer-c", "role": "member"},
+		},
+		"policy": map[string]any{"kind": "open"},
+	}})
+	if control.Err != nil {
+		t.Fatalf("healthy replacement control failed: %#v", control.Err)
+	}
+
+	// Continued exact-key revoke behavior: revoke still reaches the legacy
+	// grant despite the new peer check (RevokeTx never validates peers).
+	revoke, _ := sess.Handle(ctx, Request{ID: "4", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-legacy", "expected_grant_version": "1",
+	}})
+	if revoke.Err != nil {
+		t.Fatalf("legacy grant must remain revocable: %#v", revoke.Err)
+	}
+}
+
+// seedLegacyGrant inserts a conversation and an active grant directly (never
+// through GrantTx, which would reject a byte-malformed/oversized identifier
+// today), mirroring TestRenewRejectsLegacyUnsafePeersWithoutChangingHistory's
+// (internal/controller/controller_test.go) established pattern for a real
+// historical condition GrantTx itself can never produce anymore.
+func seedLegacyGrant(t *testing.T, db *store.DB, conversation string) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, conversation, conversation, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertGrant(ctx, tx, store.Grant{
+		Conversation: conversation, GrantVersion: 1, PeerAID: "peer-a", PeerBID: "peer-b",
+		Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestMembershipRevokeSucceedsForRepresentableLegacyConversationIdentifiers
+// is the legacy audit evidence named in review 5255666571's issuecomment-
+// 5741742001 and the mandate's "exact legacy audit-evidence corrections":
+// auditRepresentable (internal/control/membership.go) and
+// internal/store/coordinator.go's matching membership.revoke-scoped
+// exception must actually let a real revoke reach and durably audit a
+// conversation identifier that ordinary enroll/renew/replace would refuse
+// today -- not merely fail to crash on one. Each case is a distinct legacy
+// shape AGENTS.md's exact-key human revocation escape must preserve
+// verbatim, never silently substituting an alias.
+func TestMembershipRevokeSucceedsForRepresentableLegacyConversationIdentifiers(t *testing.T) {
+	cases := map[string]string{
+		"byte-malformed control character":        "legacy\x7fconversation",
+		"valid non-ASCII UTF-8":                   "café-légacy-conversation",
+		"oversized but within MaxLocatorBytes":    strings.Repeat("x", store.MaxIdentityBytes+1),
+		"leading/trailing spaces and punctuation": "  legacy, conversation!  ",
+	}
+	for name, conversation := range cases {
+		t.Run(name, func(t *testing.T) {
+			sess, db := membershipTestServer(t)
+			seedLegacyGrant(t, db, conversation)
+			resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
+				"operation_id": newOpID(), "conversation": conversation, "expected_grant_version": "1",
+			}})
+			if resp.Err != nil {
+				t.Fatalf("revoke of a representable legacy identifier must succeed: %#v", resp.Err)
+			}
+			tx, err := db.Begin(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			if _, err := store.CurrentGrant(context.Background(), tx, conversation); err == nil {
+				t.Fatal("the legacy grant must actually be revoked, not merely accepted")
+			}
+		})
+	}
+}
+
+// TestMembershipRevokeRefusesOversizedLegacyConversationIdentifierWithoutCommitting
+// is auditRepresentable's actual refusal boundary: a legacy identifier past
+// store.MaxLocatorBytes cannot be durably reported at all (the coordinator's
+// own membership.revoke-scoped exception in internal/store/coordinator.go
+// enforces the identical bound on the committed result), so it must be
+// refused before Execute ever runs -- never a wasted mutation attempt the
+// coordinator's own check would reject anyway.
+func TestMembershipRevokeRefusesOversizedLegacyConversationIdentifierWithoutCommitting(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	conversation := strings.Repeat("x", store.MaxLocatorBytes+1)
+	seedLegacyGrant(t, db, conversation)
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": conversation, "expected_grant_version": "1",
+	}})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier for a >MaxLocatorBytes legacy identifier, got %#v", resp.Err)
+	}
+	// Rolled back immediately, not deferred: db.Begin is an immediate writer
+	// transaction (BEGIN IMMEDIATE), so leaving this one open past this
+	// check would deadlock every sess.Handle call below against its own
+	// Coordinator.Execute db.Begin, which SQLite serializes behind it.
+	tx, err := db.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := store.CurrentGrant(context.Background(), tx, conversation)
+	if err != nil || g.GrantVersion != 1 {
+		t.Errorf("a pre-Execute refusal must leave the legacy grant untouched: %+v: %v", g, err)
+	}
+	tx.Rollback()
+	// Not durably audited (auditRepresentable runs before store.NewCommandRequest/
+	// Execute) -- a retry with the identical operation_id executes normally
+	// rather than replaying/conflicting, exactly mirroring the accepted
+	// invalid_membership asymmetry (see this file's own
+	// TestInvalidMembershipRejectionDoesNotReserveOperationID for the same
+	// property on a different check).
+	opID := newOpID()
+	first, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": opID, "conversation": conversation, "expected_grant_version": "1",
+	}})
+	if first.Err == nil || first.Err.Data == nil || first.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier, got %#v", first.Err)
+	}
+	second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": opID, "conversation": "conv-does-not-exist", "expected_grant_version": "1",
+	}})
+	if second.Err == nil || second.Err.Data == nil || second.Err.Data.Code != DomainCode(store.NoActiveGrant) {
+		t.Fatalf("a corrected retry reusing the same operation_id must execute normally, got %#v", second.Err)
 	}
 }
