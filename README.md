@@ -11,9 +11,12 @@ dispatch, a Claude readiness handshake/poller, strict reply-marker extraction, a
 transport adapter. Authenticated acceptance and reply ingestion belong to `internal/connection`.
 These components have synthetic tests.
 
-The only executable is `parleyctl`, a human-operated **grant administrator**. It does not start a
-server or connect sessions. Running it without arguments displays help and exits successfully.
-There is no runnable bridge, live Claude Channels connection, live identity verification or rollout
+There are two executables. `parleyd` is the standing server: `parleyd init` explicitly creates a
+database and `parleyd serve` owns it and publishes an authenticated administration socket.
+`parleyctl` is the human-operated **membership administration client** of that socket; it never
+opens a database and does not connect sessions. Running it without arguments displays help and
+exits successfully. See [Operations](docs/operations.md) for initialization, serving, backup and
+diagnostics. There is no runnable bridge, live Claude Channels connection, live identity verification or rollout
 watcher yet. The `codex queue` adapter has not been validated against a live host. Runtime work is
 tracked separately in [issue #12](https://github.com/ginsys/parley/issues/12); the durable inbox is
 tracked in [issue #6](https://github.com/ginsys/parley/issues/6).
@@ -31,9 +34,10 @@ mise install
 mise exec -- go build ./...
 ```
 
-To produce the administrator binary:
+To produce the server and administration-client binaries:
 
 ```sh
+mise exec -- go build -o parleyd ./cmd/parleyd
 mise exec -- go build -o parleyctl ./cmd/parleyctl
 ```
 
@@ -51,26 +55,41 @@ whitespace checks, shell/workflow lint, commit-lint fixtures and action-pin vali
 For the Go suite alone, use `mise exec -- go test ./...`.
 
 Tests use temporary databases, fake transports and controlled helper processes. Ordinary tests
-never invoke the installed Codex CLI. CLI routing tests inject a fake administrator; agents must
+never invoke the installed Codex CLI. CLI routing tests inject a fake control client; agents must
 never invoke the protected `parleyctl` executable, even for help. Synthetic tests do not establish
 live host compatibility.
 
-## Grant administration
+## Membership administration
 
 A human operates `parleyctl` directly in their own shell. Agents must neither execute it nor
-construct or approve grant/revoke/renew arguments on the human's behalf. Built-in help describes
-all flags; the human chooses conversation names, enrolled peer IDs, directions and budgets.
+construct or approve `membership enroll|renew|replace|revoke` arguments on the human's behalf.
+Every mutation goes through `parleyd`'s authenticated administration socket: pass
+`-endpoint`/`-server-uid`, or set `$PARLEY_ENDPOINT`/`$PARLEY_SERVER_UID`. `parleyctl` never opens
+a database, and `$PARLEY_DB` in its environment is refused as a misconfiguration. Built-in help
+(`parleyctl membership help`) describes all flags; the human chooses conversation names, enrolled
+peer IDs, directions and budgets.
 
 | Command | Effect |
 | --- | --- |
-| No arguments, `help`, `-h`, `--help` | Display usage; no database access |
-| `grant` | Enroll distinct peers with a positive exchange budget; create a new historical version |
-| `renew` | Create a successor version with a fresh budget counter; keep existing budget/expiry when their flags are zero |
-| `revoke` | Revoke the active grant and cancel queued messages; report messages already in flight |
+| No arguments, `help`, `-h`, `--help` | Display usage; no socket or database access |
+| `hello` | Diagnostic handshake: print the server's protocol, identity, state, limits and methods |
+| `membership enroll` | Enroll distinct peers with a positive exchange budget; create a new historical version |
+| `membership renew` | Create a successor version with a fresh budget counter; keep existing budget/expiry when their flags are zero |
+| `membership replace` | Create a successor version with a different peer pair or direction |
+| `membership revoke` | Revoke the active grant and cancel queued messages; report messages already in flight |
+
+Every mutation requires `-expected-grant-version`: `0` to enroll a conversation with no prior
+history, otherwise the exact current active grant version. A stale value is rejected, never
+silently overwritten. Both peers of an `enroll` or `replace` must currently hold an enabled
+binding. Each call carries an operation ID (a fresh UUID by default); when a response is lost or
+the outcome is reported unknown, retry with the same `-operation-id` so the server returns the
+original receipt rather than mutating twice. Such a retry must pin expiry with the reported
+`-expires-at` value, never recompute it with `-expires-in`.
 
 Grant direction is `bidirectional`, `a_to_b` or `b_to_a`. A positive `-expires-in` duration sets
-expiry relative to now. Zero means no expiry for a new grant and preserves expiry for renewal;
-negative budgets and durations are invalid. Required names and IDs must be nonempty and peers
+expiry relative to now; `-expires-at` sets an exact RFC3339 UTC instant with a literal `Z`. Zero
+means no expiry for a new grant and preserves expiry for renewal; negative budgets and durations
+are invalid. Required names and IDs must be nonempty and peers
 must differ. Identifiers are preserved and compared exactly: `"x"` and `" x"` are different
 conversation names, just as `"a"` and `"a "` are different peer IDs. Whitespace-only identifiers are
 invalid. Both names and peer IDs accept only printable ASCII bytes (`0x20`–`0x7E`), matching
@@ -80,7 +99,7 @@ renewed but remains revocable; its stored identifiers are not rewritten. Use the
 [identifier inventory](docs/identifier-inventory.md) before a future administration-interface cutover.
 Administrator output quotes identifiers to make whitespace visible; use the exact name
 for later operations. Unknown commands, malformed flags and positional arguments fail before
-storage opens.
+any socket is dialed.
 
 Renewal cancels ordinary queued messages from the old version. It carries eligible trusted
 replies forward by default, because their originals have already been acknowledged. The human
@@ -91,8 +110,10 @@ Exit codes: `0` for help/success, `2` for invalid arguments, `1` for operational
 
 ## Storage and recovery
 
-`PARLEY_DB` selects the SQLite database; the default is `./parley.db`. Opening storage applies
-atomic, numbered schema upgrades. The original two unversioned layouts are supported; unknown
+The server owns the SQLite database: `parleyd init -database PATH` creates it explicitly (never
+overwriting an existing file) and `parleyd serve -database PATH ...` holds exclusive ownership
+while running; `serve` never substitutes an empty database. Clients have no database path at all.
+Opening storage applies atomic, numbered schema upgrades. The original two unversioned layouts are supported; unknown
 layouts, future versions and malformed/out-of-range envelope timestamps fail without partial
 migration. Back up existing data before upgrading, using a SQLite-consistent backup or stopping
 all users first; an active WAL database cannot be backed up reliably by copying its main file alone.
