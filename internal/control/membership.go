@@ -110,27 +110,71 @@ type CommandReceiptResult struct {
 	CommitView  CommitView        `json:"commit_view"`
 }
 
-// Usable reports whether r is a genuine command receipt for the exact
-// operation the caller requested, not merely a structurally nonempty one.
-// AuditID/OperationID/CommitView.Epoch/CommitView.Revision are always
-// nonempty and Result.Code is always "" on every successful receipt this
-// server actually produces (mutationResponse only reaches successResponse,
-// with an empty Result.Code, after a real store.Coordinator.Execute call
-// that did not terminally reject -- see mutationResponse's own doc comment);
-// a response failing any of these checks did not carry a real, matching
-// receipt. Critically, r.OperationID must equal requestedOperationID: two
-// nonempty strings that merely differ (a stale or cross-operation receipt)
-// previously passed this check, letting a caller print its own locally
+// Usable reports whether r is a genuine, contract-valid command receipt for
+// the exact operation the caller requested -- not merely a response with
+// nonempty-looking metadata. Checking only that the tracked strings are
+// nonempty (an earlier version of this method) let a structurally decoded
+// but otherwise empty or placeholder-valued object pass: a JSON object
+// carrying just {"operation_id": "<matching>", "audit_id": "60...01",
+// "commit_view": {"epoch": "70...01", "revision": "1"}} with no "result"
+// member at all decodes into a zero-valued wireCommandResult (an absent or
+// null field is a no-op for encoding/json's struct decode, not an error),
+// so Result.Code stays "" and the old check accepted it as a genuine
+// mutation-result object despite carrying no result whatsoever. Likewise
+// audit_id/commit_view.epoch are documented UUIDs and commit_view.revision
+// a canonical nonnegative decimal string (control.md); "audit-1",
+// "epoch-1" and "not-a-number" are not valid spellings of any of those and
+// must not be accepted merely for being nonempty.
+//
+// This method therefore validates every mandatory field's actual form, not
+// just its presence: AuditID and CommitView.Epoch must be canonical UUIDs,
+// CommitView.Revision a canonical nonnegative decimal string, Result.Code
+// empty, and Result.Resources nonempty with every entry's Kind/ID nonempty
+// and Before/After each a canonical nonnegative decimal string -- a
+// genuinely successful membership mutation always changes at least one
+// resource (the grant itself), so an empty Resources list on a "successful"
+// receipt is exactly as suspect as a missing result object. OperationID
+// must equal requestedOperationID, both as canonical UUIDs: two nonempty
+// strings that merely differ (a stale or cross-operation receipt)
+// previously passed unnoticed, letting a caller print its own locally
 // generated operation ID as if the server had confirmed that exact
-// operation. A caller must never treat r as a proven successful completion
-// of requestedOperationID without checking this first.
+// operation.
+//
+// This intentionally validates shape and domain only, never live server
+// state: a valid historical replay of an old receipt (operation.get, or a
+// same-operation-ID retry) must remain Usable exactly as it was when first
+// produced, even though the grant's current version, queue contents or
+// commit_view have since moved on. Comparing Before/After or the resource
+// list against a later live snapshot is a distinct, separate question this
+// method does not answer.
 func (r CommandReceiptResult) Usable(requestedOperationID string) bool {
-	return r.AuditID != "" &&
-		r.OperationID != "" &&
-		r.OperationID == requestedOperationID &&
-		r.CommitView.Epoch != "" &&
-		r.CommitView.Revision != "" &&
-		r.Result.Code == ""
+	if !canonicalUUID(r.AuditID) {
+		return false
+	}
+	if !canonicalUUID(r.OperationID) || r.OperationID != requestedOperationID {
+		return false
+	}
+	if !canonicalUUID(r.CommitView.Epoch) {
+		return false
+	}
+	if _, ok := parseCanonicalNonNegative(r.CommitView.Revision); !ok {
+		return false
+	}
+	if r.Result.Code != "" || len(r.Result.Resources) == 0 {
+		return false
+	}
+	for _, rc := range r.Result.Resources {
+		if rc.Kind == "" || rc.ID == "" {
+			return false
+		}
+		if _, ok := parseCanonicalNonNegative(rc.Before); !ok {
+			return false
+		}
+		if _, ok := parseCanonicalNonNegative(rc.After); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // toWireCommandResult re-encodes a live store.CommandResult with
@@ -706,6 +750,28 @@ func decodePolicy(raw any) (membership.Policy, bool) {
 // input's lexical form, not of whether a reformatted round-trip happens to
 // look shorter.
 var expiresAtGrammar = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$`)
+
+// ValidExpiresAtForm reports whether s matches the exact wire-profile
+// lexical grammar expiresAtGrammar enforces above (canonical date/time
+// digits, an optional 1-9-digit fraction, literal "Z", no numeric offset).
+// cmd/parleyctl calls this to reject a malformed -expires-at before dialing
+// (MC-03), reusing the identical rule this handler applies rather than
+// duplicating regexp text that could drift out of sync with it. It performs
+// no range check -- store.InstantNanos still runs server-side, and the CLI
+// applies the same check itself via ExpiresAtInRange before sending.
+func ValidExpiresAtForm(s string) bool {
+	return expiresAtGrammar.MatchString(s)
+}
+
+// ExpiresAtInRange reports whether t is representable by
+// store.InstantNanos, the same bound store.Coordinator.Execute applies to
+// its own authority instant. cmd/parleyctl calls this alongside
+// ValidExpiresAtForm so an out-of-range -expires-at is rejected locally
+// instead of surfacing later as a remote storage failure.
+func ExpiresAtInRange(t time.Time) bool {
+	_, err := store.InstantNanos(t)
+	return err == nil
+}
 
 func paramOptionalExpiresAt(params map[string]any) (*time.Time, string, bool) {
 	raw, present := params["expires_at"]

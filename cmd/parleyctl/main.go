@@ -160,17 +160,34 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 		}
 		switch {
 		case c.expiresAtFlag != "":
-			parsed, err := time.Parse(time.RFC3339, c.expiresAtFlag)
+			// Validate against the server's own exact lexical grammar
+			// before parsing at all (MC-03): time.Parse(time.RFC3339, ...)
+			// alone is lenient in ways the server's expiresAtGrammar is
+			// not -- it silently truncates a >9-digit fraction, accepts a
+			// comma fraction separator, and accepts a single-digit hour.
+			// Rejecting those here, before any reformatting, means an
+			// invalid -expires-at fails locally instead of round-tripping
+			// through a silent normalization that changes the digest
+			// store.NewCommandRequest sees from what the human typed.
+			if !control.ValidExpiresAtForm(c.expiresAtFlag) {
+				return c, fmt.Errorf("-expires-at must match RFC3339 UTC with a literal Z suffix and no more than 9 fractional digits")
+			}
+			parsed, err := time.Parse(time.RFC3339Nano, c.expiresAtFlag)
 			if err != nil {
 				return c, fmt.Errorf("-expires-at must be RFC3339: %w", err)
 			}
-			// RFC3339Nano, not RFC3339: -expires-at's whole purpose is
-			// reproducing the exact original wire value across a retry, so
-			// truncating a fractional-second input (RFC3339 has no
-			// fractional spec) would silently change the resolved
-			// expires_at -- and therefore store.NewCommandRequest's digest
-			// -- from what -expires-at was given specifically to preserve.
-			c.expiresAt = parsed.UTC().Format(time.RFC3339Nano)
+			if !control.ExpiresAtInRange(parsed) {
+				return c, fmt.Errorf("-expires-at is outside the representable range")
+			}
+			// The validated input is sent verbatim, NOT reformatted via
+			// Format(time.RFC3339Nano): Format trims a trailing-zero
+			// fraction (".750Z" -> ".75Z"), which would silently change
+			// the wire digest for an input the grammar above already
+			// accepted as exact and valid. -expires-at's whole purpose is
+			// reproducing the original wire value byte-for-byte across a
+			// retry, so the original string is authoritative here, not a
+			// reformatted round trip of it.
+			c.expiresAt = c.expiresAtFlag
 		case c.expiresIn > 0:
 			// RFC3339Nano, matching -expires-at's own reformatting below: a
 			// sub-second -expires-in (e.g. "1500ms") would otherwise be
