@@ -602,7 +602,19 @@ func validateGrant(ctx context.Context, p GrantParams) error {
 // since it is not reachable with malformed input via the coordinator.
 func validatePeerIDs(ids ...string) error {
 	for _, id := range ids {
-		if err := bridgetext.ValidateMetadata(id); err != nil {
+		// Review 5256660570 (comment 4053958833): byte-shape alone let an
+		// adopted historical grant's peer -- printable ASCII but longer
+		// than store.MaxIdentityBytes, so it can never have a valid
+		// registry binding -- pass this check. Renewal then only degraded
+		// to store.EnabledPeer's own generic InvalidRequest (EnabledPeer
+		// enforces the same bound, but without this function's specific
+		// IncompatibleIdentifier), and Replace's supersede of the OLD
+		// peers never calls EnabledPeer on them at all (only the NEW
+		// peers, in internal/control's handler), so an oversized
+		// historical pair could be superseded outright with no rejection.
+		// Mirrors internal/control/membership.go's identical
+		// incompatibleConversation fix for conversation identifiers.
+		if len(id) > store.MaxIdentityBytes || bridgetext.ValidateMetadata(id) != nil {
 			return store.IncompatibleIdentifier
 		}
 	}

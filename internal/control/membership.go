@@ -283,9 +283,24 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (r
 	// no live connection.Manager to invalidate a session against.
 	ctx, expiry := store.ObserveExpiries(ctx, sess.server.Store)
 	defer func() {
-		if persistErr := expiry.Persist(sess.server.Store, nil); persistErr != nil {
-			resp = domainErrorResponse(&req.ID, domainCode(persistErr))
-		}
+		// Review 5256660570 (comment 4053958828): a Persist failure here is
+		// an independent, best-effort background write of credential-
+		// expiry evidence (a completely separate coordinator.Transition
+		// from the membership mutation above, which has already committed
+		// and been durably audited by the time this defer runs). resp
+		// already carries that mutation's own genuine outcome -- its
+		// receipt's OperationID/AuditID, or a durably-audited domain
+		// rejection -- and must not be overwritten with a generic
+		// recovery_required/temporarily_unavailable that would make a
+		// provably committed operation look unresolved, costing the CLI
+		// its retry-with-operation-id guidance for no reason. A failed
+		// observation is not lost: store.ExpiryEvidence.Persist retains it
+		// in the coordinator's credentialExpiries map (see that method's
+		// own comment) for the next call from any handler on this DB to
+		// retry, exactly the durability AGENTS.md's "persist it
+		// independently of caller cancellation" requires -- this call site
+		// does not need to compensate further.
+		_ = expiry.Persist(sess.server.Store, nil)
 	}()
 	model := membership.Model{Members: p.members, Policy: p.policy}
 	// membership.Validate must run before membersField/NewCommandRequest:
@@ -373,9 +388,24 @@ func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (re
 	// recordExpiry, which needs this same wrapped ctx.
 	ctx, expiry := store.ObserveExpiries(ctx, sess.server.Store)
 	defer func() {
-		if persistErr := expiry.Persist(sess.server.Store, nil); persistErr != nil {
-			resp = domainErrorResponse(&req.ID, domainCode(persistErr))
-		}
+		// Review 5256660570 (comment 4053958828): a Persist failure here is
+		// an independent, best-effort background write of credential-
+		// expiry evidence (a completely separate coordinator.Transition
+		// from the membership mutation above, which has already committed
+		// and been durably audited by the time this defer runs). resp
+		// already carries that mutation's own genuine outcome -- its
+		// receipt's OperationID/AuditID, or a durably-audited domain
+		// rejection -- and must not be overwritten with a generic
+		// recovery_required/temporarily_unavailable that would make a
+		// provably committed operation look unresolved, costing the CLI
+		// its retry-with-operation-id guidance for no reason. A failed
+		// observation is not lost: store.ExpiryEvidence.Persist retains it
+		// in the coordinator's credentialExpiries map (see that method's
+		// own comment) for the next call from any handler on this DB to
+		// retry, exactly the durability AGENTS.md's "persist it
+		// independently of caller cancellation" requires -- this call site
+		// does not need to compensate further.
+		_ = expiry.Persist(sess.server.Store, nil)
 	}()
 	fields := renewalFields(p.conversation, p.expectedVersion, p.maxExchanges, p.expiresAtText, p.cancelPendingReplies)
 	request, err := store.NewCommandRequest("membership.renew", p.operationID, fields...)
@@ -431,9 +461,24 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 	// See handleMembershipEnroll's identical comment.
 	ctx, expiry := store.ObserveExpiries(ctx, sess.server.Store)
 	defer func() {
-		if persistErr := expiry.Persist(sess.server.Store, nil); persistErr != nil {
-			resp = domainErrorResponse(&req.ID, domainCode(persistErr))
-		}
+		// Review 5256660570 (comment 4053958828): a Persist failure here is
+		// an independent, best-effort background write of credential-
+		// expiry evidence (a completely separate coordinator.Transition
+		// from the membership mutation above, which has already committed
+		// and been durably audited by the time this defer runs). resp
+		// already carries that mutation's own genuine outcome -- its
+		// receipt's OperationID/AuditID, or a durably-audited domain
+		// rejection -- and must not be overwritten with a generic
+		// recovery_required/temporarily_unavailable that would make a
+		// provably committed operation look unresolved, costing the CLI
+		// its retry-with-operation-id guidance for no reason. A failed
+		// observation is not lost: store.ExpiryEvidence.Persist retains it
+		// in the coordinator's credentialExpiries map (see that method's
+		// own comment) for the next call from any handler on this DB to
+		// retry, exactly the durability AGENTS.md's "persist it
+		// independently of caller cancellation" requires -- this call site
+		// does not need to compensate further.
+		_ = expiry.Persist(sess.server.Store, nil)
 	}()
 	model := membership.Model{Members: p.members, Policy: p.policy}
 	// See handleMembershipEnroll's identical comment: Validate must run

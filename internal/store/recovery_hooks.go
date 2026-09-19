@@ -106,7 +106,18 @@ func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r Command
 				// zeroing the receipt and surfacing whatever incidental
 				// code afterErr happened to carry (often RecoveryRequired,
 				// which elsewhere always means "provably never committed").
-				if err == nil {
+				//
+				// Review 5256660570 (comment 4053958839): the original
+				// EC-02 fix above only special-cased err == nil, missing
+				// the case where c.execute's own ambiguous tx.Commit had
+				// already set err = OutcomeUnknown before this deferred
+				// call ever runs (comment above). That is already the
+				// correct, most-cautious "uncertain, safe to retry"
+				// classification for a commit whose outcome could not be
+				// observed -- After's own unrelated failure must not
+				// downgrade it to a different storage code that discards
+				// the receipt and asserts a stronger, unproven claim.
+				if err == nil || err == OutcomeUnknown {
 					err = OutcomeUnknown
 					return
 				}
