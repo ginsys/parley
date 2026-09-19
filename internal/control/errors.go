@@ -34,6 +34,31 @@ const (
 // Naming a spelling here is not the same as implementing the method that
 // returns it -- several of the wire-only additions below are not returned
 // by any method wired in this PR.
+//
+// StaleGrantVersion/InvalidMembership/UnsupportedMembership moved to
+// store.Code in PR2 (internal/store/connection_contract.go): they describe
+// an actual store-mutation precondition failure, not a wire/session
+// concern, and membership.* mutations need them to be valid, terminalResult
+// codes so a rejection is durably audited and replayable like any other
+// domain rejection. They remain accessible as DomainCode constants below
+// (constant conversions of the store.Code values) purely so control-package
+// callers keep one vocabulary to write against; store.Code(d).Valid() in
+// DomainCode.valid() below already accepts them without a separate case.
+//
+// IncompatibleIdentifier joined them for the same reason (MC-02): it is
+// returned two ways that must be told apart on inspection, not confused --
+// handleMembershipEnroll/Renew/Replace's own bridgetext.ValidateMetadata
+// pre-check on the conversation field returns it directly, before
+// store.NewCommandRequest/Execute ever runs (a wire decode-adjacent
+// rejection, never durably recorded through operation_results/
+// command_audit, mirroring invalid_membership's own pre-Execute asymmetry);
+// internal/controller's validatePeerIDs, by contrast, is reached only
+// inside RenewTx's mutate callback against a conversation's already-stored,
+// historical peer IDs, and that rejection *is* durably audited like any
+// other terminal domain result -- see store.IncompatibleIdentifier's own
+// doc comment for why a plain wrapped error there was insufficient. Both
+// paths deliberately produce the identical wire spelling; a caller cannot
+// and need not distinguish which one fired from the code alone.
 type DomainCode string
 
 const (
@@ -42,12 +67,15 @@ const (
 
 	// Wire-only additions from the accepted control specification's
 	// error-contract table; no store.Code counterpart exists or is added.
-	ResnapshotRequired     DomainCode = "resnapshot_required"
-	SubscriptionConflict   DomainCode = "subscription_conflict"
-	StaleGrantVersion      DomainCode = "stale_grant_version"
-	InvalidMembership      DomainCode = "invalid_membership"
-	UnsupportedMembership  DomainCode = "unsupported_membership"
-	IncompatibleIdentifier DomainCode = "incompatible_identifier"
+	ResnapshotRequired   DomainCode = "resnapshot_required"
+	SubscriptionConflict DomainCode = "subscription_conflict"
+
+	// Constant conversions of the store.Code values of the same name (see
+	// the type doc comment above) -- not new wire-only spellings.
+	StaleGrantVersion      = DomainCode(store.StaleGrantVersion)
+	InvalidMembership      = DomainCode(store.InvalidMembership)
+	UnsupportedMembership  = DomainCode(store.UnsupportedMembership)
+	IncompatibleIdentifier = DomainCode(store.IncompatibleIdentifier)
 )
 
 // valid reports whether d is a member of the accepted error.data.code
@@ -64,10 +92,13 @@ func (d DomainCode) valid() bool {
 	}
 	switch d {
 	case ProtocolMismatch, OperationNotFound,
-		ResnapshotRequired, SubscriptionConflict, StaleGrantVersion,
-		InvalidMembership, UnsupportedMembership, IncompatibleIdentifier:
+		ResnapshotRequired, SubscriptionConflict:
 		return true
 	}
+	// Covers StaleGrantVersion/InvalidMembership/UnsupportedMembership/
+	// IncompatibleIdentifier (now store.Code values, see the type doc
+	// comment) and every other
+	// durable domain code.
 	return store.Code(d).Valid()
 }
 

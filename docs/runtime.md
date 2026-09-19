@@ -131,10 +131,12 @@ recovery inspection, readers, then services: a missing deployment database fails
 than being silently created, and an interrupt/TERM signal (or the recovery `FailStop` callback)
 triggers `Runtime.Stop`'s own ordered shutdown.
 
-`parleyctl` is not yet converted to a client: `grant`/`revoke`/`renew` still open the database
-directly, transitionally (EP-02's ownership-lock join), pending PR2. There is still no membership
-or admission wiring, no agent-facing listener, and no live host connection -- see
+`parleyctl` is now a pure client of that same listener: `grant`/`revoke`/`renew` and the
+direct-database `openController` path (EP-02's ownership-lock join) are gone, replaced by
+`parleyctl membership enroll|renew|replace|revoke` against `membership.enroll|renew|replace|revoke`
+(PR2). It never opens the database or acquires a lock. There is still no admission wiring, no
+agent-facing listener, and no live host connection -- see
 [Architecture's accepted human control protocol](architecture.md#accepted-human-control-protocol)
-for the exact `parley-control/1` method surface PR1 wires (`server.hello`, `operation.get` only),
-and [Operations](operations.md) for `parleyd`'s initialization, configuration and stopped-service
-backup procedure.
+for the exact `parley-control/1` method surface (`server.hello`, `operation.get` and the four
+membership mutation methods), and [Operations](operations.md) for `parleyd`'s initialization,
+configuration and stopped-service backup procedure.

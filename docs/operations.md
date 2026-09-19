@@ -1,9 +1,11 @@
 # Operations
 
 This document covers `cmd/parleyd` initialization, configuration and stopped-service backup. It
-describes PR1's actual capability, not a target: there is no checkpoint, backup or restore
-subcommand in this slice, and the wire administration surface exposes only `server.hello` and
-`operation.get` (see [Architecture's accepted human control protocol](architecture.md#accepted-human-control-protocol)).
+describes actual capability, not a target: there is no checkpoint, backup or restore subcommand,
+and the wire administration surface exposes `server.hello`, `operation.get` and the four
+`membership.enroll|renew|replace|revoke` mutation methods -- admission, identity/recovery mutation,
+subscriptions and snapshots remain unimplemented (see
+[Architecture's accepted human control protocol](architecture.md#accepted-human-control-protocol)).
 See [Runtime foundation](runtime.md) for the underlying ownership/startup/shutdown lifecycle this
 document assumes.
 
@@ -16,8 +18,9 @@ Run `parleyd init -database PATH` exactly once per deployment, before the first 
   zero-length file from a previous failed attempt. Remove or relocate that entry yourself before
   retrying; `init` never overwrites, and there is no `-force`.
 - creates the file privately (mode 0600) before anything else touches it, then joins the same
-  exclusive ownership lock `serve` and `parleyctl`'s legacy commands use (`runtime.Acquire`),
-  before running schema migrations.
+  exclusive ownership lock `serve` uses (`runtime.Acquire`), before running schema migrations.
+  `parleyctl` never opens the database and never joins this lock; every mutation goes through the
+  authenticated control endpoint.
 - prints the minted `installation.server_id` on success. **Record this value.** It is the
   database's stable identity, distinct from the per-process `server_epoch` a running server mints
   fresh on every `serve` invocation; a restored or relocated copy must still report the same
@@ -33,7 +36,7 @@ itself). Help and invalid arguments touch neither a database nor a socket.
 by silently reopening or overwriting on a second attempt. Every failure message names the phase
 that failed and what to do next; the file is always left in place for inspection:
 
-- **Ownership already held by another process** -- another `parleyd`/`parleyctl` instance is
+- **Ownership already held by another process** -- another `parleyd` instance is
   running against this path. This attempt did not initialize the file; its current contents are
   unverified, since another owner may already be using or have replaced it. Stop the other
   process, or investigate a stale lock manually; `init` will not guess.
@@ -155,3 +158,24 @@ a misconfiguration, never a fallback.
 A timed-out `hello` reports the outcome as unknown, not failed: the client cannot tell whether the
 server never received the request or simply did not answer in time. Retry rather than assume the
 server is down.
+
+## Membership
+
+`parleyctl membership enroll|renew|replace|revoke` is the only client for membership mutations.
+Every subcommand takes `-conversation`, `-endpoint`/`-server-uid` (same resolution as `hello`) and
+an `-expected-grant-version`: `0` for `enroll` of a conversation with no prior history, otherwise
+the exact current active grant version. A stale value is rejected (`stale_grant_version`), never
+silently overwritten. `enroll` and `replace` also take `-peer-a`/`-peer-b` and `-direction`
+(`bidirectional`/`a_to_b`/`b_to_a`); both peers must currently hold an enabled binding, or the
+server rejects with `binding_unavailable`. `renew` and `replace` accept
+`-cancel-pending-replies` to cancel rather than carry forward pending trusted replies across the
+version bump.
+
+Every call carries an operation ID: a fresh random UUID by default, or an explicit
+`-operation-id` to retry a call whose response was lost without risking a second mutation -- the
+server's command ledger recognizes a repeated operation ID and returns the original receipt rather
+than mutating twice. A timed-out membership call reports the same "outcome unknown" guidance as
+`hello`: retry with the same `-operation-id`, never assume the mutation did not happen.
+
+The client opens no database and acquires no lock; it is a pure caller of the four
+`membership.*` wire methods over the same administration socket `hello` dials.

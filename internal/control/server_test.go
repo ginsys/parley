@@ -44,7 +44,7 @@ func testServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewServer(cfg, store.Queries{}, "server-id-fixture", "epoch-fixture", StateRunning)
+	return NewServer(cfg, store.Queries{}, nil, "server-id-fixture", "epoch-fixture", StateRunning)
 }
 
 func decodeResult[T any](t *testing.T, resp Response) T {
@@ -81,6 +81,33 @@ func TestHandleRejectsAnyMethodBeforeHello(t *testing.T) {
 	}
 	if resp.Err == nil || resp.Err.Code != ServerError || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.Forbidden) {
 		t.Fatalf("%#v", resp.Err)
+	}
+}
+
+// TestHandleMembershipRefusesGracefullyWithNilStore exercises the guard
+// added in the PR2 repair batch: testServer's fixture (and any other
+// caller not wired to a real writer, per Server.Store's own doc comment)
+// must never panic on a well-formed membership.* request. Before that
+// guard existed, this test would have reached a nil-pointer dereference
+// on sess.server.Store.Coordinator() instead of a clean domain rejection.
+func TestHandleMembershipRefusesGracefullyWithNilStore(t *testing.T) {
+	srv := testServer(t)
+	sess := srv.NewSession(Identity{PrincipalID: testHelloAdmin, UID: 1001})
+	hello := Request{ID: "1", Method: "server.hello", Params: map[string]any{"protocol": ProtocolVersion}}
+	if _, closeAfter := sess.Handle(context.Background(), hello); closeAfter {
+		t.Fatal("hello unexpectedly closed")
+	}
+	for _, method := range []string{"membership.enroll", "membership.renew", "membership.replace", "membership.revoke"} {
+		t.Run(method, func(t *testing.T) {
+			req := Request{ID: "2", Method: method, Params: map[string]any{}}
+			resp, closeAfter := sess.Handle(context.Background(), req)
+			if closeAfter {
+				t.Fatal("unexpected close")
+			}
+			if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.TemporarilyUnavailable) {
+				t.Fatalf("%#v", resp.Err)
+			}
+		})
 	}
 }
 
@@ -177,7 +204,7 @@ func TestHandleOperationGetEndToEndAndScoping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewServer(cfg, db.Queries(), "server-id-fixture", "epoch-fixture", StateRunning)
+	srv := NewServer(cfg, db.Queries(), db, "server-id-fixture", "epoch-fixture", StateRunning)
 
 	owner := srv.NewSession(Identity{PrincipalID: testHelloAdmin, UID: 1001})
 	owner.negotiated = true
@@ -233,7 +260,7 @@ func TestHandleOperationGetRepublishesResourceChangesAsDecimalStrings(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := NewServer(cfg, db.Queries(), "server-id-fixture", "epoch-fixture", StateRunning)
+	srv := NewServer(cfg, db.Queries(), db, "server-id-fixture", "epoch-fixture", StateRunning)
 	sess := srv.NewSession(Identity{PrincipalID: testHelloAdmin, UID: 1001})
 	sess.negotiated = true
 	resp, _ := sess.Handle(ctx, Request{ID: "1", Method: "operation.get", Params: map[string]any{"operation_id": testHandleOperation}})

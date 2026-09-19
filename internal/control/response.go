@@ -93,6 +93,15 @@ func domainMessage(code DomainCode) string {
 		return "Temporarily unavailable."
 	case DomainCode("recovery_required"):
 		return "Recovery is required before this operation."
+	case DomainCode("outcome_unknown"):
+		// store.Coordinator.Execute's own OutcomeUnknown terminal result
+		// (internal/store/coordinator.go): the server itself could not
+		// determine whether its commit took effect. "Request rejected." is
+		// actively wrong here -- it asserts a proven failure the server
+		// never established -- so this needs its own fixed, safe summary
+		// distinct from every other domain rejection below, without adding
+		// a new field to the terminal-error envelope schema.
+		return "Outcome unknown: the server could not confirm whether this request took effect."
 	default:
 		return "Request rejected."
 	}

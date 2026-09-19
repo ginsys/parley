@@ -18,9 +18,13 @@ lifecycle/holds, authenticated ordinary-work APIs and the migrated poller. Also 
 `internal/control` (the `parley-control/1` wire foundation — framing, profile validation, the error
 vocabulary and a Linux `SO_PEERCRED` listener) and `cmd/parleyd` (`init`/`serve`), the first
 standing server executable; `parleyctl` gained `-endpoint`/`-server-uid` and a `hello` diagnostic
-that opens no database. **Only `server.hello` and `operation.get` are wired.** `parleyctl
-grant|revoke|renew` still open the database directly (transitional, removed in PR2's client
-conversion); there is no membership, admission, agent-facing listener or live host connection yet.
+that opens no database. Also present (PR2): `internal/membership` (the members/policy model and its
+exact translation to/from the existing pair-based grant storage) and the wire mutation methods
+`membership.enroll|renew|replace|revoke`, dispatched through the existing `store.Coordinator`.
+`parleyctl` is now a pure client: `grant|revoke|renew` are gone, replaced by `parleyctl membership
+enroll|renew|replace|revoke`, which never opens a database or a lock of any kind — every mutation
+goes through the authenticated control endpoint. There is no admission, agent-facing listener or
+live host connection yet.
 Do not treat anything below
 `internal/` as wired to a live agent session yet —
 `dispatch.Transport` is an interface with no real Channels implementation in this repo so far,
@@ -31,10 +35,13 @@ and [Operations](docs/operations.md) for what `cmd/parleyd`/`parleyctl` actually
 
 ## The protected controller
 
-`cmd/parleyctl` is the only code path that ever writes a grant, revocation, or renewal. It is meant
-to be run directly by a human in their own shell — **never invoke it as a tool call from an agent
-session**, and never let an agent construct or approve the grant/revoke/renew arguments on a
-human's behalf. This is a cooperative-policy boundary, not a proven impersonation-proof one: see
+`cmd/parleyctl` is the only client that ever enrolls, renews, replaces or revokes membership. It is
+meant to be run directly by a human in their own shell — **never invoke it as a tool call from an
+agent session**, and never let an agent construct or approve the `membership
+enroll|renew|replace|revoke` arguments on a human's behalf. Every mutation is authenticated and
+authorized on the server side; `parleyctl` itself holds no writer authority of its own and cannot
+open the database. This is a cooperative-policy boundary on who may run the client, not a proven
+impersonation-proof one: see
 [the architecture limitations](docs/architecture.md#authority-boundary) before treating it as stronger than that.
 
 The [accepted runtime direction](docs/architecture.md#accepted-runtime-direction) records the
