@@ -276,6 +276,43 @@ func TestMembershipEnrollPersistsObservedCredentialExpiry(t *testing.T) {
 	}
 }
 
+// TestMembershipEnrollPreservesRejectionWhenExpiryPersistFails is round-2
+// finding 1 (review 5256660570, comment 4053958828): round-1's own fix
+// above wrapped the expiry observation in a defer that overwrote resp with
+// a generic domainCode(persistErr) whenever Persist failed -- reproducing,
+// at the wire-response layer, the exact anti-pattern EC-02 fixed at the
+// coordinator layer (a best-effort background write's failure must never
+// overwrite an already-durable outcome). This forces a genuine Persist
+// failure with a synthetic trigger (the same pattern
+// internal/connection/deadline_review_test.go's
+// TestFailedExpiryPersistenceRetainsDenialAcrossClockRollback uses) during
+// an enroll whose underlying rejection (binding_unavailable) is already
+// durable by the time the deferred Persist call runs, and proves the wire
+// response still reports that exact rejection -- never a Persist-failure-
+// derived code -- while the credential's stored status is untouched
+// (Persist's own UPDATE genuinely failed, it did not silently no-op).
+func TestMembershipEnrollPreservesRejectionWhenExpiryPersistFails(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedExpiredBinding(t, db, 2, "peer-b")
+	ctx := context.Background()
+
+	if _, err := db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		_, err := tx.ExecContext(ctx, `CREATE TRIGGER reject_expiry BEFORE UPDATE OF status ON credentials WHEN NEW.status='expired' BEGIN SELECT RAISE(ABORT,'synthetic expiry failure'); END`)
+		return store.TransitionResult{Changed: true}, err
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, _ := sess.Handle(ctx, Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.BindingUnavailable) {
+		t.Fatalf("a Persist failure must not overwrite the genuine domain rejection: %#v", resp.Err)
+	}
+	if status := credentialStatus(t, db, 2); status != "current" {
+		t.Fatalf("Persist's UPDATE should have genuinely failed (trigger), not silently succeeded: status=%s", status)
+	}
+}
+
 func TestMembershipEnrollRejectsUnsupportedShape(t *testing.T) {
 	sess, db := membershipTestServer(t)
 	seedEnabledBinding(t, db, 1, "peer-a")
@@ -1672,6 +1709,64 @@ func TestMembershipReplaceRejectsIncompatibleCurrentPeersWithoutMutating(t *test
 	}})
 	if revoke.Err != nil {
 		t.Fatalf("legacy grant must remain revocable: %#v", revoke.Err)
+	}
+}
+
+// TestMembershipReplaceRejectsOversizedButByteValidCurrentPeer is round-2
+// finding 2 (review 5256660570, comment 4053958833):
+// TestMembershipReplaceRejectsIncompatibleCurrentPeersWithoutMutating above
+// uses a control-character peer, which bridgetext.ValidateMetadata alone
+// already rejected before this session's fix -- it never exercised the new
+// len(id) > store.MaxIdentityBytes bound controller.validatePeerIDs gained.
+// This uses a peer that is valid printable ASCII (passes
+// bridgetext.ValidateMetadata) but longer than MaxIdentityBytes, so it can
+// never have a real registry binding, and proves Replace's supersede of the
+// OLD peers -- which never calls store.EnabledPeer, only the NEW peers do,
+// in this handler -- still rejects it via validatePeerIDs's own bound
+// rather than superseding the historical grant outright.
+func TestMembershipReplaceRejectsOversizedButByteValidCurrentPeer(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-c")
+	ctx := context.Background()
+	oversizedPeer := strings.Repeat("x", store.MaxIdentityBytes+1)
+
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "conv-oversized", "conv-oversized", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertGrant(ctx, tx, store.Grant{
+		Conversation: "conv-oversized", GrantVersion: 1, PeerAID: oversizedPeer, PeerBID: "peer-a",
+		Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, _ := sess.Handle(ctx, Request{ID: "1", Method: "membership.replace", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-oversized", "expected_grant_version": "1",
+		"members": []any{
+			map[string]any{"peer_id": "peer-a", "role": "member"},
+			map[string]any{"peer_id": "peer-c", "role": "member"},
+		},
+		"policy": map[string]any{"kind": "open"},
+	}})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier for an oversized-but-byte-valid current peer, got %#v", resp.Err)
+	}
+
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if g, err := store.CurrentGrant(ctx, tx, "conv-oversized"); err != nil || g.GrantVersion != 1 || g.PeerAID != oversizedPeer {
+		t.Errorf("the oversized historical grant must remain unsuperseded: %+v: %v", g, err)
 	}
 }
 

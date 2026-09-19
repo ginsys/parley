@@ -160,6 +160,53 @@ func TestExecutePreservesReceiptWhenAfterFailsAfterTerminalRejection(t *testing.
 	}
 }
 
+// TestExecutePreservesOutcomeUnknownWhenAfterAlsoFailsAfterAmbiguousCommit is
+// round-2 finding 3 (review 5256660570, comment 4053958839): the two tests
+// above only special-cased err == nil entering the deferred After-failure
+// handler. c.execute's own tx.Commit can independently set err =
+// OutcomeUnknown *before* that deferred call ever runs (coordinator.go's
+// commit method, on a genuine driver-level commit failure -- forced here the
+// same way TestCommandCommitFailurePoisonsCoordinator does, with a
+// DEFERRABLE INITIALLY DEFERRED foreign key that only fails at COMMIT, not
+// at the INSERT that violates it). Before this fix, an unrelated After
+// failure on top of that would downgrade the already-correct "uncertain,
+// safe to retry" OutcomeUnknown classification to whatever storageCode(afterErr)
+// produced (typically RecoveryRequired, which elsewhere always means
+// "provably never committed") -- asserting a stronger, unproven claim about
+// a commit whose outcome could never actually be observed. There is no
+// receipt to preserve in this path (c.execute returns the zero receipt
+// alongside OutcomeUnknown, since the commit was never confirmed) -- only
+// the OutcomeUnknown classification itself must survive the After failure.
+func TestExecutePreservesOutcomeUnknownWhenAfterAlsoFailsAfterAmbiguousCommit(t *testing.T) {
+	db := commandDB(t)
+	ctx := context.Background()
+	if _, err := db.sql.Exec(`CREATE TABLE commit_parent2(id INTEGER PRIMARY KEY); CREATE TABLE commit_child2(parent INTEGER REFERENCES commit_parent2(id) DEFERRABLE INITIALLY DEFERRED)`); err != nil {
+		t.Fatal(err)
+	}
+	_, err := db.Coordinator().InstallRecovery(RecoveryHooks{
+		Before: func(context.Context, string) error { return nil },
+		Time:   func(context.Context, *sql.Tx, string) (time.Time, error) { return time.Unix(1, 0), nil },
+		After: func() error {
+			return RecoveryRequired // an unrelated, independent failure
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate := func(ctx context.Context, tx *sql.Tx) (CommandResult, error) {
+		_, err := tx.ExecContext(ctx, "INSERT INTO commit_child2 VALUES(1)")
+		return CommandResult{}, err
+	}
+	request := testRequest(t, testOperation)
+	receipt, err := db.Coordinator().Execute(ctx, CommandPrincipal{ID: testPrincipal}, request, allowed, mutate, nil)
+	if err != OutcomeUnknown {
+		t.Fatalf("an unrelated After failure must not downgrade an already-ambiguous commit's OutcomeUnknown, got %v", err)
+	}
+	if receipt.OperationID != "" || receipt.AuditID != "" {
+		t.Fatalf("an unconfirmed commit has no receipt to preserve, got %+v", receipt)
+	}
+}
+
 func TestRecoveryHooksCannotBeInstalledAfterAdmission(t *testing.T) {
 	db := commandDB(t)
 	if err := db.Coordinator().ClaimConnections(context.Background()); err != nil {
