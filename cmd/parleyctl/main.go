@@ -120,7 +120,24 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	// key even if it is byte-malformed (outside printable ASCII, or
 	// otherwise ASCII-incompatible) -- new-enrollment validation does not
 	// apply to that path (AGENTS.md).
-	if strings.TrimSpace(c.conversation) == "" {
+	//
+	// Revoke must NOT use TrimSpace here (review d89c4e6 post-push finding,
+	// comment 4053366764): AGENTS.md requires every new identifier to
+	// contain "at least one non-space byte", but a historical, already-
+	// enrolled legacy key is exempt from that rule and may be space-only.
+	// TrimSpace(c.conversation) == "" is indistinguishable between "the
+	// flag was never supplied" (default "") and "-conversation '   '" was
+	// supplied verbatim -- the former must be rejected, the latter must
+	// reach the server exactly as typed so an operator can revoke that
+	// exact historical key. Checking the untrimmed value against "" keeps
+	// the missing-flag rejection while letting a supplied space-only value
+	// through on the revoke path only; enroll/renew/replace still require
+	// TrimSpace nonemptiness since AGENTS.md's rule applies to them.
+	if c.op == "revoke" {
+		if c.conversation == "" {
+			return c, fmt.Errorf("membership %s requires -conversation", c.op)
+		}
+	} else if strings.TrimSpace(c.conversation) == "" {
 		return c, fmt.Errorf("membership %s requires -conversation", c.op)
 	}
 	if c.op != "revoke" {
@@ -216,6 +233,18 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 		for _, id := range []string{c.peerA, c.peerB} {
 			if err := bridgetext.ValidateMetadata(id); err != nil {
 				return c, fmt.Errorf("peer identifier: %w", err)
+			}
+			// Mirrors the conversation-length check above (review d89c4e6
+			// post-push finding, comment 4053366765): an ASCII peer
+			// identifier longer than store.MaxIdentityBytes passes
+			// ValidateMetadata's shape check, dials, and only then hits
+			// store.EnabledPeer's identical length bound inside
+			// Coordinator.Execute -- a durable but generic invalid_request,
+			// consuming an operation ID and audit history for a boundary
+			// this client can already reject deterministically before
+			// dialing.
+			if len(id) > store.MaxIdentityBytes {
+				return c, fmt.Errorf("peer identifier: exceeds maximum length of %d bytes", store.MaxIdentityBytes)
 			}
 		}
 		switch c.direction {
