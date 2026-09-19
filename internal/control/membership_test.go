@@ -389,8 +389,11 @@ func TestMembershipEnrollResultEchoesExactOperationID(t *testing.T) {
 	if result.OperationID != opID {
 		t.Fatalf("operation_id=%q, want %q", result.OperationID, opID)
 	}
-	if !result.Usable() {
+	if !result.Usable(opID) {
 		t.Fatalf("a genuine receipt must be Usable: %#v", result)
+	}
+	if result.Usable("some-other-operation-id") {
+		t.Fatalf("a receipt for a different operation_id must not be Usable: %#v", result)
 	}
 }
 
@@ -469,19 +472,54 @@ func TestMembershipRenewResultReportsCarriedAndCancelledCounts(t *testing.T) {
 // TestMembershipRenewResultReportsCarriedAndCancelledCounts's replace-side
 // equivalent: replace shares supersede/SupersedeResult with renew, but is
 // its own wire handler and must be checked independently rather than
-// assumed identical from renew's coverage alone.
+// assumed identical from renew's coverage alone. Unlike an earlier version
+// of this test (a hosted review finding), it seeds an actual carryable
+// trusted reply -- not just an ordinary queued message -- and asserts
+// queued_carried explicitly: removing carried-count reporting from
+// replace's response entirely would not have failed the earlier version.
+// peer-a/peer-b are kept as members under an "open" policy (bidirectional
+// direction) in the replacement, matching the sibling renew test: the reply
+// flows peer-b -> peer-a, which CarryForwardQueuedReplies' own direction
+// re-check only carries under 'bidirectional' or 'b_to_a' -- a directed
+// a->b-only policy would make the reply itself ineligible and turn this into
+// a test of rejection, not of carry-forward reporting.
 func TestMembershipReplaceResultReportsCarriedAndCancelledCounts(t *testing.T) {
 	sess, db := membershipTestServer(t)
 	seedEnabledBinding(t, db, 1, "peer-a")
 	seedEnabledBinding(t, db, 2, "peer-b")
-	seedEnabledBinding(t, db, 3, "peer-c")
-	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "0",
+		"members": []any{
+			map[string]any{"peer_id": "peer-a", "role": "member"},
+			map[string]any{"peer_id": "peer-b", "role": "member"},
+		},
+		"policy":        map[string]any{"kind": "open"},
+		"max_exchanges": "5",
+	}})
 	if enroll.Err != nil {
 		t.Fatalf("enroll failed: %#v", enroll.Err)
 	}
 	ctx := context.Background()
 	tx, err := db.Begin(ctx)
 	if err != nil {
+		t.Fatal(err)
+	}
+	original := "80000000-0000-4000-8000-000000000005"
+	if err := store.InsertQueued(ctx, tx, store.Envelope{
+		ID: original, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
+		Text: "original", GrantVersion: 1, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetState(ctx, tx, original, store.Queued, store.Acked, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	reply := "80000000-0000-4000-8000-000000000006"
+	if err := store.InsertQueued(ctx, tx, store.Envelope{
+		ID: reply, Conversation: "conv-1", FromPeer: "peer-b", ToPeer: "peer-a",
+		Text: "reply", GrantVersion: 1, InReplyTo: &original, TrustedReply: true,
+		CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	ordinary := "80000000-0000-4000-8000-000000000004"
@@ -496,9 +534,15 @@ func TestMembershipReplaceResultReportsCarriedAndCancelledCounts(t *testing.T) {
 	}
 	replace, _ := sess.Handle(ctx, Request{ID: "2", Method: "membership.replace", Params: map[string]any{
 		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+		// Kept at exactly the two members enroll used (membership.Supported
+		// rejects a >2-member shape outright, e.g. as unsupported_membership
+		// -- irrelevant to what this test checks, but a >2-member
+		// replacement here would fail the call entirely for that unrelated
+		// reason before ever reaching supersede). peer-c stays enrolled as
+		// an unused binding.
 		"members": []any{
 			map[string]any{"peer_id": "peer-a", "role": "member"},
-			map[string]any{"peer_id": "peer-c", "role": "member"},
+			map[string]any{"peer_id": "peer-b", "role": "member"},
 		},
 		"policy": map[string]any{"kind": "open"},
 	}})
@@ -506,11 +550,17 @@ func TestMembershipReplaceResultReportsCarriedAndCancelledCounts(t *testing.T) {
 		t.Fatalf("replace failed: %#v", replace.Err)
 	}
 	result := decodeResult[CommandReceiptResult](t, replace)
-	var cancelled string
+	var carried, cancelled string
 	for _, r := range result.Result.Resources {
-		if r.Kind == "queued_cancelled" {
+		switch r.Kind {
+		case "queued_carried":
+			carried = r.After
+		case "queued_cancelled":
 			cancelled = r.After
 		}
+	}
+	if carried != "1" {
+		t.Fatalf("queued_carried=%q, want 1: %#v", carried, result.Result.Resources)
 	}
 	if cancelled != "1" {
 		t.Fatalf("queued_cancelled=%q, want 1: %#v", cancelled, result.Result.Resources)
@@ -553,7 +603,15 @@ func TestDecodePolicyEnforcesTaggedUnionEdgesPresence(t *testing.T) {
 // spelling was sent), sub-second precision is preserved through
 // RFC3339Nano rather than truncated, and the range is bounded by
 // store.InstantNanos, the same bound the coordinator's own authority
-// instant must satisfy.
+// instant must satisfy. The comma-fraction/overlong-fraction/single-digit-
+// hour cases are expiresAtGrammar's own regressions (F3): a bare
+// strings.HasSuffix(s, "Z") check let all three slip through to
+// time.Parse(time.RFC3339Nano, ...), which either truncated a >9-digit
+// fraction silently instead of rejecting it, or (for the comma/single-digit
+// cases) simply failed to parse -- but as a parse failure indistinguishable
+// from "not a timestamp at all", not a named lexical-grammar rejection.
+// ".750Z" is the named case that must keep working: a valid trailing-zero
+// fractional-second spelling, not a malformed one.
 func TestParamOptionalExpiresAtValidatesFormAndRange(t *testing.T) {
 	cases := []struct {
 		name string
@@ -563,10 +621,14 @@ func TestParamOptionalExpiresAtValidatesFormAndRange(t *testing.T) {
 		{"omitted", "", true}, // handled separately below: no expires_at key at all
 		{"UTC Z", "2030-06-15T12:00:00Z", true},
 		{"UTC Z with fractional nanoseconds", "2030-06-15T12:00:00.123456789Z", true},
+		{"UTC Z with valid trailing-zero fraction", "2030-06-15T12:00:00.750Z", true},
 		{"numeric UTC offset rejected, not normalized", "2030-06-15T12:00:00+00:00", false},
 		{"non-UTC numeric offset rejected", "2030-06-15T14:00:00+02:00", false},
 		{"out of int64-nanosecond range", "3000-01-01T00:00:00Z", false},
 		{"not RFC3339 at all", "not-a-timestamp", false},
+		{"comma fraction separator rejected", "2030-06-15T12:00:00,750Z", false},
+		{"more than 9 fraction digits rejected", "2030-06-15T12:00:00.1234567890Z", false},
+		{"single-digit hour rejected", "2030-06-15T2:00:00Z", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -590,8 +652,19 @@ func TestParamOptionalExpiresAtValidatesFormAndRange(t *testing.T) {
 			if text != c.s {
 				t.Fatalf("text=%q, want the wire value preserved verbatim %q", text, c.s)
 			}
-			if parsed.UTC().Format(time.RFC3339Nano) != c.s {
-				t.Fatalf("parsed=%v does not round-trip to %q (precision lost)", parsed, c.s)
+			// Compare against a fresh reference parse rather than
+			// re-Format()ing parsed and string-matching c.s: Go's
+			// time.Format trims trailing zero fraction digits (".750"
+			// formats back as ".75"), which would wrongly fail a valid
+			// trailing-zero spelling like ".750Z" even though no precision
+			// was actually lost. text's separate verbatim check above is
+			// what proves the wire byte string itself survives unchanged.
+			want, err := time.Parse(time.RFC3339Nano, c.s)
+			if err != nil {
+				t.Fatalf("test fixture %q must itself be valid RFC3339Nano: %v", c.s, err)
+			}
+			if !parsed.Equal(want) {
+				t.Fatalf("parsed=%v, want %v (precision lost)", parsed, want)
 			}
 		})
 	}
@@ -652,8 +725,13 @@ func TestMembershipRevokeBypassesIncompatibleIdentifierCheck(t *testing.T) {
 	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
 		"operation_id": newOpID(), "conversation": "bad\x7fconversation", "expected_grant_version": "1",
 	}})
-	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code == IncompatibleIdentifier {
-		t.Fatalf("revoke must not apply the new-enrollment identifier check, got %#v", resp.Err)
+	// Asserts the exact expected code, not merely "not incompatible_identifier"
+	// (an earlier version of this test only checked the latter, so a
+	// regression collapsing this rejection to e.g. temporarily_unavailable --
+	// which would also disable historical-key revocation -- would still have
+	// passed it).
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.NoActiveGrant) {
+		t.Fatalf("expected no_active_grant, got %#v", resp.Err)
 	}
 }
 
@@ -723,5 +801,36 @@ func TestUnsupportedMembershipRejectionReservesOperationIDAndConflictsOnRetry(t 
 	second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: corrected})
 	if second.Err == nil || second.Err.Data == nil || second.Err.Data.Code != DomainCode(store.OperationConflict) {
 		t.Fatalf("a corrected retry of a durably-rejected unsupported_membership operation_id must conflict, got %#v", second.Err)
+	}
+}
+
+// TestIncompatibleIdentifierRejectionDoesNotReserveOperationID is the
+// audit-boundary's third case, for MC-02/C1's own control-layer
+// pre-check (handleMembershipEnroll's bridgetext.ValidateMetadata(p.
+// conversation), returning IncompatibleIdentifier directly): like
+// invalid_membership and unlike unsupported_membership, this check runs
+// entirely before store.NewCommandRequest/Execute, so it reserves no
+// operation_id and creates no operation_results/command_audit row. A
+// corrected retry reusing the same operation_id must therefore execute
+// normally rather than durably conflict -- proving this pre-check is
+// genuinely safe to retry, not silently masking a different failure mode
+// that would need its own audit trail.
+func TestIncompatibleIdentifierRejectionDoesNotReserveOperationID(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	opID := newOpID()
+	bad := openMembers("peer-a", "peer-b")
+	bad["operation_id"] = opID
+	bad["conversation"] = "bad\x7fconversation"
+	first, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: bad})
+	if first.Err == nil || first.Err.Data == nil || first.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier, got %#v", first.Err)
+	}
+	corrected := openMembers("peer-a", "peer-b")
+	corrected["operation_id"] = opID
+	second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: corrected})
+	if second.Err != nil {
+		t.Fatalf("a corrected retry reusing the same operation_id must execute, got %#v", second.Err)
 	}
 }

@@ -90,7 +90,7 @@ func (c *Controller) Grant(ctx context.Context, p GrantParams) (*store.Grant, er
 // observable enrollment semantics (validation, version assignment, the
 // active-grant conflict check) can never diverge between the two callers.
 func GrantTx(ctx context.Context, tx *sql.Tx, p GrantParams) (*store.Grant, error) {
-	if err := validateGrant(p); err != nil {
+	if err := validateGrant(ctx, p); err != nil {
 		return nil, err
 	}
 	now := authorityNow(ctx)
@@ -264,7 +264,7 @@ func (c *Controller) Renew(ctx context.Context, p RenewParams) (*store.Grant, er
 
 // RenewTx is Renew's actual body, taking an already-open transaction.
 func RenewTx(ctx context.Context, tx *sql.Tx, p RenewParams) (*SupersedeResult, error) {
-	if err := validateRenewalInput(p.Conversation, p.MaxExchanges, p.ExpiresAt); err != nil {
+	if err := validateRenewalInput(ctx, p.Conversation, p.MaxExchanges, p.ExpiresAt); err != nil {
 		return nil, err
 	}
 	current, err := currentGrantExpecting(ctx, tx, p.Conversation, p.ExpectedVersion)
@@ -301,10 +301,10 @@ type ReplaceParams struct {
 // membership.replace handler calls it, always inside a coordinator
 // transaction, always with a concrete ExpectedVersion.
 func ReplaceTx(ctx context.Context, tx *sql.Tx, p ReplaceParams) (*SupersedeResult, error) {
-	if err := validateRenewalInput(p.Conversation, p.MaxExchanges, p.ExpiresAt); err != nil {
+	if err := validateRenewalInput(ctx, p.Conversation, p.MaxExchanges, p.ExpiresAt); err != nil {
 		return nil, err
 	}
-	if err := validateGrant(GrantParams{Conversation: p.Conversation, PeerAID: p.PeerAID, PeerBID: p.PeerBID, Direction: p.Direction, MaxExchanges: 1}); err != nil {
+	if err := validateGrant(ctx, GrantParams{Conversation: p.Conversation, PeerAID: p.PeerAID, PeerBID: p.PeerBID, Direction: p.Direction, MaxExchanges: 1}); err != nil {
 		return nil, err
 	}
 	current, err := currentGrantExpecting(ctx, tx, p.Conversation, p.ExpectedVersion)
@@ -337,14 +337,19 @@ func currentGrantExpecting(ctx context.Context, tx *sql.Tx, conversation string,
 
 // SupersedeResult is Renew/Replace's shared result: the successor grant plus
 // the exact counts of what happened to the predecessor's queued envelopes,
-// mirroring RevokeResult's own three-way split so a renew/replace receipt
-// can report its lifecycle effect just as precisely as revoke's does,
-// instead of silently discarding CarryForwardQueuedReplies/
-// CancelQueuedUnderVersion's own return counts.
+// mirroring RevokeResult's own three-way split (Cancelled/AlreadyDispatching/
+// AlreadyHandedOff) so a renew/replace receipt can report its lifecycle
+// effect just as precisely as revoke's does, instead of silently discarding
+// CarryForwardQueuedReplies/CancelQueuedUnderVersion's own return counts, or
+// -- for AlreadyDispatching/AlreadyHandedOff -- simply never counting them
+// at all. Carried has no RevokeResult analogue: revoke has no successor
+// version for a reply to carry forward to.
 type SupersedeResult struct {
-	Grant     *store.Grant
-	Carried   int64
-	Cancelled int64
+	Grant              *store.Grant
+	Carried            int64
+	Cancelled          int64
+	AlreadyDispatching int64
+	AlreadyHandedOff   int64
 }
 
 // supersede is Renew/Replace's shared version-bump body: mark the current
@@ -354,6 +359,21 @@ type SupersedeResult struct {
 // version. Called only after the caller's own validation and version check.
 func supersede(ctx context.Context, tx *sql.Tx, current *store.Grant, conversation, peerA, peerB string, direction store.Direction,
 	maxExchanges int64, expiresAt *time.Time, cancelPendingReplies bool) (*SupersedeResult, error) {
+	// Counted before any mutation below, mirroring RevokeTx's identical
+	// ordering and identical countByState call: only the currently active
+	// grant version can ever accept a dispatch claim, so any envelope
+	// presently in dispatching/handed_off state was necessarily claimed
+	// under current.GrantVersion, the one about to be superseded --
+	// scoping the count by conversation alone (not also grant_version) is
+	// therefore exact here, the same reasoning RevokeTx already relies on.
+	dispatching, err := countByState(ctx, tx, conversation, store.Dispatching)
+	if err != nil {
+		return nil, err
+	}
+	handedOff, err := countByState(ctx, tx, conversation, store.HandedOff)
+	if err != nil {
+		return nil, err
+	}
 	now := authorityNow(ctx)
 	if err := store.SetGrantStatus(ctx, tx, conversation, current.GrantVersion, store.GrantSuperseded, now); err != nil {
 		return nil, err
@@ -398,20 +418,31 @@ func supersede(ctx context.Context, tx *sql.Tx, current *store.Grant, conversati
 		return nil, err
 	}
 	next.Status = store.GrantActive
-	return &SupersedeResult{Grant: &next, Carried: carried, Cancelled: cancelled}, nil
+	return &SupersedeResult{
+		Grant: &next, Carried: carried, Cancelled: cancelled,
+		AlreadyDispatching: dispatching, AlreadyHandedOff: handedOff,
+	}, nil
 }
 
 // validateRenewalInput is Renew/Replace's shared conversation/budget/expiry
 // input validation, run before any read against the conversation's history.
-func validateRenewalInput(conversation string, maxExchanges int64, expiresAt *time.Time) error {
+// The expiry check compares against ctx's single authority instant
+// (authorityInstant), not an independently sampled time.Now() -- the same
+// MC-03 correction as validateGrant's -- and returns store.RequestExpired,
+// an existing, previously never-returned terminal store.Code (already
+// documented generically in docs/specifications/control.md and
+// connections.md's error-contract tables) rather than a plain error that
+// store.Coordinator.Execute's own classification would degrade to
+// TemporarilyUnavailable, discarding the specific, audited reason.
+func validateRenewalInput(ctx context.Context, conversation string, maxExchanges int64, expiresAt *time.Time) error {
 	if err := bridgetext.ValidateMetadata(conversation); err != nil {
 		return fmt.Errorf("conversation identifier: %w", err)
 	}
 	if maxExchanges < 0 {
 		return fmt.Errorf("renew requires conversation and nonnegative budget")
 	}
-	if expiresAt != nil && !expiresAt.After(time.Now()) {
-		return fmt.Errorf("explicit expiry must be in the future")
+	if expiresAt != nil && !expiresAt.After(authorityInstant(ctx)) {
+		return store.RequestExpired
 	}
 	return nil
 }
@@ -426,21 +457,34 @@ func countByState(ctx context.Context, tx *sql.Tx, conversation string, state st
 	return n, nil
 }
 
-// authorityNow returns store.Coordinator.Execute's single writer-validated
-// instant when one is installed on ctx (every coordinator-driven mutation
-// callback: internal/control's membership.enroll/renew/replace/revoke
-// handlers), falling back to the process wall clock only for a caller with
-// no coordinator context (the legacy self-opening Grant/Revoke/Renew
-// wrappers above). Before this, GrantTx/RevokeTx/supersede each minted
-// their own independent time.Now() sample even when called from inside a
-// coordinator transaction that had already resolved and validated a single
-// authoritative instant for the whole command -- letting a single
-// membership.enroll's EnabledPeer check and its own grant's granted_at
-// timestamp disagree about "now". store.AuthorityTime is the same time
-// authority internal/control/membership.go's handlers already use for
-// their own EnabledPeer checks.
+// authorityInstant returns store.Coordinator.Execute's single
+// writer-validated instant when one is installed on ctx (every
+// coordinator-driven mutation callback: internal/control's
+// membership.enroll/renew/replace/revoke handlers), falling back to the
+// process wall clock only for a caller with no coordinator context (the
+// legacy self-opening Grant/Revoke/Renew wrappers above). This is the raw
+// time.Time extraction authorityNow formats for storage; validateGrant and
+// validateRenewalInput also compare an explicit expiry against this exact
+// value (MC-03), rather than each independently sampling time.Now() as
+// before -- without this, a single membership.enroll's own stored
+// granted_at and its explicit-expiry-in-the-future check could disagree
+// about "now" whenever the coordinator's resolved authority instant
+// diverges from wall time (a clock-rollback/recovery scenario).
+func authorityInstant(ctx context.Context) time.Time {
+	return store.AuthorityTime(ctx, func() time.Time { return time.Now() })
+}
+
+// authorityNow returns authorityInstant formatted for storage. Before this
+// split, GrantTx/RevokeTx/supersede each minted their own independent
+// time.Now() sample even when called from inside a coordinator transaction
+// that had already resolved and validated a single authoritative instant
+// for the whole command -- letting a single membership.enroll's EnabledPeer
+// check and its own grant's granted_at timestamp disagree about "now".
+// store.AuthorityTime is the same time authority
+// internal/control/membership.go's handlers already use for their own
+// EnabledPeer checks.
 func authorityNow(ctx context.Context) string {
-	return store.AuthorityTime(ctx, func() time.Time { return time.Now() }).UTC().Format(time.RFC3339Nano)
+	return authorityInstant(ctx).UTC().Format(time.RFC3339Nano)
 }
 
 func formatOptionalTime(t *time.Time) *string {
@@ -451,7 +495,7 @@ func formatOptionalTime(t *time.Time) *string {
 	return &s
 }
 
-func validateGrant(p GrantParams) error {
+func validateGrant(ctx context.Context, p GrantParams) error {
 	if err := bridgetext.ValidateMetadata(p.Conversation); err != nil {
 		return fmt.Errorf("conversation identifier: %w", err)
 	}
@@ -464,16 +508,30 @@ func validateGrant(p GrantParams) error {
 	if p.Direction != store.Bidirectional && p.Direction != store.AToB && p.Direction != store.BToA {
 		return fmt.Errorf("invalid grant direction %q", p.Direction)
 	}
-	if p.ExpiresAt != nil && !p.ExpiresAt.After(time.Now()) {
-		return fmt.Errorf("explicit expiry must be in the future")
+	if p.ExpiresAt != nil && !p.ExpiresAt.After(authorityInstant(ctx)) {
+		return store.RequestExpired
 	}
 	return nil
 }
 
+// validatePeerIDs checks each id against the same ASCII-compatibility rule
+// enforced everywhere else (bridgetext.ValidateMetadata). Its callers are
+// not equivalent: validateGrant applies it to freshly supplied peer IDs on
+// an enroll/replace path membership.Validate has already filtered upstream
+// on every reachable wire route (so a malformed value here is unreachable
+// in practice via the coordinator); RenewTx (below) applies it to a
+// conversation's already-stored, historical peer IDs, where a legacy value
+// predating today's rule is a real, reachable condition. Returning
+// store.IncompatibleIdentifier here -- rather than a plain wrapped error --
+// gives that reachable RenewTx case a terminal, durably audited rejection
+// instead of degrading to TemporarilyUnavailable (see
+// store.IncompatibleIdentifier's own doc comment); the never-actually-taken
+// validateGrant path inherits the same return value, which is harmless
+// since it is not reachable with malformed input via the coordinator.
 func validatePeerIDs(ids ...string) error {
 	for _, id := range ids {
 		if err := bridgetext.ValidateMetadata(id); err != nil {
-			return fmt.Errorf("peer identifier: %w", err)
+			return store.IncompatibleIdentifier
 		}
 	}
 	return nil

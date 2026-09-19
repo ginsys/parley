@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/ginsys/parley/internal/store"
 	"path/filepath"
@@ -201,5 +202,57 @@ func TestConversationAndPeerIdentifiersRemainExact(t *testing.T) {
 	tx.Rollback()
 	if _, err := ctrl.Revoke(ctx, " x"); err != nil {
 		t.Fatalf("exact historical name inaccessible: %v", err)
+	}
+}
+
+// TestGrantAndRenewRejectExpiryAtOrBeforeAuthorityInstant is MC-03/F2's
+// regression at the controller boundary: validateGrant/validateRenewalInput
+// must reject on the *authority* instant, not an independently-sampled
+// time.Now(), and must return the durable store.RequestExpired code (not a
+// plain wrapped error that degrades to TemporarilyUnavailable through
+// domainRejection's fallback). The boundary is inclusive -- an ExpiresAt
+// equal to (not just before) the authority instant is rejected, verified
+// here by capturing "now" and calling immediately after: a real clock only
+// ever advances, so by the time authorityInstant(ctx) is sampled inside the
+// call, it is >= the captured value, exercising !After's inclusive edge
+// rather than a comfortably-past value that would pass even with a bug that
+// inverted the comparison direction.
+func TestGrantAndRenewRejectExpiryAtOrBeforeAuthorityInstant(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "expiry.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctrl := New(db)
+
+	boundary := time.Now()
+	if _, err := ctrl.Grant(ctx, GrantParams{
+		Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional,
+		MaxExchanges: 2, ExpiresAt: &boundary,
+	}); !errors.Is(err, store.RequestExpired) {
+		t.Fatalf("grant with expires_at == now: got %v, want store.RequestExpired", err)
+	}
+
+	future := time.Now().Add(time.Hour)
+	g, err := ctrl.Grant(ctx, GrantParams{
+		Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional,
+		MaxExchanges: 2, ExpiresAt: &future,
+	})
+	if err != nil {
+		t.Fatalf("grant with future expires_at rejected: %v", err)
+	}
+	if g.ExpiresAt == nil || *g.ExpiresAt == "" {
+		t.Fatal("accepted grant lost its expires_at")
+	}
+
+	renewBoundary := time.Now()
+	if _, err := ctrl.Renew(ctx, RenewParams{Conversation: "c", MaxExchanges: 3, ExpiresAt: &renewBoundary}); !errors.Is(err, store.RequestExpired) {
+		t.Fatalf("renew with expires_at == now: got %v, want store.RequestExpired", err)
+	}
+
+	renewFuture := time.Now().Add(time.Hour)
+	if _, err := ctrl.Renew(ctx, RenewParams{Conversation: "c", MaxExchanges: 3, ExpiresAt: &renewFuture}); err != nil {
+		t.Fatalf("renew with future expires_at rejected: %v", err)
 	}
 }

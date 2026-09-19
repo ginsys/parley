@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/control"
@@ -116,7 +117,8 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	}
 	// Identifiers are opaque exact keys. TrimSpace checks emptiness only;
 	// normalization could retarget existing grants. Revoke keeps the exact
-	// key even if it is byte-malformed -- new-enrollment validation does not
+	// key even if it is byte-malformed (outside printable ASCII, or
+	// otherwise ASCII-incompatible) -- new-enrollment validation does not
 	// apply to that path (AGENTS.md).
 	if strings.TrimSpace(c.conversation) == "" {
 		return c, fmt.Errorf("membership %s requires -conversation", c.op)
@@ -125,6 +127,22 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 		if err := bridgetext.ValidateMetadata(c.conversation); err != nil {
 			return c, fmt.Errorf("conversation identifier: %w", err)
 		}
+	} else if !utf8.ValidString(c.conversation) {
+		// Unlike an ASCII-incompatible-but-valid-UTF-8 legacy key (e.g.
+		// "café"), an invalid UTF-8 byte sequence cannot be transmitted
+		// byte-exact over this wire protocol at all: JSON strings are
+		// defined over Unicode text, and encoding/json's Marshal silently
+		// replaces each invalid byte with U+FFFD rather than rejecting or
+		// preserving it -- it does NOT "preserve arbitrary malformed
+		// bytes" the way an earlier version of this comment implied. A
+		// revoke sent for such a key would therefore silently target a
+		// different byte string than the one on disk, defeating the exact-
+		// key revocation guarantee this path exists for. Refusing before
+		// dialing (MC-02) catches this deterministically instead of
+		// producing a silently-corrupted wire request; every other
+		// byte-malformed-but-valid-UTF-8 legacy key is unaffected and still
+		// passes through unchanged, exactly as the comment above describes.
+		return c, fmt.Errorf("conversation identifier: invalid UTF-8, cannot be transmitted byte-exact")
 	}
 	if c.maxExchanges < 0 || c.expiresIn < 0 {
 		return c, fmt.Errorf("budget and expiry must not be negative")
@@ -294,7 +312,7 @@ func runMembership(args []string, stdout, stderr io.Writer, dial dialFunc, geten
 		}
 		return 1
 	}
-	if !result.Usable() {
+	if !result.Usable(operationID) {
 		// A structurally well-formed but zero-valued/malformed receipt --
 		// missing audit_id or operation_id -- must never be printed and
 		// exited 0 as if the mutation had definitely completed; the safe
@@ -308,11 +326,15 @@ func runMembership(args []string, stdout, stderr io.Writer, dial dialFunc, geten
 		return 1
 	}
 	if err := printMembershipResult(stdout, c, operationID, result); err != nil {
-		// The mutation itself already succeeded by this point -- a failure
+		// The mutation itself already succeeded by this point (result.Usable
+		// has already confirmed a genuine, matching receipt) -- a failure
 		// writing its receipt is a distinct, later failure and must not be
-		// reported as if the mutation itself were unresolved or rejected
-		// (mirrors runHello's identical printHello contract).
-		fmt.Fprintf(stderr, "parleyctl membership %s: writing result: %v\n", c.op, err)
+		// reported as if the mutation itself were unresolved, rejected or
+		// rolled back (mirrors runHello's identical printHello contract).
+		// Name the obtained operation/audit IDs here: they are the only
+		// record of which durable mutation succeeded if this stderr line is
+		// the last thing the caller sees.
+		fmt.Fprintf(stderr, "parleyctl membership %s: mutation succeeded (operation_id %s, audit_id %s) but writing its result failed: %v\n", c.op, result.OperationID, result.AuditID, err)
 		return 1
 	}
 	return 0
@@ -414,8 +436,14 @@ func policyWire(p membership.Policy) map[string]any {
 // key that may carry leading/trailing whitespace, which %q makes visible
 // the same way parseCommand's own identifier quoting does.
 func printMembershipResult(w io.Writer, c command, operationID string, result control.CommandReceiptResult) error {
+	// result.Usable(operationID) has already confirmed result.OperationID ==
+	// operationID by this point, so the two are never observably different
+	// here -- but printing result.OperationID rather than the local
+	// operationID variable keeps this function honest about whose value it
+	// is reporting (the server's confirmed receipt, not the client's
+	// request) if that invariant is ever weakened at the call site.
 	lines := []string{
-		fmt.Sprintf("membership %s %q: operation_id %s\n", c.op, c.conversation, operationID),
+		fmt.Sprintf("membership %s %q: operation_id %s\n", c.op, c.conversation, result.OperationID),
 		fmt.Sprintf("  audit_id %s, commit_epoch %s, commit_revision %s\n", result.AuditID, result.CommitView.Epoch, result.CommitView.Revision),
 	}
 	for _, r := range result.Result.Resources {

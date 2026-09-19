@@ -58,13 +58,27 @@ const (
 	// rejection contract (docs/specifications/control.md "Command
 	// atomicity, idempotency and audit": a terminal rejection records its
 	// receipt/audit, and a same-ID retry returns that receipt rather than
-	// reevaluating now-stale preconditions). IncompatibleIdentifier is
-	// deliberately left as control-only: no PR2 method returns it.
+	// reevaluating now-stale preconditions).
 	StaleGrantVersion     Code = "stale_grant_version"
 	InvalidMembership     Code = "invalid_membership"
 	UnsupportedMembership Code = "unsupported_membership"
 	NoActiveGrant         Code = "no_active_grant"
 	AlreadyActive         Code = "already_active"
+
+	// IncompatibleIdentifier promotes the wire-only spelling
+	// "incompatible_identifier" (previously control-only, per
+	// internal/control/errors.go's DomainCode of the same name) into a
+	// genuine durable store.Code: internal/controller's validatePeerIDs
+	// (the RenewTx path, checking a conversation's already-stored,
+	// historical peer IDs -- never the invalid_membership pre-admission
+	// check on freshly supplied peer IDs, which stays unaudited by design)
+	// needed a terminal, replayable rejection for a legacy/historical peer
+	// ID that fails today's ASCII-compatibility rule, instead of degrading
+	// to a plain wrapped error that store.Coordinator.Execute's own error
+	// classification turns into TemporarilyUnavailable -- discarding the
+	// specific, audited reason and implying a transient condition a retry
+	// might resolve, which this is not.
+	IncompatibleIdentifier Code = "incompatible_identifier"
 )
 
 func (c Code) Error() string { return string(c) }
@@ -80,7 +94,7 @@ func (c Code) Valid() bool { return c.valid() }
 func (c Code) valid() bool {
 	switch c {
 	case "", InvalidRequest, AuthenticationFailed, NotFound, Forbidden, IdentityConflict, BindingUnavailable, HostUnverified, NotReady, AlreadyConnected, GenerationConflict, VersionConflict, RequestExpired, RequestTerminal, OperationConflict, EventConflict, SecurityHold, RecoveryRequired, CapacityExceeded, TemporarilyUnavailable, OutcomeUnknown,
-		StaleGrantVersion, InvalidMembership, UnsupportedMembership, NoActiveGrant, AlreadyActive:
+		StaleGrantVersion, InvalidMembership, UnsupportedMembership, NoActiveGrant, AlreadyActive, IncompatibleIdentifier:
 		return true
 	}
 	return false
@@ -91,7 +105,7 @@ func (c Code) valid() bool {
 func (c Code) terminalResult() bool {
 	switch c {
 	case "", InvalidRequest, NotFound, Forbidden, IdentityConflict, BindingUnavailable, HostUnverified, NotReady, AlreadyConnected, GenerationConflict, VersionConflict, RequestExpired, RequestTerminal, OperationConflict, EventConflict, SecurityHold,
-		StaleGrantVersion, InvalidMembership, UnsupportedMembership, NoActiveGrant, AlreadyActive:
+		StaleGrantVersion, InvalidMembership, UnsupportedMembership, NoActiveGrant, AlreadyActive, IncompatibleIdentifier:
 		return true
 	}
 	return false
