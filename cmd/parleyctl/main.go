@@ -112,6 +112,12 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	if fs.NArg() != 0 {
 		return c, fmt.Errorf("unexpected positional arguments")
 	}
+	conversationGiven := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "conversation" {
+			conversationGiven = true
+		}
+	})
 	if c.op == "enroll" || c.op == "replace" {
 		c.direction = store.Direction(direction)
 	}
@@ -133,8 +139,20 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	// the missing-flag rejection while letting a supplied space-only value
 	// through on the revoke path only; enroll/renew/replace still require
 	// TrimSpace nonemptiness since AGENTS.md's rule applies to them.
+	//
+	// EC-03 (2026-09-19 review): comparing the parsed value against "" (as
+	// this used to) cannot distinguish an explicitly supplied empty string
+	// ("-conversation ''") from an omitted flag -- both parse to the same
+	// Go zero value. The historical schema permits an empty TEXT
+	// conversation key, so an operator with a genuinely empty legacy
+	// identifier to revoke had no way to reach it through this client at
+	// all. conversationGiven (fs.Visit, above) tracks presence rather than
+	// value, so an explicit empty string is accepted on the revoke path and
+	// only a truly omitted flag is rejected; enroll/renew/replace are
+	// unaffected, since their own nonemptiness rule (TrimSpace below)
+	// already rejects an explicit empty string on other grounds.
 	if c.op == "revoke" {
-		if c.conversation == "" {
+		if !conversationGiven {
 			return c, fmt.Errorf("membership %s requires -conversation", c.op)
 		}
 	} else if strings.TrimSpace(c.conversation) == "" {
@@ -369,7 +387,7 @@ func runMembership(args []string, stdout, stderr io.Writer, dial dialFunc, geten
 		}
 		return 1
 	}
-	if !result.Usable(operationID) {
+	if !result.Usable(operationID, c.conversation) {
 		// A structurally well-formed but zero-valued/malformed receipt --
 		// missing audit_id or operation_id -- must never be printed and
 		// exited 0 as if the mutation had definitely completed; the safe

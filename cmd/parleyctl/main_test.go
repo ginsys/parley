@@ -643,6 +643,52 @@ func TestMembershipEnrollRenewReplaceRejectSpaceOnlyConversation(t *testing.T) {
 	}
 }
 
+// TestMembershipRevokeAcceptsExplicitEmptyLegacyConversation and
+// TestMembershipEnrollRenewReplaceRejectExplicitEmptyConversation are EC-03
+// (2026-09-19 review): the historical schema permits an empty TEXT
+// conversation key, so revoke's exact-key legacy escape must be able to
+// target one -- but comparing the parsed -conversation value against "" (as
+// this used to) cannot distinguish an explicitly supplied empty string from
+// an omitted flag, since both parse to the same Go zero value. parseCommand
+// now tracks flag *presence* via fs.Visit instead, so an explicit empty
+// -conversation value reaches the server exactly as typed on revoke, while a
+// truly omitted flag is still rejected (see
+// TestMembershipEnrollMissingConversationFlagStillRejected below, unchanged)
+// and enroll/renew/replace still reject an explicit empty string on their
+// own separate TrimSpace nonemptiness rule.
+func TestMembershipRevokeAcceptsExplicitEmptyLegacyConversation(t *testing.T) {
+	fake := &fakeClient{}
+	var out, errOut bytes.Buffer
+	args := append([]string{"membership", "revoke", "-conversation", "", "-expected-grant-version", "1"}, membershipEndpointArgs...)
+	if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
+		t.Fatalf("expected an explicit empty legacy conversation to dial and revoke: exit=%d %s", code, &errOut)
+	}
+	if fake.params["conversation"] != "" {
+		t.Fatalf("conversation identity changed: %+v", fake.params)
+	}
+}
+
+func TestMembershipEnrollRenewReplaceRejectExplicitEmptyConversation(t *testing.T) {
+	for _, op := range []string{"enroll", "renew", "replace"} {
+		t.Run(op, func(t *testing.T) {
+			args := []string{"membership", op, "-conversation", ""}
+			switch op {
+			case "enroll":
+				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2")
+			case "renew":
+				args = append(args, "-expected-grant-version", "1")
+			case "replace":
+				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b")
+			}
+			args = append(args, membershipEndpointArgs...)
+			var out, errOut bytes.Buffer
+			if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+				t.Fatalf("%s dialed for an explicit empty conversation: exit=%d %s", op, code, &errOut)
+			}
+		})
+	}
+}
+
 func TestMembershipEnrollMissingConversationFlagStillRejected(t *testing.T) {
 	// Guards the revoke fix above: an actually-omitted -conversation flag
 	// (the untrimmed default "") must still be rejected on every op,

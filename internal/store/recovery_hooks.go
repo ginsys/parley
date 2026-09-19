@@ -82,6 +82,34 @@ func (c *Coordinator) Execute(ctx context.Context, p CommandPrincipal, r Command
 	if h != nil {
 		defer func() {
 			if afterErr := h.After(); afterErr != nil {
+				// EC-02 (2026-09-19 review): if err is already nil here, the
+				// business transaction below has already durably committed
+				// -- both a genuine success and a terminal domain rejection
+				// commit their operation_results/command_audit rows before
+				// this deferred call ever runs (c.execute's own commit is
+				// unconditional in either case; only an ambiguous
+				// tx.Commit() itself already sets err to OutcomeUnknown
+				// before reaching here, which the `err == nil` guard below
+				// correctly excludes). After's own failure is a completely
+				// separate concern -- an independent external marker/
+				// checkpoint flush (internal/recovery.Service.after) that
+				// has already triggered its own FailStop callback -- and must
+				// never be reported as if the mutation itself never
+				// happened or was rejected: doing so previously discarded
+				// the caller's only evidence (the receipt's OperationID,
+				// AuditID and CommitView) that a real, committed operation
+				// exists, making a well-formed error response look like a
+				// proven non-commitment when it was not one. Preserve the
+				// receipt and report OutcomeUnknown -- the same "uncertain,
+				// safe to retry with the same operation ID" contract a
+				// client-side *TimeoutError already carries -- instead of
+				// zeroing the receipt and surfacing whatever incidental
+				// code afterErr happened to carry (often RecoveryRequired,
+				// which elsewhere always means "provably never committed").
+				if err == nil {
+					err = OutcomeUnknown
+					return
+				}
 				receipt = CommandReceipt{}
 				err = storageCode(afterErr)
 			}

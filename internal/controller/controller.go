@@ -104,6 +104,26 @@ func GrantTx(ctx context.Context, tx *sql.Tx, p GrantParams) (*store.Grant, erro
 	if p.ExpectedVersion != nil && *p.ExpectedVersion != latest {
 		return nil, store.StaleGrantVersion
 	}
+	// Restored active-grant precondition (EC-01, thread PRRT_kwDOUT1JT86j_9VC,
+	// root 4053366763): the pre-refactor base Controller.Grant explicitly
+	// called store.CurrentGrant and rejected an existing active grant before
+	// ever computing a successor version. That check was lost when Grant was
+	// split into this shared GrantTx body, so a matching-version enrollment
+	// against an already-active conversation fell through to InsertGrant and
+	// hit the idx_grants_one_active unique-index constraint instead of the
+	// intended deterministic store.AlreadyActive rejection -- degrading to an
+	// unaudited, non-terminal storage error via storageCode, and never
+	// reserving the operation UUID (so the same UUID could later execute as
+	// new work after an unrelated revocation). Checked before NextVersion
+	// deliberately: an active grant sitting at math.MaxInt64 must still
+	// report AlreadyActive, never the version-overflow rejection below, since
+	// the version-exhaustion state is irrelevant while an active grant makes
+	// this whole enrollment attempt illegitimate.
+	if _, err := store.CurrentGrant(ctx, tx, p.Conversation); err == nil {
+		return nil, store.AlreadyActive
+	} else if !errors.Is(err, store.ErrNoActiveGrant) {
+		return nil, err
+	}
 	// Checked before any business-state mutation below (thread
 	// PRRT_kwDOUT1JT86j2RK8, root 4049498709): a bare latest+1 could wrap
 	// to a negative version if a conversation's history ever reached
