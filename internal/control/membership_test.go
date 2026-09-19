@@ -367,3 +367,361 @@ func TestMembershipRejectsInvalidParamsShape(t *testing.T) {
 		t.Fatalf("expected InvalidParams, got %#v", resp.Err)
 	}
 }
+
+// TestMembershipEnrollResultEchoesExactOperationID is MC-01.A's regression:
+// store.CommandReceipt.OperationID must carry the exact operation_id this
+// receipt was durably recorded under, distinct from the response's own
+// JSON-RPC id (a separate, per-connection correlation number a wire client
+// never even sees here -- Session.Handle takes a bare Request, not a
+// Client.nextID-assigned envelope).
+func TestMembershipEnrollResultEchoesExactOperationID(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	opID := newOpID()
+	params := openMembers("peer-a", "peer-b")
+	params["operation_id"] = opID
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: params})
+	if resp.Err != nil {
+		t.Fatalf("unexpected rejection: %#v", resp.Err)
+	}
+	result := decodeResult[CommandReceiptResult](t, resp)
+	if result.OperationID != opID {
+		t.Fatalf("operation_id=%q, want %q", result.OperationID, opID)
+	}
+	if !result.Usable() {
+		t.Fatalf("a genuine receipt must be Usable: %#v", result)
+	}
+}
+
+// TestMembershipRenewResultReportsCarriedAndCancelledCounts is MC-01.B's
+// regression: RenewTx's SupersedeResult.Carried/Cancelled counts --
+// previously discarded entirely -- must reach the wire result as
+// queued_carried/queued_cancelled resource changes, so a caller can tell a
+// renewal that silently cancelled pending replies from one that carried
+// them forward, without re-deriving it from ListQueued itself.
+func TestMembershipRenewResultReportsCarriedAndCancelledCounts(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("enroll failed: %#v", enroll.Err)
+	}
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := "80000000-0000-4000-8000-000000000001"
+	if err := store.InsertQueued(ctx, tx, store.Envelope{
+		ID: original, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
+		Text: "original", GrantVersion: 1, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetState(ctx, tx, original, store.Queued, store.Acked, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	reply := "80000000-0000-4000-8000-000000000002"
+	if err := store.InsertQueued(ctx, tx, store.Envelope{
+		ID: reply, Conversation: "conv-1", FromPeer: "peer-b", ToPeer: "peer-a",
+		Text: "reply", GrantVersion: 1, InReplyTo: &original, TrustedReply: true,
+		CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ordinary := "80000000-0000-4000-8000-000000000003"
+	if err := store.InsertQueued(ctx, tx, store.Envelope{
+		ID: ordinary, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
+		Text: "ordinary", GrantVersion: 1, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	renew, _ := sess.Handle(ctx, Request{ID: "2", Method: "membership.renew", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+	}})
+	if renew.Err != nil {
+		t.Fatalf("renew failed: %#v", renew.Err)
+	}
+	result := decodeResult[CommandReceiptResult](t, renew)
+	var carried, cancelled string
+	for _, r := range result.Result.Resources {
+		switch r.Kind {
+		case "queued_carried":
+			carried = r.After
+		case "queued_cancelled":
+			cancelled = r.After
+		}
+	}
+	if carried != "1" {
+		t.Fatalf("queued_carried=%q, want 1: %#v", carried, result.Result.Resources)
+	}
+	if cancelled != "1" {
+		t.Fatalf("queued_cancelled=%q, want 1: %#v", cancelled, result.Result.Resources)
+	}
+}
+
+// TestMembershipReplaceResultReportsCarriedAndCancelledCounts is
+// TestMembershipRenewResultReportsCarriedAndCancelledCounts's replace-side
+// equivalent: replace shares supersede/SupersedeResult with renew, but is
+// its own wire handler and must be checked independently rather than
+// assumed identical from renew's coverage alone.
+func TestMembershipReplaceResultReportsCarriedAndCancelledCounts(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	seedEnabledBinding(t, db, 3, "peer-c")
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("enroll failed: %#v", enroll.Err)
+	}
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinary := "80000000-0000-4000-8000-000000000004"
+	if err := store.InsertQueued(ctx, tx, store.Envelope{
+		ID: ordinary, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
+		Text: "ordinary", GrantVersion: 1, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	replace, _ := sess.Handle(ctx, Request{ID: "2", Method: "membership.replace", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+		"members": []any{
+			map[string]any{"peer_id": "peer-a", "role": "member"},
+			map[string]any{"peer_id": "peer-c", "role": "member"},
+		},
+		"policy": map[string]any{"kind": "open"},
+	}})
+	if replace.Err != nil {
+		t.Fatalf("replace failed: %#v", replace.Err)
+	}
+	result := decodeResult[CommandReceiptResult](t, replace)
+	var cancelled string
+	for _, r := range result.Result.Resources {
+		if r.Kind == "queued_cancelled" {
+			cancelled = r.After
+		}
+	}
+	if cancelled != "1" {
+		t.Fatalf("queued_cancelled=%q, want 1: %#v", cancelled, result.Result.Resources)
+	}
+}
+
+// TestDecodePolicyEnforcesTaggedUnionEdgesPresence is MC-02's decode-side
+// regression, complementing cmd/parleyctl's encode-side
+// TestPolicyWireOmitsEdgesForOpenAndLeadOnlyButIncludesForDirected: open/
+// lead_only must reject an edges key even when present as an empty array
+// (decoded-length alone cannot distinguish "omitted" from "sent empty");
+// directed must reject its absence.
+func TestDecodePolicyEnforcesTaggedUnionEdgesPresence(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		ok   bool
+	}{
+		{"open without edges", map[string]any{"kind": "open"}, true},
+		{"open with empty edges", map[string]any{"kind": "open", "edges": []any{}}, false},
+		{"lead_only with empty edges", map[string]any{"kind": "lead_only", "edges": []any{}}, false},
+		{"directed without edges", map[string]any{"kind": "directed"}, false},
+		{"directed with empty edges", map[string]any{"kind": "directed", "edges": []any{}}, true},
+		{"directed with an edge", map[string]any{"kind": "directed", "edges": []any{map[string]any{"from": "a", "to": "b"}}}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, ok := decodePolicy(c.raw)
+			if ok != c.ok {
+				t.Fatalf("decodePolicy(%#v) ok=%v, want %v", c.raw, ok, c.ok)
+			}
+		})
+	}
+}
+
+// TestParamOptionalExpiresAtValidatesFormAndRange is MC-03's regression:
+// only a literal "Z" UTC suffix is accepted (a numeric offset is rejected
+// outright, never normalized -- normalizing would change the wire byte
+// string store.NewCommandRequest digests depending on which equivalent
+// spelling was sent), sub-second precision is preserved through
+// RFC3339Nano rather than truncated, and the range is bounded by
+// store.InstantNanos, the same bound the coordinator's own authority
+// instant must satisfy.
+func TestParamOptionalExpiresAtValidatesFormAndRange(t *testing.T) {
+	cases := []struct {
+		name string
+		s    string
+		ok   bool
+	}{
+		{"omitted", "", true}, // handled separately below: no expires_at key at all
+		{"UTC Z", "2030-06-15T12:00:00Z", true},
+		{"UTC Z with fractional nanoseconds", "2030-06-15T12:00:00.123456789Z", true},
+		{"numeric UTC offset rejected, not normalized", "2030-06-15T12:00:00+00:00", false},
+		{"non-UTC numeric offset rejected", "2030-06-15T14:00:00+02:00", false},
+		{"out of int64-nanosecond range", "3000-01-01T00:00:00Z", false},
+		{"not RFC3339 at all", "not-a-timestamp", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			params := map[string]any{}
+			if c.name != "omitted" {
+				params["expires_at"] = c.s
+			}
+			parsed, text, ok := paramOptionalExpiresAt(params)
+			if ok != c.ok {
+				t.Fatalf("paramOptionalExpiresAt(%q) ok=%v, want %v", c.s, ok, c.ok)
+			}
+			if !ok {
+				return
+			}
+			if c.name == "omitted" {
+				if parsed != nil || text != "" {
+					t.Fatalf("omitted expires_at must decode to nil/empty, got %v %q", parsed, text)
+				}
+				return
+			}
+			if text != c.s {
+				t.Fatalf("text=%q, want the wire value preserved verbatim %q", text, c.s)
+			}
+			if parsed.UTC().Format(time.RFC3339Nano) != c.s {
+				t.Fatalf("parsed=%v does not round-trip to %q (precision lost)", parsed, c.s)
+			}
+		})
+	}
+}
+
+// TestMembershipEnrollRejectsIncompatibleConversationIdentifier and its
+// renew/replace siblings are MC-02's other regression: a conversation
+// identifier failing bridgetext.ValidateMetadata must get a deterministic
+// IncompatibleIdentifier rejection directly from the wire handler, not
+// reach controller.GrantTx/RenewTx/ReplaceTx (which reject it with a plain
+// Go error, degrading via domainRejection's fallback to the generic
+// TemporarilyUnavailable infrastructure code).
+func TestMembershipEnrollRejectsIncompatibleConversationIdentifier(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	params := openMembers("peer-a", "peer-b")
+	params["conversation"] = "bad\x7fconversation"
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: params})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier, got %#v", resp.Err)
+	}
+}
+
+func TestMembershipRenewRejectsIncompatibleConversationIdentifier(t *testing.T) {
+	sess, _ := membershipTestServer(t)
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.renew", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "bad\x7fconversation", "expected_grant_version": "1",
+	}})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier, got %#v", resp.Err)
+	}
+}
+
+func TestMembershipReplaceRejectsIncompatibleConversationIdentifier(t *testing.T) {
+	sess, _ := membershipTestServer(t)
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.replace", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "bad\x7fconversation", "expected_grant_version": "1",
+		"members": []any{
+			map[string]any{"peer_id": "peer-a", "role": "member"},
+			map[string]any{"peer_id": "peer-b", "role": "member"},
+		},
+		"policy": map[string]any{"kind": "open"},
+	}})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("expected incompatible_identifier, got %#v", resp.Err)
+	}
+}
+
+// TestMembershipRevokeBypassesIncompatibleIdentifierCheck confirms the
+// deliberate asymmetry: revoke must still reach controller.RevokeTx for a
+// byte-malformed historical conversation identifier (AGENTS.md's exact-key
+// human revocation escape), not the new IncompatibleIdentifier check --
+// it fails on no_active_grant (a domain rejection reached only past the
+// check enroll/renew/replace apply), not incompatible_identifier.
+func TestMembershipRevokeBypassesIncompatibleIdentifierCheck(t *testing.T) {
+	sess, _ := membershipTestServer(t)
+	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "bad\x7fconversation", "expected_grant_version": "1",
+	}})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code == IncompatibleIdentifier {
+		t.Fatalf("revoke must not apply the new-enrollment identifier check, got %#v", resp.Err)
+	}
+}
+
+// TestInvalidMembershipRejectionDoesNotReserveOperationID is the accepted
+// audit-boundary consequence from the consolidated report's section 4: an
+// invalid_membership rejection runs entirely before store.NewCommandRequest/
+// Execute (membership.Validate's own precondition, not a store.Coordinator
+// domain rejection), so it creates no operation_results/command_audit row
+// and never reserves p.operationID -- a corrected retry reusing the same
+// operation_id must therefore be free to execute normally, not fail with
+// operation_conflict.
+func TestInvalidMembershipRejectionDoesNotReserveOperationID(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	opID := newOpID()
+	bad := map[string]any{
+		"operation_id": opID, "conversation": "conv-1", "expected_grant_version": "0",
+		"members": []any{
+			map[string]any{"peer_id": "peer-a", "role": "member"},
+			map[string]any{"peer_id": "peer-a", "role": "member"}, // duplicate -> invalid_membership
+		},
+		"policy": map[string]any{"kind": "open"}, "max_exchanges": "5",
+	}
+	first, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: bad})
+	if first.Err == nil || first.Err.Data == nil || first.Err.Data.Code != DomainCode(store.InvalidMembership) {
+		t.Fatalf("expected invalid_membership, got %#v", first.Err)
+	}
+	corrected := openMembers("peer-a", "peer-b")
+	corrected["operation_id"] = opID
+	second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: corrected})
+	if second.Err != nil {
+		t.Fatalf("a corrected retry reusing the same operation_id must execute, got %#v", second.Err)
+	}
+}
+
+// TestUnsupportedMembershipRejectionReservesOperationIDAndConflictsOnRetry
+// is the audit-boundary's other half, explicitly for unsupported_membership
+// (the source reports' own named case, distinct from
+// TestMembershipEnrollConflictingRetrySameOperationIDDifferentPayload's
+// open-policy conflicting-conversation case): unsupported_membership is a
+// terminal domain rejection recorded through operation_results/
+// command_audit like any other, so a retry reusing the same operation_id --
+// even with a now-corrected payload -- must durably conflict rather than
+// silently succeed.
+func TestUnsupportedMembershipRejectionReservesOperationIDAndConflictsOnRetry(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	seedEnabledBinding(t, db, 3, "peer-c")
+	opID := newOpID()
+	unsupported := map[string]any{
+		"operation_id": opID, "conversation": "conv-1", "expected_grant_version": "0",
+		"members": []any{
+			map[string]any{"peer_id": "peer-a", "role": "member"},
+			map[string]any{"peer_id": "peer-b", "role": "member"},
+			map[string]any{"peer_id": "peer-c", "role": "member"}, // 3 members + open -> unsupported_membership
+		},
+		"policy": map[string]any{"kind": "open"}, "max_exchanges": "5",
+	}
+	first, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: unsupported})
+	if first.Err == nil || first.Err.Data == nil || first.Err.Data.Code != DomainCode(store.UnsupportedMembership) {
+		t.Fatalf("expected unsupported_membership, got %#v", first.Err)
+	}
+	corrected := openMembers("peer-a", "peer-b")
+	corrected["operation_id"] = opID
+	second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: corrected})
+	if second.Err == nil || second.Err.Data == nil || second.Err.Data.Code != DomainCode(store.OperationConflict) {
+		t.Fatalf("a corrected retry of a durably-rejected unsupported_membership operation_id must conflict, got %#v", second.Err)
+	}
+}

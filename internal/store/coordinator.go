@@ -42,6 +42,13 @@ type CommandReceipt struct {
 	AuditSequence int64
 	View          CommitView
 	Replayed      bool
+	// OperationID is the exact idempotency-key UUID this receipt was
+	// recorded under (CommandRequest's own private id, echoed back rather
+	// than left for a caller to reconstruct). A wire caller needs this to
+	// preserve operation identity across an unusable or lost response:
+	// AuditID/View alone do not, by themselves, prove which operation_id a
+	// given receipt actually belongs to.
+	OperationID string
 }
 
 // Coordinator is one instance per writer. Every mutation callback uses its
@@ -215,7 +222,7 @@ func (c *Coordinator) execute(ctx context.Context, p CommandPrincipal, r Command
 	if publish != nil {
 		publish(view)
 	}
-	return CommandReceipt{Result: result, AuditID: id.String(), AuditSequence: nextSequence, View: view}, nil
+	return CommandReceipt{Result: result, AuditID: id.String(), AuditSequence: nextSequence, View: view, OperationID: r.id}, nil
 }
 func lookupReceipt(ctx context.Context, tx *sql.Tx, principal string, r CommandRequest) (CommandReceipt, error) {
 	var result CommandReceipt
@@ -231,6 +238,7 @@ func lookupReceipt(ctx context.Context, tx *sql.Tx, principal string, r CommandR
 	if err := json.Unmarshal([]byte(data), &result.Result); err != nil {
 		return CommandReceipt{}, TemporarilyUnavailable
 	}
+	result.OperationID = r.id
 	return result, nil
 }
 

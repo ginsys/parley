@@ -51,7 +51,7 @@ const (
 	// named in internal/control/errors.go as "wire-only" additions before
 	// any method that could return them was wired; unlike that package's
 	// remaining wire-only codes (protocol_mismatch, operation_not_found,
-	// resnapshot_required, subscription_conflict), these four describe an
+	// resnapshot_required, subscription_conflict), these five describe an
 	// actual store-mutation precondition failure, not a wire/session
 	// concern, so they must be valid, terminalResult codes here to satisfy
 	// the accepted control specification's audited/replayable terminal-

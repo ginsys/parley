@@ -75,7 +75,10 @@ All domain 64-bit counters, versions and budgets are canonical nonnegative decim
 9223372036854775807. Logical positivity rules still apply. Page limits are JSON integers 1–100;
 UIDs are JSON integers in the platform UID range, rejecting reserved/unmapped identities.
 Timestamps use UTC RFC3339 with optional fractional seconds up to nanoseconds and the representable
-range required by connections.md. Missing optional values mean retain/default only where specified;
+range required by connections.md: a literal `Z` UTC designator is required and a numeric zone
+offset (even `+00:00`, an equivalent instant) is rejected outright rather than normalized -- two
+different wire spellings of the same instant must never collide in, or silently change, the same
+operation ID's command digest. Missing optional values mean retain/default only where specified;
 null is rejected unless a response field explicitly permits it. Never trim exact identifiers.
 
 After kernel authentication, the first call within five seconds is `server.hello` with
@@ -344,6 +347,14 @@ any operation receipt or audit row exists for it. It is not ambiguous or unsafe 
 operation ID with the same still-malformed payload simply re-evaluates the same check and returns
 the same rejection every time — but it leaves no durable trace of the attempt. `unsupported_membership`
 carries no such conflict and is audited normally.
+
+`incompatible_identifier` shares the identical exception for `membership.enroll|renew|replace`'s
+own conversation-identifier shape check: a byte-malformed conversation is rejected before the
+digest is constructed at all, so a corrected retry under the same operation ID executes normally
+rather than conflicting, and the original malformed attempt leaves no audit row.
+`membership.revoke` deliberately does not apply this check at all, so it never returns
+`incompatible_identifier` regardless of the conversation identifier's byte shape -- AGENTS.md's
+exact-key human revocation must remain reachable for a byte-malformed historical identifier.
 
 Other domain codes are the explicit membership/connection error enumerations, not arbitrary strings.
 Permission checks precede private lookup diagnostics. Expose expected/current versions only to a
