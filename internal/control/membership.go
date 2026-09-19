@@ -264,7 +264,7 @@ func domainRejection(err error) (store.CommandResult, error) {
 }
 
 // handleMembershipEnroll implements membership.enroll.
-func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (Response, bool) {
+func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (resp Response, closeConn bool) {
 	p, ok := decodeEnrollParams(req.Params)
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
@@ -272,6 +272,21 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (R
 	if incompatibleConversation(p.conversation) {
 		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
+	// Review 5256536448 (comment 4053873889): store.EnabledPeer's expired-
+	// credential branch below calls recordExpiry, which is a silent no-op
+	// unless ctx carries the *store.ExpiryEvidence installed here -- without
+	// this wrapping, an expired credential observed while enrolling a
+	// member was reported as binding_unavailable but never durably marked
+	// expired, mirroring internal/dispatch/authenticated_linux.go's and
+	// internal/connection/ingestion_linux.go's identical established
+	// observe-and-persist lifecycle. invalidate is nil: this package holds
+	// no live connection.Manager to invalidate a session against.
+	ctx, expiry := store.ObserveExpiries(ctx, sess.server.Store)
+	defer func() {
+		if persistErr := expiry.Persist(sess.server.Store, nil); persistErr != nil {
+			resp = domainErrorResponse(&req.ID, domainCode(persistErr))
+		}
+	}()
 	model := membership.Model{Members: p.members, Policy: p.policy}
 	// membership.Validate must run before membersField/NewCommandRequest:
 	// a malformed shape (e.g. a duplicate member) produces a members Set
@@ -344,7 +359,7 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (R
 }
 
 // handleMembershipRenew implements membership.renew.
-func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Response, bool) {
+func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (resp Response, closeConn bool) {
 	p, ok := decodeRenewParams(req.Params)
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
@@ -352,6 +367,16 @@ func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Re
 	if incompatibleConversation(p.conversation) {
 		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
+	// See handleMembershipEnroll's identical comment. Also backs the
+	// EnabledPeer recheck added to the mutate callback below (Review
+	// 5256536448, comment 4053873898): its expired-credential branch calls
+	// recordExpiry, which needs this same wrapped ctx.
+	ctx, expiry := store.ObserveExpiries(ctx, sess.server.Store)
+	defer func() {
+		if persistErr := expiry.Persist(sess.server.Store, nil); persistErr != nil {
+			resp = domainErrorResponse(&req.ID, domainCode(persistErr))
+		}
+	}()
 	fields := renewalFields(p.conversation, p.expectedVersion, p.maxExchanges, p.expiresAtText, p.cancelPendingReplies)
 	request, err := store.NewCommandRequest("membership.renew", p.operationID, fields...)
 	if err != nil {
@@ -367,6 +392,22 @@ func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Re
 			if err != nil {
 				return domainRejection(err)
 			}
+			// Review 5256536448 (comment 4053873898): unlike Enroll/Replace,
+			// Renew keeps its existing peers, so they are only known once
+			// RenewTx has resolved the current grant -- checked here,
+			// after RenewTx but still inside the same SAVEPOINT-wrapped
+			// mutate callback, so a stale enabled/current status still
+			// discards RenewTx's own SQL effects (Coordinator.execute's
+			// "ROLLBACK TO command_effect" on any terminal rejection.Code)
+			// before the rejection is durably audited -- never a
+			// silently-successful renewal.
+			now := store.AuthorityTime(ctx, sess.server.now())
+			if _, err := store.EnabledPeer(ctx, tx, result.Grant.PeerAID, now); err != nil {
+				return domainRejection(err)
+			}
+			if _, err := store.EnabledPeer(ctx, tx, result.Grant.PeerBID, now); err != nil {
+				return domainRejection(err)
+			}
 			return store.CommandResult{Resources: []store.ResourceChange{
 				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: result.Grant.GrantVersion},
 				{Kind: "queued_carried", ID: p.conversation, After: result.Carried},
@@ -379,7 +420,7 @@ func (sess *Session) handleMembershipRenew(ctx context.Context, req Request) (Re
 }
 
 // handleMembershipReplace implements membership.replace.
-func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (Response, bool) {
+func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (resp Response, closeConn bool) {
 	p, ok := decodeReplaceParams(req.Params)
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
@@ -387,6 +428,13 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 	if incompatibleConversation(p.conversation) {
 		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
+	// See handleMembershipEnroll's identical comment.
+	ctx, expiry := store.ObserveExpiries(ctx, sess.server.Store)
+	defer func() {
+		if persistErr := expiry.Persist(sess.server.Store, nil); persistErr != nil {
+			resp = domainErrorResponse(&req.ID, domainCode(persistErr))
+		}
+	}()
 	model := membership.Model{Members: p.members, Policy: p.policy}
 	// See handleMembershipEnroll's identical comment: Validate must run
 	// before membersField/NewCommandRequest (a duplicate member would
