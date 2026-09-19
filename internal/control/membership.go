@@ -53,26 +53,31 @@ func noopAuthorize(context.Context, *sql.Tx) error { return nil }
 // ordinary bound -- 2026-09-19 lead approval replaced this file's earlier
 // SHA-256 alias substitution (which reported an opaque digest instead of
 // the exact target, defeating self-contained audit identification) with
-// this bound instead: store.MaxLocatorBytes and UTF-8 validity, the same
-// contract the codebase already applies to other long-but-bounded
-// non-identity text fields (credential locators, target locators). Invalid
-// UTF-8 is a different boundary handled earlier, at JSON decode
-// (internal/control/json.go rejects it before any handler runs), so it
-// cannot actually reach this function via any live wire call; the check
-// here is retained anyway as an explicit, testable boundary rather than an
-// assumption about an earlier layer. An id this function refuses is
-// rejected before Execute ever runs (deterministic, not durably audited,
-// mirroring invalid_membership's own pre-Execute asymmetry) instead of
-// reaching the coordinator's own post-mutate resource check after RevokeTx
-// has already run inside the transaction -- which the coordinator would
-// still roll back, but only after wastefully running the mutation, and
-// with a generic InvalidRequest rather than an identifier-specific,
-// retryable diagnostic. RevokeTx itself always receives the conversation
-// identifier verbatim regardless of this check's outcome, so the actual
-// mutation target is exact either way; this function only gates whether
-// the command can be durably reported and replayed at all.
+// UTF-8 validity plus a length bound. EC-04 (2026-09-19 review) then
+// replaced that bound's own reuse of store.MaxLocatorBytes (a different
+// field's limit, chosen for credential/target locators, with no relation
+// to this identifier's real encoded-size constraints) with the dedicated
+// store.MaxLegacyLocatorBytes -- see that constant's doc comment for the
+// full derivation from the actual revoke-receipt encoding and
+// control.MaxFrameBytes, and TestLegacyConversationBoundStaysWithinFrameLimit
+// for the test enforcing it stays true. Invalid UTF-8 is a different
+// boundary handled earlier, at JSON decode (internal/control/json.go
+// rejects it before any handler runs), so it cannot actually reach this
+// function via any live wire call; the check here is retained anyway as an
+// explicit, testable boundary rather than an assumption about an earlier
+// layer. An id this function refuses is rejected before Execute ever runs
+// (deterministic, not durably audited, mirroring invalid_membership's own
+// pre-Execute asymmetry) instead of reaching the coordinator's own
+// post-mutate resource check after RevokeTx has already run inside the
+// transaction -- which the coordinator would still roll back, but only
+// after wastefully running the mutation, and with a generic InvalidRequest
+// rather than an identifier-specific, retryable diagnostic. RevokeTx itself
+// always receives the conversation identifier verbatim regardless of this
+// check's outcome, so the actual mutation target is exact either way; this
+// function only gates whether the command can be durably reported and
+// replayed at all.
 func auditRepresentable(id string) bool {
-	return utf8.ValidString(id) && len(id) <= store.MaxLocatorBytes
+	return utf8.ValidString(id) && len(id) <= store.MaxLegacyLocatorBytes
 }
 
 // incompatibleConversation reports whether id fails enroll/renew/replace's
@@ -182,7 +187,22 @@ type CommandReceiptResult struct {
 // commit_view have since moved on. Comparing Before/After or the resource
 // list against a later live snapshot is a distinct, separate question this
 // method does not answer.
-func (r CommandReceiptResult) Usable(requestedOperationID string) bool {
+//
+// expectedConversation is the caller's own requested target -- every
+// membership.* mutation's ResourceChange entries carry the exact
+// conversation identifier as ID (see handleMembershipEnroll/Renew/Replace/
+// Revoke), so requiring an exact match here is strictly stronger than the
+// prior "nonempty" check it replaces (EC-03, 2026-09-19 review): the
+// historical schema permits an empty TEXT conversation key, and
+// AGENTS.md's exact-key legacy revocation escape must be able to target
+// one -- rejecting every empty resource ID unconditionally made a
+// successfully committed empty-key revocation's own receipt look unusable
+// at the client, even once the CLI-side flag-presence gap (parseCommand)
+// was separately fixed to let the request itself reach the server. An
+// exact-match requirement (rather than merely "permit empty too") also
+// catches a stale or cross-target receipt whose resource ID silently
+// differs from what was actually requested, which the old check could not.
+func (r CommandReceiptResult) Usable(requestedOperationID, expectedConversation string) bool {
 	if !canonicalUUID(r.AuditID) {
 		return false
 	}
@@ -199,7 +219,7 @@ func (r CommandReceiptResult) Usable(requestedOperationID string) bool {
 		return false
 	}
 	for _, rc := range r.Result.Resources {
-		if rc.Kind == "" || rc.ID == "" {
+		if rc.Kind == "" || rc.ID != expectedConversation {
 			return false
 		}
 		if _, ok := parseCanonicalNonNegative(rc.Before); !ok {
@@ -428,7 +448,7 @@ func (sess *Session) handleMembershipRevoke(ctx context.Context, req Request) (R
 	// RevokeTx for a byte-malformed or oversized-but-representable legacy
 	// conversation identifier. auditRepresentable is the narrower question
 	// "can this be durably reported at all" (valid UTF-8, within
-	// store.MaxLocatorBytes), not "is this an ordinary new identifier" --
+	// store.MaxLegacyLocatorBytes), not "is this an ordinary new identifier" --
 	// truly unrepresentable input (which cannot currently occur on any
 	// live wire call; see auditRepresentable's own doc comment) is refused
 	// here, before Execute, rather than committing a mutation whose result

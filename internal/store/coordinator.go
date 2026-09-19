@@ -218,14 +218,15 @@ func (c *Coordinator) execute(ctx context.Context, p CommandPrincipal, r Command
 		// internal/control/membership.go's auditRepresentable, applied
 		// before Execute is even called -- the bound enforced here is the
 		// second, independent check on the actually-committed result).
-		// MaxLocatorBytes (not a new constant) is reused deliberately: the
-		// codebase's existing valid-UTF-8-but-not-identity-shaped bound
-		// (internal/store/registry.go's credential locators,
-		// internal/connection/provisioning.go's target locators) is
-		// exactly the "long, arbitrary but bounded and well-formed text"
-		// contract a legacy conversation identifier needs here too.
+		// MaxLegacyLocatorBytes (EC-04, 2026-09-19 review) is a dedicated
+		// constant derived from this command's own actual encoded-size
+		// constraints -- not MaxLocatorBytes, a different field's bound
+		// chosen for credential/target locators with no connection to this
+		// identifier's real frame/receipt-size envelope; see
+		// MaxLegacyLocatorBytes's own doc comment for the full derivation
+		// and its enforcing test.
 		if r.kind == "membership.revoke" {
-			if len(resource.ID) > MaxLocatorBytes || !utf8.ValidString(resource.ID) {
+			if len(resource.ID) > MaxLegacyLocatorBytes || !utf8.ValidString(resource.ID) {
 				return CommandReceipt{}, InvalidRequest
 			}
 			continue

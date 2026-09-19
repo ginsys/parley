@@ -22,6 +22,48 @@ const (
 	ReconnectInterval      = time.Second
 )
 
+// MaxLegacyLocatorBytes bounds membership.revoke's own exact-key legacy
+// conversation identifier (AGENTS.md's exact-key human revocation escape) --
+// internal/control/membership.go's auditRepresentable, and this package's
+// own "membership.revoke" resource-ID exception in Coordinator.execute
+// (coordinator.go), are its only two call sites. EC-04 (2026-09-19 review)
+// replaced an earlier reuse of MaxLocatorBytes -- a different field's bound,
+// chosen for credential/target locators, with no connection to this
+// identifier's own actual encoded-size constraints -- with this dedicated,
+// derived constant.
+//
+// Derivation: a revoke's own store.CommandResult always carries exactly 4
+// ResourceChange entries (see internal/control/membership.go's
+// handleMembershipRevoke), each with ID set to the same conversation
+// identifier -- so the identifier appears 4 times in every encoded revoke
+// receipt: the mutation response, its durable operation_results/
+// command_audit row, and every later operation.get replay of that row.
+// Because this identifier is exempt from bridgetext.ValidateMetadata's
+// printable-ASCII rule (unlike every other identity field in this
+// codebase), it may contain '"', '\', '<', '>', '&' or a raw control byte --
+// each of which encoding/json.Marshal's default HTML-safe escaping expands
+// to a 6-byte "\uXXXX" sequence, the worst case for any single UTF-8 byte.
+// A receipt carrying 4 copies of a MaxLegacyLocatorBytes-sized, maximally
+// adversarial identifier therefore encodes to at most
+// 4 * MaxLegacyLocatorBytes * 6 = 98,304 bytes for the identifier text
+// alone at the value below, leaving over 900 KiB of headroom inside
+// internal/control.MaxFrameBytes (1 MiB, the wire profile's single-frame
+// bound every mutation response and operation.get reply must fit within)
+// for the rest of the envelope (audit_id, commit_view, other resource
+// fields, JSON-RPC framing). internal/control's
+// TestLegacyConversationBoundStaysWithinFrameLimit constructs exactly this
+// adversarial receipt against a real Response.Encode() and asserts it
+// fits, so a future change to the resource count, the escaping assumption
+// or MaxFrameBytes itself fails that test rather than silently
+// invalidating this comment.
+//
+// This value intentionally stays well under the theoretical frame-derived
+// ceiling above (roughly 40x larger) rather than being raised to meet it: a
+// legacy identifier is bounded historical data carried through the system
+// for exact-key revocation, not a field new data should be encouraged to
+// fill out to a frame-sized maximum.
+const MaxLegacyLocatorBytes = 4096
+
 // Code is safe for diagnostics. Never replace it with a transport/SQLite error string.
 type Code string
 

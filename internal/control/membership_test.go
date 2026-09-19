@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -237,7 +238,7 @@ func TestMembershipEnrollReplayReturnsSameReceiptWithoutASecondGrant(t *testing.
 	// produced: Usable validates shape/domain only, never live server state
 	// (the grant this replay describes has not changed version since, but
 	// Usable must not depend on that -- see its own doc comment).
-	if !r2.Usable(opID) {
+	if !r2.Usable(opID, "conv-1") {
 		t.Fatalf("a replayed receipt must remain Usable: %#v", r2)
 	}
 	var count int
@@ -268,6 +269,221 @@ func TestMembershipEnrollConflictingRetrySameOperationIDDifferentPayload(t *test
 	second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: p2})
 	if second.Err == nil || second.Err.Data == nil || second.Err.Data.Code != DomainCode(store.OperationConflict) {
 		t.Fatalf("conflicting retry on the same operation_id must be rejected as operation_conflict, got %#v", second.Err)
+	}
+}
+
+// TestMembershipEnrollRejectsMatchingVersionWhileActiveWithoutMutating,
+// TestMembershipEnrollStaleVersionTakesPriorityOverActiveGrant and
+// TestMembershipEnrollRejectedOperationRemainsDurableAcrossRevocationAndConflictsOnChangedRetry
+// are the wire-level EC-01 regression matrix (thread PRRT_kwDOUT1JT86j_9VC,
+// root 4053366763): GrantTx's restored active-grant precondition
+// (internal/controller/controller.go), exercised through the actual
+// membership.enroll wire handler so the matrix covers durability/replay
+// behavior the unit-level controller tests can't (that layer never sees the
+// coordinator's operation-result/audit ledger).
+func TestMembershipEnrollRejectsMatchingVersionWhileActiveWithoutMutating(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	first := openMembers("peer-a", "peer-b")
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: first})
+	if enroll.Err != nil {
+		t.Fatalf("fresh enrollment rejected: %#v", enroll.Err)
+	}
+
+	// A second enrollment attempt with a fresh operation ID but the same,
+	// still-current expected_grant_version must be rejected as AlreadyActive
+	// -- not silently accepted, and not the idx_grants_one_active storage
+	// error the pre-fix regression degraded to.
+	second := openMembers("peer-a", "peer-b")
+	second["expected_grant_version"] = "1" // matches the latest historical version, which is active
+	resp, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: second})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.AlreadyActive) {
+		t.Fatalf("expected already_active for a matching-version enrollment while active, got %#v", resp.Err)
+	}
+
+	var count int
+	if err := db.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM grants WHERE conversation='conv-1'").Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("a rejected enrollment must not create a new grant version: found %d rows", count)
+	}
+
+	// The original successful operation ID must still replay while its
+	// grant remains active.
+	replay, _ := sess.Handle(context.Background(), Request{ID: "3", Method: "membership.enroll", Params: first})
+	if replay.Err != nil {
+		t.Fatalf("replay of the original successful enrollment must still succeed while active: %#v", replay.Err)
+	}
+	r1 := decodeResult[CommandReceiptResult](t, enroll)
+	r3 := decodeResult[CommandReceiptResult](t, replay)
+	if r1.AuditID != r3.AuditID {
+		t.Fatalf("replay of the original enrollment produced a different audit record: %s vs %s", r1.AuditID, r3.AuditID)
+	}
+}
+
+func TestMembershipEnrollStaleVersionTakesPriorityOverActiveGrant(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("fresh enrollment rejected: %#v", enroll.Err)
+	}
+
+	// A stale (non-matching) expected_grant_version must report
+	// StaleGrantVersion, never AlreadyActive -- GrantTx checks
+	// ExpectedVersion before CurrentGrant regardless of whether a grant
+	// happens to be active (see the EC-01 doc comment in controller.go).
+	stale := openMembers("peer-a", "peer-b")
+	stale["expected_grant_version"] = "99"
+	resp, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: stale})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.StaleGrantVersion) {
+		t.Fatalf("expected stale_grant_version to take priority over already_active, got %#v", resp.Err)
+	}
+}
+
+func TestMembershipEnrollRejectedOperationRemainsDurableAcrossRevocationAndConflictsOnChangedRetry(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if enroll.Err != nil {
+		t.Fatalf("fresh enrollment rejected: %#v", enroll.Err)
+	}
+
+	rejected := openMembers("peer-a", "peer-b")
+	rejected["expected_grant_version"] = "1" // matches the latest historical version, which is active
+	rejectedOpID, _ := rejected["operation_id"].(string)
+	first, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.enroll", Params: rejected})
+	if first.Err == nil || first.Err.Data == nil || first.Err.Data.Code != DomainCode(store.AlreadyActive) {
+		t.Fatalf("expected already_active, got %#v", first.Err)
+	}
+	rec1, err := db.Queries().OperationRecord(context.Background(), testHelloAdmin, rejectedOpID)
+	if err != nil {
+		t.Fatalf("rejected enrollment must still be durably recorded: %v", err)
+	}
+
+	// Changed-input reuse of the same rejected operation ID must conflict,
+	// not silently re-execute against the (unchanged) current state.
+	changed := openMembers("peer-a", "peer-b")
+	changed["operation_id"] = rejectedOpID
+	changed["max_exchanges"] = "9"
+	conflict, _ := sess.Handle(context.Background(), Request{ID: "3", Method: "membership.enroll", Params: changed})
+	if conflict.Err == nil || conflict.Err.Data == nil || conflict.Err.Data.Code != DomainCode(store.OperationConflict) {
+		t.Fatalf("changed-input retry of a rejected operation id must conflict, got %#v", conflict.Err)
+	}
+
+	// Revoke the active grant, then replay the exact same rejected payload
+	// under the same operation ID: this must still return the original
+	// AlreadyActive rejection (durable, digest-keyed), never re-execute now
+	// that an active grant no longer exists -- the entire point of the
+	// original defect being that this same operation ID could silently
+	// execute as new work after an unrelated revocation.
+	revoke, _ := sess.Handle(context.Background(), Request{ID: "4", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+	}})
+	if revoke.Err != nil {
+		t.Fatalf("revoke failed: %#v", revoke.Err)
+	}
+	replay, _ := sess.Handle(context.Background(), Request{ID: "5", Method: "membership.enroll", Params: rejected})
+	if replay.Err == nil || replay.Err.Data == nil || replay.Err.Data.Code != DomainCode(store.AlreadyActive) {
+		t.Fatalf("replay of a rejected operation after an unrelated revocation must return its original rejection, got %#v", replay.Err)
+	}
+	rec2, err := db.Queries().OperationRecord(context.Background(), testHelloAdmin, rejectedOpID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec1.AuditSequence != rec2.AuditSequence || rec1.AuditID != rec2.AuditID {
+		t.Fatalf("replay after revocation must not create a second audit record: %+v vs %+v", rec1, rec2)
+	}
+	var count int
+	if err := db.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM grants WHERE conversation='conv-1'").Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("the durable replay must not create a new grant version: found %d rows", count)
+	}
+
+	// A genuinely new operation ID may re-enroll after the revocation.
+	fresh := openMembers("peer-a", "peer-b")
+	fresh["expected_grant_version"] = "1" // latest historical version is still 1 after revoke
+	reEnroll, _ := sess.Handle(context.Background(), Request{ID: "6", Method: "membership.enroll", Params: fresh})
+	if reEnroll.Err != nil {
+		t.Fatalf("a genuinely new operation id must be able to re-enroll after revocation: %#v", reEnroll.Err)
+	}
+}
+
+// TestMembershipRevokeSucceedsForEmptyLegacyConversationIdentifier is EC-03
+// (2026-09-19 review): the historical schema permits an empty TEXT
+// conversation key, and AGENTS.md's exact-key legacy revocation escape must
+// be able to target one end to end -- not merely accept it client-side
+// (cmd/parleyctl's parseCommand fix) or report it Usable in isolation
+// (CommandReceiptResult.Usable's fix), but actually revoke the real seeded
+// empty-key grant and durably record and replay that exact empty target.
+// Seeded directly via store, not through membership.enroll's wire handler:
+// incompatibleConversation's bridgetext.ValidateMetadata check requires at
+// least one non-space byte for a fresh enrollment, so an empty-key grant can
+// only exist as pre-existing historical data, exactly the scenario this
+// escape exists for.
+func TestMembershipRevokeSucceedsForEmptyLegacyConversationIdentifier(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "", "", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertGrant(ctx, tx, store.Grant{Conversation: "", GrantVersion: 1, PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	opID := newOpID()
+	revoke, _ := sess.Handle(ctx, Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": opID, "conversation": "", "expected_grant_version": "1",
+	}})
+	if revoke.Err != nil {
+		t.Fatalf("revoke of an empty legacy conversation identifier must succeed: %#v", revoke.Err)
+	}
+	result := decodeResult[CommandReceiptResult](t, revoke)
+	if !result.Usable(opID, "") {
+		t.Fatalf("a genuine empty-key revoke receipt must be Usable against the empty target: %#v", result)
+	}
+	if len(result.Result.Resources) == 0 || result.Result.Resources[0].ID != "" {
+		t.Fatalf("resource id must be the exact empty conversation, got %#v", result.Result.Resources)
+	}
+
+	// A same-ID replay must return the identical durable receipt, not
+	// re-execute or refuse.
+	replay, _ := sess.Handle(ctx, Request{ID: "2", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": opID, "conversation": "", "expected_grant_version": "1",
+	}})
+	if replay.Err != nil {
+		t.Fatalf("replay of the empty-key revoke was rejected: %#v", replay.Err)
+	}
+	r2 := decodeResult[CommandReceiptResult](t, replay)
+	if r2.AuditID != result.AuditID {
+		t.Fatalf("replay produced a different audit record: %s vs %s", r2.AuditID, result.AuditID)
+	}
+
+	// An ordinary new-enrollment attempt against an empty conversation must
+	// still be rejected -- this escape is exclusive to revoke's already-
+	// historical exact-key path, never a general exemption.
+	fresh := openMembers("peer-a", "peer-b")
+	fresh["conversation"] = ""
+	enrollResp, _ := sess.Handle(ctx, Request{ID: "3", Method: "membership.enroll", Params: fresh})
+	if enrollResp.Err == nil || enrollResp.Err.Data == nil || enrollResp.Err.Data.Code != IncompatibleIdentifier {
+		t.Fatalf("a fresh enrollment against an empty conversation must still be rejected, got %#v", enrollResp.Err)
 	}
 }
 
@@ -398,10 +614,10 @@ func TestMembershipEnrollResultEchoesExactOperationID(t *testing.T) {
 	if result.OperationID != opID {
 		t.Fatalf("operation_id=%q, want %q", result.OperationID, opID)
 	}
-	if !result.Usable(opID) {
+	if !result.Usable(opID, "conv-1") {
 		t.Fatalf("a genuine receipt must be Usable: %#v", result)
 	}
-	if result.Usable("some-other-operation-id") {
+	if result.Usable("some-other-operation-id", "conv-1") {
 		t.Fatalf("a receipt for a different operation_id must not be Usable: %#v", result)
 	}
 }
@@ -502,6 +718,21 @@ func TestCommandReceiptResultUsableValidatesActualReceiptContents(t *testing.T) 
 			r.OperationID = "not-a-uuid"
 			return r
 		}},
+		// EC-03 (2026-09-19 review): an empty resource ID is not itself a
+		// defect -- the historical schema permits an empty TEXT conversation
+		// key, and AGENTS.md's exact-key legacy revocation escape must be
+		// able to target one. What must be checked is that the resource ID
+		// exactly matches what the caller actually requested, empty or not.
+		{"resource id empty and caller requested the empty conversation", true, func() CommandReceiptResult {
+			r := valid()
+			r.Result.Resources[0].ID = ""
+			return r
+		}},
+		{"resource id present but does not match the requested conversation", false, func() CommandReceiptResult {
+			r := valid()
+			r.Result.Resources[0].ID = "conv-2"
+			return r
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -510,7 +741,11 @@ func TestCommandReceiptResultUsableValidatesActualReceiptContents(t *testing.T) 
 			if tt.name == "non-UUID operation_id even if it matches the request string" {
 				requested = "not-a-uuid"
 			}
-			if got := r.Usable(requested); got != tt.want {
+			expectedConversation := "conv-1"
+			if tt.name == "resource id empty and caller requested the empty conversation" {
+				expectedConversation = ""
+			}
+			if got := r.Usable(requested, expectedConversation); got != tt.want {
 				t.Fatalf("Usable()=%v, want %v: %#v", got, tt.want, r)
 			}
 		})
@@ -1280,10 +1515,10 @@ func seedLegacyGrant(t *testing.T, db *store.DB, conversation string) {
 // verbatim, never silently substituting an alias.
 func TestMembershipRevokeSucceedsForRepresentableLegacyConversationIdentifiers(t *testing.T) {
 	cases := map[string]string{
-		"byte-malformed control character":        "legacy\x7fconversation",
-		"valid non-ASCII UTF-8":                   "café-légacy-conversation",
-		"oversized but within MaxLocatorBytes":    strings.Repeat("x", store.MaxIdentityBytes+1),
-		"leading/trailing spaces and punctuation": "  legacy, conversation!  ",
+		"byte-malformed control character":           "legacy\x7fconversation",
+		"valid non-ASCII UTF-8":                      "café-légacy-conversation",
+		"oversized but within MaxLegacyLocatorBytes": strings.Repeat("x", store.MaxIdentityBytes+1),
+		"leading/trailing spaces and punctuation":    "  legacy, conversation!  ",
 	}
 	for name, conversation := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1309,20 +1544,21 @@ func TestMembershipRevokeSucceedsForRepresentableLegacyConversationIdentifiers(t
 
 // TestMembershipRevokeRefusesOversizedLegacyConversationIdentifierWithoutCommitting
 // is auditRepresentable's actual refusal boundary: a legacy identifier past
-// store.MaxLocatorBytes cannot be durably reported at all (the coordinator's
-// own membership.revoke-scoped exception in internal/store/coordinator.go
-// enforces the identical bound on the committed result), so it must be
-// refused before Execute ever runs -- never a wasted mutation attempt the
-// coordinator's own check would reject anyway.
+// store.MaxLegacyLocatorBytes cannot be durably reported at all (the
+// coordinator's own membership.revoke-scoped exception in
+// internal/store/coordinator.go enforces the identical bound on the
+// committed result), so it must be refused before Execute ever runs --
+// never a wasted mutation attempt the coordinator's own check would reject
+// anyway.
 func TestMembershipRevokeRefusesOversizedLegacyConversationIdentifierWithoutCommitting(t *testing.T) {
 	sess, db := membershipTestServer(t)
-	conversation := strings.Repeat("x", store.MaxLocatorBytes+1)
+	conversation := strings.Repeat("x", store.MaxLegacyLocatorBytes+1)
 	seedLegacyGrant(t, db, conversation)
 	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
 		"operation_id": newOpID(), "conversation": conversation, "expected_grant_version": "1",
 	}})
 	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
-		t.Fatalf("expected incompatible_identifier for a >MaxLocatorBytes legacy identifier, got %#v", resp.Err)
+		t.Fatalf("expected incompatible_identifier for a >MaxLegacyLocatorBytes legacy identifier, got %#v", resp.Err)
 	}
 	// Rolled back immediately, not deferred: db.Begin is an immediate writer
 	// transaction (BEGIN IMMEDIATE), so leaving this one open past this
@@ -1355,5 +1591,136 @@ func TestMembershipRevokeRefusesOversizedLegacyConversationIdentifierWithoutComm
 	}})
 	if second.Err == nil || second.Err.Data == nil || second.Err.Data.Code != DomainCode(store.NoActiveGrant) {
 		t.Fatalf("a corrected retry reusing the same operation_id must execute normally, got %#v", second.Err)
+	}
+}
+
+// TestLegacyConversationBoundStaysWithinFrameLimit is
+// store.MaxLegacyLocatorBytes's own enforcing test (EC-04, 2026-09-19
+// review): it builds the actual worst-case membership.revoke receipt --
+// four ResourceChange entries, handleMembershipRevoke's real shape, each
+// carrying a MaxLegacyLocatorBytes-sized identifier built from repeated
+// single UTF-8-byte control characters, the input encoding/json.Marshal's
+// default HTML-safe escaping expands the most (each "\x01" becomes the
+// 6-byte sequence ``) -- and asserts the actual encoded
+// Response.Encode() output still fits comfortably inside
+// control.MaxFrameBytes, with the margin the doc comment claims. A future
+// change to the resource count, the escaping assumption, or MaxFrameBytes
+// itself must fail this test rather than silently invalidating
+// store.MaxLegacyLocatorBytes's derivation.
+func TestLegacyConversationBoundStaysWithinFrameLimit(t *testing.T) {
+	adversarial := strings.Repeat("\x01", store.MaxLegacyLocatorBytes)
+	resources := make([]wireResourceChange, 4)
+	for i := range resources {
+		resources[i] = wireResourceChange{Kind: "grant", ID: adversarial, Before: "1", After: "2"}
+	}
+	result := CommandReceiptResult{
+		Result:      wireCommandResult{Resources: resources},
+		AuditID:     newOpID(),
+		OperationID: newOpID(),
+		CommitView:  CommitView{Epoch: newOpID(), Revision: "1"},
+	}
+	resp := successResponse(newOpID(), result)
+	data, err := resp.Encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(data) >= MaxFrameBytes {
+		t.Fatalf("worst-case revoke receipt (%d bytes) does not fit MaxFrameBytes (%d)", len(data), MaxFrameBytes)
+	}
+	if margin := MaxFrameBytes - len(data); margin < 900*1024 {
+		t.Fatalf("expected at least 900 KiB of headroom per the derivation, got %d bytes (encoded=%d)", margin, len(data))
+	}
+}
+
+// TestLegacyConversationBoundIsConservativeNotFrameMaximum demonstrates
+// store.MaxLegacyLocatorBytes's own doc comment claim that the chosen
+// cutoff is a deliberate, far-under-ceiling policy choice, not the literal
+// largest identifier a frame could carry: a plain-ASCII (no escaping
+// expansion) legacy identifier several times past the bound would still
+// fit comfortably inside a single frame if it were ever let through. The
+// refusal above MaxLegacyLocatorBytes is therefore "legacy identifiers do
+// not get a frame-sized budget", not "this literally would not fit".
+func TestLegacyConversationBoundIsConservativeNotFrameMaximum(t *testing.T) {
+	oversized := strings.Repeat("x", store.MaxLegacyLocatorBytes*4)
+	resources := make([]wireResourceChange, 4)
+	for i := range resources {
+		resources[i] = wireResourceChange{Kind: "grant", ID: oversized, Before: "1", After: "2"}
+	}
+	result := CommandReceiptResult{
+		Result:      wireCommandResult{Resources: resources},
+		AuditID:     newOpID(),
+		OperationID: newOpID(),
+		CommitView:  CommitView{Epoch: newOpID(), Revision: "1"},
+	}
+	resp := successResponse(newOpID(), result)
+	data, err := resp.Encode()
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(data) >= MaxFrameBytes {
+		t.Fatalf("a merely-4x-oversized plain-ASCII identifier already exceeds MaxFrameBytes (%d bytes); the conservative-cutoff claim would be false", len(data))
+	}
+}
+
+// TestMembershipRevokeAtLegacyBoundPreservesExactIdentifierThroughAuditAndReplay
+// exercises the true boundary the earlier representable/oversized tests
+// above only approximate: a legacy conversation identifier exactly
+// store.MaxLegacyLocatorBytes bytes long, built from '"'/'\' bytes an
+// ordinary identifier could never carry, revoked through the real wire
+// handler, then read back through operation.get and replayed -- proving the
+// exact identifier (not an alias, not a re-escaped or truncated copy)
+// survives every stage of durable storage and retrieval this bound gates.
+func TestMembershipRevokeAtLegacyBoundPreservesExactIdentifierThroughAuditAndReplay(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	conversation := strings.Repeat(`x"\y`, store.MaxLegacyLocatorBytes/4)
+	if len(conversation) != store.MaxLegacyLocatorBytes {
+		t.Fatalf("test fixture must be exactly at the boundary, got %d bytes", len(conversation))
+	}
+	seedLegacyGrant(t, db, conversation)
+
+	opID := newOpID()
+	revoke, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": opID, "conversation": conversation, "expected_grant_version": "1",
+	}})
+	if revoke.Err != nil {
+		t.Fatalf("revoke at the exact boundary must succeed: %#v", revoke.Err)
+	}
+	result := decodeResult[CommandReceiptResult](t, revoke)
+	if !result.Usable(opID, conversation) {
+		t.Fatalf("boundary receipt must be Usable against the exact identifier: %#v", result)
+	}
+	if len(result.Result.Resources) == 0 || result.Result.Resources[0].ID != conversation {
+		t.Fatalf("resource id mismatch: %#v", result.Result.Resources)
+	}
+
+	getResp, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "operation.get", Params: map[string]any{"operation_id": opID}})
+	if getResp.Err != nil {
+		t.Fatalf("operation.get must retrieve the revoke record: %#v", getResp.Err)
+	}
+	getResult := decodeResult[OperationGetResult](t, getResp)
+	if getResult.AuditID != result.AuditID {
+		t.Fatalf("operation.get audit id mismatch: %s vs %s", getResult.AuditID, result.AuditID)
+	}
+	var raw struct {
+		Resources []struct {
+			ID string `json:"id"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(getResult.Result, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.Resources) == 0 || raw.Resources[0].ID != conversation {
+		t.Fatalf("operation.get must republish the exact identifier verbatim, got %#v", raw.Resources)
+	}
+
+	replay, _ := sess.Handle(context.Background(), Request{ID: "3", Method: "membership.revoke", Params: map[string]any{
+		"operation_id": opID, "conversation": conversation, "expected_grant_version": "1",
+	}})
+	if replay.Err != nil {
+		t.Fatalf("replay must succeed: %#v", replay.Err)
+	}
+	r2 := decodeResult[CommandReceiptResult](t, replay)
+	if r2.AuditID != result.AuditID || r2.Result.Resources[0].ID != conversation {
+		t.Fatalf("replay must reproduce the identical durable receipt: %#v", r2)
 	}
 }

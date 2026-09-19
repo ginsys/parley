@@ -184,6 +184,88 @@ func TestGrantTxAcceptsVersionAtTheMaxInt64Boundary(t *testing.T) {
 	}
 }
 
+// TestGrantRejectsExistingActiveGrantWithoutMutating and
+// TestGrantTxPrefersAlreadyActiveOverVersionOverflowAtExhaustion cover EC-01
+// (thread PRRT_kwDOUT1JT86j_9VC, root 4053366763): GrantTx's restored
+// active-grant precondition above, exercised through the legacy
+// Controller.Grant wrapper so the regression matrix covers every existing
+// direct caller, not just internal/control's wire handler (which already has
+// its own matrix in internal/control/membership_test.go).
+func TestGrantRejectsExistingActiveGrantWithoutMutating(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "grant-already-active.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "c", "c", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertGrant(ctx, tx, store.Grant{Conversation: "c", GrantVersion: 1, PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrl := New(db)
+	if _, err := ctrl.Grant(ctx, GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 5}); !errors.Is(err, store.AlreadyActive) {
+		t.Fatalf("expected store.AlreadyActive, got %v", err)
+	}
+
+	tx, err = db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM grants WHERE conversation='c'").Scan(&count); err != nil || count != 1 {
+		t.Errorf("history rows=%d: %v", count, err)
+	}
+	g, err := store.CurrentGrant(ctx, tx, "c")
+	if err != nil || g.GrantVersion != 1 || g.MaxExchanges != 2 {
+		t.Errorf("active grant changed: %+v: %v", g, err)
+	}
+}
+
+// TestGrantTxPrefersAlreadyActiveOverVersionOverflowAtExhaustion is the
+// active-at-version-exhaustion control the governing review required: an
+// active grant sitting at math.MaxInt64 must still report AlreadyActive, not
+// the version-overflow rejection covered by TestGrantTxRefusesVersionOverflow
+// WithoutMutating above -- the active-grant check runs first (see GrantTx's
+// ordering), so version exhaustion is irrelevant while an active grant
+// already makes the enrollment attempt illegitimate.
+func TestGrantTxPrefersAlreadyActiveOverVersionOverflowAtExhaustion(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "grant-already-active-exhausted.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureConversation(ctx, tx, "c", "c", "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertGrant(ctx, tx, store.Grant{Conversation: "c", GrantVersion: math.MaxInt64, PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctrl := New(db)
+	if _, err := ctrl.Grant(ctx, GrantParams{Conversation: "c", PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 5}); !errors.Is(err, store.AlreadyActive) {
+		t.Fatalf("expected AlreadyActive to take precedence over version-overflow at exhaustion, got %v", err)
+	}
+}
+
 // TestSupersedeRefusesVersionOverflowWithoutMutating and
 // TestSupersedeAcceptsVersionAtTheMaxInt64Boundary cover the same
 // NextVersion correction applied to supersede's successor computation
