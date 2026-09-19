@@ -138,7 +138,12 @@ func TestHelpAndInvalidArgumentsNeverDial(t *testing.T) {
 		{[]string{"membership", "renew"}, 2, "requires -conversation"},
 		{[]string{"membership", "replace"}, 2, "requires -conversation"},
 		{[]string{"membership", "revoke"}, 2, "requires -conversation"},
-		{[]string{"membership", "revoke", "-conversation", " "}, 2, "requires -conversation"},
+		// A supplied space-only value is a representable legacy exact key on
+		// revoke (see TestMembershipRevokeAcceptsSpaceOnlyLegacyConversation
+		// below, batch-9 fix for comment 4053366764) -- it must clear the
+		// -conversation check and fail on the next missing argument instead,
+		// never dialing either way.
+		{[]string{"membership", "revoke", "-conversation", " "}, 2, "requires -expected-grant-version"},
 		{[]string{"membership", "revoke", "-conversation", "c", "-expected-grant-version", "1", "extra"}, 2, "unexpected positional arguments"},
 		{append([]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-max-exchanges", "-1"}, membershipEndpointArgs...), 2, "must not be negative"},
 		{append([]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "-1s"}, membershipEndpointArgs...), 2, "must not be negative"},
@@ -593,6 +598,123 @@ func TestMembershipEnrollAcceptsConversationAtTheMaxIdentityBytesBoundary(t *tes
 	}
 	if fake.params["conversation"] != boundary {
 		t.Fatalf("conversation identity changed: %+v", fake.params)
+	}
+}
+
+// TestMembershipRevokeAcceptsSpaceOnlyLegacyConversation and
+// TestMembershipEnrollRenewReplaceRejectSpaceOnlyConversation are the batch-9
+// fix for review d89c4e6's post-push finding (comment 4053366764): revoke's
+// exact-key legacy escape must not apply the "at least one non-space byte"
+// AGENTS.md rule new enrollment requires, since a historical space-only key
+// is representable on the wire and the server's revoke path intentionally
+// accepts identifiers that fail new-enrollment validation. Before this fix,
+// -conversation "   " on revoke was rejected client-side by the same
+// TrimSpace check that (correctly) still applies to enroll/renew/replace.
+func TestMembershipRevokeAcceptsSpaceOnlyLegacyConversation(t *testing.T) {
+	fake := &fakeClient{}
+	var out, errOut bytes.Buffer
+	args := append([]string{"membership", "revoke", "-conversation", "   ", "-expected-grant-version", "1"}, membershipEndpointArgs...)
+	if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
+		t.Fatalf("expected a space-only legacy conversation to dial and revoke: exit=%d %s", code, &errOut)
+	}
+	if fake.params["conversation"] != "   " {
+		t.Fatalf("conversation identity changed: %+v", fake.params)
+	}
+}
+
+func TestMembershipEnrollRenewReplaceRejectSpaceOnlyConversation(t *testing.T) {
+	for _, op := range []string{"enroll", "renew", "replace"} {
+		t.Run(op, func(t *testing.T) {
+			args := []string{"membership", op, "-conversation", "   "}
+			switch op {
+			case "enroll":
+				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2")
+			case "renew":
+				args = append(args, "-expected-grant-version", "1")
+			case "replace":
+				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b")
+			}
+			args = append(args, membershipEndpointArgs...)
+			var out, errOut bytes.Buffer
+			if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+				t.Fatalf("%s dialed for a space-only conversation: exit=%d %s", op, code, &errOut)
+			}
+		})
+	}
+}
+
+func TestMembershipEnrollMissingConversationFlagStillRejected(t *testing.T) {
+	// Guards the revoke fix above: an actually-omitted -conversation flag
+	// (the untrimmed default "") must still be rejected on every op,
+	// including revoke -- only a *supplied* space-only value is exempt.
+	for _, op := range []string{"enroll", "renew", "replace", "revoke"} {
+		t.Run(op, func(t *testing.T) {
+			args := []string{"membership", op}
+			switch op {
+			case "enroll":
+				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2")
+			case "renew", "revoke":
+				args = append(args, "-expected-grant-version", "1")
+			case "replace":
+				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b")
+			}
+			args = append(args, membershipEndpointArgs...)
+			var out, errOut bytes.Buffer
+			if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+				t.Fatalf("%s dialed with no -conversation at all: exit=%d %s", op, code, &errOut)
+			}
+		})
+	}
+}
+
+// TestMembershipEnrollReplaceRejectOversizedPeerBeforeDialing and
+// TestMembershipEnrollAcceptsPeerAtTheMaxIdentityBytesBoundary are the
+// batch-9 fix for review d89c4e6's post-push finding (comment 4053366765):
+// an ASCII peer identifier longer than store.MaxIdentityBytes passed
+// bridgetext.ValidateMetadata's shape check, dialed, and only then hit
+// store.EnabledPeer's identical length bound inside Coordinator.Execute --
+// a durable but generic invalid_request consuming an operation ID and audit
+// history for a boundary this client can already reject deterministically,
+// mirroring the conversation-length check already covered above.
+func TestMembershipEnrollReplaceRejectOversizedPeerBeforeDialing(t *testing.T) {
+	oversized := strings.Repeat("x", store.MaxIdentityBytes+1)
+	for _, op := range []string{"enroll", "replace"} {
+		t.Run(op, func(t *testing.T) {
+			args := []string{"membership", op, "-conversation", "conv", "-peer-a", oversized, "-peer-b", "b"}
+			if op == "enroll" {
+				args = append(args, "-max-exchanges", "2")
+			} else {
+				args = append(args, "-expected-grant-version", "1")
+			}
+			args = append(args, membershipEndpointArgs...)
+			var out, errOut bytes.Buffer
+			if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+				t.Fatalf("%s dialed for a %d-byte peer: exit=%d %s", op, len(oversized), code, &errOut)
+			}
+		})
+	}
+}
+
+func TestMembershipEnrollAcceptsPeerAtTheMaxIdentityBytesBoundary(t *testing.T) {
+	boundary := strings.Repeat("x", store.MaxIdentityBytes)
+	fake := &fakeClient{}
+	var out, errOut bytes.Buffer
+	args := append([]string{"membership", "enroll", "-conversation", "conv", "-peer-a", boundary, "-peer-b", "b", "-max-exchanges", "2"}, membershipEndpointArgs...)
+	if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
+		t.Fatalf("expected a %d-byte peer to be accepted: exit=%d %s", len(boundary), code, &errOut)
+	}
+	members, ok := fake.params["members"].([]any)
+	if !ok || len(members) != 2 {
+		t.Fatalf("members=%+v", fake.params["members"])
+	}
+	var found bool
+	for _, m := range members {
+		if m.(map[string]any)["peer_id"] == boundary {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("boundary peer identity not present in members: %+v", members)
 	}
 }
 
