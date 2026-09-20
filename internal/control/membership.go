@@ -288,18 +288,23 @@ func (sess *Session) handleMembershipEnroll(ctx context.Context, req Request) (r
 				return rejection(store.UnsupportedMembership)
 			}
 			peerA, peerB, direction := membership.ToGrantFields(model)
-			now := store.AuthorityTime(ctx, sess.server.now())
-			if _, err := store.EnabledPeer(ctx, tx, peerA, now); err != nil {
-				return domainRejection(err)
-			}
-			if _, err := store.EnabledPeer(ctx, tx, peerB, now); err != nil {
-				return domainRejection(err)
-			}
 			g, err := controller.GrantTx(ctx, tx, controller.GrantParams{
 				Conversation: p.conversation, PeerAID: peerA, PeerBID: peerB, Direction: direction,
 				MaxExchanges: p.maxExchanges, ExpiresAt: p.expiresAt, ExpectedVersion: &expectedVersion,
 			})
 			if err != nil {
+				return domainRejection(err)
+			}
+			// Review 5259679438 (comment 4056232740): the grant/version
+			// precondition is resolved first, as renew does, so a stale
+			// request reports stale_grant_version and cannot probe binding
+			// availability. A binding rejection here still discards GrantTx's
+			// effects (Coordinator.execute's "ROLLBACK TO command_effect").
+			now := store.AuthorityTime(ctx, sess.server.now())
+			if _, err := store.EnabledPeer(ctx, tx, peerA, now); err != nil {
+				return domainRejection(err)
+			}
+			if _, err := store.EnabledPeer(ctx, tx, peerB, now); err != nil {
 				return domainRejection(err)
 			}
 			return store.CommandResult{Resources: []store.ResourceChange{{Kind: "grant", ID: p.conversation, Before: expectedVersion, After: g.GrantVersion}}}, nil
@@ -399,19 +404,21 @@ func (sess *Session) handleMembershipReplace(ctx context.Context, req Request) (
 				return rejection(store.UnsupportedMembership)
 			}
 			peerA, peerB, direction := membership.ToGrantFields(model)
-			now := store.AuthorityTime(ctx, sess.server.now())
-			if _, err := store.EnabledPeer(ctx, tx, peerA, now); err != nil {
-				return domainRejection(err)
-			}
-			if _, err := store.EnabledPeer(ctx, tx, peerB, now); err != nil {
-				return domainRejection(err)
-			}
 			result, err := controller.ReplaceTx(ctx, tx, controller.ReplaceParams{
 				CancelPendingReplies: p.cancelPendingReplies, Conversation: p.conversation,
 				PeerAID: peerA, PeerBID: peerB, Direction: direction,
 				MaxExchanges: p.maxExchanges, ExpiresAt: p.expiresAt, ExpectedVersion: &expectedVersion,
 			})
 			if err != nil {
+				return domainRejection(err)
+			}
+			// Version precondition first, binding checks after, inside the
+			// same savepoint: see handleMembershipEnroll's identical comment.
+			now := store.AuthorityTime(ctx, sess.server.now())
+			if _, err := store.EnabledPeer(ctx, tx, peerA, now); err != nil {
+				return domainRejection(err)
+			}
+			if _, err := store.EnabledPeer(ctx, tx, peerB, now); err != nil {
 				return domainRejection(err)
 			}
 			return store.CommandResult{Resources: []store.ResourceChange{

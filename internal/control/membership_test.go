@@ -577,6 +577,58 @@ func TestMembershipEnrollStaleVersionTakesPriorityOverActiveGrant(t *testing.T) 
 	}
 }
 
+// TestMembershipStaleVersionTakesPriorityOverBindingAvailability is review
+// 5259679438 (comment 4056232740): enroll and replace checked the requested
+// peers' bindings before the grant/version precondition, so a stale request
+// naming a peer with no binding reported binding_unavailable -- a misleading
+// terminal result, and a way to probe binding availability with a stale
+// version. The controls prove the binding check still runs, and still leaves
+// the grant untouched, once the version matches.
+func TestMembershipStaleVersionTakesPriorityOverBindingAvailability(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedEnabledBinding(t, db, 2, "peer-b")
+	ctx := context.Background()
+	handle := func(id, method string, params map[string]any) Response {
+		t.Helper()
+		resp, _ := sess.Handle(ctx, Request{ID: id, Method: method, Params: params})
+		return resp
+	}
+	expectCode := func(resp Response, want store.Code, what string) {
+		t.Helper()
+		if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(want) {
+			t.Fatalf("%s: expected %s, got %#v", what, want, resp.Err)
+		}
+	}
+
+	staleEnroll := openMembers("peer-a", "peer-unbound")
+	staleEnroll["expected_grant_version"] = "99"
+	expectCode(handle("1", "membership.enroll", staleEnroll), store.StaleGrantVersion, "stale enroll naming an unbound peer")
+	expectCode(handle("2", "membership.enroll", openMembers("peer-a", "peer-unbound")), store.BindingUnavailable, "current enroll naming an unbound peer")
+	if enroll := handle("3", "membership.enroll", openMembers("peer-a", "peer-b")); enroll.Err != nil {
+		t.Fatalf("the rejected enrollment must have left no grant behind: %#v", enroll.Err)
+	}
+
+	replace := func(version string) map[string]any {
+		return map[string]any{
+			"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": version,
+			"members": []any{
+				map[string]any{"peer_id": "peer-a", "role": "member"},
+				map[string]any{"peer_id": "peer-unbound", "role": "member"},
+			},
+			"policy": map[string]any{"kind": "open"},
+		}
+	}
+	expectCode(handle("4", "membership.replace", replace("99")), store.StaleGrantVersion, "stale replace naming an unbound peer")
+	expectCode(handle("5", "membership.replace", replace("1")), store.BindingUnavailable, "current replace naming an unbound peer")
+	renew := handle("6", "membership.renew", map[string]any{
+		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
+	})
+	if renew.Err != nil {
+		t.Fatalf("the rejected replacement must have left version 1 current: %#v", renew.Err)
+	}
+}
+
 func TestMembershipEnrollRejectedOperationRemainsDurableAcrossRevocationAndConflictsOnChangedRetry(t *testing.T) {
 	sess, db := membershipTestServer(t)
 	seedEnabledBinding(t, db, 1, "peer-a")
