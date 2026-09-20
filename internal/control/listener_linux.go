@@ -675,12 +675,6 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		reqCtx, cancelReq := context.WithDeadline(ctx, next.at.Add(RequestDeadline))
 		resp, closeAfter := sess.Handle(reqCtx, req)
 		cancelReq()
-		// Released before the write, not after: a client may legitimately
-		// reuse the ID the moment it has read this response, and the reader
-		// could see that frame before this loop resumed.
-		outstandingMu.Lock()
-		delete(outstanding, req.ID)
-		outstandingMu.Unlock()
 		if sess.negotiated {
 			// sess.negotiated is only ever written by this goroutine
 			// (inside Handle -> handleHello); helloDone is the only field
@@ -688,7 +682,20 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			// race-free without sharing sess itself across goroutines.
 			helloDone.Store(true)
 		}
-		if writeResponse(conn, resp) != nil || closeAfter {
+		// Review 5259679438 (comment 4056232738): a call stays outstanding
+		// until its response is written, so the ID is released only then.
+		// The write and the release share the reader's lock, so the reader
+		// can never admit a second call under this ID while the first is
+		// queued, executing or still being written, and a client that reuses
+		// the ID after reading this response can never be seen before the
+		// release. The reader waits at most one WriteDeadline, and a frame's
+		// arrival is stamped before it takes the lock, so that wait is still
+		// charged to the request.
+		outstandingMu.Lock()
+		writeErr := writeResponse(conn, resp)
+		delete(outstanding, req.ID)
+		outstandingMu.Unlock()
+		if writeErr != nil || closeAfter {
 			return
 		}
 	}
