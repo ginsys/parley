@@ -1193,10 +1193,15 @@ func TestListenerServiceBoundsMutationByRequestDeadline(t *testing.T) {
 	// from arrival -- not the second a further RequestDeadline later.
 	started := time.Now()
 	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":"2","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f001","conversation":"conv-deadline","expected_grant_version":"1"}}` + "\n" +
-		`{"jsonrpc":"2.0","id":"3","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f002","conversation":"conv-deadline","expected_grant_version":"1"}}` + "\n")); err != nil {
+		`{"jsonrpc":"2.0","id":"3","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f002","conversation":"conv-deadline","expected_grant_version":"1"}}` + "\n" +
+		// Review 5259780995 (comment 4056295483): an unknown method never
+		// consults its context, so only the pre-dispatch check can refuse it
+		// once its deadline passed in the queue -- without it this frame
+		// answers method-not-found after the advertised limit.
+		`{"jsonrpc":"2.0","id":"4","method":"no.such.method","params":{}}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"2", "3"} {
+	for _, id := range []string{"2", "3", "4"} {
 		reply, err := br.ReadBytes('\n')
 		if err != nil {
 			t.Fatalf("no bounded response for request %s while the gate was held: %v", id, err)
@@ -1244,6 +1249,12 @@ func TestListenerServiceClosesOnQueueOverflowAndReusedCorrelationID(t *testing.T
 	}
 	cases := map[string]func() string{
 		"reused correlation id": func() string { return revoke("2", 1) + revoke("2", 2) },
+		// Review 5259780995 (comment 4056295482): a malformed envelope whose
+		// ID can be echoed would be answered under that ID, so it counts as
+		// a reuse too (positional params are an envelope violation).
+		"violation reusing an outstanding id": func() string {
+			return revoke("2", 1) + `{"jsonrpc":"2.0","id":"2","method":"membership.revoke","params":[]}` + "\n"
+		},
 		"queue overflow": func() string {
 			var b strings.Builder
 			for i := 0; i <= MaxExecutingPerSocket+MaxQueuedPerSocket; i++ {
