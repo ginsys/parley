@@ -769,12 +769,16 @@ func TestMembershipRenewRejectsWhenCurrentPeerBindingRevokedSinceEnrollment(t *t
 func TestMembershipRenewPersistsObservedCredentialExpiry(t *testing.T) {
 	sess, db := membershipTestServer(t)
 	seedEnabledBinding(t, db, 1, "peer-a")
-	seedBindingExpiringSoon(t, db, 2, "peer-b", 50*time.Millisecond)
+	// The margin must comfortably exceed one enroll round trip, even under
+	// -race on a loaded machine: the credential has to be current at enroll
+	// and expired only by renew.
+	const ttl = time.Second
+	seedBindingExpiringSoon(t, db, 2, "peer-b", ttl)
 	enroll, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
 	if enroll.Err != nil {
 		t.Fatalf("enroll failed: %#v", enroll.Err)
 	}
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(ttl + 100*time.Millisecond)
 	renew, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.renew", Params: map[string]any{
 		"operation_id": newOpID(), "conversation": "conv-1", "expected_grant_version": "1",
 	}})
@@ -1050,6 +1054,7 @@ func TestMembershipRenewResultReportsCarriedAndCancelledCounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	original := "80000000-0000-4000-8000-000000000001"
 	if err := store.InsertQueued(ctx, tx, store.Envelope{
 		ID: original, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
@@ -1126,6 +1131,7 @@ func TestMembershipRenewResultReportsDispatchingAndHandedOffCounts(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	dispatching := "80000000-0000-4000-8000-000000000011"
 	if err := store.InsertQueued(ctx, tx, store.Envelope{
 		ID: dispatching, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
@@ -1223,6 +1229,7 @@ func TestMembershipReplaceResultReportsCarriedAndCancelledCounts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	original := "80000000-0000-4000-8000-000000000005"
 	if err := store.InsertQueued(ctx, tx, store.Envelope{
 		ID: original, Conversation: "conv-1", FromPeer: "peer-a", ToPeer: "peer-b",
@@ -1637,6 +1644,7 @@ func TestMembershipReplaceRejectsIncompatibleCurrentPeersWithoutMutating(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	if err := store.EnsureConversation(ctx, tx, "conv-legacy", "conv-legacy", "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
@@ -1676,6 +1684,7 @@ func TestMembershipReplaceRejectsIncompatibleCurrentPeersWithoutMutating(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	g, err := store.CurrentGrant(ctx, tx, "conv-legacy")
 	if err != nil || g.GrantVersion != 1 || g.PeerAID != "legacy\x7fpeer" || g.PeerBID != "peer-a" {
 		t.Errorf("legacy grant changed by a rejected replace: %+v: %v", g, err)
@@ -1758,6 +1767,7 @@ func TestMembershipReplaceRejectsOversizedButByteValidCurrentPeer(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	if err := store.EnsureConversation(ctx, tx, "conv-oversized", "conv-oversized", "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
@@ -1803,6 +1813,7 @@ func seedGrantDirectly(t *testing.T, db *store.DB, conversation string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer tx.Rollback()
 	if err := store.EnsureConversation(ctx, tx, conversation, conversation, "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
