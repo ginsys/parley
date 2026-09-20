@@ -1,6 +1,7 @@
 package membership
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ginsys/parley/internal/store"
@@ -85,6 +86,26 @@ func TestValidateRejectsMalformedShapes(t *testing.T) {
 			Members: []Member{{PeerID: "peer-é", Role: RoleMember}, {PeerID: "peer-b", Role: RoleMember}},
 			Policy:  Policy{Kind: PolicyOpen},
 		},
+		"oversized peer id": {
+			Members: []Member{{PeerID: strings.Repeat("p", store.MaxIdentityBytes+1), Role: RoleMember}, {PeerID: "peer-b", Role: RoleMember}},
+			Policy:  Policy{Kind: PolicyOpen},
+		},
+		// An unsupported shape must not mask the bound: three members would
+		// otherwise classify as unsupported_membership before any length check.
+		"oversized peer id in an unsupported shape": {
+			Members: []Member{
+				{PeerID: "peer-a", Role: RoleMember}, {PeerID: "peer-b", Role: RoleMember},
+				{PeerID: strings.Repeat("p", store.MaxIdentityBytes+1), Role: RoleMember},
+			},
+			Policy: Policy{Kind: PolicyOpen},
+		},
+	}
+	atBound := Model{
+		Members: []Member{{PeerID: strings.Repeat("p", store.MaxIdentityBytes), Role: RoleMember}, {PeerID: "peer-b", Role: RoleMember}},
+		Policy:  Policy{Kind: PolicyOpen},
+	}
+	if err := Validate(atBound); err != nil {
+		t.Fatalf("a peer id exactly at the identity bound must stay valid: %v", err)
 	}
 	for name, model := range cases {
 		t.Run(name, func(t *testing.T) {

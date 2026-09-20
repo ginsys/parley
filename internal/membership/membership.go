@@ -68,7 +68,10 @@ func Validate(m Model) error {
 	seen := make(map[string]bool, len(m.Members))
 	leads := 0
 	for _, mem := range m.Members {
-		if err := bridgetext.ValidateMetadata(mem.PeerID); err != nil {
+		// The length bound belongs here with the byte rule: left to
+		// store.EnabledPeer, an oversized ID surfaced as a durable generic
+		// invalid_request, or not at all behind unsupported_membership.
+		if len(mem.PeerID) > store.MaxIdentityBytes || bridgetext.ValidateMetadata(mem.PeerID) != nil {
 			return store.InvalidMembership
 		}
 		if seen[mem.PeerID] {
