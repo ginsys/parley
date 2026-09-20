@@ -90,8 +90,9 @@ escaped or hex diagnostics is sufficient; do not build a recovery service on spe
 inventory of an operator's database is claimed by this specification. If the check finds no
 incompatible IDs, no identifier migration or recovery feature is needed.
 
-Never rewrite or delete incompatible history automatically. Keep current exact-key human
-revocation available; applying validation to enrollment/renewal must not strand that escape path.
+Never rewrite or delete incompatible history automatically. Revocation applies the same
+conversation rule as enrollment (owner decision 2026-09-20: Parley is unreleased, so no database
+predating this rule exists and no exact-key revocation escape is provided).
 Incompatible IDs must fail new authorization and text responses explicitly, without replacement
 or silent omission. Existing attempts retain their settlement rules. If an inventory finds
 incompatible history, record its disposition before moving that database behind a text-only
@@ -232,7 +233,7 @@ Names below are logical error classes; transport codes/envelopes are defined els
 | Error | Examples | Mutation |
 | --- | --- | --- |
 | `invalid_membership` | Duplicate/self/nonmember edge, invalid role/tag/shape/identifier, fewer than two members | None |
-| `incompatible_identifier` | Historical conversation/peer ID violates the ASCII rule | No new authorization or lossy response; current exact-key human revocation remains available |
+| `incompatible_identifier` | Historical conversation/peer ID violates the ASCII rule | No new authorization or lossy response; revocation applies the same conversation rule and ignores stored peers |
 | `unsupported_membership` | Valid model outside the first-runtime subset | None |
 | `stale_grant_version` / `no_active_grant` / `already_active` | Failed operation precondition | None |
 | `not_permitted` / `grant_expired` | Invalid acceptance edge or expired grant | No accepted message or budget claim |
@@ -466,7 +467,7 @@ Use temporary file-backed WAL databases for migration/concurrency claims.
 | `lead_only`, two-edge/empty directed, larger members on first runtime | Explicit unsupported error and byte-for-byte unchanged durable state |
 | Invalid roles, duplicate IDs/edges, missing endpoints, control-bearing IDs, unknown fields | Invalid error; no version/budget/queue mutation |
 | ASCII boundaries, punctuation, permitted spaces, empty/space-only strings, control bytes, DEL, non-ASCII Unicode and malformed UTF-8 | Accept only nonempty printable ASCII containing a non-space byte; preserve accepted keys exactly; no durable mutation on rejection |
-| Historical incompatible conversation/peer IDs | Read-only inventory reports exact escaped/hex locations; rows unchanged; new authorization/renewal rejected, exact-key human revocation retained; unaffected grants still work |
+| Historical incompatible conversation/peer IDs | Read-only inventory reports exact escaped/hex locations; rows unchanged; new authorization/renewal rejected; revocation rejects an incompatible conversation name but ignores stored peers; unaffected grants still work |
 | Room backfill containing otherwise compatible non-ASCII history | Preserve raw identifier bytes and relationships; do not silently replace, merge or drop history |
 | Lead plus D1/D2, then add D3 under lead_only | Lead↔each developer allowed, developer↔developer forbidden |
 | Same members under open / explicit directed | All distinct edges / only enumerated edges; directed does not expand on add |

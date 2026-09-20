@@ -58,8 +58,8 @@ replacement characters into a new identity or discard the original bytes.
 
 If no incompatible IDs exist, this alphabet change requires no identifier migration. If findings
 exist, retain the evidence and agree their disposition before moving that database behind a
-text-only administration interface. Current exact-key human revocation remains available;
-incompatible grants cannot be renewed or authorize new work. Queued delivery rejects without a
+text-only administration interface. The control endpoint has no exact-key revocation path for an
+incompatible conversation name; incompatible grants cannot be renewed or authorize new work. Queued delivery rejects without a
 state rewrite or budget claim; already claimed attempts retain normal settlement. No automatic
 history deletion, alias mapping or new recovery API is provided.
 

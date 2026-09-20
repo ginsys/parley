@@ -138,12 +138,7 @@ func TestHelpAndInvalidArgumentsNeverDial(t *testing.T) {
 		{[]string{"membership", "renew"}, 2, "requires -conversation"},
 		{[]string{"membership", "replace"}, 2, "requires -conversation"},
 		{[]string{"membership", "revoke"}, 2, "requires -conversation"},
-		// A supplied space-only value is a representable legacy exact key on
-		// revoke (see TestMembershipRevokeAcceptsSpaceOnlyLegacyConversation
-		// below, batch-9 fix for comment 4053366764) -- it must clear the
-		// -conversation check and fail on the next missing argument instead,
-		// never dialing either way.
-		{[]string{"membership", "revoke", "-conversation", " "}, 2, "requires -expected-grant-version"},
+		{[]string{"membership", "revoke", "-conversation", " "}, 2, "requires -conversation"},
 		{[]string{"membership", "revoke", "-conversation", "c", "-expected-grant-version", "1", "extra"}, 2, "unexpected positional arguments"},
 		{append([]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-max-exchanges", "-1"}, membershipEndpointArgs...), 2, "must not be negative"},
 		{append([]string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "-1s"}, membershipEndpointArgs...), 2, "must not be negative"},
@@ -507,79 +502,40 @@ func TestCLIIdentifiersRemainExactAndVisible(t *testing.T) {
 	}
 }
 
-// TestMembershipRevokeKeepsExactMalformedKeyButOthersValidateFirst mirrors
-// the legacy CLI's exact-key revocation guarantee (AGENTS.md: "Do not apply
-// new-enrollment validation to that revocation path"): revoke never applies
-// bridgetext.ValidateMetadata to -conversation, so a byte-malformed-but-
-// valid-UTF-8 historical key is still dispatched unchanged, while every
-// other subcommand -- which enrolls or requires an existing well-formed
-// identity -- rejects the same key before ever dialing. See
-// TestMembershipRevokeRejectsInvalidUTF8BeforeDialing below for the
-// genuinely-invalid-UTF-8 case, which MC-02 changed: those bytes can no
-// longer reach the wire unchanged, since JSON cannot transmit them
-// byte-exact at all.
-func TestMembershipRevokeKeepsExactMalformedKeyButOthersValidateFirst(t *testing.T) {
-	// \ufffd is an explicit escape, not the literal replacement character --
-	// see the identical rationale on TestUnsafePeerIdentifiersRejectedBeforeDialing
-	// (a hosted AI Code Review finding on an earlier PR2 candidate applied
-	// there; this second fixture list was missed by that same fix). Every
-	// value below is valid UTF-8 (the accented letter and \ufffd's rune both
-	// encode validly), unlike the invalid-UTF-8 byte sequences moved out to
-	// TestMembershipRevokeRejectsInvalidUTF8BeforeDialing.
-	for _, name := range []string{"café", "a\ufffd"} {
-		fake := &fakeClient{}
-		var out, errOut bytes.Buffer
-		args := append([]string{"membership", "renew", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
-		if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
-			t.Fatalf("renew dialed for %x: exit=%d %s", name, code, &errOut)
-		}
-
-		args = append([]string{"membership", "revoke", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
-		if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 || fake.params["conversation"] != name {
-			t.Fatalf("revoke changed key %x: %+v, exit=%d", name, fake.params, code)
+// TestMembershipRenewAndRevokeRejectIncompatibleConversationBeforeDialing:
+// every subcommand, revoke included, applies bridgetext.ValidateMetadata to
+// -conversation before dialing (owner decision 2026-09-20: no exact-key
+// revocation escape). Covers valid non-ASCII UTF-8, U+FFFD, a control byte
+// and invalid UTF-8 byte sequences. \ufffd is an explicit escape, not the
+// literal replacement character -- see the identical rationale on
+// TestUnsafePeerIdentifiersRejectedBeforeDialing.
+func TestMembershipRenewAndRevokeRejectIncompatibleConversationBeforeDialing(t *testing.T) {
+	for _, name := range []string{"caf\xc3\xa9", "a\ufffd", "a\x7fb", "a\xff", "a\xfe", "\xc0\xaf"} {
+		for _, op := range []string{"renew", "revoke"} {
+			var out, errOut bytes.Buffer
+			args := append([]string{"membership", op, "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
+			if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
+				t.Fatalf("%s dialed for %x: exit=%d %s", op, name, code, &errOut)
+			}
 		}
 	}
 }
 
-// TestMembershipRevokeRejectsInvalidUTF8BeforeDialing is MC-02's regression:
-// an invalid UTF-8 byte sequence cannot be transmitted byte-exact over this
-// JSON-RPC wire protocol at all -- encoding/json.Marshal silently replaces
-// each invalid byte with U+FFFD rather than preserving or rejecting it, so
-// sending one for revoke would silently target a different key than the one
-// on disk, defeating the exact-key revocation guarantee this path exists
-// for. Revoke must refuse these locally, before ever dialing -- narrower
-// than every other subcommand's full bridgetext.ValidateMetadata check
-// (only genuine UTF-8 invalidity, not every ASCII-incompatible byte), and
-// needed only for revoke, since every other subcommand already rejects
-// these bytes via ValidateMetadata regardless.
-func TestMembershipRevokeRejectsInvalidUTF8BeforeDialing(t *testing.T) {
-	for _, name := range []string{"a\xff", "a\xfe", "\xc0\xaf"} {
-		var out, errOut bytes.Buffer
-		args := append([]string{"membership", "revoke", "-conversation", name, "-expected-grant-version", "1"}, membershipEndpointArgs...)
-		if code := run(args, &out, &errOut, fatalIfDialed(t), noEnv); code != 2 {
-			t.Fatalf("revoke dialed for invalid UTF-8 %x: exit=%d %s", name, code, &errOut)
-		}
-	}
-}
-
-// TestMembershipEnrollRenewReplaceRejectOversizedConversationBeforeDialing
-// and TestMembershipEnrollAcceptsConversationAtTheMaxIdentityBytesBoundary
-// are the client-side half of MC-02/review-5255666571's length finding
-// (internal/control/membership.go's incompatibleConversation): an ASCII
-// conversation identifier longer than store.MaxIdentityBytes must be
-// refused locally, before ever dialing, exactly like the invalid-UTF-8 case
-// above -- not merely eventually rejected server-side after a round trip.
-// Revoke keeps its exact-key escape and is deliberately excluded (see the
-// bound's own comment in parseCommand).
-func TestMembershipEnrollRenewReplaceRejectOversizedConversationBeforeDialing(t *testing.T) {
+// TestMembershipRejectsOversizedConversationBeforeDialing and
+// TestMembershipEnrollAcceptsConversationAtTheMaxIdentityBytesBoundary are
+// the client-side half of internal/control/membership.go's
+// incompatibleConversation length check: an ASCII conversation identifier
+// longer than store.MaxIdentityBytes must be refused locally, before ever
+// dialing -- not merely eventually rejected server-side after a round trip.
+func TestMembershipRejectsOversizedConversationBeforeDialing(t *testing.T) {
 	oversized := strings.Repeat("x", store.MaxIdentityBytes+1)
-	for _, op := range []string{"enroll", "renew", "replace"} {
+	for _, op := range []string{"enroll", "renew", "replace", "revoke"} {
 		t.Run(op, func(t *testing.T) {
 			args := []string{"membership", op, "-conversation", oversized}
 			switch op {
 			case "enroll":
 				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2")
-			case "renew":
+			case "renew", "revoke":
 				args = append(args, "-expected-grant-version", "1")
 			case "replace":
 				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b")
@@ -606,35 +562,14 @@ func TestMembershipEnrollAcceptsConversationAtTheMaxIdentityBytesBoundary(t *tes
 	}
 }
 
-// TestMembershipRevokeAcceptsSpaceOnlyLegacyConversation and
-// TestMembershipEnrollRenewReplaceRejectSpaceOnlyConversation are the batch-9
-// fix for review d89c4e6's post-push finding (comment 4053366764): revoke's
-// exact-key legacy escape must not apply the "at least one non-space byte"
-// AGENTS.md rule new enrollment requires, since a historical space-only key
-// is representable on the wire and the server's revoke path intentionally
-// accepts identifiers that fail new-enrollment validation. Before this fix,
-// -conversation "   " on revoke was rejected client-side by the same
-// TrimSpace check that (correctly) still applies to enroll/renew/replace.
-func TestMembershipRevokeAcceptsSpaceOnlyLegacyConversation(t *testing.T) {
-	fake := &fakeClient{}
-	var out, errOut bytes.Buffer
-	args := append([]string{"membership", "revoke", "-conversation", "   ", "-expected-grant-version", "1"}, membershipEndpointArgs...)
-	if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
-		t.Fatalf("expected a space-only legacy conversation to dial and revoke: exit=%d %s", code, &errOut)
-	}
-	if fake.params["conversation"] != "   " {
-		t.Fatalf("conversation identity changed: %+v", fake.params)
-	}
-}
-
-func TestMembershipEnrollRenewReplaceRejectSpaceOnlyConversation(t *testing.T) {
-	for _, op := range []string{"enroll", "renew", "replace"} {
+func TestMembershipRejectsSpaceOnlyConversation(t *testing.T) {
+	for _, op := range []string{"enroll", "renew", "replace", "revoke"} {
 		t.Run(op, func(t *testing.T) {
 			args := []string{"membership", op, "-conversation", "   "}
 			switch op {
 			case "enroll":
 				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2")
-			case "renew":
+			case "renew", "revoke":
 				args = append(args, "-expected-grant-version", "1")
 			case "replace":
 				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b")
@@ -648,39 +583,14 @@ func TestMembershipEnrollRenewReplaceRejectSpaceOnlyConversation(t *testing.T) {
 	}
 }
 
-// TestMembershipRevokeAcceptsExplicitEmptyLegacyConversation and
-// TestMembershipEnrollRenewReplaceRejectExplicitEmptyConversation are EC-03
-// (2026-09-19 review): the historical schema permits an empty TEXT
-// conversation key, so revoke's exact-key legacy escape must be able to
-// target one -- but comparing the parsed -conversation value against "" (as
-// this used to) cannot distinguish an explicitly supplied empty string from
-// an omitted flag, since both parse to the same Go zero value. parseCommand
-// now tracks flag *presence* via fs.Visit instead, so an explicit empty
-// -conversation value reaches the server exactly as typed on revoke, while a
-// truly omitted flag is still rejected (see
-// TestMembershipEnrollMissingConversationFlagStillRejected below, unchanged)
-// and enroll/renew/replace still reject an explicit empty string on their
-// own separate TrimSpace nonemptiness rule.
-func TestMembershipRevokeAcceptsExplicitEmptyLegacyConversation(t *testing.T) {
-	fake := &fakeClient{}
-	var out, errOut bytes.Buffer
-	args := append([]string{"membership", "revoke", "-conversation", "", "-expected-grant-version", "1"}, membershipEndpointArgs...)
-	if code := run(args, &out, &errOut, fakeDial(fake), noEnv); code != 0 {
-		t.Fatalf("expected an explicit empty legacy conversation to dial and revoke: exit=%d %s", code, &errOut)
-	}
-	if fake.params["conversation"] != "" {
-		t.Fatalf("conversation identity changed: %+v", fake.params)
-	}
-}
-
-func TestMembershipEnrollRenewReplaceRejectExplicitEmptyConversation(t *testing.T) {
-	for _, op := range []string{"enroll", "renew", "replace"} {
+func TestMembershipRejectsExplicitEmptyConversation(t *testing.T) {
+	for _, op := range []string{"enroll", "renew", "replace", "revoke"} {
 		t.Run(op, func(t *testing.T) {
 			args := []string{"membership", op, "-conversation", ""}
 			switch op {
 			case "enroll":
 				args = append(args, "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "2")
-			case "renew":
+			case "renew", "revoke":
 				args = append(args, "-expected-grant-version", "1")
 			case "replace":
 				args = append(args, "-expected-grant-version", "1", "-peer-a", "a", "-peer-b", "b")

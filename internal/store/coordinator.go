@@ -8,7 +8,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/google/uuid"
@@ -198,40 +197,7 @@ func (c *Coordinator) execute(ctx context.Context, p CommandPrincipal, r Command
 		return CommandReceipt{}, InvalidRequest
 	}
 	for _, resource := range result.Resources {
-		if len(resource.Kind) > 64 || bridgetext.ValidateMetadata(resource.Kind) != nil || resource.Before < 0 || resource.After < 0 {
-			return CommandReceipt{}, InvalidRequest
-		}
-		// The narrow, explicitly bounded legacy-revoke resource-ID
-		// exception (2026-09-19 lead approval): membership.revoke's own
-		// resource IDs are always the (possibly byte-malformed)
-		// conversation identifier revoke was asked to act on -- see
-		// internal/control/membership.go's handleMembershipRevoke, the
-		// only caller for this command kind, whose resource shape is fixed
-		// and never caller-influenced -- so relaxing the ID rule for
-		// exactly this one command kind cannot smuggle an oversized/
-		// non-ASCII identifier past the ordinary rule below for any other
-		// mutation. AGENTS.md's exact-key human revocation escape must
-		// remain able to durably report a legacy conversation identifier
-		// whose bytes never satisfied bridgetext.ValidateMetadata's ASCII
-		// rule or MaxIdentityBytes's ordinary bound, rather than silently
-		// substituting an opaque alias for it (see
-		// internal/control/membership.go's auditRepresentable, applied
-		// before Execute is even called -- the bound enforced here is the
-		// second, independent check on the actually-committed result).
-		// MaxLegacyLocatorBytes (EC-04, 2026-09-19 review) is a dedicated
-		// constant derived from this command's own actual encoded-size
-		// constraints -- not MaxLocatorBytes, a different field's bound
-		// chosen for credential/target locators with no connection to this
-		// identifier's real frame/receipt-size envelope; see
-		// MaxLegacyLocatorBytes's own doc comment for the full derivation
-		// and its enforcing test.
-		if r.kind == "membership.revoke" {
-			if len(resource.ID) > MaxLegacyLocatorBytes || !utf8.ValidString(resource.ID) {
-				return CommandReceipt{}, InvalidRequest
-			}
-			continue
-		}
-		if len(resource.ID) > MaxIdentityBytes || bridgetext.ValidateMetadata(resource.ID) != nil {
+		if len(resource.Kind) > 64 || bridgetext.ValidateMetadata(resource.Kind) != nil || len(resource.ID) > MaxIdentityBytes || bridgetext.ValidateMetadata(resource.ID) != nil || resource.Before < 0 || resource.After < 0 {
 			return CommandReceipt{}, InvalidRequest
 		}
 	}

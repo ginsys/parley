@@ -548,9 +548,12 @@ Unicode names. The rejected alternatives were unrestricted Unicode plus compatib
 and encoded byte identifiers across public APIs.
 
 Before upgrading an existing database, inventory stored identifiers read-only. If all comply,
-no identifier migration or recovery feature is needed. Preserve incompatible historical bytes and
-current exact-key human revocation; determine any necessary disposition from actual findings
-before replacing the administration interface. No encoded-ID recovery API is approved.
+no identifier migration or recovery feature is needed. Preserve incompatible historical bytes;
+determine any necessary disposition from actual findings. No encoded-ID recovery API is approved.
+Owner decision 2026-09-20: the control endpoint carries no exact-key revocation path for an
+incompatible conversation name. Parley is unreleased, only temporary test instances have existed,
+so no database predating the identifier rule exists to be served; the rejected alternative was a
+revoke-only validation exception with its own length bound, audit exception and byte-safe CLI input.
 The [membership specification](specifications/membership.md#accepted-ascii-identifier-rule) records
 the contract. The shared byte predicate now enforces it at enrollment/renewal, acceptance,
 queued claims, reply validation and wrapping/direct Codex delivery. Incompatible queued work
@@ -587,8 +590,8 @@ nonempty and distinct, direction must be valid, the grant budget must be positiv
 expiry must be in the future. Names and peer IDs are opaque exact keys: permitted leading/trailing
 spaces are preserved. Both conversation and peer identifiers require printable ASCII bytes
 with at least one non-space byte. Enrollment/renewal share the wrapper's byte validator and reject
-incompatible keys before grant writes; CLI input rejects them before opening storage. Legacy IDs
-are never rewritten, and a historical grant with unusable names or peers remains revocable.
+incompatible keys before grant writes; CLI input rejects them before dialing. Revocation applies
+the same conversation rule and never inspects stored peers; stored IDs are never rewritten.
 Silently trimming existing keys could target a different conversation
 or make historical grants inaccessible; administrator output quotes keys to expose whitespace.
 Renewal rejects negative budget/TTL inputs; zero budget or omitted
