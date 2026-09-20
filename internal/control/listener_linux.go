@@ -26,6 +26,11 @@ import (
 // resources indefinitely.
 const WriteDeadline = 5 * time.Second
 
+// RequestDeadline is docs/specifications/control.md's total server request
+// deadline: one dispatched request, including any wait for the coordinator
+// gate, must finish within it.
+const RequestDeadline = 5 * time.Second
+
 // staleSocketProbeTimeout bounds the connect attempt used to prove an
 // existing socket abandoned. Any outcome other than a definite connection
 // refusal within this window is treated as "not provably abandoned."
@@ -599,7 +604,18 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			}
 			continue
 		}
-		resp, closeAfter := sess.Handle(ctx, req)
+		// Review 5257748895 (comment 4054786967): ctx is the long-lived
+		// runtime worker context, so without a request-scoped deadline a
+		// mutation waiting on the coordinator gate, a slow recovery hook or
+		// a stalled writer could hold this socket slot indefinitely.
+		// docs/specifications/control.md's five-second server request
+		// deadline covers gate wait and execution together. A deadline
+		// reached before commit is a provable non-commitment
+		// (temporarily_unavailable); store.Coordinator's commit itself runs
+		// independently of this context, so it cannot be torn mid-commit.
+		reqCtx, cancelReq := context.WithTimeout(ctx, RequestDeadline)
+		resp, closeAfter := sess.Handle(reqCtx, req)
+		cancelReq()
 		if sess.negotiated {
 			// sess.negotiated is only ever written by this goroutine
 			// (inside Handle -> handleHello); helloDone is the only field

@@ -241,7 +241,18 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 			// truncation by a later retry that pins the reported value via
 			// -expires-at -- two different wire digests for what a human
 			// intends as the same retried command.
-			c.expiresAt = time.Now().Add(c.expiresIn).UTC().Format(time.RFC3339Nano)
+			//
+			// Review 5257748895 (comment 4054786969): range-check the
+			// resolved instant exactly as -expires-at is above. A large but
+			// valid time.Duration (up to ~292 years) lands past the store's
+			// Unix-nanosecond range, which the server rejects as
+			// InvalidParams -- an operational exit after a needless dial,
+			// instead of the local argument error invalid expiry input gets.
+			target := time.Now().Add(c.expiresIn).UTC()
+			if !control.ExpiresAtInRange(target) {
+				return c, fmt.Errorf("-expires-in resolves to an expiry outside the representable range")
+			}
+			c.expiresAt = target.Format(time.RFC3339Nano)
 		}
 	}
 	if c.op == "enroll" || c.op == "replace" {
