@@ -18,6 +18,7 @@ import (
 
 	"github.com/ginsys/parley/internal/connection"
 	"github.com/ginsys/parley/internal/runtime"
+	"github.com/ginsys/parley/internal/store"
 	"golang.org/x/sys/unix"
 )
 
@@ -602,6 +603,8 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		violation *Violation
 		idless    bool
 		at        time.Time
+		id        string // the correlation ID its response will carry
+		tracked   bool   // id is held in outstanding until that response is written
 	}
 	// outstanding counts the executing request too (it leaves the map only
 	// once handled), so the queue holds that many and a send never blocks.
@@ -621,11 +624,21 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			}
 			next := arrival{at: time.Now()}
 			next.req, next.violation, next.idless = classifyEnvelope(frame)
-			if next.violation == nil && !next.idless {
+			// Review 5259780995 (comment 4056295482): a violation whose ID
+			// can be echoed is answered under that ID, so it is tracked like
+			// a valid request; only an ID-less or unechoable frame is not.
+			switch {
+			case next.idless:
+			case next.violation == nil:
+				next.id, next.tracked = next.req.ID, true
+			case next.violation.ID != nil:
+				next.id, next.tracked = *next.violation.ID, true
+			}
+			if next.tracked {
 				outstandingMu.Lock()
-				_, reused := outstanding[next.req.ID]
+				_, reused := outstanding[next.id]
 				full := len(outstanding) >= maxOutstanding
-				outstanding[next.req.ID] = struct{}{}
+				outstanding[next.id] = struct{}{}
 				outstandingMu.Unlock()
 				if reused || full {
 					conn.Close()
@@ -645,6 +658,24 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		<-readerDone
 	}()
 
+	// Review 5259679438 (comment 4056232738): a call stays outstanding until
+	// its response is written, so its ID is released only then. The write and
+	// the release share the reader's lock, so the reader can never admit a
+	// second frame under this ID while the first is queued, executing or
+	// still being written, and a client that reuses the ID after reading the
+	// response can never be seen before the release. The reader waits at most
+	// one WriteDeadline, and a frame's arrival is stamped before it takes the
+	// lock, so that wait is still charged to the request.
+	respond := func(next arrival, resp Response) error {
+		outstandingMu.Lock()
+		defer outstandingMu.Unlock()
+		err := writeResponse(conn, resp)
+		if next.tracked {
+			delete(outstanding, next.id)
+		}
+		return err
+	}
+
 	for next := range queue {
 		if ctx.Err() != nil {
 			return
@@ -658,7 +689,20 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			return
 		}
 		if violation != nil {
-			if writeResponse(conn, responseForViolation(violation)) != nil {
+			if respond(next, responseForViolation(violation)) != nil {
+				return
+			}
+			continue
+		}
+		// Review 5259780995 (comment 4056295483): a request that waited out
+		// its whole deadline in the queue (behind a slow execution or a
+		// stalled response write) is refused here, before dispatch. Handlers
+		// that never consult the context -- a repeated server.hello, an
+		// unknown method, parameter validation -- would otherwise still run
+		// and answer normally after the advertised limit. Nothing has
+		// executed, so this is a provable non-commitment.
+		if !time.Now().Before(next.at.Add(RequestDeadline)) {
+			if respond(next, domainErrorResponse(&req.ID, DomainCode(store.TemporarilyUnavailable))) != nil {
 				return
 			}
 			continue
@@ -682,20 +726,7 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			// race-free without sharing sess itself across goroutines.
 			helloDone.Store(true)
 		}
-		// Review 5259679438 (comment 4056232738): a call stays outstanding
-		// until its response is written, so the ID is released only then.
-		// The write and the release share the reader's lock, so the reader
-		// can never admit a second call under this ID while the first is
-		// queued, executing or still being written, and a client that reuses
-		// the ID after reading this response can never be seen before the
-		// release. The reader waits at most one WriteDeadline, and a frame's
-		// arrival is stamped before it takes the lock, so that wait is still
-		// charged to the request.
-		outstandingMu.Lock()
-		writeErr := writeResponse(conn, resp)
-		delete(outstanding, req.ID)
-		outstandingMu.Unlock()
-		if writeErr != nil || closeAfter {
+		if respond(next, resp) != nil || closeAfter {
 			return
 		}
 	}
