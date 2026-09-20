@@ -51,9 +51,9 @@ func isHelp(s string) bool { return s == "help" || s == "-h" || s == "--help" }
 
 func usage(output io.Writer) {
 	fmt.Fprintln(output, `parleyd: the Parley administration server.
-Owns the database exclusively. parleyctl's control-endpoint client (-endpoint,
--server-uid, hello) never opens it directly; its legacy grant/revoke/renew
-commands still do, transitionally, until PR2 converts them to the endpoint.
+Owns the database exclusively. parleyctl is a pure client of the control
+endpoint (-endpoint, -server-uid; hello and membership enroll|renew|replace|
+revoke) and never opens the database.
 
 Usage:
   parleyd init  -database PATH
