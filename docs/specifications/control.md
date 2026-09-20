@@ -349,8 +349,8 @@ the same rejection every time — but it leaves no durable trace of the attempt.
 carries no such conflict and is audited normally.
 
 `incompatible_identifier` has two distinct producers sharing one wire spelling, with different
-audit dispositions. `membership.enroll|renew|replace`'s own conversation-identifier shape check
-shares the identical pre-digest exception above: a byte-malformed conversation is rejected before
+audit dispositions. `membership.enroll|renew|replace|revoke`'s own conversation-identifier check
+(byte shape and the ordinary identity length bound) shares the identical pre-digest exception above: a byte-malformed conversation is rejected before
 the digest is constructed at all, so a corrected retry under the same operation ID executes
 normally rather than conflicting, and the original malformed attempt leaves no audit row.
 Separately, `membership.renew|replace` also reject a byte-malformed *peer* identifier already
@@ -359,10 +359,10 @@ against the current grant's peer IDs, not against client-supplied input -- and t
 durable `store.Code` recorded through the normal operation-result/audit path like any other
 terminal rejection, not exempt from the audit-boundary rule. A retry under the same operation ID
 therefore durably conflicts for this producer, unlike the conversation-identifier one.
-`membership.revoke` deliberately does not apply either check, so it never returns
-`incompatible_identifier` regardless of the conversation or peer identifiers' byte shape --
-AGENTS.md's exact-key human revocation must remain reachable for byte-malformed historical
-identifiers.
+`membership.revoke` applies the conversation check but never inspects stored peer identifiers, so
+a grant under a compatible conversation name stays revocable whatever its peers' byte shape. There
+is no exact-key revocation path for an incompatible conversation name (owner decision 2026-09-20:
+Parley is unreleased and no database predating the identifier rule exists).
 
 Other domain codes are the explicit membership/connection error enumerations, not arbitrary strings.
 Permission checks precede private lookup diagnostics. Expose expected/current versions only to a

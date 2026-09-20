@@ -240,8 +240,10 @@ validation happens before storage access. Acceptance, queued claims, reply valid
 Codex transport delivery reject incompatible identities. A queued historical compatibility
 rejection leaves its state, budget and attempt token unchanged and reports an explicit diagnostic;
 it does not call the transport. Already claimed attempts retain normal settlement and refunds.
-Historical IDs are never rewritten; exact-key human revocation remains available. Do not apply
-new-enrollment validation to that revocation path.
+Stored IDs are never rewritten. Revocation validates its conversation name exactly like enrollment
+and never inspects stored peers. Owner decision 2026-09-20: there is no exact-key revocation
+escape for incompatible names — Parley is unreleased, no database predating this rule exists, and
+compatibility code for data that does not exist is not wanted. Do not reintroduce one.
 
 Before moving an existing database behind a text-only administration interface, follow the
 [identifier inventory](docs/identifier-inventory.md) on a stopped, checkpointed copy and record

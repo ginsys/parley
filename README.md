@@ -94,9 +94,7 @@ must differ. Identifiers are preserved and compared exactly: `"x"` and `" x"` ar
 conversation names, just as `"a"` and `"a "` are different peer IDs. Whitespace-only identifiers are
 invalid. Both names and peer IDs accept only printable ASCII bytes (`0x20`–`0x7E`), matching
 delivery-wrapper validation. Non-ASCII and malformed UTF-8 are rejected; message bodies are
-unaffected. An existing grant with incompatible identifiers cannot authorize new work or be
-renewed but remains revocable; its stored identifiers are not rewritten. Use the
-[identifier inventory](docs/identifier-inventory.md) before a future administration-interface cutover.
+unaffected. Every membership command, `revoke` included, applies the same rule to `-conversation`.
 Administrator output quotes identifiers to make whitespace visible; use the exact name
 for later operations. Unknown commands, malformed flags and positional arguments fail before
 any socket is dialed.

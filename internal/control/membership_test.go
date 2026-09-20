@@ -581,74 +581,6 @@ func TestMembershipEnrollRejectedOperationRemainsDurableAcrossRevocationAndConfl
 	}
 }
 
-// TestMembershipRevokeSucceedsForEmptyLegacyConversationIdentifier is EC-03
-// (2026-09-19 review): the historical schema permits an empty TEXT
-// conversation key, and AGENTS.md's exact-key legacy revocation escape must
-// be able to target one end to end -- not merely accept it client-side
-// (cmd/parleyctl's parseCommand fix) or report it Usable in isolation
-// (CommandReceiptResult.Usable's fix), but actually revoke the real seeded
-// empty-key grant and durably record and replay that exact empty target.
-// Seeded directly via store, not through membership.enroll's wire handler:
-// incompatibleConversation's bridgetext.ValidateMetadata check requires at
-// least one non-space byte for a fresh enrollment, so an empty-key grant can
-// only exist as pre-existing historical data, exactly the scenario this
-// escape exists for.
-func TestMembershipRevokeSucceedsForEmptyLegacyConversationIdentifier(t *testing.T) {
-	sess, db := membershipTestServer(t)
-	ctx := context.Background()
-	tx, err := db.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.EnsureConversation(ctx, tx, "", "", "2026-01-01T00:00:00Z"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.InsertGrant(ctx, tx, store.Grant{Conversation: "", GrantVersion: 1, PeerAID: "a", PeerBID: "b", Direction: store.Bidirectional, MaxExchanges: 2, GrantedAt: "2026-01-01T00:00:00Z"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	opID := newOpID()
-	revoke, _ := sess.Handle(ctx, Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
-		"operation_id": opID, "conversation": "", "expected_grant_version": "1",
-	}})
-	if revoke.Err != nil {
-		t.Fatalf("revoke of an empty legacy conversation identifier must succeed: %#v", revoke.Err)
-	}
-	result := decodeResult[CommandReceiptResult](t, revoke)
-	if !result.Usable(opID, "") {
-		t.Fatalf("a genuine empty-key revoke receipt must be Usable against the empty target: %#v", result)
-	}
-	if len(result.Result.Resources) == 0 || result.Result.Resources[0].ID != "" {
-		t.Fatalf("resource id must be the exact empty conversation, got %#v", result.Result.Resources)
-	}
-
-	// A same-ID replay must return the identical durable receipt, not
-	// re-execute or refuse.
-	replay, _ := sess.Handle(ctx, Request{ID: "2", Method: "membership.revoke", Params: map[string]any{
-		"operation_id": opID, "conversation": "", "expected_grant_version": "1",
-	}})
-	if replay.Err != nil {
-		t.Fatalf("replay of the empty-key revoke was rejected: %#v", replay.Err)
-	}
-	r2 := decodeResult[CommandReceiptResult](t, replay)
-	if r2.AuditID != result.AuditID {
-		t.Fatalf("replay produced a different audit record: %s vs %s", r2.AuditID, result.AuditID)
-	}
-
-	// An ordinary new-enrollment attempt against an empty conversation must
-	// still be rejected -- this escape is exclusive to revoke's already-
-	// historical exact-key path, never a general exemption.
-	fresh := openMembers("peer-a", "peer-b")
-	fresh["conversation"] = ""
-	enrollResp, _ := sess.Handle(ctx, Request{ID: "3", Method: "membership.enroll", Params: fresh})
-	if enrollResp.Err == nil || enrollResp.Err.Data == nil || enrollResp.Err.Data.Code != IncompatibleIdentifier {
-		t.Fatalf("a fresh enrollment against an empty conversation must still be rejected, got %#v", enrollResp.Err)
-	}
-}
-
 func TestMembershipRevokeThenRenewRejectsNoActiveGrant(t *testing.T) {
 	sess, db := membershipTestServer(t)
 	seedEnabledBinding(t, db, 1, "peer-a")
@@ -953,12 +885,7 @@ func TestCommandReceiptResultUsableValidatesActualReceiptContents(t *testing.T) 
 			r.OperationID = "not-a-uuid"
 			return r
 		}},
-		// EC-03 (2026-09-19 review): an empty resource ID is not itself a
-		// defect -- the historical schema permits an empty TEXT conversation
-		// key, and AGENTS.md's exact-key legacy revocation escape must be
-		// able to target one. What must be checked is that the resource ID
-		// exactly matches what the caller actually requested, empty or not.
-		{"resource id empty and caller requested the empty conversation", true, func() CommandReceiptResult {
+		{"resource id empty", false, func() CommandReceiptResult {
 			r := valid()
 			r.Result.Resources[0].ID = ""
 			return r
@@ -976,11 +903,7 @@ func TestCommandReceiptResultUsableValidatesActualReceiptContents(t *testing.T) 
 			if tt.name == "non-UUID operation_id even if it matches the request string" {
 				requested = "not-a-uuid"
 			}
-			expectedConversation := "conv-1"
-			if tt.name == "resource id empty and caller requested the empty conversation" {
-				expectedConversation = ""
-			}
-			if got := r.Usable(requested, expectedConversation); got != tt.want {
+			if got := r.Usable(requested, "conv-1"); got != tt.want {
 				t.Fatalf("Usable()=%v, want %v: %#v", got, tt.want, r)
 			}
 		})
@@ -1389,27 +1312,6 @@ func TestMembershipReplaceRejectsIncompatibleConversationIdentifier(t *testing.T
 	}
 }
 
-// TestMembershipRevokeBypassesIncompatibleIdentifierCheck confirms the
-// deliberate asymmetry: revoke must still reach controller.RevokeTx for a
-// byte-malformed historical conversation identifier (AGENTS.md's exact-key
-// human revocation escape), not the new IncompatibleIdentifier check --
-// it fails on no_active_grant (a domain rejection reached only past the
-// check enroll/renew/replace apply), not incompatible_identifier.
-func TestMembershipRevokeBypassesIncompatibleIdentifierCheck(t *testing.T) {
-	sess, _ := membershipTestServer(t)
-	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
-		"operation_id": newOpID(), "conversation": "bad\x7fconversation", "expected_grant_version": "1",
-	}})
-	// Asserts the exact expected code, not merely "not incompatible_identifier"
-	// (an earlier version of this test only checked the latter, so a
-	// regression collapsing this rejection to e.g. temporarily_unavailable --
-	// which would also disable historical-key revocation -- would still have
-	// passed it).
-	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.NoActiveGrant) {
-		t.Fatalf("expected no_active_grant, got %#v", resp.Err)
-	}
-}
-
 // TestInvalidMembershipRejectionDoesNotReserveOperationID is the accepted
 // audit-boundary consequence from the consolidated report's section 4: an
 // invalid_membership rejection runs entirely before store.NewCommandRequest/
@@ -1702,8 +1604,8 @@ func TestMembershipReplaceRejectsIncompatibleCurrentPeersWithoutMutating(t *test
 		t.Fatalf("healthy replacement control failed: %#v", control.Err)
 	}
 
-	// Continued exact-key revoke behavior: revoke still reaches the legacy
-	// grant despite the new peer check (RevokeTx never validates peers).
+	// Revoke still reaches a grant whose stored peers are incompatible:
+	// RevokeTx never validates peers, only the conversation is checked.
 	revoke, _ := sess.Handle(ctx, Request{ID: "4", Method: "membership.revoke", Params: map[string]any{
 		"operation_id": newOpID(), "conversation": "conv-legacy", "expected_grant_version": "1",
 	}})
@@ -1770,12 +1672,10 @@ func TestMembershipReplaceRejectsOversizedButByteValidCurrentPeer(t *testing.T) 
 	}
 }
 
-// seedLegacyGrant inserts a conversation and an active grant directly (never
-// through GrantTx, which would reject a byte-malformed/oversized identifier
-// today), mirroring TestRenewRejectsLegacyUnsafePeersWithoutChangingHistory's
-// (internal/controller/controller_test.go) established pattern for a real
-// historical condition GrantTx itself can never produce anymore.
-func seedLegacyGrant(t *testing.T, db *store.DB, conversation string) {
+// seedGrantDirectly inserts a conversation and an active grant through the
+// store, never through GrantTx, so a test can stage a row no wire call can
+// produce.
+func seedGrantDirectly(t *testing.T, db *store.DB, conversation string) {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := db.Begin(ctx)
@@ -1796,227 +1696,71 @@ func seedLegacyGrant(t *testing.T, db *store.DB, conversation string) {
 	}
 }
 
-// TestMembershipRevokeSucceedsForRepresentableLegacyConversationIdentifiers
-// is the legacy audit evidence named in review 5255666571's issuecomment-
-// 5741742001 and the mandate's "exact legacy audit-evidence corrections":
-// auditRepresentable (internal/control/membership.go) and
-// internal/store/coordinator.go's matching membership.revoke-scoped
-// exception must actually let a real revoke reach and durably audit a
-// conversation identifier that ordinary enroll/renew/replace would refuse
-// today -- not merely fail to crash on one. Each case is a distinct legacy
-// shape AGENTS.md's exact-key human revocation escape must preserve
-// verbatim, never silently substituting an alias.
-func TestMembershipRevokeSucceedsForRepresentableLegacyConversationIdentifiers(t *testing.T) {
+// TestMembershipRevokeRejectsIncompatibleConversationIdentifierWithoutMutating
+// is the owner decision of 2026-09-20: Parley is unreleased, no database
+// predating the identifier rule exists, so membership.revoke applies the
+// same conversation check as enroll/renew/replace and carries no exact-key
+// escape. Each case stages a grant directly under an identifier no wire
+// call can produce and proves revoke refuses it before Execute: the grant
+// is untouched and the operation_id is not reserved.
+func TestMembershipRevokeRejectsIncompatibleConversationIdentifierWithoutMutating(t *testing.T) {
 	cases := map[string]string{
-		"byte-malformed control character":           "legacy\x7fconversation",
-		"valid non-ASCII UTF-8":                      "café-légacy-conversation",
-		"oversized but within MaxLegacyLocatorBytes": strings.Repeat("x", store.MaxIdentityBytes+1),
-		"leading/trailing spaces and punctuation":    "  legacy, conversation!  ",
+		"empty":                  "",
+		"control character":      "bad\x7fconversation",
+		"valid non-ASCII UTF-8":  "café-conversation",
+		"past MaxIdentityBytes":  strings.Repeat("x", store.MaxIdentityBytes+1),
+		"space only":             "   ",
+		"raw NUL inside the key": "conv\x00ersation",
 	}
 	for name, conversation := range cases {
 		t.Run(name, func(t *testing.T) {
 			sess, db := membershipTestServer(t)
-			seedLegacyGrant(t, db, conversation)
-			resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
-				"operation_id": newOpID(), "conversation": conversation, "expected_grant_version": "1",
+			seedGrantDirectly(t, db, conversation)
+			opID := newOpID()
+			first, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
+				"operation_id": opID, "conversation": conversation, "expected_grant_version": "1",
 			}})
-			if resp.Err != nil {
-				t.Fatalf("revoke of a representable legacy identifier must succeed: %#v", resp.Err)
+			if first.Err == nil || first.Err.Data == nil || first.Err.Data.Code != IncompatibleIdentifier {
+				t.Fatalf("expected incompatible_identifier, got %#v", first.Err)
 			}
+			// Rolled back immediately, not deferred: db.Begin is an immediate
+			// writer transaction, so leaving it open would deadlock the
+			// sess.Handle call below against Coordinator.Execute's own Begin.
 			tx, err := db.Begin(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer tx.Rollback()
-			if _, err := store.CurrentGrant(context.Background(), tx, conversation); err == nil {
-				t.Fatal("the legacy grant must actually be revoked, not merely accepted")
+			g, err := store.CurrentGrant(context.Background(), tx, conversation)
+			tx.Rollback()
+			if err != nil || g.GrantVersion != 1 {
+				t.Errorf("a pre-Execute refusal must leave the grant untouched: %+v: %v", g, err)
+			}
+			// Not durably audited: a corrected retry reusing the same
+			// operation_id executes normally instead of conflicting (see
+			// TestInvalidMembershipRejectionDoesNotReserveOperationID).
+			second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.revoke", Params: map[string]any{
+				"operation_id": opID, "conversation": "conv-does-not-exist", "expected_grant_version": "1",
+			}})
+			if second.Err == nil || second.Err.Data == nil || second.Err.Data.Code != DomainCode(store.NoActiveGrant) {
+				t.Fatalf("a corrected retry reusing the same operation_id must execute normally, got %#v", second.Err)
 			}
 		})
 	}
 }
 
-// TestMembershipRevokeRefusesOversizedLegacyConversationIdentifierWithoutCommitting
-// is auditRepresentable's actual refusal boundary: a legacy identifier past
-// store.MaxLegacyLocatorBytes cannot be durably reported at all (the
-// coordinator's own membership.revoke-scoped exception in
-// internal/store/coordinator.go enforces the identical bound on the
-// committed result), so it must be refused before Execute ever runs --
-// never a wasted mutation attempt the coordinator's own check would reject
-// anyway.
-func TestMembershipRevokeRefusesOversizedLegacyConversationIdentifierWithoutCommitting(t *testing.T) {
+// TestMembershipRevokeAtIdentityBoundPreservesExactIdentifierThroughAuditAndReplay
+// revokes a conversation identifier exactly store.MaxIdentityBytes long,
+// built from '"'/'\' bytes JSON must escape, through the real wire handler,
+// then reads it back through operation.get and replays it -- proving the
+// exact identifier (not a re-escaped or truncated copy) survives every
+// stage of durable storage and retrieval.
+func TestMembershipRevokeAtIdentityBoundPreservesExactIdentifierThroughAuditAndReplay(t *testing.T) {
 	sess, db := membershipTestServer(t)
-	conversation := strings.Repeat("x", store.MaxLegacyLocatorBytes+1)
-	seedLegacyGrant(t, db, conversation)
-	resp, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
-		"operation_id": newOpID(), "conversation": conversation, "expected_grant_version": "1",
-	}})
-	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != IncompatibleIdentifier {
-		t.Fatalf("expected incompatible_identifier for a >MaxLegacyLocatorBytes legacy identifier, got %#v", resp.Err)
-	}
-	// Rolled back immediately, not deferred: db.Begin is an immediate writer
-	// transaction (BEGIN IMMEDIATE), so leaving this one open past this
-	// check would deadlock every sess.Handle call below against its own
-	// Coordinator.Execute db.Begin, which SQLite serializes behind it.
-	tx, err := db.Begin(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	g, err := store.CurrentGrant(context.Background(), tx, conversation)
-	if err != nil || g.GrantVersion != 1 {
-		t.Errorf("a pre-Execute refusal must leave the legacy grant untouched: %+v: %v", g, err)
-	}
-	tx.Rollback()
-	// Not durably audited (auditRepresentable runs before store.NewCommandRequest/
-	// Execute) -- a retry with the identical operation_id executes normally
-	// rather than replaying/conflicting, exactly mirroring the accepted
-	// invalid_membership asymmetry (see this file's own
-	// TestInvalidMembershipRejectionDoesNotReserveOperationID for the same
-	// property on a different check).
-	opID := newOpID()
-	first, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{
-		"operation_id": opID, "conversation": conversation, "expected_grant_version": "1",
-	}})
-	if first.Err == nil || first.Err.Data == nil || first.Err.Data.Code != IncompatibleIdentifier {
-		t.Fatalf("expected incompatible_identifier, got %#v", first.Err)
-	}
-	second, _ := sess.Handle(context.Background(), Request{ID: "2", Method: "membership.revoke", Params: map[string]any{
-		"operation_id": opID, "conversation": "conv-does-not-exist", "expected_grant_version": "1",
-	}})
-	if second.Err == nil || second.Err.Data == nil || second.Err.Data.Code != DomainCode(store.NoActiveGrant) {
-		t.Fatalf("a corrected retry reusing the same operation_id must execute normally, got %#v", second.Err)
-	}
-}
-
-// TestLegacyConversationBoundStaysWithinFrameLimit is
-// store.MaxLegacyLocatorBytes's own enforcing test (EC-04, 2026-09-19
-// review): it builds the actual worst-case membership.revoke receipt --
-// four ResourceChange entries, handleMembershipRevoke's real shape, each
-// carrying a MaxLegacyLocatorBytes-sized identifier built from repeated
-// single UTF-8-byte control characters, the input encoding/json.Marshal's
-// default HTML-safe escaping expands the most (each "\x01" becomes the
-// 6-byte sequence ``) -- and asserts the actual encoded
-// Response.Encode() output still fits comfortably inside
-// control.MaxFrameBytes, with the margin the doc comment claims. A future
-// change to the resource count, the escaping assumption, or MaxFrameBytes
-// itself must fail this test rather than silently invalidating
-// store.MaxLegacyLocatorBytes's derivation.
-func TestLegacyConversationBoundStaysWithinFrameLimit(t *testing.T) {
-	adversarial := strings.Repeat("\x01", store.MaxLegacyLocatorBytes)
-	resources := make([]wireResourceChange, 4)
-	for i := range resources {
-		resources[i] = wireResourceChange{Kind: "grant", ID: adversarial, Before: "1", After: "2"}
-	}
-	result := CommandReceiptResult{
-		Result:      wireCommandResult{Resources: resources},
-		AuditID:     newOpID(),
-		OperationID: newOpID(),
-		CommitView:  CommitView{Epoch: newOpID(), Revision: "1"},
-	}
-	resp := successResponse(newOpID(), result)
-	data, err := resp.Encode()
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	if len(data) >= MaxFrameBytes {
-		t.Fatalf("worst-case revoke receipt (%d bytes) does not fit MaxFrameBytes (%d)", len(data), MaxFrameBytes)
-	}
-	// The bound is the frame-derived ceiling itself (owner decision
-	// 2026-09-19, review 5257641949), so the remaining envelope budget is
-	// small by design -- but it must stay comfortably above the few hundred
-	// bytes the rest of a real receipt needs.
-	if margin := MaxFrameBytes - len(data); margin < 32*1024 {
-		t.Fatalf("expected at least 32 KiB left for the rest of the envelope, got %d bytes (encoded=%d)", margin, len(data))
-	}
-}
-
-// TestMembershipRevokeWorstCaseLegacyIdentifierAtBoundFitsEveryReply drives
-// the same maximally-escaping identifier through the real handlers rather
-// than a hand-built receipt: the revoke response, its operation.get
-// republication and a same-operation-id replay must each encode within
-// MaxFrameBytes and carry the exact identifier, proving the raised bound is
-// genuinely revocable end to end, not merely arithmetically admissible.
-func TestMembershipRevokeWorstCaseLegacyIdentifierAtBoundFitsEveryReply(t *testing.T) {
-	sess, db := membershipTestServer(t)
-	conversation := strings.Repeat("\x01", store.MaxLegacyLocatorBytes)
-	seedLegacyGrant(t, db, conversation)
-	opID := newOpID()
-	revokeParams := map[string]any{"operation_id": opID, "conversation": conversation, "expected_grant_version": "1"}
-
-	steps := []struct {
-		name string
-		req  Request
-	}{
-		{"revoke", Request{ID: "1", Method: "membership.revoke", Params: revokeParams}},
-		{"operation.get", Request{ID: "2", Method: "operation.get", Params: map[string]any{"operation_id": opID}}},
-		{"replay", Request{ID: "3", Method: "membership.revoke", Params: revokeParams}},
-	}
-	for _, step := range steps {
-		resp, _ := sess.Handle(context.Background(), step.req)
-		if resp.Err != nil {
-			t.Fatalf("%s at the worst-case boundary must succeed: %#v", step.name, resp.Err)
-		}
-		data, err := resp.Encode()
-		if err != nil {
-			t.Fatalf("%s encode: %v", step.name, err)
-		}
-		if len(data) >= MaxFrameBytes {
-			t.Fatalf("%s reply (%d bytes) does not fit MaxFrameBytes (%d)", step.name, len(data), MaxFrameBytes)
-		}
-	}
-	tx, err := db.Begin(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-	if _, err := store.CurrentGrant(context.Background(), tx, conversation); err == nil {
-		t.Fatal("the worst-case legacy grant must actually be revoked")
-	}
-}
-
-// TestLegacyConversationBoundIsTheFrameCeilingNotAPolicyCutoff is the other
-// half of store.MaxLegacyLocatorBytes's derivation (owner decision
-// 2026-09-19, review 5257641949): the bound must not sit arbitrarily below
-// what a frame can carry. A maximally-escaping identifier only 10% past it
-// already produces a revoke receipt that cannot be carried in one frame, so
-// the refusal above the bound is "this genuinely would not fit", never a
-// smaller policy choice that strands a representable legacy grant.
-func TestLegacyConversationBoundIsTheFrameCeilingNotAPolicyCutoff(t *testing.T) {
-	oversized := strings.Repeat("\x01", store.MaxLegacyLocatorBytes+store.MaxLegacyLocatorBytes/10)
-	resources := make([]wireResourceChange, 4)
-	for i := range resources {
-		resources[i] = wireResourceChange{Kind: "grant", ID: oversized, Before: "1", After: "2"}
-	}
-	result := CommandReceiptResult{
-		Result:      wireCommandResult{Resources: resources},
-		AuditID:     newOpID(),
-		OperationID: newOpID(),
-		CommitView:  CommitView{Epoch: newOpID(), Revision: "1"},
-	}
-	resp := successResponse(newOpID(), result)
-	data, err := resp.Encode()
-	if err != nil {
-		t.Fatalf("encode: %v", err)
-	}
-	if len(data) < MaxFrameBytes {
-		t.Fatalf("a worst-case identifier 10%% past the bound still fits one frame (%d bytes); the bound is below the real ceiling", len(data))
-	}
-}
-
-// TestMembershipRevokeAtLegacyBoundPreservesExactIdentifierThroughAuditAndReplay
-// exercises the true boundary the earlier representable/oversized tests
-// above only approximate: a legacy conversation identifier exactly
-// store.MaxLegacyLocatorBytes bytes long, built from '"'/'\' bytes an
-// ordinary identifier could never carry, revoked through the real wire
-// handler, then read back through operation.get and replayed -- proving the
-// exact identifier (not an alias, not a re-escaped or truncated copy)
-// survives every stage of durable storage and retrieval this bound gates.
-func TestMembershipRevokeAtLegacyBoundPreservesExactIdentifierThroughAuditAndReplay(t *testing.T) {
-	sess, db := membershipTestServer(t)
-	conversation := strings.Repeat(`x"\y`, store.MaxLegacyLocatorBytes/4)
-	if len(conversation) != store.MaxLegacyLocatorBytes {
+	conversation := strings.Repeat(`x"\y`, store.MaxIdentityBytes/4)
+	if len(conversation) != store.MaxIdentityBytes {
 		t.Fatalf("test fixture must be exactly at the boundary, got %d bytes", len(conversation))
 	}
-	seedLegacyGrant(t, db, conversation)
+	seedGrantDirectly(t, db, conversation)
 
 	opID := newOpID()
 	revoke, _ := sess.Handle(context.Background(), Request{ID: "1", Method: "membership.revoke", Params: map[string]any{

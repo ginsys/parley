@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/control"
@@ -112,83 +111,23 @@ func parseCommand(args []string, output io.Writer) (command, error) {
 	if fs.NArg() != 0 {
 		return c, fmt.Errorf("unexpected positional arguments")
 	}
-	conversationGiven := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "conversation" {
-			conversationGiven = true
-		}
-	})
 	if c.op == "enroll" || c.op == "replace" {
 		c.direction = store.Direction(direction)
 	}
 	// Identifiers are opaque exact keys. TrimSpace checks emptiness only;
-	// normalization could retarget existing grants. Revoke keeps the exact
-	// key even if it is byte-malformed (outside printable ASCII, or
-	// otherwise ASCII-incompatible) -- new-enrollment validation does not
-	// apply to that path (AGENTS.md).
-	//
-	// Revoke must NOT use TrimSpace here (review d89c4e6 post-push finding,
-	// comment 4053366764): AGENTS.md requires every new identifier to
-	// contain "at least one non-space byte", but a historical, already-
-	// enrolled legacy key is exempt from that rule and may be space-only.
-	// TrimSpace(c.conversation) == "" is indistinguishable between "the
-	// flag was never supplied" (default "") and "-conversation '   '" was
-	// supplied verbatim -- the former must be rejected, the latter must
-	// reach the server exactly as typed so an operator can revoke that
-	// exact historical key. Checking the untrimmed value against "" keeps
-	// the missing-flag rejection while letting a supplied space-only value
-	// through on the revoke path only; enroll/renew/replace still require
-	// TrimSpace nonemptiness since AGENTS.md's rule applies to them.
-	//
-	// EC-03 (2026-09-19 review): comparing the parsed value against "" (as
-	// this used to) cannot distinguish an explicitly supplied empty string
-	// ("-conversation ''") from an omitted flag -- both parse to the same
-	// Go zero value. The historical schema permits an empty TEXT
-	// conversation key, so an operator with a genuinely empty legacy
-	// identifier to revoke had no way to reach it through this client at
-	// all. conversationGiven (fs.Visit, above) tracks presence rather than
-	// value, so an explicit empty string is accepted on the revoke path and
-	// only a truly omitted flag is rejected; enroll/renew/replace are
-	// unaffected, since their own nonemptiness rule (TrimSpace below)
-	// already rejects an explicit empty string on other grounds.
-	if c.op == "revoke" {
-		if !conversationGiven {
-			return c, fmt.Errorf("membership %s requires -conversation", c.op)
-		}
-	} else if strings.TrimSpace(c.conversation) == "" {
+	// normalization could retarget existing grants. Every operation,
+	// revoke included, applies the same identifier rule (owner decision
+	// 2026-09-20: unreleased software, no database predating the rule).
+	if strings.TrimSpace(c.conversation) == "" {
 		return c, fmt.Errorf("membership %s requires -conversation", c.op)
 	}
-	if c.op != "revoke" {
-		if err := bridgetext.ValidateMetadata(c.conversation); err != nil {
-			return c, fmt.Errorf("conversation identifier: %w", err)
-		}
-		// Mirrors internal/control's own incompatibleConversation length
-		// check (MC-02/review-5255666571 length finding): an ASCII
-		// conversation identifier longer than store.MaxIdentityBytes
-		// would otherwise pass this client-side check, dial, and only
-		// then be rejected server-side -- correct, but a needless round
-		// trip for a boundary this client can already evaluate locally.
-		// Revoke deliberately keeps its exact-key escape and does not
-		// apply this bound (AGENTS.md).
-		if len(c.conversation) > store.MaxIdentityBytes {
-			return c, fmt.Errorf("conversation identifier: exceeds maximum length of %d bytes", store.MaxIdentityBytes)
-		}
-	} else if !utf8.ValidString(c.conversation) {
-		// Unlike an ASCII-incompatible-but-valid-UTF-8 legacy key (e.g.
-		// "café"), an invalid UTF-8 byte sequence cannot be transmitted
-		// byte-exact over this wire protocol at all: JSON strings are
-		// defined over Unicode text, and encoding/json's Marshal silently
-		// replaces each invalid byte with U+FFFD rather than rejecting or
-		// preserving it -- it does NOT "preserve arbitrary malformed
-		// bytes" the way an earlier version of this comment implied. A
-		// revoke sent for such a key would therefore silently target a
-		// different byte string than the one on disk, defeating the exact-
-		// key revocation guarantee this path exists for. Refusing before
-		// dialing (MC-02) catches this deterministically instead of
-		// producing a silently-corrupted wire request; every other
-		// byte-malformed-but-valid-UTF-8 legacy key is unaffected and still
-		// passes through unchanged, exactly as the comment above describes.
-		return c, fmt.Errorf("conversation identifier: invalid UTF-8, cannot be transmitted byte-exact")
+	if err := bridgetext.ValidateMetadata(c.conversation); err != nil {
+		return c, fmt.Errorf("conversation identifier: %w", err)
+	}
+	// Mirrors internal/control's own incompatibleConversation length check,
+	// saving a round trip for a boundary this client can evaluate locally.
+	if len(c.conversation) > store.MaxIdentityBytes {
+		return c, fmt.Errorf("conversation identifier: exceeds maximum length of %d bytes", store.MaxIdentityBytes)
 	}
 	if c.maxExchanges < 0 || c.expiresIn < 0 {
 		return c, fmt.Errorf("budget and expiry must not be negative")
@@ -518,7 +457,7 @@ func policyWire(p membership.Policy) map[string]any {
 // succeeded by the time this is called, so a failure here is a distinct,
 // later delivery failure and must never be silently dropped behind a zero
 // exit status. r.ID is rendered with %q, not %s: a resource identifier
-// (the conversation, or auditResourceID's legacy-sha256 alias) is an exact
+// (the conversation) is an exact
 // key that may carry leading/trailing whitespace, which %q makes visible
 // the same way parseCommand's own identifier quoting does.
 func printMembershipResult(w io.Writer, c command, operationID string, result control.CommandReceiptResult) error {

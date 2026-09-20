@@ -7,7 +7,6 @@ import (
 	"regexp"
 	"strconv"
 	"time"
-	"unicode/utf8"
 
 	"github.com/ginsys/parley/internal/bridgetext"
 	"github.com/ginsys/parley/internal/controller"
@@ -43,45 +42,8 @@ import (
 // redundant retirement check.
 func noopAuthorize(context.Context, *sql.Tx) error { return nil }
 
-// auditRepresentable reports whether id can be recorded verbatim as a
-// membership.revoke resource identifier, through the coordinator's own
-// narrow, command-kind-scoped validation exception for this one command
-// (internal/store/coordinator.go's matching "membership.revoke" case).
-// AGENTS.md's exact-key human revocation must remain able to target a
-// legacy conversation identifier whose bytes never satisfied
-// bridgetext.ValidateMetadata's ASCII rule or store.MaxIdentityBytes's
-// ordinary bound -- 2026-09-19 lead approval replaced this file's earlier
-// SHA-256 alias substitution (which reported an opaque digest instead of
-// the exact target, defeating self-contained audit identification) with
-// UTF-8 validity plus a length bound. EC-04 (2026-09-19 review) then
-// replaced that bound's own reuse of store.MaxLocatorBytes (a different
-// field's limit, chosen for credential/target locators, with no relation
-// to this identifier's real encoded-size constraints) with the dedicated
-// store.MaxLegacyLocatorBytes -- see that constant's doc comment for the
-// full derivation from the actual revoke-receipt encoding and
-// control.MaxFrameBytes, and TestLegacyConversationBoundStaysWithinFrameLimit
-// for the test enforcing it stays true. Invalid UTF-8 is a different
-// boundary handled earlier, at JSON decode (internal/control/json.go
-// rejects it before any handler runs), so it cannot actually reach this
-// function via any live wire call; the check here is retained anyway as an
-// explicit, testable boundary rather than an assumption about an earlier
-// layer. An id this function refuses is rejected before Execute ever runs
-// (deterministic, not durably audited, mirroring invalid_membership's own
-// pre-Execute asymmetry) instead of reaching the coordinator's own
-// post-mutate resource check after RevokeTx has already run inside the
-// transaction -- which the coordinator would still roll back, but only
-// after wastefully running the mutation, and with a generic InvalidRequest
-// rather than an identifier-specific, retryable diagnostic. RevokeTx itself
-// always receives the conversation identifier verbatim regardless of this
-// check's outcome, so the actual mutation target is exact either way; this
-// function only gates whether the command can be durably reported and
-// replayed at all.
-func auditRepresentable(id string) bool {
-	return utf8.ValidString(id) && len(id) <= store.MaxLegacyLocatorBytes
-}
-
-// incompatibleConversation reports whether id fails enroll/renew/replace's
-// top-level conversation pre-check: either byte shape (bridgetext's ASCII
+// incompatibleConversation reports whether id fails every membership.*
+// method's top-level conversation pre-check: either byte shape (bridgetext's ASCII
 // rule) or length (store.MaxIdentityBytes, the ordinary bound every other
 // exact identifier in this codebase is held to -- internal/store/registry.go's
 // binding peer IDs, internal/store/work_authorization.go's queue keys,
@@ -191,17 +153,8 @@ type CommandReceiptResult struct {
 // expectedConversation is the caller's own requested target -- every
 // membership.* mutation's ResourceChange entries carry the exact
 // conversation identifier as ID (see handleMembershipEnroll/Renew/Replace/
-// Revoke), so requiring an exact match here is strictly stronger than the
-// prior "nonempty" check it replaces (EC-03, 2026-09-19 review): the
-// historical schema permits an empty TEXT conversation key, and
-// AGENTS.md's exact-key legacy revocation escape must be able to target
-// one -- rejecting every empty resource ID unconditionally made a
-// successfully committed empty-key revocation's own receipt look unusable
-// at the client, even once the CLI-side flag-presence gap (parseCommand)
-// was separately fixed to let the request itself reach the server. An
-// exact-match requirement (rather than merely "permit empty too") also
-// catches a stale or cross-target receipt whose resource ID silently
-// differs from what was actually requested, which the old check could not.
+// Revoke), so an exact match catches a stale or cross-target receipt whose
+// resource ID silently differs from what was actually requested.
 func (r CommandReceiptResult) Usable(requestedOperationID, expectedConversation string) bool {
 	if !canonicalUUID(r.AuditID) {
 		return false
@@ -535,18 +488,11 @@ func (sess *Session) handleMembershipRevoke(ctx context.Context, req Request) (R
 	if !ok {
 		return envelopeErrorResponse(InvalidParams, &req.ID), false
 	}
-	// Deliberately does NOT apply bridgetext.ValidateMetadata/length like
-	// enroll/renew/replace's own top-level conversation check --
-	// AGENTS.md's exact-key human revocation escape must still reach
-	// RevokeTx for a byte-malformed or oversized-but-representable legacy
-	// conversation identifier. auditRepresentable is the narrower question
-	// "can this be durably reported at all" (valid UTF-8, within
-	// store.MaxLegacyLocatorBytes), not "is this an ordinary new identifier" --
-	// truly unrepresentable input (which cannot currently occur on any
-	// live wire call; see auditRepresentable's own doc comment) is refused
-	// here, before Execute, rather than committing a mutation whose result
-	// the coordinator's own post-mutate check would then reject anyway.
-	if !auditRepresentable(p.conversation) {
+	// Same top-level conversation check as enroll/renew/replace. Owner
+	// decision 2026-09-20: Parley is unreleased and no database predating
+	// the identifier rule exists, so revoke carries no exact-key escape
+	// for identifiers that rule would reject.
+	if incompatibleConversation(p.conversation) {
 		return domainErrorResponse(&req.ID, IncompatibleIdentifier), false
 	}
 	request, err := store.NewCommandRequest("membership.revoke", p.operationID,
@@ -561,9 +507,6 @@ func (sess *Session) handleMembershipRevoke(ctx context.Context, req Request) (R
 			if err != nil {
 				return domainRejection(err)
 			}
-			// The exact conversation identifier, never an alias: see
-			// auditRepresentable and internal/store/coordinator.go's
-			// matching membership.revoke-scoped validation exception.
 			return store.CommandResult{Resources: []store.ResourceChange{
 				{Kind: "grant", ID: p.conversation, Before: p.expectedVersion, After: p.expectedVersion},
 				{Kind: "queued_cancelled", ID: p.conversation, After: int64(result.Cancelled)},
@@ -617,9 +560,8 @@ func policyField(p membership.Policy) store.Field {
 // (right key set, right JSON type per field) and produces InvalidParams
 // for a violation.
 //
-// The top-level conversation field is the one exception: enroll/renew/
-// replace each apply bridgetext.ValidateMetadata to p.conversation
-// themselves, immediately after decode and before building the digest
+// The top-level conversation field is the one exception: every handler
+// applies incompatibleConversation to p.conversation itself, immediately after decode and before building the digest
 // fields or calling Execute, and return a deterministic IncompatibleIdentifier
 // rejection rather than letting a malformed identifier reach
 // controller.GrantTx/RenewTx/ReplaceTx -- which reject it with a plain Go
@@ -631,11 +573,7 @@ func policyField(p membership.Policy) store.Field {
 // (see handleMembershipEnroll's comment): a retry with the same
 // operation_id and a still-malformed conversation re-runs this exact check
 // and gets the same IncompatibleIdentifier response every time, with no
-// OperationConflict risk. handleMembershipRevoke deliberately does not
-// apply this check: AGENTS.md's exact-key human revocation escape must
-// remain reachable for a byte-malformed historical conversation identifier
-// (see auditResourceID's own doc comment for the matching audit-side
-// accommodation).
+// OperationConflict risk.
 
 type enrollParams struct {
 	operationID     string
