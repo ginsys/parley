@@ -5,6 +5,7 @@ package control
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1133,6 +1134,85 @@ func TestListenerServiceReceiptEpochMatchesHelloEpoch(t *testing.T) {
 	}
 	if receipt.View.Epoch != helloEpoch {
 		t.Fatalf("receipt epoch %q != hello epoch %q", receipt.View.Epoch, helloEpoch)
+	}
+}
+
+// TestListenerServiceBoundsMutationByRequestDeadline is review 5257748895
+// (comment 4054786967): serveSession used to hand the long-lived runtime
+// worker context straight to Session.Handle, so a membership mutation stuck
+// behind the coordinator gate waited for as long as the gate stayed held.
+// The gate is held here by a real, deliberately blocked Transition; the
+// mutation must come back as temporarily_unavailable once RequestDeadline
+// passes, while the gate is still held, and must not have committed.
+func TestListenerServiceBoundsMutationByRequestDeadline(t *testing.T) {
+	fx := newListenerFixture(t)
+	entered, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		_, err := fx.db.Coordinator().Transition(context.Background(), func(context.Context, *sql.Tx, store.CommitView) (store.TransitionResult, error) {
+			close(entered)
+			<-release
+			return store.TransitionResult{}, nil
+		}, nil)
+		held <- err
+	}()
+	<-entered
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseOnce)
+
+	conn, err := connection.DialTrustedServer(context.Background(), fx.socketPath, fx.serverUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(RequestDeadline + restartTeardownWait)); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(conn)
+	roundTrip := func(line string) map[string]any {
+		t.Helper()
+		if _, err := conn.Write([]byte(line + "\n")); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := br.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("no bounded response while the gate was held: %v", err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(reply, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		return decoded
+	}
+	if hello := roundTrip(`{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}`); hello["error"] != nil {
+		t.Fatalf("hello failed: %#v", hello)
+	}
+
+	started := time.Now()
+	resp := roundTrip(`{"jsonrpc":"2.0","id":"2","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f001","conversation":"conv-deadline","expected_grant_version":"1"}}`)
+	elapsed := time.Since(started)
+	select {
+	case err := <-held:
+		t.Fatalf("the gate was released before the response arrived (err=%v); the deadline was not what bounded it", err)
+	default:
+	}
+	wireErr, _ := resp["error"].(map[string]any)
+	data, _ := wireErr["data"].(map[string]any)
+	if data["code"] != string(store.TemporarilyUnavailable) {
+		t.Fatalf("expected temporarily_unavailable at the request deadline, got %#v", resp)
+	}
+	if elapsed < RequestDeadline-time.Second || elapsed > RequestDeadline+3*time.Second {
+		t.Fatalf("response after %v, want about RequestDeadline (%v)", elapsed, RequestDeadline)
+	}
+
+	releaseOnce()
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := fx.db.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT count(*) FROM operation_results WHERE operation_id='80000000-0000-4000-8000-00000000f001'").Scan(&count)
+	}); err != nil || count != 0 {
+		t.Fatalf("a deadline-refused mutation must not have recorded a result: count=%d err=%v", count, err)
 	}
 }
 

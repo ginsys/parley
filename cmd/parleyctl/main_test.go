@@ -381,6 +381,11 @@ func TestMembershipExpiresAtValidation(t *testing.T) {
 		{"comma_fraction_separator", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "2030-06-15T12:00:00,5Z"}, "-expires-at must match RFC3339 UTC"},
 		{"single_digit_hour", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "2030-06-15T1:00:00Z"}, "-expires-at must match RFC3339 UTC"},
 		{"numeric_offset_not_normalized", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-at", "2030-06-15T12:00:00+02:00"}, "-expires-at must match RFC3339 UTC"},
+		// Review 5257748895 (comment 4054786969): the maximum valid
+		// time.Duration resolves past the store's Unix-nanosecond range;
+		// fatalIfDialed below proves it now fails locally, before any dial.
+		{"expires_in_out_of_range", []string{"membership", "enroll", "-conversation", "c", "-peer-a", "a", "-peer-b", "b", "-max-exchanges", "1", "-expires-in", "2562047h47m16.854775807s"}, "-expires-in resolves to an expiry outside the representable range"},
+		{"renew_expires_in_out_of_range", []string{"membership", "renew", "-conversation", "c", "-expected-grant-version", "1", "-expires-in", "2562047h47m16.854775807s"}, "-expires-in resolves to an expiry outside the representable range"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
