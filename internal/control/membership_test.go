@@ -65,6 +65,9 @@ func membershipTestServer(t *testing.T) (*Session, *store.DB) {
 	srv := NewServer(cfg, db.Queries(), db, "server-id-fixture", "epoch-fixture", StateRunning)
 	sess := srv.NewSession(Identity{PrincipalID: testHelloAdmin, UID: 1001})
 	sess.negotiated = true
+	// Registered after controlTestDB's own cleanup, so it runs first:
+	// background expiry persistence drains before the store closes.
+	t.Cleanup(srv.WaitBackground)
 	return sess, db
 }
 
@@ -189,8 +192,10 @@ func seedBindingExpiringSoon(t *testing.T, db *store.DB, index int, peer string,
 // credentialStatus reads back a credential's durable status, used to prove
 // store.ExpiryEvidence.Persist actually ran rather than merely that the
 // mutation reported binding_unavailable.
-func credentialStatus(t *testing.T, db *store.DB, index int) string {
+func credentialStatus(t *testing.T, sess *Session, db *store.DB, index int) string {
 	t.Helper()
+	// Persistence runs off the request path; wait for it before reading.
+	sess.server.WaitBackground()
 	var status string
 	if err := db.Coordinator().Inspect(context.Background(), func(ctx context.Context, tx *sql.Tx) error {
 		c, err := store.ReadCredential(ctx, tx, fmt.Sprintf("70000000-0000-4000-8000-%012d", index))
@@ -271,7 +276,7 @@ func TestMembershipEnrollPersistsObservedCredentialExpiry(t *testing.T) {
 	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.BindingUnavailable) {
 		t.Fatalf("expected binding_unavailable, got %#v", resp.Err)
 	}
-	if status := credentialStatus(t, db, 2); status != "expired" {
+	if status := credentialStatus(t, sess, db, 2); status != "expired" {
 		t.Fatalf("expired credential observation was not persisted: status=%s", status)
 	}
 }
@@ -308,8 +313,72 @@ func TestMembershipEnrollPreservesRejectionWhenExpiryPersistFails(t *testing.T) 
 	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.BindingUnavailable) {
 		t.Fatalf("a Persist failure must not overwrite the genuine domain rejection: %#v", resp.Err)
 	}
-	if status := credentialStatus(t, db, 2); status != "current" {
+	if status := credentialStatus(t, sess, db, 2); status != "current" {
 		t.Fatalf("Persist's UPDATE should have genuinely failed (trigger), not silently succeeded: status=%s", status)
+	}
+}
+
+// TestExpiryPersistenceNeverHoldsTheRequestPath is review 5259563170
+// (comment 4056153935): store.ExpiryEvidence.Persist waits on the
+// coordinator under its own fresh deadline, so running it inline could hold
+// a response past RequestDeadline. A first enroll leaves a retained
+// observation (its Persist fails on the trigger); the coordinator is then
+// held by a real blocked Transition, and persistExpiries must return at once
+// while its write stays pending until the coordinator is free again.
+func TestExpiryPersistenceNeverHoldsTheRequestPath(t *testing.T) {
+	sess, db := membershipTestServer(t)
+	seedEnabledBinding(t, db, 1, "peer-a")
+	seedExpiredBinding(t, db, 2, "peer-b")
+	ctx := context.Background()
+	if _, err := db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+		_, err := tx.ExecContext(ctx, `CREATE TRIGGER reject_expiry BEFORE UPDATE OF status ON credentials WHEN NEW.status='expired' BEGIN SELECT RAISE(ABORT,'synthetic expiry failure'); END`)
+		return store.TransitionResult{Changed: true}, err
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ := sess.Handle(ctx, Request{ID: "1", Method: "membership.enroll", Params: openMembers("peer-a", "peer-b")})
+	if resp.Err == nil || resp.Err.Data == nil || resp.Err.Data.Code != DomainCode(store.BindingUnavailable) {
+		t.Fatalf("expected binding_unavailable, got %#v", resp.Err)
+	}
+	if status := credentialStatus(t, sess, db, 2); status != "current" {
+		t.Fatalf("the trigger should have failed the first write: status=%s", status)
+	}
+
+	entered, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		_, err := db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+			close(entered)
+			<-release
+			_, err := tx.ExecContext(ctx, `DROP TRIGGER reject_expiry`)
+			return store.TransitionResult{Changed: true}, err
+		}, nil)
+		held <- err
+	}()
+	<-entered
+
+	_, expiry := store.ObserveExpiries(ctx, db)
+	started := time.Now()
+	sess.server.persistExpiries(expiry)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("persistExpiries held its caller for %s while the coordinator was busy", elapsed)
+	}
+	drained := make(chan struct{})
+	go func() {
+		sess.server.WaitBackground()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		t.Fatal("the expiry write completed while the coordinator was still held")
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	<-drained
+	if status := credentialStatus(t, sess, db, 2); status != "expired" {
+		t.Fatalf("the retained observation was not persisted once the coordinator was free: status=%s", status)
 	}
 }
 
@@ -660,7 +729,7 @@ func TestMembershipRenewPersistsObservedCredentialExpiry(t *testing.T) {
 	if renew.Err == nil || renew.Err.Data == nil || renew.Err.Data.Code != DomainCode(store.BindingUnavailable) {
 		t.Fatalf("expected binding_unavailable, got %#v", renew.Err)
 	}
-	if status := credentialStatus(t, db, 2); status != "expired" {
+	if status := credentialStatus(t, sess, db, 2); status != "expired" {
 		t.Fatalf("expired credential observation was not persisted: status=%s", status)
 	}
 }
@@ -709,7 +778,7 @@ func TestMembershipReplacePersistsObservedCredentialExpiry(t *testing.T) {
 	if replace.Err == nil || replace.Err.Data == nil || replace.Err.Data.Code != DomainCode(store.BindingUnavailable) {
 		t.Fatalf("expected binding_unavailable, got %#v", replace.Err)
 	}
-	if status := credentialStatus(t, db, 3); status != "expired" {
+	if status := credentialStatus(t, sess, db, 3); status != "expired" {
 		t.Fatalf("expired credential observation was not persisted: status=%s", status)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ginsys/parley/internal/store"
@@ -67,7 +68,57 @@ type Server struct {
 	State    ServerState
 
 	byUID map[uint32]string // reverse of Config.administrators, built once
+
+	// Credential-expiry persistence runs off the request path (see
+	// persistExpiries): at most one goroutine at a time, rerun once more if
+	// another request observed an expiry meanwhile.
+	background    sync.WaitGroup
+	expiryMu      sync.Mutex
+	expiryRunning bool
+	expiryAgain   bool
 }
+
+// persistExpiries durably records the credential expiries a membership
+// handler observed, without holding that handler's response. Review
+// 5256660570 (comment 4053958828): this write is a separate
+// coordinator.Transition from the already-committed, already-audited
+// mutation, so its failure must never overwrite that response. Review
+// 5259563170 (comment 4056153935): store.ExpiryEvidence.Persist waits on the
+// coordinator under its own fresh deadline, independent of caller
+// cancellation as AGENTS.md requires, so running it inline could hold a
+// response -- and its socket slot -- well past RequestDeadline. An
+// observation is never lost by deferring it: recordExpiry already retained
+// it in the coordinator's credentialExpiries map, which every Persist call
+// retries, so a single in-flight goroutine covers concurrent observers.
+func (s *Server) persistExpiries(e *store.ExpiryEvidence) {
+	s.expiryMu.Lock()
+	if s.expiryRunning {
+		s.expiryAgain = true
+		s.expiryMu.Unlock()
+		return
+	}
+	s.expiryRunning = true
+	s.background.Add(1)
+	s.expiryMu.Unlock()
+	go func() {
+		defer s.background.Done()
+		for {
+			_ = e.Persist(s.Store, nil)
+			s.expiryMu.Lock()
+			if !s.expiryAgain {
+				s.expiryRunning = false
+				s.expiryMu.Unlock()
+				return
+			}
+			s.expiryAgain = false
+			s.expiryMu.Unlock()
+		}
+	}()
+}
+
+// WaitBackground blocks until expiry persistence started by finished
+// requests has drained. Call it only while no request is in flight.
+func (s *Server) WaitBackground() { s.background.Wait() }
 
 // now returns Server.Now, defaulting to time.Now -- Now is injectable for
 // tests, never required of a production caller.

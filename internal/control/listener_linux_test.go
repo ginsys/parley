@@ -1187,21 +1187,38 @@ func TestListenerServiceBoundsMutationByRequestDeadline(t *testing.T) {
 		t.Fatalf("hello failed: %#v", hello)
 	}
 
+	// Two mutations pipelined in one write (review 5259563170, comment
+	// 4056153933): the second waits behind the first, and that wait counts
+	// toward its own deadline, so both are refused at about RequestDeadline
+	// from arrival -- not the second a further RequestDeadline later.
 	started := time.Now()
-	resp := roundTrip(`{"jsonrpc":"2.0","id":"2","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f001","conversation":"conv-deadline","expected_grant_version":"1"}}`)
-	elapsed := time.Since(started)
-	select {
-	case err := <-held:
-		t.Fatalf("the gate was released before the response arrived (err=%v); the deadline was not what bounded it", err)
-	default:
+	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":"2","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f001","conversation":"conv-deadline","expected_grant_version":"1"}}` + "\n" +
+		`{"jsonrpc":"2.0","id":"3","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f002","conversation":"conv-deadline","expected_grant_version":"1"}}` + "\n")); err != nil {
+		t.Fatal(err)
 	}
-	wireErr, _ := resp["error"].(map[string]any)
-	data, _ := wireErr["data"].(map[string]any)
-	if data["code"] != string(store.TemporarilyUnavailable) {
-		t.Fatalf("expected temporarily_unavailable at the request deadline, got %#v", resp)
-	}
-	if elapsed < RequestDeadline-time.Second || elapsed > RequestDeadline+3*time.Second {
-		t.Fatalf("response after %v, want about RequestDeadline (%v)", elapsed, RequestDeadline)
+	for _, id := range []string{"2", "3"} {
+		reply, err := br.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("no bounded response for request %s while the gate was held: %v", id, err)
+		}
+		elapsed := time.Since(started)
+		var resp map[string]any
+		if err := json.Unmarshal(reply, &resp); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-held:
+			t.Fatalf("the gate was released before the response arrived (err=%v); the deadline was not what bounded it", err)
+		default:
+		}
+		wireErr, _ := resp["error"].(map[string]any)
+		data, _ := wireErr["data"].(map[string]any)
+		if resp["id"] != id || data["code"] != string(store.TemporarilyUnavailable) {
+			t.Fatalf("expected temporarily_unavailable for request %s at the request deadline, got %#v", id, resp)
+		}
+		if elapsed < RequestDeadline-time.Second || elapsed > RequestDeadline+3*time.Second {
+			t.Fatalf("response %s after %v, want about RequestDeadline (%v) from arrival", id, elapsed, RequestDeadline)
+		}
 	}
 
 	releaseOnce()
@@ -1213,6 +1230,71 @@ func TestListenerServiceBoundsMutationByRequestDeadline(t *testing.T) {
 		return tx.QueryRowContext(ctx, "SELECT count(*) FROM operation_results WHERE operation_id='80000000-0000-4000-8000-00000000f001'").Scan(&count)
 	}); err != nil || count != 0 {
 		t.Fatalf("a deadline-refused mutation must not have recorded a result: count=%d err=%v", count, err)
+	}
+}
+
+// TestListenerServiceClosesOnQueueOverflowAndReusedCorrelationID holds the
+// coordinator gate so pipelined mutations stay outstanding, then proves the
+// two bounds the per-socket queue enforces: a correlation ID reused while
+// outstanding, and one request more than MaxExecutingPerSocket +
+// MaxQueuedPerSocket, each close the socket instead of executing.
+func TestListenerServiceClosesOnQueueOverflowAndReusedCorrelationID(t *testing.T) {
+	revoke := func(id string, op int) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%q,"method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-0000000000%02d","conversation":"conv-queue","expected_grant_version":"1"}}`+"\n", id, op)
+	}
+	cases := map[string]func() string{
+		"reused correlation id": func() string { return revoke("2", 1) + revoke("2", 2) },
+		"queue overflow": func() string {
+			var b strings.Builder
+			for i := 0; i <= MaxExecutingPerSocket+MaxQueuedPerSocket; i++ {
+				b.WriteString(revoke(fmt.Sprint(i+2), i+1))
+			}
+			return b.String()
+		},
+	}
+	for name, burst := range cases {
+		t.Run(name, func(t *testing.T) {
+			fx := newListenerFixture(t)
+			entered, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+			go func() {
+				_, err := fx.db.Coordinator().Transition(context.Background(), func(context.Context, *sql.Tx, store.CommitView) (store.TransitionResult, error) {
+					close(entered)
+					<-release
+					return store.TransitionResult{}, nil
+				}, nil)
+				held <- err
+			}()
+			<-entered
+			defer func() {
+				close(release)
+				if err := <-held; err != nil {
+					t.Error(err)
+				}
+			}()
+
+			conn, err := connection.DialTrustedServer(context.Background(), fx.socketPath, fx.serverUID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			// Shorter than RequestDeadline: the close must come from the
+			// queue bound, not from the held mutation timing out first.
+			if err := conn.SetDeadline(time.Now().Add(RequestDeadline - 2*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			br := bufio.NewReader(conn)
+			if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}` + "\n")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := br.ReadBytes('\n'); err != nil {
+				t.Fatalf("hello: %v", err)
+			}
+			if _, err := conn.Write([]byte(burst())); err != nil {
+				t.Fatal(err)
+			}
+			_, err = br.ReadBytes('\n')
+			assertConnectionActuallyClosed(t, err)
+		})
 	}
 }
 

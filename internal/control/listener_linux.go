@@ -200,12 +200,10 @@ func probeConnectionRefused(addr string) (bool, error) {
 // (see Listen). It authenticates each accepted connection via
 // connection.PeerUID against the server's configured administrators
 // (never a client-supplied identity), enforces the per-administrator and
-// total socket caps, and serves each session strictly sequentially: read
-// one frame, dispatch it, write its response, then read the next. This
-// trivially satisfies the profile's "one executing plus at most eight
-// queued requests per socket" bound -- there is never more than one
-// request in flight per socket -- at the cost of not implementing
-// per-socket request pipelining in PR1.
+// total socket caps, and executes each session's requests strictly
+// sequentially in arrival order: one executing plus at most
+// MaxQueuedPerSocket complete frames waiting, each charged for its wait
+// (see serveSession).
 type Listener struct {
 	cfg  Config
 	mode os.FileMode
@@ -406,6 +404,15 @@ func unlinkOwnedSocket(path string, boundDev, boundIno uint64) {
 func (ln *Listener) Wait() error {
 	ln.wg.Wait()
 	ln.mu.Lock()
+	server := ln.server
+	ln.mu.Unlock()
+	if server != nil {
+		// Every session has ended, so no new expiry persistence can start;
+		// drain what finished requests left running before the runtime
+		// closes the writer underneath it.
+		server.WaitBackground()
+	}
+	ln.mu.Lock()
 	defer ln.mu.Unlock()
 	return ln.acceptErr
 }
@@ -546,8 +553,7 @@ func (ln *Listener) releaseSocketSlot(principal string) {
 // fatal framing error occurs, a handled request signals closeAfter, or
 // ctx is cancelled (runtime shutdown). Correlation IDs cannot be reused
 // while outstanding on the same socket (docs/specifications/control.md);
-// because this loop never has more than one request in flight, that
-// constraint holds vacuously here and needs no separate tracking.
+// the reader below tracks queued and executing IDs to enforce that.
 func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 	defer conn.Close()
 	done := make(chan struct{})
@@ -581,16 +587,69 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 	})
 	defer preHelloTimer.Stop()
 
-	br := bufio.NewReader(conn)
-	for {
+	// Review 5259563170 (comment 4056153933): a frame pipelined behind an
+	// executing request must be charged for that wait. One reader goroutine
+	// per socket (never one per frame) stamps each complete frame's arrival
+	// and hands it to this loop through the profile's bounded queue, so the
+	// request deadline below runs from arrival, not from dequeue. A frame
+	// that finds the queue full closes the socket: this loop owns the
+	// socket's only output path, so there is no bounded output space for a
+	// capacity_exceeded reply (docs/specifications/control.md's "otherwise
+	// close"). Correlation IDs stay unique while outstanding the same way:
+	// a reused one closes the socket rather than executing.
+	type arrival struct {
+		req       Request
+		violation *Violation
+		idless    bool
+		at        time.Time
+	}
+	// outstanding counts the executing request too (it leaves the map only
+	// once handled), so the queue holds that many and a send never blocks.
+	const maxOutstanding = MaxExecutingPerSocket + MaxQueuedPerSocket
+	queue := make(chan arrival, maxOutstanding)
+	readerDone := make(chan struct{})
+	var outstandingMu sync.Mutex
+	outstanding := make(map[string]struct{}, maxOutstanding)
+	go func() {
+		defer close(readerDone)
+		defer close(queue)
+		br := bufio.NewReader(conn)
+		for {
+			frame, err := ReadFrame(br, conn, FrameDeadline)
+			if err != nil {
+				return
+			}
+			next := arrival{at: time.Now()}
+			next.req, next.violation, next.idless = classifyEnvelope(frame)
+			if next.violation == nil && !next.idless {
+				outstandingMu.Lock()
+				_, reused := outstanding[next.req.ID]
+				full := len(outstanding) >= maxOutstanding
+				outstanding[next.req.ID] = struct{}{}
+				outstandingMu.Unlock()
+				if reused || full {
+					conn.Close()
+					return
+				}
+			}
+			select {
+			case queue <- next:
+			default:
+				conn.Close()
+				return
+			}
+		}
+	}()
+	defer func() {
+		conn.Close() // unblocks the reader's pending ReadFrame
+		<-readerDone
+	}()
+
+	for next := range queue {
 		if ctx.Err() != nil {
 			return
 		}
-		frame, err := ReadFrame(br, conn, FrameDeadline)
-		if err != nil {
-			return
-		}
-		req, violation, idless := classifyEnvelope(frame)
+		req, violation, idless := next.req, next.violation, next.idless
 		if idless {
 			// docs/specifications/control.md:64-65: "ID-less client
 			// objects (including notifications) are not executed and
@@ -613,9 +672,15 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		// reached before commit is a provable non-commitment
 		// (temporarily_unavailable); store.Coordinator's commit itself runs
 		// independently of this context, so it cannot be torn mid-commit.
-		reqCtx, cancelReq := context.WithTimeout(ctx, RequestDeadline)
+		reqCtx, cancelReq := context.WithDeadline(ctx, next.at.Add(RequestDeadline))
 		resp, closeAfter := sess.Handle(reqCtx, req)
 		cancelReq()
+		// Released before the write, not after: a client may legitimately
+		// reuse the ID the moment it has read this response, and the reader
+		// could see that frame before this loop resumed.
+		outstandingMu.Lock()
+		delete(outstanding, req.ID)
+		outstandingMu.Unlock()
 		if sess.negotiated {
 			// sess.negotiated is only ever written by this goroutine
 			// (inside Handle -> handleHello); helloDone is the only field
