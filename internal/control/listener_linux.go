@@ -658,20 +658,22 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		<-readerDone
 	}()
 
-	// Review 5259679438 (comment 4056232738): a call stays outstanding until
-	// its response is written, so its ID is released only then. The write and
-	// the release share the reader's lock, so the reader can never admit a
-	// second frame under this ID while the first is queued, executing or
-	// still being written, and a client that reuses the ID after reading the
-	// response can never be seen before the release. The reader waits at most
-	// one WriteDeadline, and a frame's arrival is stamped before it takes the
-	// lock, so that wait is still charged to the request.
+	// Review 5259679438 (comment 4056232738) and 5259801666 (comment
+	// 4056315885): a call stays outstanding until its response is written,
+	// so its ID is released only after the write, and the lock is not held
+	// across the write -- the reader keeps classifying frames meanwhile, so a
+	// reuse pipelined during a slow write is detected and closes the socket
+	// rather than being admitted once the write completes. A conforming
+	// client reuses an ID only after reading its response; the release
+	// follows the write immediately, so such a reuse is practically never
+	// mistaken for a violation, and a client that never reuses IDs (the
+	// package's own Client) is unaffected.
 	respond := func(next arrival, resp Response) error {
-		outstandingMu.Lock()
-		defer outstandingMu.Unlock()
 		err := writeResponse(conn, resp)
 		if next.tracked {
+			outstandingMu.Lock()
 			delete(outstanding, next.id)
+			outstandingMu.Unlock()
 		}
 		return err
 	}
