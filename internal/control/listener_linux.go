@@ -617,13 +617,20 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		id        string // the correlation ID its response will carry
 		tracked   bool   // id is held in outstanding until that response is written
 	}
-	// outstanding counts the executing request too (it leaves the map only
-	// once handled), so the queue holds that many and a send never blocks.
+	// outstanding holds the correlation IDs whose responses are not yet
+	// written; occupied counts the socket's executing and queued requests, so
+	// the queue holds that many and a send never blocks. Review 5264346948
+	// (comment 4060293329): the two part ways once a request is answered at
+	// its deadline while its handler still runs -- the ID is released with
+	// the reply (a conforming client may reuse it), but the executing slot
+	// stays occupied until the handler returns, so the reader admits at most
+	// MaxQueuedPerSocket behind it, as advertised.
 	const maxOutstanding = MaxExecutingPerSocket + MaxQueuedPerSocket
 	queue := make(chan arrival, maxOutstanding)
 	readerDone := make(chan struct{})
 	var outstandingMu sync.Mutex
 	outstanding := make(map[string]struct{}, maxOutstanding)
+	occupied := 0
 	go func() {
 		defer close(readerDone)
 		defer close(queue)
@@ -648,8 +655,9 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			if next.tracked {
 				outstandingMu.Lock()
 				_, reused := outstanding[next.id]
-				full := len(outstanding) >= maxOutstanding
+				full := occupied >= maxOutstanding
 				outstanding[next.id] = struct{}{}
+				occupied++
 				outstandingMu.Unlock()
 				if reused || full {
 					conn.Close()
@@ -684,6 +692,7 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		if next.tracked {
 			outstandingMu.Lock()
 			delete(outstanding, next.id)
+			occupied--
 			outstandingMu.Unlock()
 		}
 		return err
@@ -722,6 +731,10 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 	var running *execution
 	defer func() {
 		if running != nil {
+			// The socket's close does not wait for the handler -- an ID-less
+			// frame's bounded close, a write failure and shutdown all close
+			// now; the drain below is what keeps the writer open for it.
+			conn.Close()
 			<-running.done
 		}
 	}()
@@ -745,9 +758,49 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			helloDone.Store(true)
 		}
 		if ex.answered {
+			// The deadline reply released the correlation ID; the executing
+			// slot it kept occupied is free only now that the handler returned.
+			outstandingMu.Lock()
+			occupied--
+			outstandingMu.Unlock()
 			return !out.closeAfter
 		}
 		return respond(ex.next, out.resp) == nil && !out.closeAfter
+	}
+	// answerAtDeadline writes the deadline reply for the running request. Its
+	// correlation ID is released with the reply, as for any written response;
+	// its capacity is not (see finish), so the reader still admits at most
+	// MaxQueuedPerSocket behind the live handler.
+	answerAtDeadline := func(ex *execution) error {
+		ex.answered = true
+		err := writeResponse(conn, deadlineResponse(ex.next.req))
+		outstandingMu.Lock()
+		delete(outstanding, ex.next.id)
+		outstandingMu.Unlock()
+		return err
+	}
+	// refuse settles a dequeued frame without dispatching it. An ID-less
+	// object closes the socket (docs/specifications/control.md:64-65: "ID-less
+	// client objects (including notifications) are not executed and receive
+	// no response; close with a bounded operational diagnostic" -- the
+	// deferred conn.Close() above is that close); a malformed envelope gets
+	// its envelope error under its echoable ID; and a request that waited out
+	// its whole deadline in the queue is refused before dispatch (review
+	// 5259780995, comment 4056295483: handlers that never consult the context
+	// -- a repeated server.hello, an unknown method, parameter validation --
+	// would otherwise still run and answer after the advertised limit;
+	// nothing has executed, so this is a provable non-commitment). Review
+	// 5264346948 (comment 4060293322): the same classification governs a
+	// frame that expires while an earlier request is still executing.
+	refuse := func(next arrival) (keepServing bool) {
+		switch {
+		case next.idless:
+			return false
+		case next.violation != nil:
+			return respond(next, responseForViolation(next.violation)) == nil
+		default:
+			return respond(next, domainErrorResponse(&next.req.ID, DomainCode(store.TemporarilyUnavailable))) == nil
+		}
 	}
 
 	// pending is a dequeued request waiting for the running execution to
@@ -757,27 +810,8 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		if running == nil && pending != nil {
 			next := *pending
 			pending = nil
-			switch {
-			case next.idless:
-				// docs/specifications/control.md:64-65: "ID-less client
-				// objects (including notifications) are not executed and
-				// receive no response; close with a bounded operational
-				// diagnostic." The deferred conn.Close() above is that close.
-				return
-			case next.violation != nil:
-				if respond(next, responseForViolation(next.violation)) != nil {
-					return
-				}
-				continue
-			case !time.Now().Before(next.at.Add(RequestDeadline)):
-				// Review 5259780995 (comment 4056295483): a request that
-				// waited out its whole deadline in the queue is refused
-				// before dispatch. Handlers that never consult the context
-				// -- a repeated server.hello, an unknown method, parameter
-				// validation -- would otherwise still run and answer after
-				// the advertised limit. Nothing has executed, so this is a
-				// provable non-commitment.
-				if respond(next, domainErrorResponse(&next.req.ID, DomainCode(store.TemporarilyUnavailable))) != nil {
+			if next.idless || next.violation != nil || !time.Now().Before(next.at.Add(RequestDeadline)) {
+				if !refuse(next) {
 					return
 				}
 				continue
@@ -825,13 +859,12 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 				// Both ready: a definite result beats an uncertain one.
 				keepServing = finish(out)
 			default:
-				running.answered = true
-				keepServing = respond(running.next, deadlineResponse(running.next.req)) == nil
+				keepServing = answerAtDeadline(running) == nil
 			}
 		case <-expiry:
 			next := *pending
 			pending = nil
-			keepServing = respond(next, domainErrorResponse(&next.req.ID, DomainCode(store.TemporarilyUnavailable))) == nil
+			keepServing = refuse(next)
 		}
 		for _, timer := range timers {
 			timer.Stop()

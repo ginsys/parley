@@ -71,8 +71,12 @@ runs even when admission refused -- may outlive the budget. At the deadline the 
 answers a mutation `outcome_unknown` (the same-ID retry rule applies; it may have committed) and a
 read `temporarily_unavailable`, never a non-commitment claim for a dispatched mutation. The
 handler stays owned: one execution per socket, nothing further dispatches on that socket until it
-returns, its late result is discarded, requests queued behind it still expire on their own
-arrival-based deadlines, and shutdown drains it before the writer closes.
+returns, its late result is discarded, and shutdown drains it before the writer closes. The
+deadline reply releases only the correlation ID; the executing slot stays occupied until the
+handler returns, so at most eight further requests are admitted behind it. Frames queued behind it
+keep their classification when their own arrival-based deadlines pass: a request is refused
+`temporarily_unavailable`, a malformed envelope gets its envelope error, an ID-less object closes
+the socket without a response.
 
 Mutations additionally carry `params.operation_id`, a canonical lowercase UUID distinct from the
 JSON-RPC correlation ID. A retry may use a new correlation ID but must keep its operation ID and
