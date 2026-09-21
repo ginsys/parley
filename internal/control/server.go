@@ -46,6 +46,13 @@ var ImplementedMethods = []string{
 	"membership.enroll", "membership.renew", "membership.replace", "membership.revoke",
 }
 
+// isMutationMethod reports whether method durably commits through
+// store.Coordinator.Execute -- the methods whose outcome a caller must treat
+// as unknown, not absent, when no result reaches it (see serveSession).
+func isMutationMethod(method string) bool {
+	return strings.HasPrefix(method, "membership.")
+}
+
 // Identity is one session's negotiated administrator identity, resolved
 // from the kernel-verified connecting UID via the server's configured
 // administrator map. It is never derived from a request field.

@@ -32,6 +32,17 @@ const WriteDeadline = 5 * time.Second
 // gate, must finish within it.
 const RequestDeadline = 5 * time.Second
 
+// handlerContextLead is how far before its RequestDeadline a dispatched
+// handler's context expires. A handler that honors its context -- the
+// coordinator gate wait, a reader query -- then returns its own definite
+// classification (temporarily_unavailable is a proven non-commitment when
+// the gate was never acquired) before serveSession has to answer for it at
+// the deadline with the weaker outcome_unknown. Review 5259801666 (comment
+// 4056340196): the recovery hooks' marker-I/O mutex and marker writes are
+// not bounded by any context, so a handler may outlive its budget; see
+// serveSession for what happens then.
+const handlerContextLead = 500 * time.Millisecond
+
 // staleSocketProbeTimeout bounds the connect attempt used to prove an
 // existing socket abandoned. Any outcome other than a definite connection
 // refusal within this window is treated as "not provably abandoned."
@@ -678,60 +689,169 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		return err
 	}
 
-	for next := range queue {
-		if ctx.Err() != nil {
-			return
+	// Review 5257748895 (comment 4054786967) and 5259801666 (comment
+	// 4056340196): ctx is the long-lived runtime worker context, so a
+	// handler gets a request-scoped deadline -- docs/specifications/
+	// control.md's five-second server request deadline covers queue wait,
+	// gate wait and execution together. That context bounds what honors it
+	// (the coordinator gate, reader queries); it does not bound the recovery
+	// hooks' marker-I/O mutex or a marker write, and the deferred After hook
+	// runs even when Before refused. So a handler runs in its own goroutine
+	// -- one per executing request, never one per frame: MaxExecutingPerSocket
+	// is one, so this is bounded by the socket caps -- and this loop stops
+	// waiting for it at the deadline. What it answers then is not a
+	// non-commitment claim: the handler may have committed and be finishing
+	// recovery evidence, so a mutation gets outcome_unknown (same-ID retry
+	// replays the durable receipt or executes once) and a read, which has no
+	// commitment to be uncertain about, temporarily_unavailable. The handler
+	// stays owned: no further request on this socket dispatches until it
+	// returns (queued ones expire at their own deadlines meanwhile), its late
+	// result is discarded, and serveSession does not return -- so
+	// Listener.Wait does not, and the runtime keeps the writer open -- until
+	// it has. store.Coordinator's commit runs independently of the request
+	// context, so an expiring context never tears a commit.
+	type outcome struct {
+		resp       Response
+		closeAfter bool
+	}
+	type execution struct {
+		next     arrival
+		done     chan outcome // buffered: a handler never blocks on a loop that stopped waiting
+		answered bool         // the deadline reply was written; the late result is discarded
+	}
+	var running *execution
+	defer func() {
+		if running != nil {
+			<-running.done
 		}
-		req, violation, idless := next.req, next.violation, next.idless
-		if idless {
-			// docs/specifications/control.md:64-65: "ID-less client
-			// objects (including notifications) are not executed and
-			// receive no response; close with a bounded operational
-			// diagnostic." The deferred conn.Close() above is that close.
-			return
-		}
-		if violation != nil {
-			if respond(next, responseForViolation(violation)) != nil {
-				return
-			}
-			continue
-		}
-		// Review 5259780995 (comment 4056295483): a request that waited out
-		// its whole deadline in the queue (behind a slow execution or a
-		// stalled response write) is refused here, before dispatch. Handlers
-		// that never consult the context -- a repeated server.hello, an
-		// unknown method, parameter validation -- would otherwise still run
-		// and answer normally after the advertised limit. Nothing has
-		// executed, so this is a provable non-commitment.
-		if !time.Now().Before(next.at.Add(RequestDeadline)) {
-			if respond(next, domainErrorResponse(&req.ID, DomainCode(store.TemporarilyUnavailable))) != nil {
-				return
-			}
-			continue
-		}
-		// Review 5257748895 (comment 4054786967): ctx is the long-lived
-		// runtime worker context, so without a request-scoped deadline a
-		// mutation waiting on the coordinator gate, a slow recovery hook or
-		// a stalled writer could hold this socket slot indefinitely.
-		// docs/specifications/control.md's five-second server request
-		// deadline covers gate wait and execution together. A deadline
-		// reached before commit is a provable non-commitment
-		// (temporarily_unavailable); store.Coordinator's commit itself runs
-		// independently of this context, so it cannot be torn mid-commit.
-		reqCtx, cancelReq := context.WithDeadline(ctx, next.at.Add(RequestDeadline))
-		resp, closeAfter := sess.Handle(reqCtx, req)
-		cancelReq()
+	}()
+	dispatch := func(next arrival) *execution {
+		ex := &execution{next: next, done: make(chan outcome, 1)}
+		reqCtx, cancelReq := context.WithDeadline(ctx, next.at.Add(RequestDeadline-handlerContextLead))
+		go func() {
+			defer cancelReq()
+			resp, closeAfter := sess.Handle(reqCtx, next.req)
+			ex.done <- outcome{resp: resp, closeAfter: closeAfter}
+		}()
+		return ex
+	}
+	finish := func(out outcome) (keepServing bool) {
+		ex := *running
+		running = nil
 		if sess.negotiated {
-			// sess.negotiated is only ever written by this goroutine
-			// (inside Handle -> handleHello); helloDone is the only field
-			// preHelloTimer's separate goroutine reads, so this stays
-			// race-free without sharing sess itself across goroutines.
+			// sess.negotiated is written by the handler goroutine, whose
+			// send on done happens-before this read; helloDone is the only
+			// field preHelloTimer's goroutine reads.
 			helloDone.Store(true)
 		}
-		if respond(next, resp) != nil || closeAfter {
+		if ex.answered {
+			return !out.closeAfter
+		}
+		return respond(ex.next, out.resp) == nil && !out.closeAfter
+	}
+
+	// pending is a dequeued request waiting for the running execution to
+	// end; it expires on its own arrival-based deadline while it waits.
+	var pending *arrival
+	for {
+		if running == nil && pending != nil {
+			next := *pending
+			pending = nil
+			switch {
+			case next.idless:
+				// docs/specifications/control.md:64-65: "ID-less client
+				// objects (including notifications) are not executed and
+				// receive no response; close with a bounded operational
+				// diagnostic." The deferred conn.Close() above is that close.
+				return
+			case next.violation != nil:
+				if respond(next, responseForViolation(next.violation)) != nil {
+					return
+				}
+				continue
+			case !time.Now().Before(next.at.Add(RequestDeadline)):
+				// Review 5259780995 (comment 4056295483): a request that
+				// waited out its whole deadline in the queue is refused
+				// before dispatch. Handlers that never consult the context
+				// -- a repeated server.hello, an unknown method, parameter
+				// validation -- would otherwise still run and answer after
+				// the advertised limit. Nothing has executed, so this is a
+				// provable non-commitment.
+				if respond(next, domainErrorResponse(&next.req.ID, DomainCode(store.TemporarilyUnavailable))) != nil {
+					return
+				}
+				continue
+			}
+			running = dispatch(next)
+			continue
+		}
+		queueIn := queue
+		if pending != nil {
+			queueIn = nil // hold one; the reader's bounded queue holds the rest
+		}
+		var (
+			execDone       <-chan outcome
+			cutoff, expiry <-chan time.Time
+			timers         []*time.Timer
+		)
+		if running != nil {
+			execDone = running.done
+			if !running.answered {
+				timer := time.NewTimer(time.Until(running.next.at.Add(RequestDeadline)))
+				timers = append(timers, timer)
+				cutoff = timer.C
+			}
+		}
+		if pending != nil {
+			timer := time.NewTimer(time.Until(pending.at.Add(RequestDeadline)))
+			timers = append(timers, timer)
+			expiry = timer.C
+		}
+		keepServing := true
+		select {
+		case <-ctx.Done():
+			keepServing = false
+		case next, ok := <-queueIn:
+			// !ok: the reader ended -- the socket closed or a frame was fatal.
+			keepServing = ok
+			if ok {
+				pending = &next
+			}
+		case out := <-execDone:
+			keepServing = finish(out)
+		case <-cutoff:
+			select {
+			case out := <-running.done:
+				// Both ready: a definite result beats an uncertain one.
+				keepServing = finish(out)
+			default:
+				running.answered = true
+				keepServing = respond(running.next, deadlineResponse(running.next.req)) == nil
+			}
+		case <-expiry:
+			next := *pending
+			pending = nil
+			keepServing = respond(next, domainErrorResponse(&next.req.ID, DomainCode(store.TemporarilyUnavailable))) == nil
+		}
+		for _, timer := range timers {
+			timer.Stop()
+		}
+		if !keepServing {
 			return
 		}
 	}
+}
+
+// deadlineResponse answers a request whose handler is still running at its
+// deadline. A mutation's outcome cannot be established from outside the
+// handler -- it may have committed and be finishing recovery evidence -- so
+// it is outcome_unknown, never a non-commitment claim; a read has nothing to
+// be uncertain about and is temporarily_unavailable.
+func deadlineResponse(req Request) Response {
+	if isMutationMethod(req.Method) {
+		return domainErrorResponse(&req.ID, DomainCode(store.OutcomeUnknown))
+	}
+	return domainErrorResponse(&req.ID, DomainCode(store.TemporarilyUnavailable))
 }
 
 func writeResponse(conn *net.UnixConn, resp Response) error {
