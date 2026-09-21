@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -516,4 +517,115 @@ func TestListenerServiceCompletesMutationWithRealRecoveryHooks(t *testing.T) {
 	if got := readReply(t, br); got["id"] != "4" || got["error"] != nil {
 		t.Fatalf("a follow-up revoke on the enrolled version must succeed, got %#v", got)
 	}
+}
+
+// liveHandlerConn negotiates a connection and pipelines one membership.revoke
+// whose marker write blocks inside Before (clock rollback under the recovery
+// I/O mutex), followed by extra frames, returning once that write is reached.
+// The revoke is answered outcome_unknown at RequestDeadline while its handler
+// stays alive until release is called (cleanup calls it too).
+func liveHandlerConn(t *testing.T, extra string) (conn net.Conn, br *bufio.Reader, started time.Time, markers *gatedMarkers, release func()) {
+	t.Helper()
+	fx := newListenerFixture(t)
+	markers = newGatedMarkers()
+	clock := new(atomic.Int64)
+	clock.Store(110)
+	installListenerRecovery(t, fx, markers, func() time.Time { return time.Unix(clock.Load(), 0) })
+	release = sync.OnceFunc(func() {
+		markers.blockPut.Store(false)
+		close(markers.release)
+	})
+	t.Cleanup(release)
+
+	conn, br = negotiatedConn(t, fx)
+	clock.Store(100)
+	markers.blockPut.Store(true)
+	started = time.Now()
+	if _, err := conn.Write([]byte(revokeLine("2", "80000000-0000-4000-8000-00000000f601", "conv-live") + extra)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-markers.putEntered:
+	case <-time.After(restartTeardownWait):
+		t.Fatal("the marker write was never reached")
+	}
+	return conn, br, started, markers, release
+}
+
+// TestListenerServiceClassifiesFramesExpiringBehindLiveHandler: review
+// 5264346948 (comment 4060293322). A frame dequeued behind a handler that
+// outlives its deadline is still an ID-less object or an envelope violation
+// when its own deadline passes: the first closes the socket without any
+// response, the second is answered with its envelope error under its own ID.
+// Before this change both were answered temporarily_unavailable as if they
+// were valid requests -- the ID-less one under an empty ID, socket left open.
+func TestListenerServiceClassifiesFramesExpiringBehindLiveHandler(t *testing.T) {
+	t.Run("envelope violation keeps its error and id", func(t *testing.T) {
+		_, br, started, _, _ := liveHandlerConn(t, `{"jsonrpc":"2.0","id":"3","method":"membership.revoke","params":[]}`+"\n")
+		expectBoundedReply(t, br, started, "2", string(store.OutcomeUnknown))
+		resp := readReply(t, br)
+		elapsed := time.Since(started)
+		wireErr, _ := resp["error"].(map[string]any)
+		if resp["id"] != "3" || wireErr["code"] != float64(InvalidRequest) || replyCode(resp) != "" {
+			t.Fatalf("expected the -32600 envelope error under id 3, got %#v", resp)
+		}
+		if elapsed < RequestDeadline-time.Second || elapsed > RequestDeadline+2*time.Second {
+			t.Fatalf("violation answered after %v, want about RequestDeadline (%v) from arrival", elapsed, RequestDeadline)
+		}
+	})
+	t.Run("id-less object closes the socket without a response", func(t *testing.T) {
+		_, br, started, _, _ := liveHandlerConn(t, `{"jsonrpc":"2.0","method":"server.hello","params":{"protocol":"parley-control/1"}}`+"\n")
+		expectBoundedReply(t, br, started, "2", string(store.OutcomeUnknown))
+		_, err := br.ReadBytes('\n')
+		assertConnectionActuallyClosed(t, err)
+		if elapsed := time.Since(started); elapsed > RequestDeadline+2*time.Second {
+			t.Fatalf("socket closed after %v; the close must not wait for the live handler", elapsed)
+		}
+	})
+}
+
+// TestListenerServiceKeepsExecutingSlotOccupiedAfterDeadlineReply: review
+// 5264346948 (comment 4060293329). After a mutation is answered
+// outcome_unknown its handler still holds the socket's one executing slot, so
+// the reader admits exactly MaxQueuedPerSocket more requests behind it and the
+// next one closes the socket. Before this change the reply released the slot
+// together with the correlation ID and nine were admitted, all queued.
+func TestListenerServiceKeepsExecutingSlotOccupiedAfterDeadlineReply(t *testing.T) {
+	burst := func(n int) string {
+		var b strings.Builder
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&b, `{"jsonrpc":"2.0","id":%q,"method":"no.such.method","params":{}}`+"\n", fmt.Sprint(i+3))
+		}
+		return b.String()
+	}
+	t.Run("one more than the queue bound closes the socket", func(t *testing.T) {
+		conn, br, started, _, _ := liveHandlerConn(t, "")
+		expectBoundedReply(t, br, started, "2", string(store.OutcomeUnknown))
+		// Shorter than the queued requests' own deadlines: a close must come
+		// from the queue bound, not be confused with their expiry replies.
+		if err := conn.SetDeadline(time.Now().Add(RequestDeadline - 2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte(burst(MaxQueuedPerSocket + 1))); err != nil {
+			t.Fatal(err)
+		}
+		_, err := br.ReadBytes('\n')
+		assertConnectionActuallyClosed(t, err)
+	})
+	t.Run("the queue bound itself is admitted and served", func(t *testing.T) {
+		conn, br, started, _, release := liveHandlerConn(t, "")
+		expectBoundedReply(t, br, started, "2", string(store.OutcomeUnknown))
+		if _, err := conn.Write([]byte(burst(MaxQueuedPerSocket))); err != nil {
+			t.Fatal(err)
+		}
+		release()
+		if err := conn.SetDeadline(time.Now().Add(restartTeardownWait)); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < MaxQueuedPerSocket; i++ {
+			if resp := readReply(t, br); resp["id"] != fmt.Sprint(i+3) {
+				t.Fatalf("reply %d: want id %d, got %#v", i, i+3, resp)
+			}
+		}
+	})
 }
