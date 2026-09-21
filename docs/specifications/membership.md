@@ -100,8 +100,11 @@ administration interface; this decision does not pre-authorize a new recovery AP
 grants remain usable. The later room backfill preserves historical bytes and still rejects the
 independent membership/self-send/FK incompatibilities described below.
 
-The implementation is tracked separately in #40. This document records an accepted target rule;
-it does not claim that shipped code enforces ASCII today.
+This rule is enforced (#40 is closed): the shared metadata validator
+(`bridgetext.ValidateMetadata`) checks conversation names and peer IDs on every authorization
+path, and the membership model, the `membership.*` control handlers and `parleyctl`'s input
+validation apply the same validator before any durable mutation. Enforcement in code does not
+change the policy above or the inventory obligation for pre-existing databases.
 
 ## First-runtime subset and exact translation
 

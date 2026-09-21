@@ -1246,72 +1246,91 @@ func TestListenerServiceBoundsMutationByRequestDeadline(t *testing.T) {
 }
 
 // TestListenerServiceClosesOnQueueOverflowAndReusedCorrelationID holds the
-// coordinator gate so pipelined mutations stay outstanding, then proves the
-// two bounds the per-socket queue enforces: a correlation ID reused while
-// outstanding, and one request more than MaxExecutingPerSocket +
-// MaxQueuedPerSocket, each close the socket instead of executing.
+// coordinator gate so a pipelined mutation stays executing, then proves the
+// bounds the per-socket queue enforces before any deadline reply: a
+// correlation ID reused while outstanding, and one frame more than
+// MaxExecutingPerSocket + MaxQueuedPerSocket -- whatever the frames are
+// (review 5264559000, comment 4060461953: ID-less objects and unechoable
+// violations occupy capacity like requests) -- each close the socket instead
+// of executing. The boundary cases prove the bound itself is admitted, served
+// once the gate frees, and its capacity reusable afterwards.
 func TestListenerServiceClosesOnQueueOverflowAndReusedCorrelationID(t *testing.T) {
 	revoke := func(id string, op int) string {
 		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%q,"method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-0000000000%02d","conversation":"conv-queue","expected_grant_version":"1"}}`+"\n", id, op)
 	}
-	cases := map[string]func() string{
-		"reused correlation id": func() string { return revoke("2", 1) + revoke("2", 2) },
+	const queued = MaxQueuedPerSocket
+	// Every burst starts with one executing revoke (id "2"); the rest follow it.
+	behind := func(kinds []frameKind) string { return revoke("2", 1) + burstOf(kinds, 3) }
+	mixed := append(repeatKind(validFrame, queued/2), repeatKind(unechoableFrame, queued-queued/2)...)
+	closing := map[string]string{
+		"reused correlation id": revoke("2", 1) + revoke("2", 2),
 		// Review 5259780995 (comment 4056295482): a malformed envelope whose
 		// ID can be echoed would be answered under that ID, so it counts as
 		// a reuse too (positional params are an envelope violation).
-		"violation reusing an outstanding id": func() string {
-			return revoke("2", 1) + `{"jsonrpc":"2.0","id":"2","method":"membership.revoke","params":[]}` + "\n"
-		},
-		"queue overflow": func() string {
-			var b strings.Builder
-			for i := 0; i <= MaxExecutingPerSocket+MaxQueuedPerSocket; i++ {
-				b.WriteString(revoke(fmt.Sprint(i+2), i+1))
-			}
-			return b.String()
-		},
+		"violation reusing an outstanding id": revoke("2", 1) + `{"jsonrpc":"2.0","id":"2","method":"membership.revoke","params":[]}` + "\n",
+		"queue overflow":                      behind(repeatKind(validFrame, queued+1)),
+		"queue overflow of unechoable frames": behind(repeatKind(unechoableFrame, queued+1)),
+		"queue overflow by an id-less frame":  behind(append(mixed, idlessFrame)),
 	}
-	for name, burst := range cases {
+	open := func(t *testing.T) (*listenerFixture, net.Conn, *bufio.Reader, func()) {
+		t.Helper()
+		fx := newListenerFixture(t)
+		release, _ := holdCoordinator(t, fx.db, nil)
+		conn, err := connection.DialTrustedServer(context.Background(), fx.socketPath, fx.serverUID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		// Shorter than RequestDeadline: a close must come from the queue
+		// bound, not from the held mutation timing out first.
+		if err := conn.SetDeadline(time.Now().Add(RequestDeadline - 2*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		br := bufio.NewReader(conn)
+		if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}` + "\n")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := br.ReadBytes('\n'); err != nil {
+			t.Fatalf("hello: %v", err)
+		}
+		return fx, conn, br, release
+	}
+	for name, burst := range closing {
 		t.Run(name, func(t *testing.T) {
-			fx := newListenerFixture(t)
-			entered, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
-			go func() {
-				_, err := fx.db.Coordinator().Transition(context.Background(), func(context.Context, *sql.Tx, store.CommitView) (store.TransitionResult, error) {
-					close(entered)
-					<-release
-					return store.TransitionResult{}, nil
-				}, nil)
-				held <- err
-			}()
-			<-entered
-			defer func() {
-				close(release)
-				if err := <-held; err != nil {
-					t.Error(err)
-				}
-			}()
-
-			conn, err := connection.DialTrustedServer(context.Background(), fx.socketPath, fx.serverUID)
-			if err != nil {
+			_, conn, br, _ := open(t)
+			if _, err := conn.Write([]byte(burst)); err != nil {
 				t.Fatal(err)
 			}
-			defer conn.Close()
-			// Shorter than RequestDeadline: the close must come from the
-			// queue bound, not from the held mutation timing out first.
-			if err := conn.SetDeadline(time.Now().Add(RequestDeadline - 2*time.Second)); err != nil {
-				t.Fatal(err)
-			}
-			br := bufio.NewReader(conn)
-			if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":"1","method":"server.hello","params":{"protocol":"parley-control/1"}}` + "\n")); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := br.ReadBytes('\n'); err != nil {
-				t.Fatalf("hello: %v", err)
-			}
-			if _, err := conn.Write([]byte(burst())); err != nil {
-				t.Fatal(err)
-			}
-			_, err = br.ReadBytes('\n')
+			_, err := br.ReadBytes('\n')
 			assertConnectionActuallyClosed(t, err)
+		})
+	}
+	boundary := map[string][]frameKind{
+		"the bound of requests":          repeatKind(validFrame, queued),
+		"the bound of unechoable frames": repeatKind(unechoableFrame, queued),
+		"a mixed bound":                  mixed,
+	}
+	for name, kinds := range boundary {
+		t.Run(name+" is admitted, served and its capacity reusable", func(t *testing.T) {
+			_, conn, br, release := open(t)
+			if _, err := conn.Write([]byte(behind(kinds))); err != nil {
+				t.Fatal(err)
+			}
+			release()
+			if err := conn.SetDeadline(time.Now().Add(restartTeardownWait)); err != nil {
+				t.Fatal(err)
+			}
+			// The executing revoke answers first (a domain rejection: no
+			// grant exists), then every frame behind it in order.
+			if resp := readReply(t, br); resp["id"] != "2" || resp["error"] == nil {
+				t.Fatalf("expected the executing revoke's rejection first, got %#v", resp)
+			}
+			expectRepliesInOrder(t, br, kinds, 3)
+			again := append(repeatKind(validFrame, MaxExecutingPerSocket), kinds...)
+			if _, err := conn.Write([]byte(burstOf(again, 20))); err != nil {
+				t.Fatal(err)
+			}
+			expectRepliesInOrder(t, br, again, 20)
 		})
 	}
 }

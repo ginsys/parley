@@ -574,9 +574,12 @@ Usage:
   parleyctl membership replace -conversation NAME -expected-grant-version N -peer-a ID -peer-b ID [-direction bidirectional|a_to_b|b_to_a] [-max-exchanges N] [-expires-in DURATION | -expires-at RFC3339] [-cancel-pending-replies] [-operation-id UUID] -endpoint PATH -server-uid UID
   parleyctl membership revoke  -conversation NAME -expected-grant-version N [-operation-id UUID] -endpoint PATH -server-uid UID
 
--expected-grant-version pins optimistic concurrency: 0 for enroll of a
-conversation with no prior history, else the exact current active grant
-version. A stale value is rejected rather than silently overwritten.
+-expected-grant-version pins optimistic concurrency. enroll compares it with
+the conversation's latest historical version, revoked versions included: 0
+only when the conversation has no history at all; re-enrolling a revoked
+conversation expects its latest historical version. renew, replace and revoke
+expect the exact current active version. A stale value is rejected rather
+than silently overwritten.
 -operation-id defaults to a fresh random UUID; pass the same value again to
 retry a call whose response was lost without risking a second mutation.
 -expires-in resolves to an absolute expiry once, at the moment this command

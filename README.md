@@ -78,9 +78,11 @@ peer IDs, directions and budgets.
 | `membership replace` | Create a successor version with a different peer pair or direction |
 | `membership revoke` | Revoke the active grant and cancel queued messages; report messages already in flight |
 
-Every mutation requires `-expected-grant-version`: `0` to enroll a conversation with no prior
-history, otherwise the exact current active grant version. A stale value is rejected, never
-silently overwritten. Both peers of an `enroll` or `replace` must currently hold an enabled
+Every mutation requires `-expected-grant-version`. `enroll` compares it with the conversation's
+latest historical version, revoked versions included: `0` only when the conversation has no
+history at all; re-enrolling a revoked conversation expects its latest historical version.
+`renew`, `replace` and `revoke` expect the exact current active version. A stale value is
+rejected, never silently overwritten. Both peers of an `enroll` or `replace` must currently hold an enabled
 binding. Each call carries an operation ID (a fresh UUID by default); when a response is lost or
 the outcome is reported unknown, retry with the same `-operation-id` so the server returns the
 original receipt rather than mutating twice. Such a retry must pin expiry with the reported

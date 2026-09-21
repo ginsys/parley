@@ -344,17 +344,10 @@ func TestExpiryPersistenceNeverHoldsTheRequestPath(t *testing.T) {
 		t.Fatalf("the trigger should have failed the first write: status=%s", status)
 	}
 
-	entered, release, held := make(chan struct{}), make(chan struct{}), make(chan error, 1)
-	go func() {
-		_, err := db.Coordinator().Transition(ctx, func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
-			close(entered)
-			<-release
-			_, err := tx.ExecContext(ctx, `DROP TRIGGER reject_expiry`)
-			return store.TransitionResult{Changed: true}, err
-		}, nil)
-		held <- err
-	}()
-	<-entered
+	release, held := holdCoordinator(t, db, func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DROP TRIGGER reject_expiry`)
+		return err
+	})
 
 	_, expiry := store.ObserveExpiries(ctx, db)
 	started := time.Now()
@@ -369,16 +362,95 @@ func TestExpiryPersistenceNeverHoldsTheRequestPath(t *testing.T) {
 	}()
 	select {
 	case <-drained:
+		// The fixture's cleanup releases the held transition, so this
+		// failure reports instead of hanging srv.WaitBackground's cleanup.
 		t.Fatal("the expiry write completed while the coordinator was still held")
 	case <-time.After(300 * time.Millisecond):
 	}
-	close(release)
-	if err := <-held; err != nil {
-		t.Fatal(err)
+	release()
+	awaitHeld(t, held)
+	select {
+	case <-drained:
+	case <-time.After(fixtureSettleWait):
+		t.Fatal("the background expiry write did not complete once the coordinator was free")
 	}
-	<-drained
 	if status := credentialStatus(t, sess, db, 2); status != "expired" {
 		t.Fatalf("the retained observation was not persisted once the coordinator was free: status=%s", status)
+	}
+}
+
+// fixtureSettleWait bounds every wait a fixture makes on work it owns: a
+// bound turns a stranded goroutine into a reported failure.
+const fixtureSettleWait = 5 * time.Second
+
+// holdCoordinator takes the coordinator gate in a background Transition and
+// keeps it until release is called; body, if any, runs inside that
+// transaction after the release. release is idempotent and registered as
+// cleanup before the transition starts, so a failure anywhere after this call
+// cannot strand the writer behind it (and with it the store's close). Entry
+// is bounded; held reports the transition's result once it ends.
+func holdCoordinator(t *testing.T, db *store.DB, body func(ctx context.Context, tx *sql.Tx) error) (release func(), held <-chan error) {
+	t.Helper()
+	entered, releaseCh, result := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	release = sync.OnceFunc(func() { close(releaseCh) })
+	t.Cleanup(release)
+	go func() {
+		_, err := db.Coordinator().Transition(context.Background(), func(ctx context.Context, tx *sql.Tx, _ store.CommitView) (store.TransitionResult, error) {
+			close(entered)
+			<-releaseCh
+			if body == nil {
+				return store.TransitionResult{}, nil
+			}
+			if err := body(ctx, tx); err != nil {
+				return store.TransitionResult{}, err
+			}
+			return store.TransitionResult{Changed: true}, nil
+		}, nil)
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(fixtureSettleWait):
+		t.Fatal("the coordinator gate was never taken")
+	}
+	return release, result
+}
+
+// awaitHeld reads a held transition's result within fixtureSettleWait.
+func awaitHeld(t *testing.T, held <-chan error) {
+	t.Helper()
+	select {
+	case err := <-held:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(fixtureSettleWait):
+		t.Fatal("the held transition did not end after its release")
+	}
+}
+
+// TestHeldCoordinatorFixtureSettlesAfterEarlyReturn: a test that fails before
+// releasing the held coordinator must report, not hang the package. The
+// subtest takes the gate and returns at once -- the shape of a t.Fatal before
+// release -- and its cleanup must end the transition and free the writer
+// within a bound.
+func TestHeldCoordinatorFixtureSettlesAfterEarlyReturn(t *testing.T) {
+	_, db := membershipTestServer(t)
+	var held <-chan error
+	started := time.Now()
+	t.Run("returns before release", func(t *testing.T) {
+		_, held = holdCoordinator(t, db, nil)
+	})
+	awaitHeld(t, held)
+	if elapsed := time.Since(started); elapsed > fixtureSettleWait {
+		t.Fatalf("the fixture took %v to settle after an early return", elapsed)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), fixtureSettleWait)
+	defer cancel()
+	if _, err := db.Coordinator().Transition(ctx, func(context.Context, *sql.Tx, store.CommitView) (store.TransitionResult, error) {
+		return store.TransitionResult{}, nil
+	}, nil); err != nil {
+		t.Fatalf("the writer was not free after the subtest's cleanup: %v", err)
 	}
 }
 
@@ -1936,7 +2008,7 @@ func TestMembershipRevokeAtIdentityBoundPreservesExactIdentifierThroughAuditAndR
 		t.Fatalf("replay must succeed: %#v", replay.Err)
 	}
 	r2 := decodeResult[CommandReceiptResult](t, replay)
-	if r2.AuditID != result.AuditID || r2.Result.Resources[0].ID != conversation {
+	if r2.AuditID != result.AuditID || len(r2.Result.Resources) == 0 || r2.Result.Resources[0].ID != conversation {
 		t.Fatalf("replay must reproduce the identical durable receipt: %#v", r2)
 	}
 }

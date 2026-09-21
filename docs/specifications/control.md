@@ -73,7 +73,8 @@ read `temporarily_unavailable`, never a non-commitment claim for a dispatched mu
 handler stays owned: one execution per socket, nothing further dispatches on that socket until it
 returns, its late result is discarded, and shutdown drains it before the writer closes. The
 deadline reply releases only the correlation ID; the executing slot stays occupied until the
-handler returns, so at most eight further requests are admitted behind it. Frames queued behind it
+handler returns, so at most eight further frames of any kind -- ID-less objects and malformed
+envelopes count like requests -- are admitted behind it. Frames queued behind it
 keep their classification when their own arrival-based deadlines pass: a request is refused
 `temporarily_unavailable`, a malformed envelope gets its envelope error, an ID-less object closes
 the socket without a response.
