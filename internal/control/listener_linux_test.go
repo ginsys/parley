@@ -468,6 +468,7 @@ type listenerFixture struct {
 	serverUID  uint32
 	db         *store.DB
 	ln         *Listener
+	cancel     context.CancelFunc // the worker context runtime shutdown would cancel
 }
 
 func newListenerFixture(t *testing.T) *listenerFixture {
@@ -495,7 +496,7 @@ func newListenerFixture(t *testing.T) *listenerFixture {
 		cancel()
 		service.Wait()
 	})
-	return &listenerFixture{socketPath: socketPath, adminID: adminID, serverUID: uid, db: db, ln: service}
+	return &listenerFixture{socketPath: socketPath, adminID: adminID, serverUID: uid, db: db, ln: service, cancel: cancel}
 }
 
 // dialAndRoundTripErr is dialAndRoundTrip's actual I/O core, returning an
@@ -1190,14 +1191,16 @@ func TestListenerServiceBoundsMutationByRequestDeadline(t *testing.T) {
 	// Two mutations pipelined in one write (review 5259563170, comment
 	// 4056153933): the second waits behind the first, and that wait counts
 	// toward its own deadline, so both are refused at about RequestDeadline
-	// from arrival -- not the second a further RequestDeadline later.
+	// from arrival -- not the second a further RequestDeadline later. The
+	// gate wait honors the request context, so these are the coordinator's
+	// own provable non-commitments (temporarily_unavailable), delivered
+	// handlerContextLead before the deadline; a third, context-free request
+	// behind them therefore still has budget when dispatched and is answered
+	// normally. Its refusal once a context-ignoring handler used up the whole
+	// deadline is TestListenerServiceAnswersUncertainWhileRecoveryPreparationBlocks.
 	started := time.Now()
 	if _, err := conn.Write([]byte(`{"jsonrpc":"2.0","id":"2","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f001","conversation":"conv-deadline","expected_grant_version":"1"}}` + "\n" +
 		`{"jsonrpc":"2.0","id":"3","method":"membership.revoke","params":{"operation_id":"80000000-0000-4000-8000-00000000f002","conversation":"conv-deadline","expected_grant_version":"1"}}` + "\n" +
-		// Review 5259780995 (comment 4056295483): an unknown method never
-		// consults its context, so only the pre-dispatch check can refuse it
-		// once its deadline passed in the queue -- without it this frame
-		// answers method-not-found after the advertised limit.
 		`{"jsonrpc":"2.0","id":"4","method":"no.such.method","params":{}}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -1218,7 +1221,11 @@ func TestListenerServiceBoundsMutationByRequestDeadline(t *testing.T) {
 		}
 		wireErr, _ := resp["error"].(map[string]any)
 		data, _ := wireErr["data"].(map[string]any)
-		if resp["id"] != id || data["code"] != string(store.TemporarilyUnavailable) {
+		if id == "4" {
+			if resp["id"] != id || wireErr["code"] != float64(MethodNotFound) {
+				t.Fatalf("expected method-not-found for request %s (it still had budget when dispatched), got %#v", id, resp)
+			}
+		} else if resp["id"] != id || data["code"] != string(store.TemporarilyUnavailable) {
 			t.Fatalf("expected temporarily_unavailable for request %s at the request deadline, got %#v", id, resp)
 		}
 		if elapsed < RequestDeadline-time.Second || elapsed > RequestDeadline+3*time.Second {

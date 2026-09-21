@@ -62,6 +62,18 @@ failure returns `capacity_exceeded` if bounded output space exists; otherwise cl
 allocation, goroutine per incoming frame or unbounded response queue. These limits are profile
 constants initially; changing them requires an advertised protocol capability revision.
 
+The request deadline bounds the response, not every operation behind it. A handler's context
+expires shortly before the deadline, so work that honors it (the coordinator gate, reader
+queries) returns its own definite classification; a deadline reached before the gate was acquired
+is a provable non-commitment (`temporarily_unavailable`). Work that cannot be interrupted --
+recovery marker I/O runs under a mutex and writes files no context cancels, and its finalization
+runs even when admission refused -- may outlive the budget. At the deadline the server then
+answers a mutation `outcome_unknown` (the same-ID retry rule applies; it may have committed) and a
+read `temporarily_unavailable`, never a non-commitment claim for a dispatched mutation. The
+handler stays owned: one execution per socket, nothing further dispatches on that socket until it
+returns, its late result is discarded, requests queued behind it still expire on their own
+arrival-based deadlines, and shutdown drains it before the writer closes.
+
 Mutations additionally carry `params.operation_id`, a canonical lowercase UUID distinct from the
 JSON-RPC correlation ID. A retry may use a new correlation ID but must keep its operation ID and
 identical logical payload. Correlation IDs cannot be reused while outstanding on the same socket.

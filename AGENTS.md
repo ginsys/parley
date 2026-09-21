@@ -351,6 +351,11 @@ one writer-validated instant governs credential/grant authorization inside a tra
 and checkpoint time under the same writer acquisition. Every detected rollback retains its exact
 external marker and durable incident; failed marker publication requires the trusted supervisor's
 fail-stop callback. This callback must be nonblocking, perform no I/O and never reenter the store.
+Neither the hooks' I/O mutex nor a marker write is bounded by a request context, and the After
+hook runs even when Before refused; the control listener therefore runs each executing request in
+an owned goroutine, answers a still-running mutation `outcome_unknown` at the request deadline
+(never a non-commitment claim), dispatches nothing further on that socket until it returns, and
+drains it before shutdown closes the writer.
 Failed credential-expiry storage instead retains an exact credential denial and retries persistence;
 it does not stop unrelated credentials. That in-memory denial alone is not crash persistence.
 

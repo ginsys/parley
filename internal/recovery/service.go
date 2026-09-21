@@ -254,6 +254,10 @@ func (s *Service) after() error {
 	if !s.initialized.Load() {
 		return store.RecoveryRequired
 	}
+	// The background context bounds the flush once ioMu is held; it does not
+	// bound the wait for ioMu, and a marker write is not cancellable anyway.
+	// Callers with a response deadline own that wait separately
+	// (internal/control's serveSession).
 	ctx, cancel := context.WithTimeout(context.Background(), store.AuthenticationDeadline)
 	defer cancel()
 	s.ioMu.Lock()
