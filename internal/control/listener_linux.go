@@ -618,13 +618,19 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		tracked   bool   // id is held in outstanding until that response is written
 	}
 	// outstanding holds the correlation IDs whose responses are not yet
-	// written; occupied counts the socket's executing and queued requests, so
-	// the queue holds that many and a send never blocks. Review 5264346948
-	// (comment 4060293329): the two part ways once a request is answered at
-	// its deadline while its handler still runs -- the ID is released with
-	// the reply (a conforming client may reuse it), but the executing slot
-	// stays occupied until the handler returns, so the reader admits at most
-	// MaxQueuedPerSocket behind it, as advertised.
+	// written; occupied counts every admitted complete frame -- in the
+	// channel, dequeued as pending, or executing -- so the queue holds that
+	// many and a send never blocks. Review 5264346948 (comment 4060293329):
+	// the two part ways once a request is answered at its deadline while its
+	// handler still runs -- the ID is released with the reply (a conforming
+	// client may reuse it), but the executing slot stays occupied until the
+	// handler returns. Review 5264559000 (comment 4060461953): an ID-less
+	// object or an unechoable violation has no ID to track but still occupies
+	// a slot, so capacity is charged independently of tracking. Either way
+	// the reader admits at most MaxQueuedPerSocket frames behind a live
+	// handler, as advertised. Each admitted frame releases its slot exactly
+	// once: with its written response, or -- for a request answered at the
+	// deadline -- when its handler returns; an ID-less frame ends the session.
 	const maxOutstanding = MaxExecutingPerSocket + MaxQueuedPerSocket
 	queue := make(chan arrival, maxOutstanding)
 	readerDone := make(chan struct{})
@@ -652,17 +658,18 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 			case next.violation.ID != nil:
 				next.id, next.tracked = *next.violation.ID, true
 			}
+			outstandingMu.Lock()
+			full := occupied >= maxOutstanding
+			occupied++
+			reused := false
 			if next.tracked {
-				outstandingMu.Lock()
-				_, reused := outstanding[next.id]
-				full := occupied >= maxOutstanding
+				_, reused = outstanding[next.id]
 				outstanding[next.id] = struct{}{}
-				occupied++
-				outstandingMu.Unlock()
-				if reused || full {
-					conn.Close()
-					return
-				}
+			}
+			outstandingMu.Unlock()
+			if reused || full {
+				conn.Close()
+				return
 			}
 			select {
 			case queue <- next:
@@ -689,12 +696,12 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 	// package's own Client) is unaffected.
 	respond := func(next arrival, resp Response) error {
 		err := writeResponse(conn, resp)
+		outstandingMu.Lock()
 		if next.tracked {
-			outstandingMu.Lock()
 			delete(outstanding, next.id)
-			occupied--
-			outstandingMu.Unlock()
 		}
+		occupied--
+		outstandingMu.Unlock()
 		return err
 	}
 
@@ -760,6 +767,7 @@ func serveSession(ctx context.Context, sess *Session, conn *net.UnixConn) {
 		if ex.answered {
 			// The deadline reply released the correlation ID; the executing
 			// slot it kept occupied is free only now that the handler returned.
+			// The ID is not touched here: a newer request may hold it by now.
 			outstandingMu.Lock()
 			occupied--
 			outstandingMu.Unlock()

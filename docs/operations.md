@@ -163,9 +163,11 @@ server is down.
 
 `parleyctl membership enroll|renew|replace|revoke` is the only client for membership mutations.
 Every subcommand takes `-conversation`, `-endpoint`/`-server-uid` (same resolution as `hello`) and
-an `-expected-grant-version`: `0` for `enroll` of a conversation with no prior history, otherwise
-the exact current active grant version. A stale value is rejected (`stale_grant_version`), never
-silently overwritten. `enroll` and `replace` also take `-peer-a`/`-peer-b` and `-direction`
+an `-expected-grant-version`. `enroll` compares it with the conversation's latest historical
+version, revoked versions included: `0` only when the conversation has no history at all;
+re-enrolling a revoked conversation expects its latest historical version. `renew`, `replace` and
+`revoke` expect the exact current active version. A stale value is rejected
+(`stale_grant_version`), never silently overwritten. `enroll` and `replace` also take `-peer-a`/`-peer-b` and `-direction`
 (`bidirectional`/`a_to_b`/`b_to_a`); both peers must currently hold an enabled binding, or the
 server rejects with `binding_unavailable`. `renew` and `replace` accept
 `-cancel-pending-replies` to cancel rather than carry forward pending trusted replies across the
